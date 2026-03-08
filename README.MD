@@ -139,28 +139,28 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | Site | Notes | Integration Status |
 | ----- | ----- | ----- |
 | [asuracomic.net](https://asuracomic.net) | Alternative URLs: [asurascans.net](https://asurascans.net) | recent check 03.08.26 ✅ |
-| [Atsumaru / atsu.moe](https://atsu.moe) | | recent check 11.26.25 ✅ |
-| [**comix.to**](https://comix.to) | Supports multiple scanlation groups | recent check 11.26.25 ✅ |
-| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | recent check 11.26.25 ✅ |
-| [flamecomics.xyz](https://flamecomics.xyz) | | recent check 11.25.25 ✅ |
-| [galaxymanga.io](https://galaxymanga.io) | | recent check 11.25.25 ✅ |
+| [Atsumaru / atsu.moe](https://atsu.moe) | | recent check 03.08.26 ✅ |
+| [**comix.to**](https://comix.to) | Supports multiple scanlation groups | recent check 03.08.26 ✅ |
+| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | recent check 03.08.26 ✅ |
+| [flamecomics.xyz](https://flamecomics.xyz) | | recent check 03.08.26 ✅ |
+| [galaxymanga.io](https://galaxymanga.io) | | recent check 03.08.26 ✅ |
 | [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) | updated API (v2) 03.08.26 ⚠️ |
 | [kappabeast.com](https://kappabeast.com) | CF-protected; solved via zendriver | recent check 03.08.26 ✅ |
 | [kingofshojo.com](https://kingofshojo.com) | CF-protected; solved via zendriver | recent check 03.08.26 ✅ |
 | [likemanga.io](https://likemanga.io) | CF-protected; solved via zendriver | recent check 03.08.26 ✅ |
-| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/SUPPORTED_SITES.MD) | recent check 11.27.25 ✅ |
-| [**mangadex.org**](https://mangadex.org) | Supports scanlation group selection | recent check 11.25.25 ✅ |
+| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/SUPPORTED_SITES.MD) | recent check 03.08.26 ✅ |
+| [**mangadex.org**](https://mangadex.org) | Supports scanlation group selection | recent check 03.08.26 ✅ |
 | [**mangafire.to**](https://mangafire.to) | Supports multiple languages; CF bypass via zendriver | recent check 03.08.26 ✅ |
-| [mangahub.io](https://mangahub.io) | | recent check 11.25.25 ✅ |
+| [mangahub.io](https://mangahub.io) | | recent check 03.08.26 ✅ |
 | [MangaKakalot / MangaNato](https://www.manganato.gg) | JSON API + impit for zstd; See [mirror list](docs/SUPPORTED_SITES.MD) | recent check 03.08.26 ✅ |
-| [mangataro.org](https://mangataro.org) | Supports scanlation group selection | recent check 11.25.25 ✅ |
+| [mangataro.org](https://mangataro.org) | Supports scanlation group selection | recent check 03.08.26 ✅ |
 | [manhuafast.net](https://manhuafast.net) | Mirror: [manhuafast.com](https://manhuafast.com) | recent check 11.25.25 ✅ |
-| [manhuaplus.com](https://manhuaplus.com) | | recent check 11.25.25 ✅ |
-| [manhuaus.com](https://manhuaus.com) | | recent check 11.25.25 ✅ |
+| [manhuaplus.com](https://manhuaplus.com) | | recent check 03.08.26 ✅ |
+| [manhuaus.com](https://manhuaus.com) | | recent check 03.08.26 ✅ |
 | [ragescans.com](https://ragescans.com) | CF-protected; solved via zendriver | recent check 03.08.26 ✅ |
-| [razure.org](https://razure.org) | light-novel support | recent check 11.25.25 ✅ |
+| [razure.org](https://razure.org) | light-novel support | recent check 03.08.26 ✅ |
 | [utoon.net](https://utoon.net) | | recent check 11.26.25 ✅ |
-| [violetscans.org](https://violetscans.org) | | recent check 11.26.25 ✅ |
+| [violetscans.org](https://violetscans.org) | | recent check 03.08.26 ✅ |
 | [**weebcentral.com**](https://weebcentral.com) | Supports scanlation group selection; impit fallback for zstd | recent check 03.08.26 ✅ |
 | [webtoon.xyz](https://www.webtoon.xyz) | CF-protected; solved via zendriver | recent check 03.08.26 ✅ |
 | [zeroscann.com](https://zeroscann.com) | Migrated from zscans.com REST API to HTML scraping | recent check 03.08.26 ✅ |
