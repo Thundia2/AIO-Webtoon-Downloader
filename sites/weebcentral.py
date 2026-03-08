@@ -209,7 +209,24 @@ class WeebCentralSiteHandler(BaseSiteHandler):
             series_url = urljoin(self._BASE_URL + "/", f"series/{context.identifier}")
 
         chapter_url = self._build_chapter_list_url(series_url)
-        soup = self._make_soup(make_request(chapter_url, scraper).text)
+        try:
+            resp = make_request(chapter_url, scraper)
+            if resp.status_code in (403, 429, 503):
+                raise RuntimeError(f"HTTP {resp.status_code} on chapter list")
+            chapter_html = resp.text
+        except Exception:
+            # WeebCentral uses zstd compression that cloudscraper can't decode;
+            # impit with Chrome impersonation handles it transparently.
+            try:
+                from .crawlee_utils import fetch_html_impit, IMPIT_AVAILABLE
+                if not IMPIT_AVAILABLE:
+                    raise RuntimeError("impit not available")
+                chapter_html = fetch_html_impit(chapter_url, browser="chrome")
+            except Exception as imp_err:
+                raise RuntimeError(
+                    f"WeebCentral chapter list fetch failed: {imp_err}"
+                ) from imp_err
+        soup = self._make_soup(chapter_html)
 
         chapters: List[Dict] = []
         for anchor in soup.select("div[x-data] > a"):
@@ -254,8 +271,22 @@ class WeebCentralSiteHandler(BaseSiteHandler):
         base = chapter_url.rstrip("/")
         # Ensure we request the full list
         images_url = f"{base}/images?is_prev=False&current_page=1&reading_style=long_strip"
-        response = make_request(images_url, scraper)
-        soup = self._make_soup(response.text)
+        try:
+            resp = make_request(images_url, scraper)
+            if resp.status_code in (403, 429, 503):
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            images_html = resp.text
+        except Exception:
+            try:
+                from .crawlee_utils import fetch_html_impit, IMPIT_AVAILABLE
+                if not IMPIT_AVAILABLE:
+                    raise RuntimeError("impit not available")
+                images_html = fetch_html_impit(images_url, browser="chrome")
+            except Exception as imp_err:
+                raise RuntimeError(
+                    f"WeebCentral images fetch failed: {imp_err}"
+                ) from imp_err
+        soup = self._make_soup(images_html)
         
         images: List[str] = []
         # The images usually have class "maw-w-full" (max-width: full)

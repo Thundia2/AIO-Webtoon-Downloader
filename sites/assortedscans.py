@@ -249,11 +249,37 @@ class AssortedScansSiteHandler(BaseSiteHandler):
         if not first_page_url:
             raise RuntimeError("Chapter URL missing.")
 
+        # Use impit (Chrome TLS impersonation) for all per-page requests.
+        # impit is much faster than cloudscraper for this site and handles
+        # the per-page fetches within the timeout budget.
+        try:
+            from .crawlee_utils import fetch_html_impit, IMPIT_AVAILABLE
+            if IMPIT_AVAILABLE:
+                first_html = fetch_html_impit(first_page_url, browser="chrome",
+                                              headers={"Referer": self._BASE_URL + "/"})
+                first_page_soup = self._make_soup(first_html)
+                page_urls = self._extract_page_urls(first_page_soup, first_page_url)
+                images: List[str] = []
+                for idx, page_url in enumerate(page_urls):
+                    if idx == 0:
+                        img_src = self._extract_page_image(first_page_soup, page_url)
+                    else:
+                        page_html = fetch_html_impit(page_url, browser="chrome",
+                                                     headers={"Referer": first_page_url})
+                        page_soup = self._make_soup(page_html)
+                        img_src = self._extract_page_image(page_soup, page_url)
+                    if img_src and img_src not in images:
+                        images.append(img_src)
+                if images:
+                    return images
+        except Exception:
+            pass
+
+        # Fallback: original per-page scraper loop
         first_page_response = make_request(first_page_url, scraper)
         first_page_soup = self._make_soup(first_page_response.text)
-
         page_urls = self._extract_page_urls(first_page_soup, first_page_url)
-        images: List[str] = []
+        images = []
         for idx, page_url in enumerate(page_urls):
             if idx == 0:
                 img_src = self._extract_page_image(first_page_soup, page_url)

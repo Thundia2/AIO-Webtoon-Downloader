@@ -2,7 +2,8 @@
 
 > [!IMPORTANT]
 > comick.io has ceased providing any media themselves. This project now targets multiple other platforms with the same feature set—thanks for sticking around!
-> bato.to and all of its mirror sites have shut down, thus bato.to has been removed from the supported sites.
+> bato.to and mangapark have shut down permanently and have been removed from supported sites.
+> Cloudflare-protected sites (WebtoonXYZ, LikeManga, KappaBeast, RageScans, KingOfShojo, MangaFire) are now solved automatically via **zendriver** — no manual cookie setup required.
 
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/) [![GNU GPLv3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
@@ -83,6 +84,9 @@ The most versatile, feature-rich & customizable tool to download webtoons (manhw
   - Pillow
   - pypdf
   - requests
+  - impit — Chrome/Firefox TLS impersonation for bot-protected sites (handles zstd/brotli)
+  - zendriver — Cloudflare Managed Challenge solver for CF-protected sites
+  - playwright — required for MangaFire VRF generation (`playwright install chromium` after pip install)
 - Notes for macOS (Apple Silicon), Python 3.7 only:
   - Building Pillow from source may require system libraries. If you see build errors,
     install via Homebrew:
@@ -134,28 +138,33 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 
 | Site | Notes | Integration Status |
 | ----- | ----- | ----- |
-| [asuracomic.net](https://asuracomic.net) | Alternative URLs: [asurascans.net](https://asurascans.net) | recent check 11.25.25 ✅  |
-| [Atsumaru / atsu.moe](https://atsu.moe) |  | recent check 11.26.25 ✅ |
-| [**BATO.to / mpark.to**](https://bato.to) | See [mirror list](docs/SUPPORTED_SITES.MD) | ⛓️‍💥 bato.to and mangapark shut down; mirrors may still work |
-| [**comix.to**](https://comix.to) | Supports multiple scanlation groups | recent check 11.26.25 ✅  |
-| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | recent check 11.26.25 ✅  |
-| [flamecomics.xyz](https://flamecomics.xyz) |  | recent check 11.25.25 ✅  |
+| [asuracomic.net](https://asuracomic.net) | Alternative URLs: [asurascans.net](https://asurascans.net) | recent check 03.08.26 ✅ |
+| [Atsumaru / atsu.moe](https://atsu.moe) | | recent check 11.26.25 ✅ |
+| [**comix.to**](https://comix.to) | Supports multiple scanlation groups | recent check 11.26.25 ✅ |
+| [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | recent check 11.26.25 ✅ |
+| [flamecomics.xyz](https://flamecomics.xyz) | | recent check 11.25.25 ✅ |
 | [galaxymanga.io](https://galaxymanga.io) | | recent check 11.25.25 ✅ |
-| [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) | currently untested due to .wvd requirement ⚠️ |
-| [kingofshojo.com](https://kingofshojo.com) | | recent check 11.25.25 ✅ |
-| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/SUPPORTED_SITES.MD) | recent check 11.27.25 ✅  |
+| [kagane.org](https://kagane.org) | DRM-protected, requires Widevine `.wvd` file. See [docs/Widevine.md](docs/Widevine.md) | updated API (v2) 03.08.26 ⚠️ |
+| [kappabeast.com](https://kappabeast.com) | CF-protected; solved via zendriver | recent check 03.08.26 ✅ |
+| [kingofshojo.com](https://kingofshojo.com) | CF-protected; solved via zendriver | recent check 03.08.26 ✅ |
+| [likemanga.io](https://likemanga.io) | CF-protected; solved via zendriver | recent check 03.08.26 ✅ |
+| [mangabuddy.com](https://mangabuddy.com) | See [MangaBuddy mirrors](docs/SUPPORTED_SITES.MD) | recent check 11.27.25 ✅ |
 | [**mangadex.org**](https://mangadex.org) | Supports scanlation group selection | recent check 11.25.25 ✅ |
-| [**mangafire.to**](https://mangafire.to) | Supports multiple languages | recent check 11.25.25 ✅  |
-| [mangahub.io](https://mangahub.io) |  | recent check 11.25.25 ✅ |
-| [MangaKakalot / MangaNato](https://www.manganato.gg) | See [mirror list](docs/SUPPORTED_SITES.MD) | recent check 11.25.25 ✅  |
+| [**mangafire.to**](https://mangafire.to) | Supports multiple languages; CF bypass via zendriver | recent check 03.08.26 ✅ |
+| [mangahub.io](https://mangahub.io) | | recent check 11.25.25 ✅ |
+| [MangaKakalot / MangaNato](https://www.manganato.gg) | JSON API + impit for zstd; See [mirror list](docs/SUPPORTED_SITES.MD) | recent check 03.08.26 ✅ |
 | [mangataro.org](https://mangataro.org) | Supports scanlation group selection | recent check 11.25.25 ✅ |
 | [manhuafast.net](https://manhuafast.net) | Mirror: [manhuafast.com](https://manhuafast.com) | recent check 11.25.25 ✅ |
-| [manhuaplus.com](https://manhuaplus.com) |  | recent check 11.25.25 ✅  |
-| [manhuaus.com](https://manhuaus.com) |  | recent check 11.25.25 ✅  |
-| [razure.org](https://razure.org) | light-novel support | recent check 11.25.25 ✅  |
-| [utoon.net](https://utoon.net) | |recent check 11.26.25 ✅ |
-| [violetscans.org](https://violetscans.org) |  | recent check 11.26.25 ✅  |
-| [**weebcentral.com**](https://weebcentral.com) | Supports scanlation group selection | recent check 11.27.25 ✅  |
+| [manhuaplus.com](https://manhuaplus.com) | | recent check 11.25.25 ✅ |
+| [manhuaus.com](https://manhuaus.com) | | recent check 11.25.25 ✅ |
+| [ragescans.com](https://ragescans.com) | CF-protected; solved via zendriver | recent check 03.08.26 ✅ |
+| [razure.org](https://razure.org) | light-novel support | recent check 11.25.25 ✅ |
+| [utoon.net](https://utoon.net) | | recent check 11.26.25 ✅ |
+| [violetscans.org](https://violetscans.org) | | recent check 11.26.25 ✅ |
+| [**weebcentral.com**](https://weebcentral.com) | Supports scanlation group selection; impit fallback for zstd | recent check 03.08.26 ✅ |
+| [webtoon.xyz](https://www.webtoon.xyz) | CF-protected; solved via zendriver | recent check 03.08.26 ✅ |
+| [zeroscann.com](https://zeroscann.com) | Migrated from zscans.com REST API to HTML scraping | recent check 03.08.26 ✅ |
+| ~~bato.to / mangapark~~ | Shut down permanently | ⛓️‍💥 removed |
 
 
 ---
@@ -462,6 +471,44 @@ Please follow the existing style and include tests where applicable.
 
 ## 📖 Changelog
 
+### 03.08.26
+
+**Anti-bot infrastructure (`sites/crawlee_utils.py` — new module):**
+- Added `fetch_html_impit()` — Chrome/Firefox TLS impersonation via `impit`; handles zstd/brotli compression transparently without launching a browser
+- Added `get_cf_session()` — zendriver-based Cloudflare challenge solver; launches visible Chrome once, solves CF Managed Challenge, captures `cf_clearance` cookie (~10s), then reuses a lightweight `requests.Session` for all subsequent calls (cached per domain, 25-min TTL)
+- Added `fetch_html_with_cf_cookies()` — convenience wrapper around `get_cf_session` for one-shot HTML fetches
+- Added `impit` and `zendriver` to `requirements.txt`
+
+**Cloudflare bypass rollout:**
+- **Madara** (`madara.py`): `MadaraSiteHandler.__init__` now accepts `use_zendriver=True`; all three fetch paths (`fetch_comic_context`, `_parse_chapters` / `_load_ajax_chapters`, `get_chapter_images`) transparently route through `get_cf_session` when enabled; added automatic CF-detection fallback for non-zendriver sites (short HTML, "just a moment" strings, 403/429/503 status)
+- **MangaThemesia** (`mangathemesia.py`): added `use_zendriver` parameter mirroring the Playwright path; all three fetch points use `fetch_html_with_cf_cookies`; `_fetch_series_metadata_via_api` uses CF session when `use_zendriver=True`
+- **WebtoonXYZ** (`webtoonxyz.py`): switched from the plain Madara entry in `madara_extra_sites.py` to the dedicated `WebtoonXYZSiteHandler` with `use_zendriver=True`; removed the duplicate generic Madara entry that was shadowing the custom handler
+- **KingOfShojo, KappaBeast, RageScans** (`mangathemesia_sites.py`): added `use_zendriver: True` to their site configs
+- **LikeManga** (`likemanga.py`): all three fetch paths now go directly through `fetch_html_with_cf_cookies` / `get_cf_session`; removed the old cloudscraper-based paths
+- **MangaFire** (`mangafire.py`): `fetch_comic_context` uses `fetch_html_with_cf_cookies`; chapter-list and image AJAX calls use `get_cf_session`-backed session instead of `make_request`
+- **`__init__.py`**: forwards `use_zendriver` from site config dict to `MangaThemesiaSiteHandler`; removed duplicate `MangaFireSiteHandler` import
+
+**Site handler rewrites & fixes:**
+- **ZeroScans** (`zeroscans.py`): full rewrite from REST API (zscans.com) to HTML scraping on the new domain `zeroscann.com`; HTML pagination replaces API pagination; chapter links scraped from `<a href*="/chapter-">` anchors; image extraction from `<img>` tags filtered by CDN URL pattern
+- **Manganato** (`manganato.py`): added `_impit_get()` helper for Chrome-impersonated fetches; `fetch_comic_context` and `get_chapter_images` now use impit with cloudscraper fallback; added `_fetch_chapters_api()` using the `/api/manga/{slug}/chapters?limit=-1` JSON endpoint as primary chapter source (handles zstd); HTML fallback retained for legacy domains
+- **WeebCentral** (`weebcentral.py`): chapter-list and image-list fetches now fall back to `fetch_html_impit` when cloudscraper returns 403/429/503 or raises (zstd compression fix)
+- **AssortedScans** (`assortedscans.py`): primary image fetch path uses `fetch_html_impit` for all per-page requests; cloudscraper loop retained as fallback
+- **Kagane** (`kagane.py`): updated API base to `yuzuki.kagane.org`, endpoint paths to `/api/v2/`; added integrity-token fetch (`/api/integrity`) and `x-integrity-token` header injection into DRM challenge POST; updated thumbnail URL template
+- **ErosScans** (`mangathemesia_sites.py`): migrated primary domain from `erosvoid.xyz` to `erosxsun.xyz`
+
+**MangaThemesia enhancements:**
+- Added `/read/` + `chapter-` anchor fallback for sites (e.g. nikatoons) that place chapter links outside standard MangaThemesia containers; deduplication by chapter number applied
+- Added `img[src*='/uploads/']` fallback image selector for Next.js-injected pages (e.g. nikatoons)
+- Extended reader selectors to include `#readerArea` (capital A) variant
+- Removed stale `import re` / `from urllib.parse import urljoin` inline imports; moved to top-level
+
+**Removals:**
+- Deleted `sites/batoto.py` and `sites/bato_mirrors.py` (bato.to and all mirrors shut down permanently)
+- Deleted `sites/mangapark.py` (mangapark domain bounces endlessly; confirmed offline)
+- Removed `BatoToSiteHandler` and `MangaParkSiteHandler` from `__init__.py`
+
+---
+
 ### 03.07.26
 
 **New features:**
@@ -497,7 +544,10 @@ This project stands on the shoulders of many wonderful open-source tools and lib
 - **Beautiful Soup** ([BeautifulSoup](https://www.crummy.com/software/BeautifulSoup/)) – HTML/XML parsing made easy  
 - **lxml** ([lxml/lxml](https://github.com/lxml/lxml)) – Fast, feature-rich XML/HTML processing  
 - **Pillow** ([python-pillow/Pillow](https://github.com/python-pillow/Pillow)) – The friendly PIL fork for image manipulation  
-- **pypdf** ([py-pdf/pypdf](https://github.com/py-pdf/pypdf)) – PDF generation and manipulation  
+- **pypdf** ([py-pdf/pypdf](https://github.com/py-pdf/pypdf)) – PDF generation and manipulation
+- **impit** – Chrome/Firefox TLS fingerprint impersonation; handles zstd/brotli compression without launching a browser
+- **zendriver** – CDP-based Chrome automation with built-in Cloudflare challenge solving
+- **Playwright** ([microsoft/playwright-python](https://github.com/microsoft/playwright-python)) – Headless browser automation for VRF generation (MangaFire)
 
 ---
 

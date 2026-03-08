@@ -135,10 +135,19 @@ class ManganatoSiteHandler(BaseSiteHandler):
     def configure_session(self, scraper, args) -> None:
         scraper.headers.setdefault("Referer", self._BASE_URL + "/")
 
+    def _impit_get(self, url: str, referer: str = "") -> str:
+        """Fetch via impit (handles zstd/brotli that cloudscraper cannot)."""
+        from .crawlee_utils import fetch_html_impit
+        headers = {"Referer": referer} if referer else {}
+        return fetch_html_impit(url, browser="chrome", headers=headers)
+
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
         slug = self._slug_from_url(url)
-        response = make_request(url, scraper)
-        soup = self._make_soup(response.text)
+        try:
+            html = self._impit_get(url, referer=self._BASE_URL + "/")
+        except Exception:
+            html = make_request(url, scraper).text
+        soup = self._make_soup(html)
 
         title = self._extract_text(soup, ["h1.manga-info-title", ".manga-info-text h1", "h1"])
         if not title:
@@ -189,34 +198,75 @@ class ManganatoSiteHandler(BaseSiteHandler):
         }
         return SiteComicContext(comic=comic, title=title, identifier=slug, soup=soup)
 
+    def _fetch_chapters_api(self, slug: str, series_url: str) -> List[Dict]:
+        """Use the manganato.gg JSON API to get all chapters."""
+        import json as _json
+        from .crawlee_utils import fetch_html_impit
+        api_url = f"{self._BASE_URL}/api/manga/{slug}/chapters?limit=-1"
+        raw = fetch_html_impit(api_url, browser="chrome", headers={"Referer": series_url})
+        data = _json.loads(raw)
+        chapters_data = data.get("data", {}).get("chapters", [])
+        chapters: List[Dict] = []
+        for ch in chapters_data:
+            ch_slug = ch.get("chapter_slug", "")
+            ch_url = f"{series_url.rstrip('/')}/{ch_slug}" if ch_slug else ""
+            num = str(ch.get("chapter_num", ""))
+            name = ch.get("chapter_name", ch_slug)
+            chapters.append({
+                "hid": ch_url,
+                "chap": num,
+                "title": name,
+                "url": ch_url,
+                "uploaded": ch.get("updated_at"),
+            })
+        return chapters
+
     def get_chapters(self, context: SiteComicContext, scraper, language: str, make_request) -> List[Dict]:
+        slug = context.identifier
+        source_url = context.comic.get("url") or f"{self._BASE_URL}/manga/{slug}"
+
+        # Primary: use the JSON API (works with impit, handles zstd)
+        try:
+            chapters = self._fetch_chapters_api(slug, source_url)
+            if chapters:
+                chapters.sort(key=lambda c: float(c.get("chap") or 0), reverse=True)
+                return chapters
+        except Exception:
+            pass
+
+        # Fallback: parse HTML (works on legacy mangakakalot domains)
         soup = context.soup
         if soup is None:
-            response = make_request(context.comic.get("url"), scraper)
-            soup = self._make_soup(response.text)
-        source_url = context.comic.get("url") or self._BASE_URL
+            try:
+                html = self._impit_get(source_url, referer=self._BASE_URL + "/")
+            except Exception:
+                html = make_request(source_url, scraper).text
+            soup = self._make_soup(html)
         chapter_rows = self._collect_chapter_rows(soup, source_url)
-        chapters: List[Dict] = []
+        chapters = []
         for row in chapter_rows:
             number = self._chapter_number(row["title"])
-            chapters.append(
-                {
-                    "hid": row["url"],
-                    "chap": number,
-                    "title": row["title"],
-                    "url": row["url"],
-                    "uploaded": row.get("uploaded"),
-                }
-            )
+            chapters.append({
+                "hid": row["url"],
+                "chap": number,
+                "title": row["title"],
+                "url": row["url"],
+                "uploaded": row.get("uploaded"),
+            })
         chapters.sort(key=lambda c: float(c.get("chap") or 0), reverse=True)
+        if not chapters:
+            raise RuntimeError("No chapters found for this Manganato title.")
         return chapters
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         url = chapter.get("url")
         if not isinstance(url, str):
             raise RuntimeError("Chapter URL missing for Manganato.")
-        response = make_request(url, scraper)
-        soup = self._make_soup(response.text)
+        try:
+            html = self._impit_get(url, referer=self._BASE_URL + "/")
+        except Exception:
+            html = make_request(url, scraper).text
+        soup = self._make_soup(html)
         images: List[str] = []
         for img in soup.select("#chapter-content img, .reading-detail img, .page_chapter img, .container-chapter-reader img"):
             src = img.get("data-src") or img.get("data-original") or img.get("src")

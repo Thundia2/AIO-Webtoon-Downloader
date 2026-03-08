@@ -7,3 +7,5 @@ requests
 pywidevine
 cryptography
 playwright>=1.40.0  # Required for MangaFire VRF generation
+impit               # Chrome/Firefox TLS impersonation for bot-protected sites
+zendriver           # Cloudflare challenge solver (CF-protected sites)

@@ -119,14 +119,15 @@ class MangaFireSiteHandler(BaseSiteHandler):
             return None
 
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
+        from .crawlee_utils import fetch_html_with_cf_cookies
         _mf_throttle('request')
-        response = make_request(url, scraper)
+        html_content = fetch_html_with_cf_cookies(url, base_url=self._BASE_URL)
 
         # MangaFire sometimes returns JSON-wrapped HTML
-        html_content = response.text
         if html_content.strip().startswith("{"):
             try:
-                data = response.json()
+                import json as _json
+                data = _json.loads(html_content)
                 if data.get("status") == 200 and "result" in data:
                     html_content = data["result"]
             except Exception:
@@ -196,11 +197,13 @@ class MangaFireSiteHandler(BaseSiteHandler):
     # ----------------------------- Chapters -----------------------------
 
     def get_chapters(self, context: SiteComicContext, scraper, language: str, make_request) -> List[Dict]:
+        from .crawlee_utils import get_cf_session
         manga_id = context.identifier
         if not manga_id:
             return []
 
         lang_code = language if language else "en"
+        cf_session = get_cf_session(self._BASE_URL)
 
         # Primary endpoint (VRF-protected):
         # https://mangafire.to/ajax/read/{id}/chapter/{lang}?vrf=...
@@ -221,7 +224,7 @@ class MangaFireSiteHandler(BaseSiteHandler):
         try:
             print(f"[*] Fetching chapters from: {read_ajax_url}")
             _mf_throttle('request')
-            resp = make_request(read_ajax_url, scraper)
+            resp = cf_session.get(read_ajax_url, timeout=20)
             data = self._safe_json(resp, label="chapter-list", url=read_ajax_url)
             if not data or data.get("status") != 200:
                 raise RuntimeError(f"status={None if not data else data.get('status')}")
@@ -266,7 +269,7 @@ class MangaFireSiteHandler(BaseSiteHandler):
 
         try:
             _mf_throttle('request')
-            resp = make_request(fallback_url, scraper)
+            resp = cf_session.get(fallback_url, timeout=20)
             data = self._safe_json(resp, label="chapter-list-fallback", url=fallback_url)
             if not data or data.get("status") != 200:
                 return []
@@ -344,6 +347,7 @@ class MangaFireSiteHandler(BaseSiteHandler):
                 "Install with: pip install playwright && playwright install chromium"
             )
 
+        from .crawlee_utils import get_cf_session
         chapter_id = chapter.get("hid")
         chapter_url = chapter.get("url")
         if not chapter_id:
@@ -354,6 +358,7 @@ class MangaFireSiteHandler(BaseSiteHandler):
         ajax_url_base = self._BASE_URL + ajax_path
 
         vrf_gen = get_vrf_generator()
+        cf_session = get_cf_session(self._BASE_URL)
 
         last_err: Optional[Exception] = None
 
@@ -364,7 +369,6 @@ class MangaFireSiteHandler(BaseSiteHandler):
                 stage = "vrf"
                 if chapter_url:
                     print(f"[*] Capturing chapter VRF via navigation: {chapter_url}")
-                    # ensure_vrf logs its own per-attempt reasons.
                     vrf = vrf_gen.ensure_vrf(ajax_path, page_url=chapter_url, init_url=chapter_url)
                 else:
                     vrf = vrf_gen.ensure_vrf(ajax_path)
@@ -374,7 +378,7 @@ class MangaFireSiteHandler(BaseSiteHandler):
                 stage = "ajax"
                 print(f"[*] Fetching images for chapter {chapter_id} (attempt {attempt}/{self._JSON_RETRIES})…")
                 _mf_throttle('request')
-                resp = make_request(ajax_url, scraper)
+                resp = cf_session.get(ajax_url, timeout=20)
 
                 # 3) JSON parse
                 stage = "json"

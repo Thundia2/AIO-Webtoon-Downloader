@@ -231,7 +231,7 @@ MADARA_EXTRA_SITES = [
     ('webtoonhatti', 'https://webtoonhatti.club'),
     ('webtoonscan', 'https://webtoonscan.com'),
     ('webtoontr', 'https://webtoontr.net'),
-    ('webtoonxyz', 'https://www.webtoon.xyz'),
+
     ('whalemanga', 'https://whalemanga.com'),
     ('woopread', 'https://woopread.com'),
     ('wuxiaworld', 'https://wuxiaworld.site'),

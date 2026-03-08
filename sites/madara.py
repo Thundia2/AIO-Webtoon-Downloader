@@ -42,7 +42,7 @@ class MadaraSiteHandler(BaseSiteHandler):
         "div.page-break img",
     )
 
-    def __init__(self, site_name: str, base_url: str, extra_domains: Optional[Iterable[str]] = None) -> None:
+    def __init__(self, site_name: str, base_url: str, extra_domains: Optional[Iterable[str]] = None, use_zendriver: bool = False) -> None:
         super().__init__()
         self.site_name = site_name
         self.base_url = base_url.rstrip("/")
@@ -56,6 +56,7 @@ class MadaraSiteHandler(BaseSiteHandler):
             domains.update(extra_domains)
         self.domains = tuple(sorted(domains))
         self.name = site_name
+        self.use_zendriver = use_zendriver
 
         try:
             import lxml  # type: ignore  # noqa: F401
@@ -425,8 +426,25 @@ class MadaraSiteHandler(BaseSiteHandler):
         )
 
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
-        response = make_request(url, scraper)
-        html = response.text
+        if self.use_zendriver:
+            from .crawlee_utils import fetch_html_with_cf_cookies
+            html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
+        else:
+            response = make_request(url, scraper)
+            html = response.text
+            # If Cloudflare blocked us, try CF cookie capture
+            if (
+                response.status_code in (403, 429, 503)
+                or len(html) < 2000
+                or "just a moment" in html.lower()
+                or "checking your browser" in html.lower()
+            ):
+                try:
+                    from .crawlee_utils import fetch_html_with_cf_cookies, ZENDRIVER_AVAILABLE
+                    if ZENDRIVER_AVAILABLE:
+                        html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
+                except Exception:
+                    pass
         soup = self._make_soup(html)
 
         title = (
@@ -475,14 +493,40 @@ class MadaraSiteHandler(BaseSiteHandler):
         source_url = context.comic.get("url")
         if isinstance(source_url, str):
             page_url = source_url
-        return self._parse_chapters(soup, scraper, page_url=page_url)
+        # For CF-protected sites use CF cookie session for any AJAX calls
+        chapters_scraper = scraper
+        if self.use_zendriver:
+            try:
+                from .crawlee_utils import get_cf_session
+                chapters_scraper = get_cf_session(self.base_url)
+            except Exception:
+                chapters_scraper = scraper
+        return self._parse_chapters(soup, chapters_scraper, page_url=page_url)
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         chapter_url = chapter.get("url")
         if not chapter_url:
             raise RuntimeError("Chapter URL missing.")
-        response = make_request(chapter_url, scraper)
-        soup = self._make_soup(response.text)
+        if self.use_zendriver:
+            from .crawlee_utils import fetch_html_with_cf_cookies
+            html = fetch_html_with_cf_cookies(chapter_url, base_url=self.base_url)
+        else:
+            response = make_request(chapter_url, scraper)
+            html = response.text
+            # If Cloudflare blocked us, try CF cookie capture
+            if (
+                response.status_code in (403, 429, 503)
+                or len(html) < 2000
+                or "just a moment" in html.lower()
+                or "checking your browser" in html.lower()
+            ):
+                try:
+                    from .crawlee_utils import fetch_html_with_cf_cookies, ZENDRIVER_AVAILABLE
+                    if ZENDRIVER_AVAILABLE:
+                        html = fetch_html_with_cf_cookies(chapter_url, base_url=self.base_url)
+                except Exception:
+                    pass
+        soup = self._make_soup(html)
 
         image_urls: List[str] = []
         for selector in self.reader_selectors:

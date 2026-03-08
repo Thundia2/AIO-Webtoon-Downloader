@@ -29,9 +29,10 @@ class KaganeSiteHandler(BaseSiteHandler):
     domains = ("kagane.org", "www.kagane.org")
 
     _BASE_URL = "https://kagane.org"
-    _API_URL = "https://api.kagane.org"
-    _CERT_ENDPOINT = f"{_API_URL}/api/v1/static/bin.bin"
-    _THUMBNAIL_TEMPLATE = f"{_API_URL}/api/v1/series/{{series_id}}/thumbnail"
+    _API_URL = "https://yuzuki.kagane.org"
+    _CERT_ENDPOINT = f"{_API_URL}/api/v2/static/bin.bin"
+    _THUMBNAIL_TEMPLATE = f"{_API_URL}/api/v2/image/{{series_id}}/compressed"
+    _INTEGRITY_ENDPOINT = "https://kagane.org/api/integrity"
     _INSTRUCTIONS_URL = (
         "https://github.com/zzyil/comick.io-Downloader/blob/main/docs/Widevine.md"
     )
@@ -42,6 +43,8 @@ class KaganeSiteHandler(BaseSiteHandler):
         self._cdm: Optional[Cdm] = None
         self._device_path: Optional[Path] = None
         self._token_cache: Dict[Tuple[str, str], Dict[str, object]] = {}
+        self._integrity_token: Optional[str] = None
+        self._integrity_token_exp: Optional[int] = None
 
     # ------------------------------------------------------------------ helpers
     def _extract_series_id(self, url: str) -> str:
@@ -117,6 +120,29 @@ class KaganeSiteHandler(BaseSiteHandler):
         except Exception:
             return None
 
+    def _fetch_integrity_token(self, scraper) -> str:
+        """Fetch a short-lived integrity token from kagane.org/api/integrity."""
+        now = int(time.time())
+        if self._integrity_token and self._integrity_token_exp and self._integrity_token_exp - 30 > now:
+            return self._integrity_token
+        resp = scraper.post(
+            self._INTEGRITY_ENDPOINT,
+            headers={
+                "Content-Type": "application/json",
+                "Referer": f"{self._BASE_URL}/",
+                "Origin": self._BASE_URL,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("token")
+        exp = data.get("exp")
+        if not token:
+            raise RuntimeError("Kagane integrity token response missing 'token' field.")
+        self._integrity_token = token
+        self._integrity_token_exp = int(exp) if exp else None
+        return token
+
     def _issue_token(
         self,
         series_id: str,
@@ -137,13 +163,13 @@ class KaganeSiteHandler(BaseSiteHandler):
         finally:
             self._cdm.close(session_id)
 
+        integrity_token = self._fetch_integrity_token(scraper)
         payload = {
             "challenge": base64.b64encode(challenge).decode("ascii"),
         }
 
-        url = (
-            f"{self._API_URL}/api/v1/books/{series_id}/file/{chapter_id}"
-        )
+        # New API: POST /api/v2/books/{book_id}?is_datasaver=false
+        url = f"{self._API_URL}/api/v2/books/{chapter_id}?is_datasaver=false"
 
         resp = scraper.post(
             url,
@@ -152,6 +178,7 @@ class KaganeSiteHandler(BaseSiteHandler):
                 "Origin": self._BASE_URL,
                 "Referer": f"{self._BASE_URL}/",
                 "Content-Type": "application/json",
+                "x-integrity-token": integrity_token,
             },
         )
         resp.raise_for_status()

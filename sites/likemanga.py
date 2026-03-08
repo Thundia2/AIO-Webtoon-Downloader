@@ -83,8 +83,13 @@ class LikeMangaSiteHandler(BaseSiteHandler):
 
     # ----------------------------------------------------------- Base overrides
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
-        response = make_request(url, scraper)
-        soup = self._make_soup(response.text)
+        # LikeManga is behind Cloudflare Managed Challenge; go straight to zendriver.
+        from .crawlee_utils import fetch_html_with_cf_cookies
+        try:
+            html = fetch_html_with_cf_cookies(url, base_url=self._BASE_URL)
+        except Exception as zd_err:
+            raise RuntimeError(f"LikeManga context fetch failed: {zd_err}") from zd_err
+        soup = self._make_soup(html)
         slug = self._slug_from_url(url)
 
         title = soup.select_one("#title-detail-manga").get_text(strip=True)
@@ -161,10 +166,14 @@ class LikeMangaSiteHandler(BaseSiteHandler):
         language: str,
         make_request,
     ) -> List[Dict]:
+        # Always use CF cookie session for LikeManga
+        from .crawlee_utils import get_cf_session
+        cf_scraper = get_cf_session(self._BASE_URL)
+
         soup = context.soup
         if soup is None:
-            response = make_request(context.comic.get("url", ""), scraper)
-            soup = self._make_soup(response.text)
+            html = fetch_html_with_cf_cookies(context.comic.get("url", ""), base_url=self._BASE_URL)
+            soup = self._make_soup(html)
         chapters = self._collect_chapters_from_soup(soup)
 
         pagination = soup.select("div.chapters_pagination a:not(.next)")
@@ -191,7 +200,7 @@ class LikeMangaSiteHandler(BaseSiteHandler):
 
         if manga_id and last_page > 1:
             for page in range(2, last_page + 1):
-                chapters.extend(self._fetch_chapter_page(manga_id, page, scraper))
+                chapters.extend(self._fetch_chapter_page(manga_id, page, cf_scraper))
 
         return chapters
 
@@ -221,8 +230,15 @@ class LikeMangaSiteHandler(BaseSiteHandler):
         chapter_url = chapter.get("url")
         if not chapter_url:
             raise RuntimeError("Chapter URL missing for LikeManga.")
-        response = make_request(chapter_url, scraper)
-        soup = self._make_soup(response.text)
+
+        # LikeManga is behind Cloudflare Managed Challenge; go straight to zendriver.
+        from .crawlee_utils import fetch_html_with_cf_cookies
+        try:
+            html = fetch_html_with_cf_cookies(chapter_url, base_url=self._BASE_URL)
+        except Exception as zd_err:
+            raise RuntimeError(f"LikeManga chapter fetch failed: {zd_err}") from zd_err
+
+        soup = self._make_soup(html)
 
         manifest = self._decode_image_manifest(soup)
         if manifest:

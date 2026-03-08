@@ -12,7 +12,6 @@ from .asmotoon import AsmotoonSiteHandler
 from .assortedscans import AssortedScansSiteHandler
 from .arc_relight import ArcRelightSiteHandler
 from .arcanescans import ArcaneScansSiteHandler
-from .batoto import BatoToSiteHandler
 from .dynasty import DynastySiteHandler
 from .likemanga import LikeMangaSiteHandler
 from .kagane import KaganeSiteHandler
@@ -26,11 +25,9 @@ from .mangafox import MangaFoxSiteHandler
 from .manganato import ManganatoSiteHandler
 from .mangareader import MangaReaderSiteHandler
 from .mangakatana import MangaKatanaSiteHandler
-from .mangapark import MangaParkSiteHandler
 from .mangataro import MangataroSiteHandler
 from .summanga import SumMangaSiteHandler
 from .weebcentral import WeebCentralSiteHandler
-from .mangafire import MangaFireSiteHandler
 from .mangafire import MangaFireSiteHandler
 from .comix import ComixSiteHandler
 from .flamecomics import FlameComicsSiteHandler
@@ -62,8 +59,6 @@ _BASE_HANDLERS: Iterable[BaseSiteHandler] = (
     AssortedScansSiteHandler(),
     ArcRelightSiteHandler(),
     ArcaneScansSiteHandler(),
-    BatoToSiteHandler(),
-    MangaParkSiteHandler(),
     MangaBuddySiteHandler(),
     MangaBinSiteHandler(),
     MangaReaderSiteHandler(),
@@ -98,8 +93,6 @@ _BASE_HANDLERS: Iterable[BaseSiteHandler] = (
 # Create MangaThemesia handlers from configuration
 _MANGATHEMESIA_HANDLERS = []
 for site_conf in MANGATHEMESIA_SITES:
-    # Skip disabled sites (commented out in config)
-    
     handler = MangaThemesiaSiteHandler(
         name=site_conf["name"],
         display_name=site_conf["display_name"],
@@ -108,6 +101,7 @@ for site_conf in MANGATHEMESIA_SITES:
         url_normalizer=site_conf.get("url_normalizer"),
         chapter_filter=site_conf.get("chapter_filter"),
         use_playwright=site_conf.get("use_playwright", False),
+        use_zendriver=site_conf.get("use_zendriver", False),
         chapter_selector=site_conf.get("chapter_selector"),
         verify_ssl=site_conf.get("verify_ssl", True),
     )
