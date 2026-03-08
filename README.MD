@@ -12,6 +12,7 @@ The most versatile, feature-rich & customizable tool to download webtoons (manhw
 
 ![AIO Webtoon & Light Novel Downloader Banner](https://github.com/zzyil/comick.io-Downloader/blob/main/AIO.png?raw=true)
 
+### [Follow me on 𝕏](https://x.com/listentovv)  
 
 ## 📑 Table of Contents
 
