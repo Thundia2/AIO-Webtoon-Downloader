@@ -73,6 +73,30 @@ def fetch_html_impit(
 try:
     import zendriver as _zd
     ZENDRIVER_AVAILABLE = True
+
+    # -----------------------------------------------------------------------
+    # Monkey-patch zendriver's Cookie.from_json to handle missing 'sameParty'.
+    #
+    # Chrome removed the deprecated 'sameParty' field from its CDP Cookie
+    # response, but zendriver's auto-generated CDP bindings still require it
+    # (using json["sameParty"] instead of json.get("sameParty")).  This causes
+    # a KeyError crash on every cookie retrieval, hanging browser.cookies
+    # and browser.stop().  We patch from_json to use .get() at import time.
+    # -----------------------------------------------------------------------
+    try:
+        from zendriver.cdp.network import Cookie as _ZDCookie
+
+        _orig_cookie_from_json = _ZDCookie.from_json.__func__  # unwrap classmethod
+
+        @classmethod  # type: ignore[misc]
+        def _patched_cookie_from_json(cls, json):
+            json.setdefault("sameParty", False)
+            return _orig_cookie_from_json(cls, json)
+
+        _ZDCookie.from_json = _patched_cookie_from_json
+    except Exception:
+        pass  # If the patch fails zendriver may still work for non-cookie flows.
+
 except ImportError:
     ZENDRIVER_AVAILABLE = False
 
@@ -85,26 +109,75 @@ _cf_cookie_lock = _threading.Lock()
 _CF_COOKIE_TTL = 25 * 60             # 25 minutes (cf_clearance lasts ~30 min)
 
 
-async def _solve_cf_async(url: str) -> dict:
-    """Open a visible Chrome, solve CF challenge, return {cookies, user_agent}."""
+async def _solve_cf_async(url: str, overall_timeout: float = 45.0) -> dict:
+    """Open a visible Chrome, solve CF challenge, return {cookies, user_agent}.
+
+    The zendriver ``Cookie.from_json`` bug (``KeyError: 'sameParty'``) is
+    fixed by the module-level monkey-patch above, so we can safely use
+    ``browser.cookies.get_all()`` directly.
+    """
     from zendriver.core.cloudflare import cf_is_interactive_challenge_present, verify_cf
+    import signal as _signal
 
     browser = await _zd.start(headless=False)
+    chrome_pid = None
     try:
+        if hasattr(browser, '_process') and browser._process:
+            chrome_pid = browser._process.pid
+        elif hasattr(browser, 'process') and browser.process:
+            chrome_pid = browser.process.pid
+    except Exception:
+        pass
+
+    async def _inner():
         page = await browser.get(url)
-        if await cf_is_interactive_challenge_present(page, timeout=10):
-            await verify_cf(page, timeout=30)
+
+        try:
+            has_challenge = await _asyncio.wait_for(
+                cf_is_interactive_challenge_present(page, timeout=10), timeout=15
+            )
+            if has_challenge:
+                await _asyncio.wait_for(verify_cf(page, timeout=30), timeout=40)
+        except _asyncio.TimeoutError:
+            pass  # No interactive challenge, proceed anyway
+
         # Wait briefly for any post-challenge redirects to settle
-        await _asyncio.sleep(1)
-        raw_cookies = await browser.cookies.get_all()
-        ua = await page.evaluate("navigator.userAgent")
-        cookies = [
-            {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
-            for c in raw_cookies
-        ]
+        await _asyncio.sleep(2)
+
+        # Get User-Agent
+        ua = "Mozilla/5.0"
+        try:
+            ua = await _asyncio.wait_for(page.evaluate("navigator.userAgent"), timeout=5)
+        except Exception:
+            pass
+
+        # Get cookies — the monkey-patched Cookie.from_json handles missing sameParty
+        cookies = []
+        try:
+            raw_cookies = await _asyncio.wait_for(browser.cookies.get_all(), timeout=10)
+            cookies = [
+                {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
+                for c in raw_cookies
+            ]
+        except Exception as e:
+            print(f"[!] cookie retrieval warning: {e}")
+
         return {"cookies": cookies, "user_agent": ua}
+
+    try:
+        return await _asyncio.wait_for(_inner(), timeout=overall_timeout)
     finally:
-        await browser.stop()
+        # Force-kill Chrome first (fast, reliable), then try graceful stop
+        if chrome_pid:
+            try:
+                import os as _os
+                _os.kill(chrome_pid, _signal.SIGKILL)
+            except Exception:
+                pass
+        try:
+            await _asyncio.wait_for(browser.stop(), timeout=5)
+        except Exception:
+            pass
 
 
 def get_cf_session(base_url: str) -> "requests.Session":

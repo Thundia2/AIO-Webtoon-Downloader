@@ -9,16 +9,56 @@ from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SiteComicContext
 
+try:
+    from .crawlee_utils import get_cf_session, is_cf_challenge
+    _CF_AVAILABLE = True
+except ImportError:
+    _CF_AVAILABLE = False
+
 
 class ComixSiteHandler(BaseSiteHandler):
     name = "comix"
     domains = ("comix.to", "www.comix.to")
+    _BASE_URL = "https://comix.to"
+
+    def __init__(self):
+        super().__init__()
+        self._cf_session = None  # Lazy-init zendriver CF session
 
     def configure_session(self, scraper, args) -> None:
         scraper.headers.update({
             "Referer": "https://comix.to/",
             "Origin": "https://comix.to",
         })
+
+    def _get_cf_session(self):
+        """Get or create a CF-cookie session for comix.to."""
+        if self._cf_session is None and _CF_AVAILABLE:
+            try:
+                self._cf_session = get_cf_session(self._BASE_URL)
+                self._cf_session.headers.update({
+                    "Referer": "https://comix.to/",
+                    "Origin": "https://comix.to",
+                })
+            except Exception as e:
+                print(f"[!] Comix CF session failed: {e}")
+        return self._cf_session
+
+    def _cf_aware_request(self, url: str, scraper, make_request):
+        """Try standard request first; on CF 403, fall back to zendriver session."""
+        response = make_request(url, scraper)
+
+        # Check if we got a CF challenge
+        if _CF_AVAILABLE and response.status_code in (403, 503):
+            try:
+                if is_cf_challenge(response.status_code, response.text):
+                    cf = self._get_cf_session()
+                    if cf:
+                        response = cf.get(url, timeout=20)
+            except Exception:
+                pass  # Return original response
+
+        return response
 
     def _extract_next_data(self, html: str) -> List[Any]:
         """Extracts data pushed to self.__next_f."""
@@ -138,7 +178,7 @@ class ComixSiteHandler(BaseSiteHandler):
         return names
 
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
-        response = make_request(url, scraper)
+        response = self._cf_aware_request(url, scraper, make_request)
         html = response.text
         soup = BeautifulSoup(html, "html.parser")
         
@@ -159,7 +199,7 @@ class ComixSiteHandler(BaseSiteHandler):
         if hash_id:
             try:
                 api_url = f"https://comix.to/api/v2/manga/{hash_id}"
-                api_response = make_request(api_url, scraper)
+                api_response = self._cf_aware_request(api_url, scraper, make_request)
                 api_data = api_response.json()
                 
                 if api_data.get("status") == 200 and api_data.get("result"):
@@ -281,7 +321,7 @@ class ComixSiteHandler(BaseSiteHandler):
         
         while True:
             api_url = f"https://comix.to/api/v2/manga/{hash_id}/chapters?order[number]=desc&limit={limit}&page={page}"
-            response = make_request(api_url, scraper)
+            response = self._cf_aware_request(api_url, scraper, make_request)
             try:
                 data = response.json()
             except json.JSONDecodeError:
@@ -295,9 +335,18 @@ class ComixSiteHandler(BaseSiteHandler):
                 break
                 
             for item in items:
-                # Filter by language if needed, though the API seems to return 'en' mostly
-                if language and item.get("language") != language:
-                    continue
+                # Filter by language — but be lenient:
+                # - If the item has no language field, include it (don't silently drop)
+                # - Handle variations like "English" vs "en", case-insensitive
+                item_lang = item.get("language")
+                if language and item_lang is not None:
+                    # Normalize both to lowercase for comparison
+                    lang_lower = language.lower()
+                    item_lang_lower = item_lang.lower()
+                    # Match exact code, or long-form name starting with the code
+                    # e.g. "en" matches "en", "english", "English"
+                    if item_lang_lower != lang_lower and not item_lang_lower.startswith(lang_lower):
+                        continue
                     
                 chap_num = item.get("number")
                 chap_id = item.get("chapter_id")
@@ -353,7 +402,8 @@ class ComixSiteHandler(BaseSiteHandler):
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         url = chapter.get("url")
-        response = make_request(url, scraper)
+        # Use CF-aware request for image page fetches too
+        response = self._cf_aware_request(url, scraper, make_request)
         html = response.text
         
         next_data = self._extract_next_data(html)
