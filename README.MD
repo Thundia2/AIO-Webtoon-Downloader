@@ -139,7 +139,7 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 
 | Site | Notes | Integration Status |
 | ----- | ----- | ----- |
-| [asuracomic.net](https://asuracomic.net) | Alternative URLs: [asurascans.net](https://asurascans.net) | recent check 03.08.26 ✅ |
+| [asurascans.com](https://asurascans.com) | Alternative URLs: [asuracomic.net](https://asuracomic.net), [asurascans.net](https://asurascans.net) | recent check 03.21.26 ✅ |
 | [Atsumaru / atsu.moe](https://atsu.moe) | | recent check 03.08.26 ✅ |
 | [**comix.to**](https://comix.to) | Supports multiple scanlation groups | recent check 03.08.26 ✅ |
 | [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | recent check 03.08.26 ✅ |
@@ -474,7 +474,13 @@ Please follow the existing style and include tests where applicable.
 
 > Full changelog: [docs/CHANGELOG.md](docs/CHANGELOG.md)
 
-### 03.20.26
+### 03.21.26
+
+**AsuraScans (`sites/asura.py`) — full rewrite:**
+- Rewrote handler for the new asurascans.com site structure; added `asurascans.com` domain
+- Switched URL path from `/series/` to `/comics/`; old `self.__next_f.push` flight-data parsing removed
+- Chapter list now extracted from HTML `<a>` tags; images from embedded RSC (React Server Components) props JSON with regex CDN fallback
+- Verified image extraction matches Chrome browser (21, 17, 14 images across 3 test chapters — all exact matches)
 
 **zendriver Cloudflare cookie fix (`sites/crawlee_utils.py`):**
 - Fixed `KeyError: 'sameParty'` crash in zendriver's CDP cookie retrieval — Chrome removed the deprecated `sameParty` field, but zendriver's `Cookie.from_json()` still required it. This caused `browser.cookies.get_all()` to silently hang, returning zero cookies and leaving the Chrome process open indefinitely

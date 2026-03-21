@@ -5,7 +5,13 @@ Only the latest entry is shown in the [README](../README.MD); the full history l
 
 ---
 
-### 03.20.26
+### 03.21.26
+
+**AsuraScans (`sites/asura.py`) — full rewrite:**
+- Rewrote handler for the new asurascans.com site structure; added `asurascans.com` domain
+- Switched URL path from `/series/` to `/comics/`; old `self.__next_f.push` flight-data parsing removed
+- Chapter list now extracted from HTML `<a>` tags; images from embedded RSC (React Server Components) props JSON with regex CDN fallback
+- Verified image extraction matches Chrome browser (21, 17, 14 images across 3 test chapters — all exact matches)
 
 **zendriver Cloudflare cookie fix (`sites/crawlee_utils.py`):**
 - Fixed `KeyError: 'sameParty'` crash in zendriver's CDP cookie retrieval — Chrome removed the deprecated `sameParty` field, but zendriver's `Cookie.from_json()` still required it. This caused `browser.cookies.get_all()` to silently hang, returning zero cookies and leaving the Chrome process open indefinitely

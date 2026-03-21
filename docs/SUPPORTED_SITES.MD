@@ -12,8 +12,9 @@
 | [artlapsa.com](https://artlapsa.com) | recent check 03.08.26 ✅ |
 | [aryascans.com/brainrotcomics.com](https://brainrotcomics.com/) | recent check 11.26.25 ✅ |
 | [asmotoon.com](https://asmotoon.com) | recent check 03.08.26 ✅ |
-| [asuracomic.net](https://asuracomic.net) | recent check 03.08.26 ✅ |
-| [asurascans.net](https://asurascans.net) | recent check 03.08.26 ✅ |
+| [asurascans.com](https://asurascans.com) | recent check 03.21.26 ✅ · Primary domain; full handler rewrite for new site structure |
+| [asuracomic.net](https://asuracomic.net) | recent check 03.21.26 ✅ · Alternative domain for asurascans.com |
+| [asurascans.net](https://asurascans.net) | recent check 03.21.26 ✅ · Alternative domain for asurascans.com |
 | [atsu.moe](https://atsu.moe) | recent check 03.08.26 ✅ |
 | [Azora](https://azoramoon.com) | recent check 11.26.25 ✅ |
 | [BiblioPanda](https://bibliopanda.com) | image selection not working ⛔️ |
@@ -215,4 +216,4 @@
 | [zazamanga.com](https://zazamanga.com/) | also supports `www.zazamanga.com` |
 | [zinmanga.net](https://zinmanga.net/) | also supports `www.zinmanga.net` |
 
-For supported NSFW sites, check [NSFW.MD](NSFW.MD)
+For supported NSFW sites, check [NSFW.md](NSFW.md)

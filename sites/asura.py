@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from html import unescape
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -10,6 +11,7 @@ from bs4 import BeautifulSoup
 from .base import BaseSiteHandler, SiteComicContext
 from .hardening import configure_throttling
 
+
 class AsuraSiteHandler(BaseSiteHandler):
     name = "asura"
     domains = (
@@ -17,14 +19,16 @@ class AsuraSiteHandler(BaseSiteHandler):
         "www.asuracomic.net",
         "asurascans.net",
         "www.asurascans.net",
+        "asurascans.com",
+        "www.asurascans.com",
     )
 
     def configure_session(self, scraper, args) -> None:
         if "Referer" not in scraper.headers:
             scraper.headers.update(
                 {
-                    "Referer": "https://asuracomic.net/",
-                    "Origin": "https://asuracomic.net",
+                    "Referer": "https://asurascans.com/",
+                    "Origin": "https://asurascans.com",
                 }
             )
         
@@ -44,162 +48,138 @@ class AsuraSiteHandler(BaseSiteHandler):
 
     # -- Helpers -----------------------------------------------------
     def _fetch_html(self, url: str, scraper, make_request) -> str:
-        # Patching handles the text fetching logic if using scraper.request
         response = make_request(url, scraper)
         response.encoding = response.encoding or "utf-8"
         return response.text
 
-    def _extract_flight_content(self, html: str) -> str:
-        """
-        Next.js App Router streams data via self.__next_f pushes. We decode the
-        escaped payload into plain text for easier parsing.
-        """
-        chunks: List[str] = []
-        search = 'self.__next_f.push([1,"'
-        idx = 0
-        while True:
-            start = html.find(search, idx)
-            if start == -1:
-                break
-            start += len(search)
-            end = html.find('"])', start)
-            if end == -1:
-                break
-            raw = html[start:end]
-            chunks.append(bytes(raw, "utf-8").decode("unicode_escape"))
-            idx = end
-        return "\n".join(chunks)
-
-    def _extract_json_block(self, text: str, pattern: str) -> Optional[Dict]:
-        idx = text.find(pattern)
-        if idx == -1:
-            return None
-        start = text.find("{", idx)
-        if start == -1:
-            return None
-        depth = 0
-        for i in range(start, len(text)):
-            ch = text[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    block = text[start : i + 1]
-                    return json.loads(block)
-        return None
-
-    def _extract_array_block(self, text: str, pattern: str) -> Optional[List]:
-        idx = text.find(pattern)
-        if idx == -1:
-            return None
-        start = text.find("[", idx)
-        if start == -1:
-            return None
-        depth = 0
-        for i in range(start, len(text)):
-            ch = text[i]
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    block = text[start : i + 1]
-                    return json.loads(block)
-        return None
-
-    def _build_pointer_map(self, content: str) -> Dict[str, object]:
-        pattern = re.compile(r"^([0-9a-z]+):(.*)$", re.MULTILINE)
-        values: Dict[str, object] = {}
-        for match in pattern.finditer(content):
-            key = match.group(1)
-            raw = match.group(2).strip()
-            if not raw:
-                continue
-            if raw.startswith("$"):
-                values[key] = raw
-                continue
-            if raw.startswith('"'):
-                try:
-                    values[key] = json.loads(raw)
-                except json.JSONDecodeError:
-                    values[key] = raw
-                continue
-            try:
-                if raw.startswith("[") or raw.startswith("{"):
-                    values[key] = json.loads(raw)
-                else:
-                    values[key] = raw
-            except json.JSONDecodeError:
-                values[key] = raw
-        return values
-
-    def _resolve(
-        self,
-        value,
-        mapping: Dict[str, object],
-        visited: Optional[set] = None,
-    ):
-        if visited is None:
-            visited = set()
-        if isinstance(value, str) and value.startswith("$"):
-            token = value[1:]
-            if token in visited:
-                return None
-            visited.add(token)
-            return self._resolve(mapping.get(token), mapping, visited)
+    def _unwrap_rsc(self, value):
+        """Unwrap React Server Component wire format [type, value] pairs recursively."""
+        if isinstance(value, list) and len(value) == 2 and isinstance(value[0], int):
+            return self._unwrap_rsc(value[1])
         if isinstance(value, list):
-            return [self._resolve(v, mapping, set()) for v in value]
+            return [self._unwrap_rsc(item) for item in value]
         if isinstance(value, dict):
-            return {k: self._resolve(v, mapping, set()) for k, v in value.items()}
+            return {k: self._unwrap_rsc(v) for k, v in value.items()}
         return value
 
-    def _find_chapter_map(self, mapping: Dict[str, object]) -> Optional[List[Dict]]:
-        for value in mapping.values():
-            resolved = self._resolve(value, mapping)
-            if (
-                isinstance(resolved, list)
-                and resolved
-                and isinstance(resolved[0], dict)
-                and {"label", "value"}.issubset(resolved[0].keys())
-            ):
-                return resolved
-        return None
+    def _extract_props_json(self, html: str) -> Optional[Dict]:
+        """Extract the RSC props JSON from page HTML.
 
-    def _find_pages(self, mapping: Dict[str, object]) -> Optional[List[Dict]]:
-        for value in mapping.values():
-            resolved = self._resolve(value, mapping)
-            if (
-                isinstance(resolved, list)
-                and resolved
-                and isinstance(resolved[0], dict)
-                and {"order", "url"}.issubset(resolved[0].keys())
-            ):
-                return resolved
-        return None
+        The site embeds chapter/series data in a custom element attribute like:
+            props="{&quot;seriesSlug&quot;:[0,&quot;...&quot;], ...}"
+        We decode and parse this.
+        """
+        # Look for 'props="{' pattern (HTML-encoded JSON in a props attribute)
+        match = re.search(r'props="(\{&quot;.*?})"', html, re.DOTALL)
+        if not match:
+            return None
+        raw = unescape(match.group(1))
+        try:
+            data = json.loads(raw)
+            return self._unwrap_rsc(data)
+        except (json.JSONDecodeError, ValueError):
+            return None
 
-    def _split_people(self, text: str) -> List[str]:
-        parts = re.split(r"[,/]", text)
-        return [p.strip() for p in parts if p.strip()]
+    def _extract_chapters_from_html(self, html: str) -> List[Dict]:
+        """Extract chapter list from the comic page HTML.
+
+        Chapters are <a> tags inside a scrollable container:
+            div.max-h-[500px] > a[href*="/chapter/"]
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        chapters = []
+
+        # Primary: links inside the scrollable chapter list
+        chapter_links = soup.select('a[href*="/chapter/"]')
+        seen = set()
+        for a in chapter_links:
+            href = a.get("href", "")
+            if not href or href in seen:
+                continue
+            seen.add(href)
+
+            # Extract chapter number from URL: /comics/{slug}/chapter/{number}
+            ch_match = re.search(r'/chapter/(\d+(?:\.\d+)?)', href)
+            if not ch_match:
+                continue
+            chap_num = ch_match.group(1)
+
+            # Title: try to get it from the link text
+            text = a.get_text(strip=True)
+            # Typical text: "Chapter109Choicelast week" — extract meaningful part
+            title_match = re.match(r'Chapter\s*\d+(?:\.\d+)?\s*(.*?)(?:\d+\s*\w+\s*ago|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', text, re.IGNORECASE)
+            title = title_match.group(1).strip() if title_match else ""
+            if not title:
+                title = f"Chapter {chap_num}"
+
+            chapters.append({
+                "chap": chap_num,
+                "title": title,
+                "href": href,
+            })
+
+        return chapters
+
+    def _extract_title_from_html(self, html: str) -> str:
+        """Extract comic title from the page HTML."""
+        soup = BeautifulSoup(html, "html.parser")
+        h1 = soup.find("h1")
+        if h1:
+            return h1.get_text(strip=True)
+        return ""
+
+    def _extract_images_from_html(self, html: str) -> List[str]:
+        """Extract chapter page image URLs from the HTML.
+
+        Strategy 1: Parse RSC props JSON embedded in the page (has all images).
+        Strategy 2: Regex for CDN image URLs in the HTML (fallback).
+        """
+        images = []
+
+        # Strategy 1: RSC props JSON
+        props = self._extract_props_json(html)
+        if props and isinstance(props.get("pages"), list):
+            for page in props["pages"]:
+                if isinstance(page, dict) and page.get("url"):
+                    images.append(page["url"])
+            if images:
+                return images
+
+        # Strategy 2: Regex for all CDN chapter image URLs
+        pattern = r'https://cdn\.asurascans\.com/asura-images/chapters/[^"&\s]+'
+        # Decode &quot; first for HTML-encoded contexts
+        decoded_html = unescape(html)
+        urls = re.findall(pattern, decoded_html)
+        seen = set()
+        for url in urls:
+            if url not in seen:
+                seen.add(url)
+                images.append(url)
+
+        return images
 
     def _extract_people_from_html(self, html: str) -> Dict[str, List[str]]:
         soup = BeautifulSoup(html, "html.parser")
         authors: List[str] = []
         artists: List[str] = []
-        info_section = soup.select_one(
-            "div.grid.grid-cols-1.md\\:grid-cols-2.gap-5.mt-8"
-        )
-        if info_section:
-            for row in info_section.find_all("div", recursive=False):
-                labels = row.find_all("h3")
-                if len(labels) < 2:
-                    continue
-                label_text = labels[0].get_text(strip=True).lower()
-                value_text = labels[1].get_text(strip=True)
-                if "author" in label_text or "writer" in label_text:
-                    authors = self._split_people(value_text)
-                elif "artist" in label_text or "illustrator" in label_text:
-                    artists = self._split_people(value_text)
+        # Look for author/artist info sections
+        for h3 in soup.find_all("h3"):
+            text = h3.get_text(strip=True).lower()
+            next_el = h3.find_next_sibling()
+            if not next_el:
+                # Try parent's next h3
+                parent = h3.parent
+                if parent:
+                    siblings = parent.find_all("h3")
+                    if len(siblings) >= 2 and siblings[0] == h3:
+                        next_el = siblings[1]
+            if not next_el:
+                continue
+            value = next_el.get_text(strip=True)
+            if "author" in text or "writer" in text:
+                authors = [p.strip() for p in re.split(r'[,/]', value) if p.strip()]
+            elif "artist" in text or "illustrator" in text:
+                artists = [p.strip() for p in re.split(r'[,/]', value) if p.strip()]
         result: Dict[str, List[str]] = {}
         if authors:
             result["authors"] = authors
@@ -209,96 +189,74 @@ class AsuraSiteHandler(BaseSiteHandler):
                 result.setdefault("authors", artists)
         return result
 
-    def _parse_chapter_page(self, html: str) -> Dict:
-        content = self._extract_flight_content(html)
-        pointer_map = self._build_pointer_map(content)
-        comic = self._extract_json_block(content, '"comic":{')
-        chapter = self._extract_json_block(content, '"chapter":{"id"')
-        chapter_map = self._extract_array_block(content, '"chapterMapData":[')
-        if comic:
-            comic = self._resolve(comic, pointer_map)
-        if chapter:
-            chapter = self._resolve(chapter, pointer_map)
-        if chapter_map:
-            chapter_map = self._resolve(chapter_map, pointer_map)
-        else:
-            chapter_map = self._find_chapter_map(pointer_map) or []
-        if chapter and not chapter.get("pages"):
-            chapter["pages"] = self._find_pages(pointer_map) or []
-        return {
-            "comic": comic or {},
-            "chapter": chapter or {},
-            "chapter_map": chapter_map or [],
-            "pointers": pointer_map,
-        }
+    def _slug_from_url(self, url: str) -> str:
+        path = urlparse(url).path
+        parts = [part for part in path.split("/") if part]
+        if not parts:
+            return ""
+        # New format: /comics/<slug> or /comics/<slug>/chapter/<n>
+        if parts[0] == "comics" and len(parts) > 1:
+            return parts[1]
+        # Old format: /series/<slug> or /series/<slug>/chapter/<n>
+        if parts[0] == "series" and len(parts) > 1:
+            return parts[1]
+        return parts[0]
 
     def _chapter_url(self, base: str, slug: str, chapter_value: str) -> str:
-        return f"{base}/series/{slug}/chapter/{chapter_value}"
+        return f"{base}/comics/{slug}/chapter/{chapter_value}"
 
     # -- Base overrides ----------------------------------------------
     def fetch_comic_context(
         self, url: str, scraper, make_request
     ) -> SiteComicContext:
         html = self._fetch_html(url, scraper, make_request)
-        data = self._parse_chapter_page(html)
-        comic = data["comic"] or {}
-        if not comic:
-            raise RuntimeError("Unable to parse comic metadata from Asura page.")
 
         parsed = urlparse(url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
-        slug = comic.get("slug") or self._slug_from_url(url)
-        title = comic.get("name") or slug
+        slug = self._slug_from_url(url)
+
+        # Extract title
+        title = self._extract_title_from_html(html)
+        if not title:
+            title = slug
+
+        # Try RSC props first for metadata
+        props = self._extract_props_json(html)
+
+        comic: Dict = {}
+        if props:
+            comic = {
+                "name": props.get("seriesName") or title,
+                "slug": props.get("seriesSlug") or slug,
+                "id": props.get("seriesId"),
+                "cover": props.get("seriesCover"),
+            }
+        else:
+            comic = {
+                "name": title,
+                "slug": slug,
+            }
+
         comic.setdefault("slug", slug)
         comic.setdefault("name", title)
         comic.setdefault("hid", str(comic.get("id") or slug))
-        if comic.get("thumb") and not comic.get("cover"):
-            comic["cover"] = comic["thumb"]
+        if comic.get("cover") and not comic.get("thumb"):
+            comic["thumb"] = comic["cover"]
         comic["_base_url"] = base_url
+
+        # Extract people metadata
         extra_people = self._extract_people_from_html(html)
         for key, value in extra_people.items():
             if value:
                 comic[key] = value
 
-        # inject helpers
-        comic["_chapter_map"] = data.get("chapter_map", [])
-
-        if not comic["_chapter_map"]:
-            series_url = self._series_base(base_url, slug)
-            series_html = self._fetch_html(series_url, scraper, make_request)
-            series_data = self._parse_chapter_page(series_html)
-            if series_data.get("chapter_map"):
-                comic["_chapter_map"] = series_data["chapter_map"]
-            if series_data.get("comic"):
-                for key, value in series_data["comic"].items():
-                    if key not in comic or comic[key] in (None, "", []):
-                        comic[key] = value
-            extra_people = self._extract_people_from_html(series_html)
-            for key, value in extra_people.items():
-                if not comic.get(key):
-                    comic[key] = value
-        if not comic["_chapter_map"]:
-            try:
-                first_html = self._fetch_html(
-                    self._chapter_url(base_url, slug, "1"), scraper, make_request
-                )
-                first_data = self._parse_chapter_page(first_html)
-                if first_data.get("chapter_map"):
-                    comic["_chapter_map"] = first_data["chapter_map"]
-                if first_data.get("comic"):
-                    for key, value in first_data["comic"].items():
-                        if key not in comic or comic[key] in (None, "", []):
-                            comic[key] = value
-                extra_people = self._extract_people_from_html(first_html)
-                for key, value in extra_people.items():
-                    if not comic.get(key):
-                        comic[key] = value
-            except Exception:
-                pass
+        # Extract chapter list from HTML
+        chapter_list = self._extract_chapters_from_html(html)
+        comic["_chapter_list"] = chapter_list
 
         return SiteComicContext(
             comic=comic,
-            title=title,
+            title=comic["name"],
             identifier=slug,
             soup=None,
         )
@@ -311,15 +269,12 @@ class AsuraSiteHandler(BaseSiteHandler):
 
         description = comic.get("description") or comic.get("summary")
         if description:
-            # store in comic for downstream builder
             comic["desc"] = description
 
-        # genres may be available as a list under "genres"
         genres = comic.get("genres")
         if isinstance(genres, list):
             metadata["genres"] = [g["name"] for g in genres if isinstance(g, dict) and g.get("name")]
 
-        # authors / artists might be included under different keys; handle gracefully
         for key, target in (("authors", "authors"), ("artists", "artists")):
             if key in comic and isinstance(comic[key], list):
                 if comic[key] and isinstance(comic[key][0], dict):
@@ -338,35 +293,35 @@ class AsuraSiteHandler(BaseSiteHandler):
     ) -> List[Dict]:
         comic = context.comic or {}
         slug = context.identifier
-        base_url = comic.get("_base_url") or "https://asuracomic.net"
-        chapter_map: List[Dict] = context.comic.get("_chapter_map", [])
+        base_url = comic.get("_base_url") or "https://asurascans.com"
+        chapter_list: List[Dict] = comic.get("_chapter_list", [])
         chapters: List[Dict] = []
 
-        normalized_entries = []
-        for entry in chapter_map:
-            if not isinstance(entry, dict):
-                continue
-            label = entry.get("label") or ""
-            value = entry.get("value")
-            if value is None:
-                continue
-            chapter_no = self._normalize_chapter_number(value)
-            normalized_entries.append((chapter_no, label))
-
         def chapter_sort_key(item):
-            chap_no, _ = item
             try:
-                return float(chap_no)
-            except ValueError:
+                return float(item["chap"])
+            except (ValueError, KeyError):
                 return float("inf")
 
-        for chapter_no, label in sorted(normalized_entries, key=chapter_sort_key):
+        for entry in sorted(chapter_list, key=chapter_sort_key):
+            chap_num = entry.get("chap", "")
+            href = entry.get("href", "")
+            title = entry.get("title", f"Chapter {chap_num}")
+
+            # Build full URL
+            if href.startswith("/"):
+                chapter_url = f"{base_url}{href}"
+            elif href.startswith("http"):
+                chapter_url = href
+            else:
+                chapter_url = self._chapter_url(base_url, slug, chap_num)
+
             chapters.append(
                 {
-                    "hid": f"{slug}-{chapter_no}",
-                    "chap": chapter_no,
-                    "title": label or f"Chapter {chapter_no}",
-                    "url": self._chapter_url(base_url, slug, chapter_no),
+                    "hid": f"{slug}-{chap_num}",
+                    "chap": chap_num,
+                    "title": title,
+                    "url": chapter_url,
                     "group_name": None,
                 }
             )
@@ -382,38 +337,13 @@ class AsuraSiteHandler(BaseSiteHandler):
             raise RuntimeError("Chapter URL missing for Asura chapter.")
 
         html = self._fetch_html(chapter_url, scraper, make_request)
-        data = self._parse_chapter_page(html)
-        pages = data.get("chapter", {}).get("pages", [])
+        images = self._extract_images_from_html(html)
 
-        image_urls: List[str] = []
-        for page in sorted(
-            pages,
-            key=lambda p: p.get("order", 0) if isinstance(p, dict) else 0,
-        ):
-            if isinstance(page, dict) and page.get("url"):
-                image_urls.append(page["url"])
-        return image_urls
-
-    # -- Internal helpers --------------------------------------------
-    def _series_base(self, base: str, slug: str) -> str:
-        return f"{base}/series/{slug}"
-
-    def _slug_from_url(self, url: str) -> str:
-        path = urlparse(url).path
-        # path like /series/<slug>/chapter/<name> or /series/<slug>
-        parts = [part for part in path.split("/") if part]
-        if not parts:
-            return ""
-        if parts[0] == "series":
-            return parts[1] if len(parts) > 1 else ""
-        return parts[0]
-
-    def _normalize_chapter_number(self, value) -> str:
-        if isinstance(value, (int, float)):
-            if isinstance(value, float) and not value.is_integer():
-                return str(value).rstrip("0").rstrip(".")
-            return str(int(value))
-        return str(value)
+        if not images:
+            raise RuntimeError(
+                f"No images found for Asura chapter: {chapter_url}"
+            )
+        return images
 
 
 __all__ = ["AsuraSiteHandler"]
