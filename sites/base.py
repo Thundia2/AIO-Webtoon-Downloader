@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -50,6 +51,25 @@ class BaseSiteHandler:
     def get_group_name(self, chapter_version: Dict) -> Optional[str]:
         return None
 
+    def normalize_group_name(self, group_name: Optional[str]) -> Optional[str]:
+        if not isinstance(group_name, str):
+            return None
+        cleaned = group_name.strip().casefold()
+        if not cleaned:
+            return None
+        cleaned = re.sub(r"[_./-]+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if re.search(r"\bofficial\b", cleaned):
+            return "official"
+        return cleaned
+
+    def get_group_match_key(self, group_name: Optional[str]) -> Optional[str]:
+        normalized = self.normalize_group_name(group_name)
+        if not normalized:
+            return None
+        squashed = re.sub(r"[^0-9a-z]+", "", normalized)
+        return squashed or normalized
+
     def select_best_chapter_version(
         self,
         versions: List[Dict],
@@ -67,6 +87,17 @@ class BaseSiteHandler:
             if log_debug_fn:
                 log_debug_fn(msg)
 
+        def _available_groups() -> str:
+            groups: List[str] = []
+            for version in versions:
+                group_name = self.get_group_name(version)
+                if not isinstance(group_name, str):
+                    continue
+                cleaned = group_name.strip()
+                if cleaned and cleaned not in groups:
+                    groups.append(cleaned)
+            return ", ".join(groups) if groups else "none"
+
         chap_label = versions[0].get("chap", "?")
         best_by_upvote = max(versions, key=upvotes)
 
@@ -76,9 +107,27 @@ class BaseSiteHandler:
             )
             return best_by_upvote
 
+        preferred_entries = [
+            (group_name, self.get_group_match_key(group_name))
+            for group_name in preferred_groups
+        ]
+        preferred_entries = [
+            (group_name, match_key)
+            for group_name, match_key in preferred_entries
+            if match_key
+        ]
+        if not preferred_entries:
+            _debug(
+                f"    Ch {chap_label}: Group filter contained no usable names. Selected by upvotes ({best_by_upvote.get('up_count', 0)})."
+            )
+            return best_by_upvote
+
         if mix_by_upvote:
             preferred = [
-                v for v in versions if self.get_group_name(v) in preferred_groups
+                v
+                for v in versions
+                if self.get_group_match_key(self.get_group_name(v))
+                in {match_key for _, match_key in preferred_entries}
             ]
             if preferred:
                 best = max(preferred, key=upvotes)
@@ -87,24 +136,26 @@ class BaseSiteHandler:
                 )
                 return best
             _debug(
-                f"    Ch {chap_label}: Mix-by-upvote. No preferred groups found. Fallback to upvotes."
+                f"    Ch {chap_label}: Mix-by-upvote. None of the requested groups were present. Skipping chapter. Available groups: {_available_groups()}."
             )
-            return best_by_upvote
+            return None
 
-        for group_name in preferred_groups:
+        for group_name, match_key in preferred_entries:
             candidates = [
-                v for v in versions if self.get_group_name(v) == group_name
+                v
+                for v in versions
+                if self.get_group_match_key(self.get_group_name(v)) == match_key
             ]
             if candidates:
                 best = max(candidates, key=upvotes)
                 _debug(
-                    f"    Ch {chap_label}: Found in priority group '{group_name}'. Selected."
+                    f"    Ch {chap_label}: Found in priority group '{group_name}'. Selected '{self.get_group_name(best)}'."
                 )
                 return best
         _debug(
-            f"    Ch {chap_label}: No priority groups found. Fallback to upvotes."
+            f"    Ch {chap_label}: None of the requested groups were present. Skipping chapter. Available groups: {_available_groups()}."
         )
-        return best_by_upvote
+        return None
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         raise NotImplementedError

@@ -5,6 +5,20 @@ Only the latest entry is shown in the [README](../README.MD); the full history l
 
 ---
 
+### 04.09.26
+
+**Group selection safety (`sites/base.py`, `aio-dl.py`):**
+- Normalized scanlation-group matching so case, spacing, punctuation, and common `official` label variants no longer cause false mismatches
+- Changed `--group` behavior to be strict: if a requested scanlation group is not present for a chapter, that chapter is skipped instead of silently falling back to the highest-upvoted release from another group
+- Updated `--mix-by-upvote` so it only compares releases from the groups explicitly allowed by the user
+- Added verbose reporting for chapters skipped by the group filter
+
+**Tests & docs:**
+- Added focused unit tests covering normalized group matching, `official` aliases, strict skip behavior, and `mix-by-upvote` filtering
+- Updated CLI/README help text to document that `--group` now skips chapters with no matching scanlation group
+
+---
+
 ### 04.04.26
 
 **New features:**

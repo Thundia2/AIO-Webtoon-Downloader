@@ -2146,15 +2146,15 @@ def main():
         "--group",
         nargs="+",
         default=[],
-        help="One or more preferred scanlation groups, in order of priority. "
+        help="Only download versions from the specified scanlation groups, in order of priority. "
         'Can be a single quoted string with commas (e.g., "A, B") '
-        'or multiple arguments (e.g., "A" "B").',
+        'or multiple arguments (e.g., "A" "B"). Chapters without a matching group are skipped.',
     )
     p.add_argument(
         "--mix-by-upvote",
         action="store_true",
-        help="When multiple --group args are used, ignore priority and pick the "
-        "version with the most upvotes from any of the specified groups.",
+        help="When multiple specified --group args are available for the same chapter, "
+        "pick the matched version with the most upvotes.",
     )
     p.add_argument(
         "--no-partials",
@@ -2847,6 +2847,7 @@ def main():
 
     # 2. For each chapter number, select the best version
     best_chapters = []
+    skipped_group_chapters = 0
     sorted_chap_nums = sorted(chapters_by_num.keys(), key=float)
     for num in sorted_chap_nums:
         versions = chapters_by_num[num]
@@ -2855,6 +2856,13 @@ def main():
         )
         if best_version:
             best_chapters.append(best_version)
+        elif args.group:
+            skipped_group_chapters += 1
+
+    if args.group and skipped_group_chapters:
+        log_verbose(
+            f"  Group filter skipped {skipped_group_chapters} chapter(s) with no matching scanlation group."
+        )
 
     # 3. Apply filters to the final list
     chapters = best_chapters
@@ -2898,6 +2906,8 @@ def main():
             )
 
     if not chapters:
+        if args.group:
+            sys.exit("No chapters selected. None of the requested scanlation groups matched the requested chapters.")
         sys.exit("No chapters selected.")
     # --- End of Chapter Selection Logic ---
 

@@ -226,8 +226,8 @@ uvicorn api:app --host 0.0.0.0 --port 8000
 | `--epub-dir PATH`             | Optional override directory specifically for EPUB outputs.                                                                                                                                                                    | _none_      |
 | `--temp-dir PATH`             | Optional override base directory for temporary processing folders.                                                                                                                                                            | _none_      |
 | `--cookies STRING`            | HTTP cookie string for restricted content (e.g. `key1=val1; key2=val2`)                                                                                                                                                     | `""`        |
-| `--group STRING...`           | Preferred scanlation groups (comma-separated or multiple args).                                                                                                                                                              | `[]`        |
-| `--mix-by-upvote`             | When multiple `--group` entries exist, pick the version with the highest upvotes among them.                                                                                                                                 | `False`     |
+| `--group STRING...`           | Only download versions from the specified scanlation groups (comma-separated or multiple args). Chapters without a matching group are skipped.                                                                               | `[]`        |
+| `--mix-by-upvote`             | When multiple specified `--group` entries exist for the same chapter, pick the matched version with the highest upvotes.                                                                                                    | `False`     |
 | `--no-partials`               | Skip fractional chapters (e.g. 1.5).                                                                                                                                                                                          | `False`     |
 | `--chapters STRING`           | Chapter filter: `all`, single (`5`), range (`1-10`), list/ranges (`1,3,5-7`), or open-ended (`-10`, `5-`).                                                                                                                   | `all`       |
 | `--language STRING`           | Language code (e.g. `en`, `ja`).                                                                                                                                                                                              | `en`        |
@@ -434,8 +434,8 @@ Here are some handy pointers to get the most out of your workflow:
   • Combine with `--split` to keep individual file sizes manageable.
 
 - 🏷️ **Best Scanlation Version**  
-  • `--group "YourFavGroup"` to prefer a specific scanlation team or even teams by using  `--group "YourFavGroup1, YourFavGroup2"`.  
-  • Add `--mix-by-upvote` to pick the highest-upvoted release among your chosen groups.
+  • `--group "YourFavGroup"` to only download that scanlation team, or use `--group "YourFavGroup1, YourFavGroup2"` to allow several teams in priority order. Chapters with no match are skipped.  
+  • Add `--mix-by-upvote` to pick the highest-upvoted release among the groups you allowed for that chapter.
 
 - 🔍 **Debugging & Verbose Logs**  
   • `-v` / `--verbose` for step-by-step progress.  
@@ -501,23 +501,17 @@ Please follow the existing style and include tests where applicable.
 
 > Full changelog: [docs/CHANGELOG.md](docs/CHANGELOG.md)
 
-### 03.21.26
+### 04.09.26
 
-**AsuraScans (`sites/asura.py`) — full rewrite:**
-- Rewrote handler for the new asurascans.com site structure; added `asurascans.com` domain
-- Switched URL path from `/series/` to `/comics/`; old `self.__next_f.push` flight-data parsing removed
-- Chapter list now extracted from HTML `<a>` tags; images from embedded RSC (React Server Components) props JSON with regex CDN fallback
-- Verified image extraction matches Chrome browser (21, 17, 14 images across 3 test chapters — all exact matches)
+**Group selection safety (`sites/base.py`, `aio-dl.py`):**
+- Normalized scanlation-group matching so case, spacing, punctuation, and common `official` label variants no longer cause false mismatches
+- Changed `--group` behavior to be strict: if a requested scanlation group is not present for a chapter, that chapter is skipped instead of silently falling back to the highest-upvoted release from another group
+- Updated `--mix-by-upvote` so it only compares releases from the groups explicitly allowed by the user
+- Added verbose reporting for chapters skipped by the group filter
 
-**zendriver Cloudflare cookie fix (`sites/crawlee_utils.py`):**
-- Fixed `KeyError: 'sameParty'` crash in zendriver's CDP cookie retrieval — Chrome removed the deprecated `sameParty` field, but zendriver's `Cookie.from_json()` still required it. This caused `browser.cookies.get_all()` to silently hang, returning zero cookies and leaving the Chrome process open indefinitely
-- Added module-level monkey-patch for `Cookie.from_json` that defaults `sameParty` to `False`
-- Added overall `asyncio.wait_for` timeout (45s) and Chrome process force-kill to `_solve_cf_async` to prevent abandoned browser windows
-
-**Comix (`sites/comix.py`):**
-- Fixed "No chapters selected" bug — the language filter used `item.get("language") != language`, which silently dropped chapters that had no `language` field (since `None != "en"`)
-- Language comparison is now case-insensitive and matches long-form names (e.g. `"English"` matches `"en"`)
-- Added CF-aware requests (`_cf_aware_request`) — all API and page fetches now auto-fall back to a zendriver CF session on Cloudflare 403, since comix.to added Cloudflare protection
+**Tests & docs:**
+- Added focused unit tests covering normalized group matching, `official` aliases, strict skip behavior, and `mix-by-upvote` filtering
+- Updated CLI/README help text to document that `--group` now skips chapters with no matching scanlation group
 
 ## 🙏 Acknowledgements
 
@@ -541,4 +535,3 @@ This project stands on the shoulders of many wonderful open-source tools and lib
 This project is licensed under the [GNU GPLv3](LICENSE).
 
 ---
-
