@@ -89,6 +89,25 @@ class AtsumaruSiteHandler(BaseSiteHandler):
 
         return SiteComicContext(comic=comic, title=title, identifier=slug, soup=None)
 
+    def _fetch_all_chapters(self, slug: str, scraper) -> List[Dict]:
+        """Fetch all chapters via /api/manga/allChapters.
+
+        This endpoint returns every chapter for the manga in a single response,
+        avoiding the pagination gaps that /api/manga/page has (which shows only
+        the newest and oldest chapters, hiding the middle ones behind a
+        "Show All" button on the website).
+        """
+        try:
+            response = self._api_get(
+                scraper,
+                "/api/manga/allChapters",
+                params={"mangaId": slug},
+            )
+            payload = response.json()
+            return payload.get("chapters") or []
+        except Exception:
+            return []
+
     def _fetch_chapter_batch(self, slug: str, page: int, scraper) -> Dict:
         response = self._api_get(
             scraper,
@@ -197,10 +216,19 @@ class AtsumaruSiteHandler(BaseSiteHandler):
             return chapters
 
         # --- Fallback for adult-content manga ---
-        # /api/manga/chapters returns empty chapters without an authenticated
-        # session. Fall back to the chapters that were embedded in the
-        # /api/manga/page response (stored during fetch_comic_context), then
-        # keep paginating via the manga page endpoint if hasMoreChapters is set.
+        # /api/manga/chapters returns empty without an authenticated session.
+        # First try /api/manga/allChapters which returns every chapter in one
+        # shot — this avoids the pagination gaps that /api/manga/page has
+        # (it only shows the newest and oldest chapters, hiding the middle
+        # ones behind a "Show All" button on the website).
+        all_entries = self._fetch_all_chapters(slug, scraper)
+        if all_entries:
+            for entry in all_entries:
+                chapters.append(self._parse_chapter_entry(slug, entry, fallback_index=len(chapters) + 1))
+            return chapters
+
+        # Last resort: use embedded chapters from the manga page response,
+        # then paginate via the manga page endpoint if hasMoreChapters is set.
         embedded: List[Dict] = list(context.comic.get("_embedded_chapters") or [])
         has_more: bool = bool(context.comic.get("_has_more_chapters"))
 

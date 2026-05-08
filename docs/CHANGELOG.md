@@ -5,6 +5,17 @@ Only the latest entry is shown in the [README](../README.MD); the full history l
 
 ---
 
+### 05.09.26
+
+**Atsumaru (`sites/atsumaru.py`):**
+- Fixed chapters 11–33 being silently skipped on adult manga with more than 20 chapters (e.g. `csh9`). The `/api/manga/page` endpoint only returns the newest 10 and oldest 10 chapters in its initial response, hiding the middle ones behind a "Show All" button.
+- The downloader now uses the `/api/manga/allChapters` endpoint as the primary fallback, which returns every chapter in a single response without pagination gaps. The previous `index`-based pagination through `/api/manga/page` is retained as a last resort.
+
+**MangaFire VRF (`sites/mangafire_vrf_simple.py`):**
+- Fixed `It looks like you are using Playwright Sync API inside the asyncio loop` error that occurred when the MangaFire VRF generator was used after zendriver's CF cookie solver (`crawlee_utils.get_cf_session`) ran in the same process. The asyncio running-loop reference is now cleared before every VRF call, not just on first initialization.
+
+---
+
 ### 05.08.26
 
 **Comix (`sites/comix.py`):**

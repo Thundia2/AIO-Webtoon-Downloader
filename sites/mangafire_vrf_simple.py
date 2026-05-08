@@ -747,15 +747,17 @@ _VRF_GEN = None  # created lazily inside the VRF thread
 
 def _vrf_thread_entry(fn_name: str, args: tuple, kwargs: dict):
     global _VRF_GEN
+    # Always clear any stale running event loop before each call.
+    # Playwright's Sync API checks asyncio.get_running_loop() and refuses
+    # to start if one is found.  Other parts of the downloader (e.g.
+    # zendriver's asyncio.run() in crawlee_utils) may leave a running-loop
+    # reference on this thread even after completion, causing the
+    # "using Playwright Sync API inside the asyncio loop" error.
+    try:
+        asyncio._set_running_loop(None)
+    except Exception:
+        pass
     if _VRF_GEN is None:
-        # Clear any stale running event loop ONLY before first init.
-        # Playwright's Sync API checks asyncio.get_running_loop() and refuses
-        # to start if one is found.  Once Playwright is running it manages
-        # the running-loop reference itself, so we must not touch it again.
-        try:
-            asyncio._set_running_loop(None)
-        except Exception:
-            pass
         _VRF_GEN = SimpleMangaFireVRFGenerator()
     fn = getattr(_VRF_GEN, fn_name)
     return fn(*args, **kwargs)
