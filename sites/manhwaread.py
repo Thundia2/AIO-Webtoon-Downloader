@@ -3,34 +3,77 @@ from __future__ import annotations
 import base64
 import json
 import re
-from typing import Dict, List
+from typing import Dict, List, Optional
+from urllib.parse import urljoin
 
-from .madara import MadaraSiteHandler
+from .madara import MadaraSiteHandler, _MadaraChapter
 
 
 class ManhwaReadHandler(MadaraSiteHandler):
+    # Keep legacy selectors as a fallback for the parent's _collect_chapter_elements
     chapter_selectors = (
         "li.wp-manga-chapter",
-        "div.chapter-list a",
         "ul.main.version-chap li",
-        "div.flex.flex-col a[href*='chapter-']",
     )
 
     def __init__(self) -> None:
         super().__init__("manhwaread", "https://manhwaread.com")
 
+    # -------------------------------------------------------------- chapters
+    def _collect_chapter_elements(self, soup) -> List[_MadaraChapter]:
+        """Override: manhwaread.com uses `<a class="chapter-item">` inside
+        `#chaptersList` instead of the standard Madara `<li>` layout.
+        The chapter name lives in a child `.chapter-item__name` span and
+        the date in `.chapter-item__date`.
+        """
+        chapters: List[_MadaraChapter] = []
+
+        # Primary: site-specific selectors scoped to the chapter list container
+        # to avoid picking up recommendation links that also use .chapter-item.
+        for selector in (
+            "div#chaptersList a.chapter-item",
+            "div.chapters-list a.chapter-item",
+        ):
+            for link in soup.select(selector):
+                href = link.get("href")
+                if not href:
+                    continue
+                href = urljoin(self.base_url, href)
+
+                # Prefer the dedicated name span; fall back to full link text
+                name_node = link.select_one(".chapter-item__name")
+                title = (
+                    name_node.get_text(strip=True)
+                    if name_node
+                    else link.get_text(" ", strip=True)
+                )
+
+                date_node = link.select_one(".chapter-item__date")
+                date_text = date_node.get_text(strip=True) if date_node else None
+
+                chapters.append(
+                    _MadaraChapter(url=href, title=title, date_text=date_text)
+                )
+            if chapters:
+                return chapters
+
+        # Fallback: delegate to the parent's generic Madara logic
+        return super()._collect_chapter_elements(soup)
+
+    # -------------------------------------------------------------- context
     def fetch_comic_context(self, url: str, scraper, make_request):
         context = super().fetch_comic_context(url, scraper, make_request)
-        
+
         # Refine title if fallback slug was used
         if context.title == context.identifier and context.soup:
             title_node = context.soup.select_one("h1.text-3xl.text-primary, h1.clipboard-copy")
             if title_node:
                 context.title = title_node.get_text(strip=True)
                 context.comic["title"] = context.title
-                
+
         return context
 
+    # -------------------------------------------------------------- images
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         chapter_url = chapter.get("url")
         if not chapter_url:
