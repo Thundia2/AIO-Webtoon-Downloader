@@ -5,6 +5,13 @@ Only the latest entry is shown in the [README](../README.MD); the full history l
 
 ---
 
+### 05.08.26
+
+**Comix (`sites/comix.py`):**
+- Fixed a bug where `comix.to` failed to download chapters because of an API shift from `v2` to `v1`. The scraper now natively cascades from v1 to v2 endpoints across context fetching, chapter listing, and image parsing.
+- Refactored API status code matching to accept either integer `200` or string `"ok"`, and abstracted group parsing schema definitions to correctly parse both `group` and `scanlation_group` dynamically from either API version.
+- Image fetching now relies natively on the new `/api/v1/chapters/{id}` endpoint to extract page URLs dynamically rather than depending on regex extraction from the chapter HTML, while retaining the robust HTML regex fallback for `v2` endpoints.
+
 ### 05.07.26
 
 **ManhwaRead Support (`sites/manhwaread.py`, `sites/__init__.py`):**

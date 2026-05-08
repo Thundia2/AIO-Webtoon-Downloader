@@ -23,7 +23,7 @@
 | [BorutoExplorer](https://leitor.borutoexplorer.com.br) | image selection not working ⛔️ |
 | [cocomic.co](https://cocomic.co) | currently offline ⛓️‍💥 |
 | [coffeemanga.io](https://coffeemanga.io) | recent check 11.26.25 ✅ · Mirror: [coffeemanga.ink](https://coffeemanga.ink) |
-| [comix.to](https://comix.to) | recent check 03.08.26 ✅  · Supports scanlation group selection |
+| [comix.to](https://comix.to) | recent check 05.08.26 ✅  · Supports scanlation group selection |
 | [culturedworks.com](https://culturedworks.com) | recent check 03.08.26 ✅ |
 | [darkscans.net](https://darkscans.net) | currently offline ⛓️‍💥 |
 | [decadencescans.com](https://reader.decadencescans.com) | only first image downloads due to page style being default ⛔️ |

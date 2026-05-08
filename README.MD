@@ -142,7 +142,7 @@ For all supported sites, check [docs/SUPPORTED_SITES.MD](docs/SUPPORTED_SITES.MD
 | ----- | ----- | ----- |
 | [asurascans.com](https://asurascans.com) | Alternative URLs: [asuracomic.net](https://asuracomic.net), [asurascans.net](https://asurascans.net) | recent check 03.21.26 ✅ |
 | [Atsumaru / atsu.moe](https://atsu.moe) | | recent check 03.08.26 ✅ |
-| [**comix.to**](https://comix.to) | Supports multiple scanlation groups | recent check 04.04.26 ✅ |
+| [**comix.to**](https://comix.to) | Supports multiple scanlation groups | recent check 05.08.26 ✅ |
 | [fanfox.net](https://fanfox.net) | Mirrors: [mangafox.la](https://mangafox.la) and [mangahere.cc](https://mangahere.cc) | recent check 03.08.26 ✅ |
 | [flamecomics.xyz](https://flamecomics.xyz) | | recent check 03.08.26 ✅ |
 | [galaxymanga.io](https://galaxymanga.io) | | recent check 03.08.26 ✅ |
@@ -506,25 +506,12 @@ Please follow the existing style and include tests where applicable.
 
 > Full changelog: [docs/CHANGELOG.md](docs/CHANGELOG.md)
 
-### 05.07.26
+### 05.08.26
 
-**ManhwaRead Support (`sites/manhwaread.py`, `sites/__init__.py`):**
-- Added a dedicated `ManhwaReadHandler` to handle `manhwaread.com`'s unique Base64-encoded image data structure.
-- Implemented automatic Base64 padding correction to resolve "Incorrect padding" errors on certain chapters.
-- Optimized title and chapter list extraction with site-specific selectors.
-
-**Image Downloader & Referer Fix (`aio-dl.py`):**
-- Modified the image download logic to pass the `Referer` header from the main scraper session to the individual image requests. This resolves 403 Forbidden errors on CDNs like `manread.xyz` that enforce hotlink protection.
-
-**Atsumaru (`sites/atsumaru.py`):**
-- Fixed a bug where adult-content manga would fail with "No chapters selected" because the dedicated `/api/manga/chapters` endpoint returns an empty list without an authenticated session.
-- The downloader now uses a two-stage fallback: it extracts the first batch of chapters embedded in the `/api/manga/page` response, and pages through the rest using the `index` offset parameter.
-- Handled edge cases where adult chapters return non-numeric titles instead of chapter numbers, preventing them from being silently skipped during filtering.
-
-**Bug Fixes (`aio-dl.py`, `gui.py`):**
-- Fixed a crash (`Invalid size format: NONE`) that occurred when resuming or updating series with blank split settings; the GUI no longer accidentally translates empty parameters into the literal string `"None"`.
-- Improved parameter loading in `gui.py` to correctly handle `null` JSON values across all inputs (split, site, cookies).
-- Added strict fallback safeguards to `aio-dl.py` parsers (`parse_size`, `parse_aspect_ratio`) so they explicitly ignore `"NONE"` strings to prevent similar edge-case crashes.
+**Comix (`sites/comix.py`):**
+- Fixed a bug where `comix.to` failed to download chapters because of an API shift from `v2` to `v1`. The scraper now natively cascades from v1 to v2 endpoints across context fetching, chapter listing, and image parsing.
+- Refactored API status code matching to accept either integer `200` or string `"ok"`, and abstracted group parsing schema definitions to correctly parse both `group` and `scanlation_group` dynamically from either API version.
+- Image fetching now relies natively on the new `/api/v1/chapters/{id}` endpoint to extract page URLs dynamically rather than depending on regex extraction from the chapter HTML, while retaining the robust HTML regex fallback for `v2` endpoints.
 
 ## 🙏 Acknowledgements
 
