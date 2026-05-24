@@ -15,14 +15,7 @@ class VioletScansSiteHandler(MangaThemesiaSiteHandler):
             base_url=self.base_url,
             domains=self.domains,
             use_playwright=True,
-            verify_ssl=False,
+            verify_ssl=True,
             *args, **kwargs
         )
 
-    def configure_session(self, scraper, args) -> None:
-        # Call parent to set up headers and basic SSL verification setting
-        super().configure_session(scraper, args)
-        
-        # Explicitly suppress warnings for this session if verification is disabled
-        if not self.verify_ssl:
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)

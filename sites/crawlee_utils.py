@@ -138,8 +138,9 @@ async def _solve_cf_async(url: str, overall_timeout: float = 45.0) -> dict:
             )
             if has_challenge:
                 await _asyncio.wait_for(verify_cf(page, timeout=30), timeout=40)
-        except _asyncio.TimeoutError:
-            pass  # No interactive challenge, proceed anyway
+        except (_asyncio.TimeoutError, Exception) as e:
+            # Catch DOM resolution errors or timeout and proceed anyway
+            pass
 
         # Wait briefly for any post-challenge redirects to settle
         await _asyncio.sleep(2)
@@ -317,5 +318,130 @@ def fetch_html_with_cf_cookies(
     resp = session.get(url, timeout=timeout)
     resp.raise_for_status()
     return resp.text
+
+
+def sync_cf_cookies(scraper, url: str) -> None:
+    """If we have cached CF cookies for url's domain, sync them and User-Agent to scraper."""
+    if not ZENDRIVER_AVAILABLE:
+        return
+    domain = _urlparse(url).netloc
+    domain_no_www = domain[4:] if domain.startswith("www.") else domain
+
+    with _cf_cookie_lock:
+        cached = _cf_cookie_cache.get(domain) or _cf_cookie_cache.get(domain_no_www)
+        if cached:
+            # Sync user agent
+            scraper.headers["User-Agent"] = cached["user_agent"]
+            # Sync cookies
+            for c in cached["cookies"]:
+                scraper.cookies.set(
+                    c["name"],
+                    c["value"],
+                    domain=c.get("domain", domain),
+                    path=c.get("path", "/"),
+                )
+
+
+async def _fetch_html_zendriver_async(
+    url: str, wait_selector: Optional[str] = None, overall_timeout: float = 60.0
+) -> dict:
+    from zendriver.core.cloudflare import cf_is_interactive_challenge_present, verify_cf
+    import asyncio as _asyncio
+    import signal as _signal
+
+    browser = await _zd.start(headless=False)
+    chrome_pid = None
+    try:
+        if hasattr(browser, "_process") and browser._process:
+            chrome_pid = browser._process.pid
+        elif hasattr(browser, "process") and browser.process:
+            chrome_pid = browser.process.pid
+    except Exception:
+        pass
+
+    async def _inner():
+        page = await browser.get(url)
+
+        try:
+            has_challenge = await _asyncio.wait_for(
+                cf_is_interactive_challenge_present(page, timeout=10), timeout=15
+            )
+            if has_challenge:
+                await _asyncio.wait_for(verify_cf(page, timeout=30), timeout=40)
+        except Exception:
+            pass
+
+        await _asyncio.sleep(3)  # Wait for SPA load/redirects
+
+        if wait_selector:
+            try:
+                for _ in range(20):
+                    el = await page.query_selector(wait_selector)
+                    if el:
+                        break
+                    await _asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+        # Extract fully rendered HTML
+        html = await page.evaluate("document.documentElement.outerHTML")
+
+        # Get User-Agent
+        ua = "Mozilla/5.0"
+        try:
+            ua = await page.evaluate("navigator.userAgent")
+        except Exception:
+            pass
+
+        # Get cookies
+        cookies = []
+        try:
+            raw_cookies = await browser.cookies.get_all()
+            cookies = [
+                {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
+                for c in raw_cookies
+            ]
+        except Exception as e:
+            print(f"[!] cookie retrieval warning: {e}")
+
+        return {"html": html, "cookies": cookies, "user_agent": ua}
+
+    try:
+        return await _asyncio.wait_for(_inner(), timeout=overall_timeout)
+    finally:
+        if chrome_pid:
+            try:
+                import os as _os
+                _os.kill(chrome_pid, _signal.SIGKILL)
+            except Exception:
+                pass
+        try:
+            await _asyncio.wait_for(browser.stop(), timeout=5)
+        except Exception:
+            pass
+
+
+def fetch_html_zendriver(url: str, wait_selector: Optional[str] = None) -> str:
+    """Fetch URL and return fully-rendered HTML using zendriver (handling Cloudflare & SPA)."""
+    if not ZENDRIVER_AVAILABLE:
+        raise RuntimeError("zendriver is not installed.")
+
+    import asyncio as _asyncio
+
+    domain = _urlparse(url).netloc
+    result = _asyncio.run(_fetch_html_zendriver_async(url, wait_selector))
+
+    # Cache cookies
+    now = _time.time()
+    with _cf_cookie_lock:
+        _cf_cookie_cache[domain] = {
+            "cookies": result["cookies"],
+            "user_agent": result["user_agent"],
+            "ts": now,
+        }
+
+    return result["html"]
+
+
 
 

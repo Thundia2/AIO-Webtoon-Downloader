@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Set
 
 
 SAVED_PARAMS_FILE = "download_params.json"
+SERIES_META_FILE = ".aio_series.json"
 SUPPORTED_BOOK_EXTS = {".cbz", ".pdf", ".epub"}
 SUPPORTED_COVER_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 CHAPTER_FILE_RE = re.compile(
@@ -139,6 +140,18 @@ def load_saved_params(folder: str) -> tuple[bool, Dict]:
         return False, {}
     try:
         with open(params_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return True, {}
+    return True, data if isinstance(data, dict) else {}
+
+
+def load_series_meta(folder: str) -> tuple[bool, Dict]:
+    meta_path = os.path.join(folder, SERIES_META_FILE)
+    if not os.path.isfile(meta_path):
+        return False, {}
+    try:
+        with open(meta_path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except Exception:
         return True, {}
@@ -314,8 +327,15 @@ def scan_library(root: str) -> List[Dict]:
         if not os.path.isdir(folder) or entry.startswith("."):
             continue
 
+        has_meta, series_meta = load_series_meta(folder)
         has_params, params = load_saved_params(folder)
+        saved = dict(params)
+        saved.update(series_meta)
         chapter_numbers = scan_downloaded_chapters(folder)
+        for number in saved.get("chapters_downloaded") or []:
+            parsed = parse_chapter_number(number)
+            if parsed is not None:
+                chapter_numbers.add(parsed)
         latest = max(chapter_numbers) if chapter_numbers else None
 
         book_files = list_saved_books(folder)
@@ -332,10 +352,15 @@ def scan_library(root: str) -> List[Dict]:
             {
                 "name": entry,
                 "folder": folder,
-                "has_params": has_params,
-                "params": params,
-                "url": params.get("url", ""),
-                "format": params.get("format", "?"),
+                "has_params": has_params or has_meta,
+                "params": saved,
+                "series_meta": series_meta,
+                "url": saved.get("url", ""),
+                "format": saved.get("format", "?"),
+                "language": saved.get("language", "en"),
+                "status": saved.get("status"),
+                "authors": saved.get("authors", []),
+                "genres": saved.get("genres", []),
                 "chapters": len(chapter_numbers),
                 "highest_contiguous": highest_contiguous_whole_chapter(chapter_numbers),
                 "latest_chapter": format_chapter_number(latest) if latest is not None else "",
@@ -349,3 +374,17 @@ def scan_library(root: str) -> List[Dict]:
         )
 
     return entries
+
+
+def to_jsonable(value):
+    if isinstance(value, Decimal):
+        return format_chapter_number(value)
+    if isinstance(value, set):
+        return sorted((to_jsonable(item) for item in value), key=str)
+    if isinstance(value, list):
+        return [to_jsonable(item) for item in value]
+    if isinstance(value, tuple):
+        return [to_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {key: to_jsonable(item) for key, item in value.items()}
+    return value

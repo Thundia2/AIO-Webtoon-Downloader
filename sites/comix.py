@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import re
 from typing import Dict, List, Optional, Any
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 from bs4 import BeautifulSoup
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 try:
     from .crawlee_utils import get_cf_session, is_cf_challenge
@@ -61,9 +61,17 @@ class ComixSiteHandler(BaseSiteHandler):
         return response
 
     def _get_api_token(self, url: str) -> Optional[str]:
-        """Temporarily launches Playwright to capture the token needed for the chapters API."""
+        """Temporarily launches Patchright to capture the token needed for the chapters API."""
+        if not url:
+            return None
+        if not url.startswith("http"):
+            from urllib.parse import urljoin
+            url = urljoin(self._BASE_URL, url)
         try:
-            from playwright.sync_api import sync_playwright
+            try:
+                from patchright.sync_api import sync_playwright
+            except ImportError:
+                from playwright.sync_api import sync_playwright
             from urllib.parse import parse_qsl
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -321,7 +329,11 @@ class ComixSiteHandler(BaseSiteHandler):
             if desc_meta and desc_meta.get("content"):
                 manga_data["desc"] = desc_meta["content"].strip()
 
-        if url and not manga_data.get("url"):
+        if manga_data.get("url"):
+            if not manga_data["url"].startswith("http"):
+                from urllib.parse import urljoin
+                manga_data["url"] = urljoin("https://comix.to", manga_data["url"])
+        elif url:
             manga_data["url"] = url
 
         list_mappings = {
@@ -435,6 +447,10 @@ class ComixSiteHandler(BaseSiteHandler):
                         slug = f"{hash_id}-{slug}"
 
                     chap_url = f"https://comix.to/title/{slug}/{chap_id}-chapter-{chap_num}"
+                else:
+                    if not chap_url.startswith("http"):
+                        from urllib.parse import urljoin
+                        chap_url = urljoin(self._BASE_URL, chap_url)
                 
                 group_info = item.get("group") or item.get("scanlation_group") or {}
                 group_name = group_info.get("name") if group_info else None
@@ -459,6 +475,9 @@ class ComixSiteHandler(BaseSiteHandler):
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         url = chapter.get("url")
+        if url and not url.startswith("http"):
+            from urllib.parse import urljoin
+            url = urljoin(self._BASE_URL, url)
         chap_id = chapter.get("id")
         
         images = []
@@ -521,3 +540,59 @@ class ComixSiteHandler(BaseSiteHandler):
             
         return images
 
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        url = (
+            f"{self._BASE_URL}/api/v1/manga"
+            f"?keyword={quote_plus(clean)}"
+            f"&limit={int(limit)}"
+        )
+        response = make_request(url, scraper)
+        try:
+            data = response.json()
+        except (ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(data, dict) or data.get("status") not in ("ok", 200):
+            return []
+        items = (data.get("result") or {}).get("items") or []
+        if not isinstance(items, list):
+            return []
+
+        hits: List[SearchHit] = []
+        for idx, item in enumerate(items):
+            hid = item.get("hid")
+            title = (item.get("title") or "").strip()
+            if not hid or not title:
+                continue
+            poster = item.get("poster") or {}
+            cover = None
+            if isinstance(poster, dict):
+                cover = poster.get("large") or poster.get("medium") or poster.get("small")
+            chapter_count = item.get("finalChapter") or item.get("latestChapter")
+            if isinstance(chapter_count, (int, float)):
+                chapter_count = int(chapter_count)
+            else:
+                chapter_count = None
+            year = item.get("year") if isinstance(item.get("year"), int) else None
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=f"{self._BASE_URL}/title/{hid}",
+                    cover=cover,
+                    year=year,
+                    chapter_count_hint=chapter_count,
+                    raw_score=max(0.05, 1.0 - (idx / max(1, len(items)))),
+                )
+            )
+        return hits

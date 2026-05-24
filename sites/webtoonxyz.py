@@ -13,7 +13,7 @@ class WebtoonXYZSiteHandler(MadaraSiteHandler):
 
     def __init__(self) -> None:
         super().__init__("WebtoonXYZ", "https://www.webtoon.xyz", use_zendriver=True)
-        self.name = "webtoonxyz"  # keep lowercase so get_handler_by_name() finds it
+        self.name = "webtoonxyz"
 
     def _slug_from_url(self, url: str) -> str:
         # Override to handle "read" instead of "manga" if needed,

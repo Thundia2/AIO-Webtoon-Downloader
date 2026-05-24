@@ -1,0 +1,109 @@
+{
+  "name": "aio-downloader-ui",
+  "version": "1.6.1",
+  "description": "Desktop UI for AIO Manga/Webtoon Downloader",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "electron:dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .\"",
+    "electron:build": "node scripts/prepare-src.js && vite build && electron-builder",
+    "electron:preview": "vite build && cross-env NODE_ENV=production electron .",
+    "dist:win":   "node scripts/prepare-src.js && vite build && electron-builder --win",
+    "dist:mac":   "node scripts/prepare-src.js && vite build && electron-builder --mac",
+    "dist:linux": "node scripts/prepare-src.js && vite build && electron-builder --linux"
+  },
+  "build": {
+    "appId": "com.aio.downloader",
+    "productName": "AIO Downloader",
+    "icon": "build-resources/icon",
+    "files": [
+      "dist/**",
+      "electron/**"
+    ],
+    "extraResources": [
+      {
+        "from": "build-resources/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "build-resources/icon.ico",
+        "to": "icon.ico"
+      },
+      {
+        "from": "python-src",
+        "to": "python-src",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "signAndEditExecutable": false,
+      "extraResources": [
+        {
+          "from": "build-resources/vcruntime",
+          "to": "vcruntime",
+          "filter": ["*.dll"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "deleteAppDataOnUninstall": true
+    },
+    "mac": {
+      "target": [
+        { "target": "dmg", "arch": ["x64", "arm64"] },
+        { "target": "zip", "arch": ["x64", "arm64"] }
+      ],
+      "category": "public.app-category.utilities",
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "entitlements": "build-resources/entitlements.mac.plist",
+      "entitlementsInherit": "build-resources/entitlements.mac.plist"
+    },
+    "dmg": {
+      "writeUpdateInfo": false
+    },
+    "linux": {
+      "target": [
+        { "target": "AppImage", "arch": ["x64"] }
+      ],
+      "category": "Network"
+    },
+    "directories": {
+      "output": "release"
+    },
+    "asar": true,
+    "asarUnpack": []
+  },
+  "dependencies": {
+    "class-variance-authority": "^0.7.0",
+    "clsx": "^2.1.0",
+    "lucide-react": "^0.263.1",
+    "mupdf": "^1.27.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "tailwind-merge": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@vitejs/plugin-react": "^4.2.0",
+    "autoprefixer": "^10.4.17",
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^40.6.1",
+    "electron-builder": "^26.8.1",
+    "postcss": "^8.4.33",
+    "tailwindcss": "^3.4.1",
+    "vite": "^7.3.1",
+    "wait-on": "^7.2.0"
+  }
+}

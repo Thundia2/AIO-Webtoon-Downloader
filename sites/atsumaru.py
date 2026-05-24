@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 from typing import Dict, List, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class AtsumaruSiteHandler(BaseSiteHandler):
@@ -12,6 +12,7 @@ class AtsumaruSiteHandler(BaseSiteHandler):
     domains = ("atsu.moe", "www.atsu.moe")
 
     _BASE_URL = "https://atsu.moe"
+    _SEARCH_URL = "/collections/manga/documents/search"
 
     def __init__(self) -> None:
         super().__init__()
@@ -296,6 +297,68 @@ class AtsumaruSiteHandler(BaseSiteHandler):
         if not images:
             raise RuntimeError("No images returned for Atsumaru chapter.")
         return images
+
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        params = (
+            f"?q={quote_plus(clean)}"
+            f"&query_by=title,englishTitle,otherNames"
+            f"&per_page={int(limit)}"
+        )
+        response = make_request(urljoin(self._BASE_URL, self._SEARCH_URL + params), scraper)
+        try:
+            data = response.json()
+        except ValueError:
+            return []
+        hits_raw = data.get("hits") if isinstance(data, dict) else None
+        if not isinstance(hits_raw, list):
+            return []
+
+        hits: List[SearchHit] = []
+        for idx, item in enumerate(hits_raw):
+            doc = item.get("document") if isinstance(item, dict) else None
+            if not isinstance(doc, dict):
+                continue
+            slug = doc.get("id")
+            title = (doc.get("englishTitle") or doc.get("title") or "").strip()
+            if not slug or not title:
+                continue
+            alt_titles = []
+            for value in (doc.get("title"), *(doc.get("otherNames") or [])):
+                if isinstance(value, str) and value.strip() and value.strip() != title:
+                    alt_titles.append(value.strip())
+            cover = self._parse_cover(doc)
+            chapter_count = doc.get("chaptersCount") or doc.get("chapterCount")
+            if not isinstance(chapter_count, int):
+                chapter_count = None
+            year = doc.get("year")
+            if not isinstance(year, int):
+                year = None
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=urljoin(self._BASE_URL, f"/manga/{slug}"),
+                    cover=cover,
+                    alt_titles=alt_titles,
+                    year=year,
+                    chapter_count_hint=chapter_count,
+                    raw_score=max(0.05, 1.0 - (idx / max(1, len(hits_raw)))),
+                )
+            )
+            if len(hits) >= limit:
+                break
+        return hits
 
 
 __all__ = ["AtsumaruSiteHandler"]

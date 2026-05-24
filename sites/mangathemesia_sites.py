@@ -11,9 +11,9 @@ MANGATHEMESIA_SITES = [
     {
         "name": "erosscans",
         "display_name": "ErosScans",
-        "base_url": "https://erosxsun.xyz",
-        "domains": ("erosxsun.xyz", "www.erosxsun.xyz", "erosvoid.xyz", "www.erosvoid.xyz", "erosscans.xyz", "www.erosscans.xyz"),
-        "url_normalizer": lambda url: url.replace("erosvoid.xyz", "erosxsun.xyz").replace("erosscans.xyz", "erosxsun.xyz"),
+        "base_url": "https://erosvoid.xyz",
+        "domains": ("erosvoid.xyz", "www.erosvoid.xyz", "erosscans.xyz", "www.erosscans.xyz", "erosxsun.xyz", "www.erosxsun.xyz"),
+        "url_normalizer": lambda url: url.replace("erosscans.xyz", "erosvoid.xyz").replace("erosxsun.xyz", "erosvoid.xyz"),
     },
     {
         "name": "galaxymanga",
@@ -59,13 +59,6 @@ MANGATHEMESIA_SITES = [
         "display_name": "EvaScans",
         "base_url": "https://evascans.org",
         "domains": ("evascans.org", "www.evascans.org"),
-    },
-    {
-        "name": "kappabeast",
-        "display_name": "KappaBeast",
-        "base_url": "https://kappabeast.com",
-        "domains": ("kappabeast.com", "www.kappabeast.com"),
-        "use_zendriver": True,
     },
     {
         "name": "culturedworks",
@@ -140,13 +133,7 @@ MANGATHEMESIA_SITES = [
         "base_url": "https://rackusreads.com",
         "domains": ("rackusreads.com", "www.rackusreads.com"),
     },
-    {
-        "name": "ragescans",
-        "display_name": "RageScans",
-        "base_url": "https://ragescans.com",
-        "domains": ("ragescans.com", "www.ragescans.com"),
-        "use_zendriver": True,
-    },
+
     {
         "name": "ravenscans",
         "display_name": "RavenScans",

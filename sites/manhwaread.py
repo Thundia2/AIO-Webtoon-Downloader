@@ -16,8 +16,21 @@ class ManhwaReadHandler(MadaraSiteHandler):
         "ul.main.version-chap li",
     )
 
+    reader_selectors = (
+        "div.reading-content img",
+        "div#chapter-images img",
+        "div.page-break img",
+        "div#chapter-content img",
+        "#chapter-content img",
+    )
+
     def __init__(self) -> None:
-        super().__init__("manhwaread", "https://manhwaread.com")
+        super().__init__(
+            "manhwaread",
+            "https://manhwaread.com",
+            extra_domains=("mgread.io", "www.mgread.io")
+        )
+
 
     # -------------------------------------------------------------- chapters
     def _collect_chapter_elements(self, soup) -> List[_MadaraChapter]:

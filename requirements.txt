@@ -6,8 +6,10 @@ pypdf
 requests
 pywidevine
 cryptography
-playwright>=1.40.0  # Required for MangaFire VRF generation
-impit               # Chrome/Firefox TLS impersonation for bot-protected sites
-zendriver           # Cloudflare challenge solver (CF-protected sites)
-fastapi
-uvicorn
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+impit
+zendriver
+patchright>=1.40.0  # Drop-in Playwright fork with CDP-leak patches (Cloudflare-stealthier). Drives sites/mangafire_vrf_simple.py and sites/playwright_utils.py.
+rapidfuzz  # Cross-site search title matching (sites/search_orchestrator.py)
+curl_cffi>=0.7.0  # MangaFire fast image-download path (HTTP/2 + Chrome120 TLS fingerprint, async). See sites/mangafire.py:fast_download_images.

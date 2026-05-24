@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Callable
 from urllib.parse import urljoin, quote
 import re
 from bs4 import BeautifulSoup, NavigableString
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 from .mangathemesia_utils import (
     extract_ts_reader_images,
     extract_ts_reader_payload,
@@ -18,11 +18,20 @@ except ImportError:
         raise ImportError("Playwright not available")
 
 try:
-    from .crawlee_utils import fetch_html_with_cf_cookies, ZENDRIVER_AVAILABLE
+    from .crawlee_utils import (
+        fetch_html_with_cf_cookies,
+        fetch_html_zendriver,
+        sync_cf_cookies,
+        ZENDRIVER_AVAILABLE,
+    )
 except ImportError:
     ZENDRIVER_AVAILABLE = False
     def fetch_html_with_cf_cookies(*args, **kwargs):
         raise ImportError("zendriver not available")
+    def fetch_html_zendriver(*args, **kwargs):
+        raise ImportError("zendriver not available")
+    def sync_cf_cookies(*args, **kwargs):
+        pass
 
 class MangaThemesiaSiteHandler(BaseSiteHandler):
     """Base handler for MangaThemesia framework sites."""
@@ -71,11 +80,118 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         if self._url_normalizer:
             return self._url_normalizer(url)
         return url
-    
+
+    # ---------------------------------------------------------------- search
+    # MangaThemesia framework search: GET /?s=<query> returns the standard
+    # WordPress search-results page with manga cards under .listupd .bs.
+    # Each card structure:
+    #   <div class="bs">
+    #     <div class="bsx">
+    #       <a href="/manga/<slug>/" title="<Title>">
+    #         <div class="limit">
+    #           <img class="ts-post-image" src="<cover>" />
+    #         </div>
+    #         <div class="bigor">
+    #           <div class="tt"><h2 itemprop="headline"><Title></h2></div>
+    #         </div>
+    #       </a>
+    #     </div>
+    #   </div>
+    # Single implementation covers ~50 sites in MANGATHEMESIA_SITES at once.
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        url = f"{self.base_url.rstrip('/')}/?s={quote(clean)}"
+        # HTTP errors propagate to orchestrator's _run_one for probe-cache
+        # tracking. Sites that return tiny bodies (some MangaThemesia sites
+        # serve a JS-only search and return ~24 bytes from the static path)
+        # produce empty results without raising.
+        response = make_request(url, scraper)
+        html = response.text or ""
+        if len(html) < 200:
+            return []
+        soup = self._make_soup(html)
+
+        # Primary: cards in .listupd .bs .bsx > a. Fallback: any .bs with
+        # a /manga/ link if the .bsx wrapper changed.
+        cards = soup.select(".listupd .bs, .bs")
+        if not cards:
+            return []
+
+        hits: List[SearchHit] = []
+        seen: set = set()
+        for idx, card in enumerate(cards):
+            if len(hits) >= limit:
+                break
+            link = card.select_one("a[href]")
+            if not link:
+                continue
+            href = (link.get("href") or "").strip()
+            if not href:
+                continue
+            # Filter to series/manga URLs only — skip nav links, ads, etc.
+            if not re.search(r"/(manga|series|comic|comics)/[^/?#]+", href):
+                continue
+            abs_url = href if href.startswith("http") else urljoin(self.base_url, href)
+            abs_url = abs_url.split("?")[0].split("#")[0]
+            if abs_url in seen:
+                continue
+            seen.add(abs_url)
+
+            # Title preference: <a title="..."> attribute → <h2 itemprop>
+            # → fallback to slug-derived. The title attribute is the most
+            # reliable across MangaThemesia variants.
+            title = (link.get("title") or "").strip()
+            if not title:
+                t = card.select_one(".tt h2, h2[itemprop='headline'], .tt, h2, h3")
+                if t:
+                    title = t.get_text(strip=True)
+            if not title:
+                continue
+
+            # Cover from img inside the card (data-src for lazy-load).
+            cover: Optional[str] = None
+            img = card.select_one("img")
+            if img is not None:
+                src = (
+                    img.get("data-src")
+                    or img.get("data-lazy-src")
+                    or img.get("data-cfsrc")
+                    or img.get("src")
+                )
+                if src:
+                    cover = src if src.startswith("http") else urljoin(self.base_url, src)
+
+            raw_score = max(0.05, 1.0 - (idx / max(1, len(cards))))
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=abs_url,
+                    cover=cover,
+                    alt_titles=[],
+                    year=None,
+                    language=None,
+                    chapter_count_hint=None,
+                    raw_score=raw_score,
+                )
+            )
+        return hits
+
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
         url = self._normalize_url(url)
         if self.use_zendriver:
-            html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
+            html = fetch_html_zendriver(url, wait_selector="h1.entry-title, h1.series-title, h1.post-title")
+            sync_cf_cookies(scraper, url)
             soup = BeautifulSoup(html, "html.parser")
         elif self.use_playwright:
             html = fetch_html_playwright(url)
@@ -112,7 +228,13 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             bg_container = soup.select_one(".thumb, .summary_image")
             if bg_container:
                 style = bg_container.get("style") or ""
-                match = re.search(r"url\\(['\"]?(.*?)['\"]?\\)", style)
+                # Single-escape parens are correct here: in a raw string,
+                # `\\(` is two characters (backslash + paren) and the regex
+                # looks for a literal backslash, which never appears in
+                # `style="background-image: url(...)"`. The previous
+                # double-escape made cover-from-style detection always fail
+                # silently — handlers fell through to the WP REST API path.
+                match = re.search(r"url\(['\"]?(.*?)['\"]?\)", style)
                 if match:
                     cover = match.group(1)
         
@@ -136,15 +258,7 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         post_id_from_html = self._extract_post_id(html)
         api_data = None
         if title == "Unknown" or not desc or not cover or not post_id_from_html:
-            # For CF-protected sites use CF cookie session, not raw cloudscraper
-            api_scraper = scraper
-            if self.use_zendriver:
-                try:
-                    from .crawlee_utils import get_cf_session
-                    api_scraper = get_cf_session(self.base_url)
-                except Exception:
-                    api_scraper = None
-            api_data = self._fetch_series_metadata_via_api(slug, api_scraper)
+            api_data = self._fetch_series_metadata_via_api(slug, scraper)
             if api_data:
                 title = api_data.get("title") or title
                 desc = api_data.get("desc") or desc
@@ -174,13 +288,17 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         url = context.comic["url"]
         
         if self.use_zendriver:
-            # Reuse the soup from context if already fetched (avoids a second browser launch)
-            if context.soup is not None:
-                soup = context.soup
+            # Reuse the HTML already fetched by fetch_comic_context to avoid
+            # launching a second browser window.  CF cookies were cached on
+            # the first call so subsequent plain requests will work too.
+            cached_html = context.comic.get("_raw_html")
+            if cached_html:
+                soup = BeautifulSoup(cached_html, "html.parser")
             else:
-                wait_sel = self.chapter_selector if self.chapter_selector else "#chapterlist li, .eplister li"
-                html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
-                soup = BeautifulSoup(html, "html.parser")
+                # Fallback: cookies should already be cached from fetch_comic_context
+                sync_cf_cookies(scraper, url)
+                response = make_request(url, scraper)
+                soup = BeautifulSoup(response.text, "html.parser")
         elif self.use_playwright:
             # Use custom selector for waiting if available
             wait_sel = self.chapter_selector if self.chapter_selector else "#chapterlist li, .eplister li"
@@ -200,49 +318,51 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             selector = self.chapter_selector
         else:
             selector = "#chapterlist li, .eplister li, .chapter-list li"
-
+            
         if self._chapter_filter:
             # Apply filter to selector(s)
             # This is a bit complex if selector is a list string, but assuming simple cases
-            pass
-
+            pass 
+        
         for item in soup.select(selector):
             # Check if item is 'a' or 'li'
             if item.name == 'a':
                 link = item
             else:
                 link = item.select_one("a")
-
+                
             if not link:
                 continue
-
+            
             href = link.get("href")
             if not href:
                 # Skip chapters without URL (locked/paid)
                 continue
-
+                
             # Ensure absolute URL
             if not href.startswith("http"):
+                from urllib.parse import urljoin
                 href = urljoin(self.base_url, href)
-
+                
             if self._url_normalizer:
                 href = self._url_normalizer(href)
-
+            
             title_node = link.select_one(".chapternum, .epl-num")
             if title_node:
                 title = title_node.get_text(strip=True)
             else:
                 # Use separator to prevent merging text (e.g. "Chapter 1" + "Date" -> "Chapter 1Date")
                 title = link.get_text(separator=" ", strip=True)
-
+            
             # Extract numeric chapter number
             # First try from URL as it's often cleaner for sites like OmegaScans
             # /chapter-123
+            import re
             chap = None
             url_match = re.search(r'chapter-(\d+(?:\.\d+)?)', href)
             if url_match:
                 chap = float(url_match.group(1))
-
+            
             if chap is None:
                 # Fallback to title extraction
                 chap_match = re.search(r'Chapter\s+(\d+(?:\.\d+)?)', title, re.IGNORECASE)
@@ -252,12 +372,12 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
                     # Fallback to first number found
                     chap_match = re.search(r'(\d+(?:\.\d+)?)', title)
                     chap = float(chap_match.group(1)) if chap_match else 0.0
-
+            
             date_text = ""
             date_node = link.select_one(".chapterdate, .epl-date")
             if date_node:
                 date_text = date_node.get_text(strip=True)
-
+            
             chapters.append({
                 "hid": href,
                 "chap": chap,
@@ -265,42 +385,7 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
                 "url": href,
                 "uploaded": date_text,
             })
-
-        # Fallback: some sites (e.g. nikatoons) use plain <a href="/read/slug/chapter-N">
-        # links outside of standard MangaThemesia containers
-        if not chapters:
-            slug = url.rstrip("/").split("/")[-1]
-            for anchor in soup.find_all("a", href=True):
-                href = anchor["href"]
-                if not href.startswith("http"):
-                    href = urljoin(self.base_url, href)
-                if "/read/" not in href or "chapter-" not in href:
-                    continue
-                title = anchor.get_text(separator=" ", strip=True)
-                chap = None
-                url_match = re.search(r'chapter-(\d+(?:\.\d+)?)', href)
-                if url_match:
-                    chap = float(url_match.group(1))
-                if chap is None:
-                    continue
-                if self._url_normalizer:
-                    href = self._url_normalizer(href)
-                chapters.append({
-                    "hid": href,
-                    "chap": chap,
-                    "title": title or f"Chapter {chap}",
-                    "url": href,
-                    "uploaded": "",
-                })
-            # Deduplicate by chap number
-            seen_chaps = set()
-            deduped = []
-            for ch in chapters:
-                if ch["chap"] not in seen_chaps:
-                    seen_chaps.add(ch["chap"])
-                    deduped.append(ch)
-            chapters = deduped
-
+        
         # Reverse to get oldest first (MangaThemesia returns newest first)
         chapters.reverse()
         
@@ -314,7 +399,11 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
         html: Optional[str]
         soup: Optional[BeautifulSoup]
         if self.use_zendriver:
-            html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
+            # Reuse CF cookies captured in fetch_comic_context instead of
+            # opening yet another Chrome window for every chapter.
+            sync_cf_cookies(scraper, url)
+            response = make_request(url, scraper)
+            html = response.text
             soup = BeautifulSoup(html, "html.parser")
         elif self.use_playwright:
             html = fetch_html_playwright(url, wait_selector="img.ts-main-image")
@@ -353,25 +442,13 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
 
         if soup:
             html_images: List[str] = []
-            for img in soup.select("#readerarea img, #readerArea img, .reading-content img"):
+            for img in soup.select("#readerarea img, .reading-content img"):
                 src = img.get("src") or img.get("data-src")
                 if src:
                     html_images.append(src)
             html_images = self._finalize_image_urls(html_images, url)
             if html_images:
                 return html_images
-
-            # Fallback for Next.js-based sites (e.g. nikatoons) that serve
-            # chapter images as plain <img src="/uploads/pages/..."> without a
-            # named reader container.
-            uploads_images: List[str] = []
-            for img in soup.select("img[src*='/uploads/']"):
-                src = img.get("src") or img.get("data-src")
-                if src:
-                    uploads_images.append(src)
-            uploads_images = self._finalize_image_urls(uploads_images, url)
-            if uploads_images:
-                return uploads_images
 
             paragraphs = self._extract_novel_paragraphs(soup)
             if paragraphs:
@@ -562,7 +639,7 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
     def _extract_novel_paragraphs(self, soup: Optional[BeautifulSoup]) -> List[str]:
         if not soup:
             return []
-        container = soup.select_one("#readerarea, #readerArea, .readerarea, .reading-content")
+        container = soup.select_one("#readerarea, .readerarea, .reading-content")
         if not container:
             return []
 

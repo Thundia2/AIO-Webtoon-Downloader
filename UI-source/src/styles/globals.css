@@ -1,0 +1,159 @@
+/* Tailwind base layers */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   COLOR THEME VARIABLES
+   
+   These HSL values define every color in the app.
+   Light mode is the default; dark mode activates when the
+   Electron main process adds class="dark" to <html> based
+   on the Windows system theme.
+   ============================================================ */
+
+@layer base {
+  /* ── Light mode ── */
+  :root {
+    /* Tells Chromium to render native UI (scrollbars, <select> dropdown
+       options, autofill backgrounds, form pickers) in light theme. Without
+       this, the OS-rendered <option> elements ignore our HSL theme and
+       render with whatever default Windows decides — often unreadable
+       light-on-light or dark-on-dark. */
+    color-scheme: light;
+    --background: 0 0% 98%;
+    --foreground: 220 15% 13%;
+    --card: 0 0% 100%;
+    --card-foreground: 220 15% 13%;
+    --primary: 220 75% 50%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 10% 93%;
+    --secondary-foreground: 220 15% 20%;
+    --muted: 220 10% 95%;
+    --muted-foreground: 220 8% 46%;
+    --accent: 220 10% 90%;
+    --accent-foreground: 220 15% 13%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 10% 88%;
+    --input: 220 10% 88%;
+    --ring: 220 75% 50%;
+    --radius: 0.5rem;
+
+    /* Status colors */
+    --success: 142 60% 40%;
+    --warning: 38 92% 50%;
+    --info: 200 80% 50%;
+  }
+
+  /* ── Dark mode ── */
+  .dark {
+    /* See light-mode comment above. Without `color-scheme: dark`, native
+       <select> options render unreadable in dark mode — the canonical fix
+       reported by Library tab's sort dropdown bug, 2026-05-07. */
+    color-scheme: dark;
+    --background: 224 15% 10%;
+    --foreground: 210 15% 90%;
+    --card: 224 15% 13%;
+    --card-foreground: 210 15% 90%;
+    --primary: 217 75% 58%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 224 12% 18%;
+    --secondary-foreground: 210 15% 85%;
+    --muted: 224 12% 16%;
+    --muted-foreground: 220 8% 55%;
+    --accent: 224 12% 20%;
+    --accent-foreground: 210 15% 90%;
+    --destructive: 0 62% 55%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 224 12% 20%;
+    --input: 224 12% 20%;
+    --ring: 217 75% 58%;
+
+    --success: 142 55% 48%;
+    --warning: 38 92% 55%;
+    --info: 200 75% 55%;
+  }
+
+  /* ── Base element styles ── */
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-family: "DM Sans", system-ui, sans-serif;
+    margin: 0;
+    padding: 0;
+    overflow: hidden; /* Electron window handles its own scrolling */
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Remove the default focus outline and add our own */
+  *:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+    border-radius: var(--radius);
+  }
+
+  /* ── Native <select> popup options in dark mode ──
+     `color-scheme: dark` alone is supposed to force Chromium to render the
+     native dropdown popup in dark theme, but on Windows it doesn't fully
+     honor that when the OS itself is in light mode — the popup background
+     stays light while our CSS-themed text becomes dim/unreadable. The
+     specific bug surfaced via Library tab's sort dropdown 2026-05-07.
+     <option> has limited CSS support but background-color + color do work
+     in Chromium, so we set them explicitly as a fallback. */
+  .dark select option {
+    background-color: hsl(var(--card));
+    color: hsl(var(--foreground));
+  }
+  .dark select option:checked {
+    background-color: hsl(var(--primary) / 0.15);
+    color: hsl(var(--primary));
+  }
+  /* Same fallback for light mode for symmetry — keeps the popup visually
+     paired with the rest of the UI even when CSS-via-color-scheme alone
+     would suffice. */
+  select option {
+    background-color: hsl(var(--card));
+    color: hsl(var(--foreground));
+  }
+
+  /* Custom scrollbar styling that matches the theme */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.3);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.5);
+  }
+}
+
+/* ============================================================
+   UTILITY CLASSES
+   ============================================================ */
+
+@layer utilities {
+  /* Glass-like card effect for the sidebar and panels */
+  .glass-panel {
+    background: hsl(var(--card) / 0.8);
+    backdrop-filter: blur(12px);
+    border: 1px solid hsl(var(--border) / 0.5);
+  }
+
+  /* The log panel monospace text style */
+  .log-text {
+    font-family: "JetBrains Mono", "Cascadia Code", monospace;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+}

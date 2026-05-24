@@ -27,6 +27,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 
 import sites
+from aio_config import resolve_output_dir
 from library_state import (
     build_update_chapters_arg,
     list_saved_books,
@@ -95,7 +96,7 @@ class AIODownloaderGUI:
         self.brand_image = self._load_brand_image()
 
         # ── Variables ──
-        self.output_dir = StringVar(value=self.prefs.get("output_dir", str(REPO_DIR / "comics")))
+        self.output_dir = StringVar(value=self.prefs.get("output_dir", str(REPO_DIR / resolve_output_dir())))
         self.chapters = StringVar(value="all")
         self.site_name = StringVar(value=self.prefs.get("site_name", ""))
         self.fmt = StringVar(value=self.prefs.get("format", "epub"))

@@ -4,11 +4,11 @@ import json
 import re
 from html import unescape
 from typing import Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 from .hardening import configure_throttling
 
 
@@ -21,7 +21,13 @@ class AsuraSiteHandler(BaseSiteHandler):
         "www.asurascans.net",
         "asurascans.com",
         "www.asurascans.com",
+        "asurascans.org",
+        "www.asurascans.org",
+        "asuracomic.com",
+        "www.asuracomic.com",
     )
+    _BASE_URL = "https://asurascans.com"
+    _COMICS_HREF_RE = re.compile(r"^/comics/[a-z0-9\-]+/?$")
 
     def configure_session(self, scraper, args) -> None:
         if "Referer" not in scraper.headers:
@@ -47,6 +53,9 @@ class AsuraSiteHandler(BaseSiteHandler):
         )
 
     # -- Helpers -----------------------------------------------------
+    def _make_soup(self, html: str) -> BeautifulSoup:
+        return BeautifulSoup(html, "html.parser")
+
     def _fetch_html(self, url: str, scraper, make_request) -> str:
         response = make_request(url, scraper)
         response.encoding = response.encoding or "utf-8"
@@ -344,6 +353,64 @@ class AsuraSiteHandler(BaseSiteHandler):
                 f"No images found for Asura chapter: {chapter_url}"
             )
         return images
+
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        url = f"{self._BASE_URL}/browse?search={quote_plus(clean)}"
+        response = make_request(url, scraper)
+        html = response.text or ""
+        if len(html) < 1000:
+            return []
+        soup = self._make_soup(html)
+
+        by_href: Dict[str, List] = {}
+        for anchor in soup.select('a[href^="/comics/"]'):
+            href = (anchor.get("href") or "").strip()
+            if not self._COMICS_HREF_RE.match(href):
+                continue
+            by_href.setdefault(href, []).append(anchor)
+
+        hits: List[SearchHit] = []
+        for idx, (href, anchors) in enumerate(by_href.items()):
+            if len(hits) >= limit:
+                break
+            title = ""
+            cover = None
+            for anchor in anchors:
+                if not title:
+                    h3 = anchor.select_one("h3")
+                    if h3:
+                        title = h3.get_text(strip=True)
+                if not cover:
+                    img = anchor.select_one("img")
+                    if img:
+                        if not title:
+                            title = (img.get("alt") or "").strip()
+                        src = (img.get("src") or "").strip()
+                        if src:
+                            cover = src if src.startswith("http") else urljoin(self._BASE_URL, src)
+            if not title:
+                continue
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=urljoin(self._BASE_URL, href),
+                    cover=cover,
+                    raw_score=max(0.05, 1.0 - (idx / max(1, len(by_href)))),
+                )
+            )
+        return hits
 
 
 __all__ = ["AsuraSiteHandler"]

@@ -6,12 +6,15 @@ test_scripts/3.9.*/
 test_scripts/3.8.*/
 test_scripts/3.7.*/
 .DS_Store
+.gui_prefs.json
 comics/
 tmp_*/
 temp_epub_*/
 *.epub
+*.har
 test_scripts/*/venv/
 /venv
+.venv/
 mangataro.org.har
 sites/__pycache__
 asuracomic.net.har
@@ -25,3 +28,39 @@ node_modules/
 __pycache__/
 rip/
 test_scripts/internal/
+AIO-merged/
+output/
+n/
+# Local manga library — downloaded books, not source.
+manga/
+manga_test/
+*.har
+/*.har
+
+# Dev tooling outputs (calibrate_quality_probe.py + webp_pdf_test.py scratch).
+# The committed sites/quality_seed.json is a curated seed; these underscored
+# outputs are regenerated runs and should never be tracked.
+_calibration_series.json
+_quality_calibration.json
+_webp_test/
+.pytest_cache/
+
+# Old/stray top-level artifacts.
+UI-binary/
+python3
+exclude.txt
+
+# Electron build outputs — installers and per-OS staging dirs.
+# These are produced by `npm run dist:*` and should never be tracked
+# (a single .exe/.dmg can be hundreds of MB).
+UI-source/release/
+UI-source/dist/
+
+# MCP / dev probes / scratch artifacts left behind by interactive sessions.
+.playwright-mcp/
+search_out.json
+settings-full.png
+probe_*.py
+tests/
+aio_config.json
+test_downloads.py

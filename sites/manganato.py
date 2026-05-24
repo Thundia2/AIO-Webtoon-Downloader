@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 _MANGANATO_DOMAINS = (
@@ -276,6 +277,79 @@ class ManganatoSiteHandler(BaseSiteHandler):
         if not images:
             raise RuntimeError("Unable to locate Manganato chapter images.")
         return images
+
+    _SEARCH_DOMAINS = (
+        "https://www.natomanga.com",
+        "https://www.mangakakalot.gg",
+    )
+    _SLUG_NONWORD_RE = re.compile(r"\W+")
+
+    def _query_to_slug(self, query: str) -> str:
+        slug = self._SLUG_NONWORD_RE.sub("_", query).strip("_").lower()
+        return slug or "_"
+
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        slug = self._query_to_slug(clean)
+        for base in self._SEARCH_DOMAINS:
+            url = f"{base}/search/story/{slug}"
+            try:
+                response = make_request(url, scraper)
+            except Exception:
+                continue
+            html = response.text or ""
+            if getattr(response, "status_code", 0) >= 400 or "Just a moment..." in html[:1000] or len(html) < 1000:
+                continue
+            hits = self._parse_search_html(html, base, limit)
+            if hits:
+                return hits
+        return []
+
+    def _parse_search_html(self, html: str, base: str, limit: int) -> List[SearchHit]:
+        soup = self._make_soup(html)
+        items = (
+            soup.select(".search-story-item")
+            or soup.select(".story_item")
+            or soup.select(".panel_story_list .story_item")
+        )
+        hits: List[SearchHit] = []
+        for idx, item in enumerate(items):
+            if len(hits) >= limit:
+                break
+            title_a = item.select_one(".item-title") or item.select_one("h3 a")
+            if not title_a:
+                continue
+            title = title_a.get_text(strip=True)
+            href = title_a.get("href") or ""
+            if not title or not href:
+                continue
+            cover_img = item.select_one("img")
+            cover = None
+            if cover_img:
+                cover = self._absolute(
+                    base + "/",
+                    cover_img.get("data-src") or cover_img.get("data-original") or cover_img.get("src"),
+                )
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=self._absolute(base + "/", href) or href,
+                    cover=cover,
+                    raw_score=max(0.05, 1.0 - (idx / max(1, len(items)))),
+                )
+            )
+        return hits
 
 
 __all__ = ["ManganatoSiteHandler"]

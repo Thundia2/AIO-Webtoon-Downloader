@@ -5,6 +5,24 @@ Only the latest entry is shown in the [README](../README.MD); the full history l
 
 ---
 
+### 05.24.26
+
+**Merged Thundia2's fork with Electron UI:**
+- Added the Electron desktop UI under `UI-source/`, including Download, Search, Queue, Logs, Library, and Settings tabs, Vite development tooling, Electron packaging scripts, installer resources, and synced in-app docs.
+- Added cross-site search, multi-source chapter fallback, official-publisher detection, image-quality source ranking, and the supporting CLI/config utilities (`aio_search_cli.py`, `aio_config.py`, `aio_config.json`, `sites/search_orchestrator.py`, `sites/chapter_merger.py`, `sites/quality_seed.json`).
+
+**Site handlers and download engine:**
+- Added or integrated handlers and helpers for KappaBeast, Line Webtoon, MangaGo, MangaFire async VRF batching, shared image IO, publisher metadata, and expanded Madara/MangaThemesia site support.
+- Integrated the merged May 2026 site fixes: dedicated KappaBeast Strapi API support, reduced zendriver browser spawning for KingOfShojo-style sites, `browser.stop()` timeout protection, and updated site status notes for MangaBuddy, RageScans, ManhwaRead/MGRead, and ZeroScans.
+- Removed the committed KappaBeast API key; the handler now uses the public Strapi API by default and dynamically discovers the frontend `X-API-Key` only if the API starts rejecting unauthenticated requests.
+- Updated core downloader, REST API, library state, and existing handlers for search metadata, chapter merging, source fallback, image quality data, and current site behavior.
+
+**Docs, tests, and release tooling:**
+- Added GitHub workflows, development requirements, pytest configuration, merge regression tests, search/handler tests, and download test harnesses.
+- Updated README, supported-sites docs, NSFW docs, requirements, packaging assets, icons, and migration/metadata CLI utilities for the merged feature set.
+
+---
+
 ### 05.09.26
 
 **Atsumaru (`sites/atsumaru.py`):**

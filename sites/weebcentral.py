@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class WeebCentralSiteHandler(BaseSiteHandler):
@@ -15,6 +15,7 @@ class WeebCentralSiteHandler(BaseSiteHandler):
     domains = ("weebcentral.com", "www.weebcentral.com")
 
     _BASE_URL = "https://weebcentral.com"
+    _SERIES_HREF_RE = re.compile(r"/series/[A-Z0-9]+/")
 
     def __init__(self) -> None:
         super().__init__()
@@ -318,6 +319,97 @@ class WeebCentralSiteHandler(BaseSiteHandler):
         if not images:
             raise RuntimeError("Unable to locate images for chapter.")
         return images
+
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        from urllib.parse import quote_plus
+
+        url = (
+            f"{self._BASE_URL}/search/data"
+            f"?text={quote_plus(clean)}"
+            f"&sort=Best+Match&order=Descending&official=Any&anime=Any"
+            f"&adult=Any&display_mode=Full+Display&series_status=Any"
+        )
+        response = make_request(url, scraper)
+        html = response.text
+        if not html or len(html) < 100:
+            return []
+
+        soup = self._make_soup(html)
+        articles = [
+            article
+            for article in soup.select("article.bg-base-300, article")
+            if article.find("a", href=self._SERIES_HREF_RE)
+        ]
+        hits: List[SearchHit] = []
+        seen: set[str] = set()
+        for idx, article in enumerate(articles):
+            if len(hits) >= limit:
+                break
+            anchor = article.find("a", href=self._SERIES_HREF_RE)
+            if not anchor:
+                continue
+            href = (anchor.get("href") or "").strip()
+            abs_url = href if href.startswith("http") else urljoin(self._BASE_URL, href)
+            abs_url = abs_url.split("?")[0].split("#")[0]
+            if abs_url in seen:
+                continue
+            seen.add(abs_url)
+
+            img = article.select_one("img[alt]")
+            title: Optional[str] = None
+            if img:
+                alt = (img.get("alt") or "").strip()
+                if alt.lower().endswith(" cover"):
+                    alt = alt[:-len(" cover")].strip()
+                if alt:
+                    title = alt
+            if not title:
+                disp = article.select_one(".text-ellipsis")
+                if disp:
+                    title = disp.get_text(strip=True)
+            if not title:
+                slug = abs_url.rstrip("/").rsplit("/", 1)[-1]
+                title = slug.replace("-", " ").strip() or slug
+
+            cover: Optional[str] = None
+            source = article.select_one("source[srcset]")
+            if source:
+                srcset = (source.get("srcset") or "").strip()
+                if srcset:
+                    cover = srcset.split()[0]
+            if not cover and img:
+                src = img.get("src")
+                if src:
+                    cover = src
+
+            alt_titles: List[str] = []
+            slug = abs_url.rstrip("/").rsplit("/", 1)[-1]
+            slug_alt = slug.replace("-", " ").strip()
+            if slug_alt and slug_alt.lower() != (title or "").lower():
+                alt_titles.append(slug_alt)
+
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=abs_url,
+                    cover=cover,
+                    alt_titles=alt_titles,
+                    raw_score=max(0.05, 1.0 - (idx / max(1, len(articles)))),
+                )
+            )
+        return hits
 
 
 __all__ = ["WeebCentralSiteHandler"]

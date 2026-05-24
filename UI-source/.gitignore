@@ -1,0 +1,27 @@
+# Build/dev artifacts
+node_modules/
+dist/
+release/
+.cache/
+.vite/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Bundled Python — the parent project's aio-dl.py is the source of truth.
+# This dir is only populated/consumed by `npm run electron:build` (extraResources copy).
+python-src/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local downloads — created when running the dev build from this dir
+# (e.g. `npm run electron:dev` writes the user's library somewhere; this
+# stray copy got created during early-iteration testing).
+mangas/

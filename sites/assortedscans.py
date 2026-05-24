@@ -6,7 +6,7 @@ from urllib.parse import urljoin, urlparse, urlunparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
 
-from .base import BaseSiteHandler, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
 
 class AssortedScansSiteHandler(BaseSiteHandler):
@@ -293,3 +293,57 @@ class AssortedScansSiteHandler(BaseSiteHandler):
         if not images:
             raise RuntimeError("No images were extracted for this chapter.")
         return images
+
+    def search(
+        self,
+        query: str,
+        scraper,
+        make_request,
+        *,
+        language: str = "en",
+        limit: int = 20,
+    ) -> List[SearchHit]:
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        response = make_request(f"{self._BASE_URL}/reader/", scraper)
+        html = response.text or ""
+        if len(html) < 200:
+            return []
+        soup = self._make_soup(html)
+        slug_re = re.compile(r"^/reader/[^/]+/?$")
+        seen: Dict[str, str] = {}
+        for anchor in soup.select("a[href]"):
+            href = (anchor.get("href") or "").strip()
+            if not slug_re.match(href):
+                continue
+            title = (anchor.get("title") or "").strip() or anchor.get_text(strip=True)
+            if title:
+                seen.setdefault(href.rstrip("/"), title)
+
+        ql = clean.lower()
+        tokens = {token for token in ql.split() if token}
+        scored: List[tuple] = []
+        for href, title in seen.items():
+            tl = title.lower()
+            if ql in tl:
+                relevance = 1.0
+            elif tokens and all(token in tl for token in tokens):
+                relevance = 0.7
+            else:
+                continue
+            scored.append((relevance, title, href))
+        scored.sort(key=lambda item: -item[0])
+
+        hits: List[SearchHit] = []
+        for idx, (relevance, title, href) in enumerate(scored[:limit]):
+            hits.append(
+                SearchHit(
+                    site=self.name,
+                    title=title,
+                    url=urljoin(self._BASE_URL, href + "/"),
+                    cover=None,
+                    raw_score=max(0.05, relevance * (1.0 - (idx / max(1, len(scored))))),
+                )
+            )
+        return hits
