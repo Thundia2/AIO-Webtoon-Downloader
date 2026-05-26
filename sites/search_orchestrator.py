@@ -5424,6 +5424,24 @@ def search_all(
         # every repeat search (cache hit path was returning score-only).
         cache_misses: List[SourceEntry] = []
         for src in sources_to_probe:
+            # SKIP_QUALITY_PROBE handlers (currently only comix — see
+            # sites/comix.py for the rationale) opt out of probing
+            # entirely: their per-source probe cost is dominated by a
+            # single-threaded browser bridge that would trip the 240 s
+            # probe-phase deadline before any candidate completed. The
+            # comparator `_quality_for` (~line 5329) falls back to
+            # seed_quality when img_quality_score is None, so leaving
+            # the score un-set IS how the calibrated seed becomes the
+            # effective ranking signal. We also skip the persistent-
+            # cache read so stale per-URL scores from earlier buggy
+            # probes (which scored 0.0 because synthetic
+            # `comix-page://` URLs aren't HTTP-fetchable) don't leak
+            # back into ranking.
+            handler = get_handler_by_name(src.site)
+            if handler is not None and getattr(
+                handler, "SKIP_QUALITY_PROBE", False,
+            ):
+                continue
             cached = img_cache.get_with_metadata(src.site, src.url)
             if cached is not None:
                 score, metadata = cached

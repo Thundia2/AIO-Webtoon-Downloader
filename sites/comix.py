@@ -54,6 +54,32 @@ class ComixSiteHandler(BaseSiteHandler):
     name = "comix"
     domains = ("comix.to", "www.comix.to")
 
+    # Opt out of the orchestrator's image-quality probe entirely. Two
+    # facts make probing comix uneconomic at search time:
+    #   1. comix's chapter list AND every chapter page require the
+    #      single-threaded Patchright bridge (encrypted /chapters API +
+    #      JS-decrypted canvas-rendered pages). The probe phase runs
+    #      up to 6 sources in parallel — they all serialize on the
+    #      bridge worker thread, so adding comix to the probe set
+    #      uniformly trips the orchestrator's 240 s probe-phase
+    #      deadline before any comix candidate completes.
+    #   2. Canvas-captured pages come back as synthetic `comix-page://`
+    #      URLs. sites/base.py:_fetch_probe_item_bytes uses
+    #      scraper.get(url) which doesn't know that scheme, so even
+    #      when the probe DOES finish it scores 0.0 on every chapter.
+    # Resolution: the comix seed in sites/quality_seed.json is
+    # calibrated offline (run comix_seed_calibration.py — drives the
+    # full T1+T2 ML pipeline against one good + one bad title; the
+    # current 0.74 is the median across both). The comparator
+    # `_quality_for` (sites/search_orchestrator.py:~5329) falls back
+    # to seed_quality when img_quality_score is None, so leaving the
+    # score un-set IS the mechanism by which the calibrated seed
+    # becomes the effective ranking signal.
+    # Cross-file: sites/search_orchestrator.py:~5425 honors this attr
+    # in the per-source probe loop (skips both the persistent-cache
+    # lookup and the worker enqueue).
+    SKIP_QUALITY_PROBE = True
+
     # comix.to API endpoints are token-gated with per-URL HMAC signatures
     # (`_=<sig>` param) we can't reproduce in Python. The only tractable
     # path is letting Patchright navigate the page and either capturing the
