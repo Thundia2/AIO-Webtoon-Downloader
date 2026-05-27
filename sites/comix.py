@@ -80,6 +80,24 @@ class ComixSiteHandler(BaseSiteHandler):
     # lookup and the worker enqueue).
     SKIP_QUALITY_PROBE = True
 
+    # Opt out of --multi-source merging too. Even with the probe phase
+    # already skipped (above), comix's calibrated seed (0.74 — see
+    # quality_seed.json) clears the default --multi-source-quality-min
+    # of 0.65, so without this flag comix candidates survive
+    # _filter_and_rank_alt_sources and reach _fetch_chapters_for_winner,
+    # where each one pays a ~25 s bridge-DOM-scrape just to enumerate
+    # chapters. Those scrapes serialize through the single-threaded
+    # Patchright bridge with no concurrency benefit — they pile up
+    # while the user's primary download is waiting for multi-source
+    # alignment to finish. And the merged result almost never actually
+    # uses comix as a fallback: the primary site (mangafire / mangadex
+    # / etc.) has the same chapters, so the alt is dead weight.
+    # Cross-file: aio_search_cli.py:_filter_and_rank_alt_sources honors
+    # this attribute alongside the existing primary_host filter so
+    # comix is dropped from the alts list before any chapter-list
+    # fetch is queued.
+    SKIP_MULTI_SOURCE = True
+
     # comix.to API endpoints are token-gated with per-URL HMAC signatures
     # (`_=<sig>` param) we can't reproduce in Python. The only tractable
     # path is letting Patchright navigate the page and either capturing the

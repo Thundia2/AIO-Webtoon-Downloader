@@ -33,7 +33,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import cmp_to_key
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from .base import BaseSiteHandler, SearchHit
@@ -4959,6 +4959,7 @@ def search_all(
     probe_failure_cache: Optional[ProbeFailureCache] = None,
     img_quality_cache: Optional[ImageQualityCache] = None,
     seed_hits: Optional[List[SearchHit]] = None,
+    skip_probe_sites: Optional[Set[str]] = None,
     on_status: Optional[Callable[[str], None]] = None,
     seeded_only: bool = False,
 ) -> List[SeriesCandidate]:
@@ -4981,6 +4982,18 @@ def search_all(
         MangaFire's flaky typeahead). Seeded hits go through the same
         rapidfuzz scoring + union-find merge as parallel-search results, so
         they end up in the right candidate cluster.
+      skip_probe_sites: optional set of site names whose candidates should
+        be excluded from the image-quality probe loop. Used when the caller
+        already knows it's going to download from this site regardless of
+        what the probe says — direct-URL mode (aio-dl.py URL) treats the
+        URL's host as the committed primary, and the --search URL mode
+        treats every seed_hits[i].site the same way. Skipped sources read
+        the persistent cache (free) but never get enqueued for a fresh
+        probe; their img_quality_score stays None and the comparator falls
+        back to seed_quality. Skipping is per-site (not per-URL) because
+        once the user has committed to a host we don't care about scoring
+        any OTHER candidates from that host either — they wouldn't be
+        used for the download.
       on_status: optional progress callback for human output (e.g., the
         "[*] Probing image quality across N sources..." line in Phase 2).
 
@@ -5441,6 +5454,26 @@ def search_all(
             if handler is not None and getattr(
                 handler, "SKIP_QUALITY_PROBE", False,
             ):
+                continue
+            if skip_probe_sites and src.site in skip_probe_sites:
+                # Caller marked this site as already-committed: we're
+                # going to download from this URL regardless of any
+                # quality score, so the score has no operational effect
+                # on the download decision. Skip both the persistent-
+                # cache read AND a fresh probe — feeding a cached score
+                # in here would push the seed source through the same
+                # sort as alternatives (e.g. a different site that
+                # happens to have a higher cached score outranks the
+                # seed and steals the primary slot in the candidate's
+                # sources list, contradicting "this is the URL the
+                # user picked"). Leave img_quality_score=None so the
+                # comparator's `_quality_for` (~line 5329) falls back
+                # to seed_quality — that's the per-site prior the user
+                # implicitly trusts when they hand us a URL from that
+                # site. Cross-file: callers populate this set from
+                # aio_search_cli.run_search_mode (seed_hits[*].site)
+                # and aio_search_cli.find_alternatives_for_direct_url
+                # (primary_handler.name).
                 continue
             cached = img_cache.get_with_metadata(src.site, src.url)
             if cached is not None:
