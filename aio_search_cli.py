@@ -362,6 +362,15 @@ def run_search_mode(
         probe_failure_cache=cache,
         img_quality_cache=img_cache,
         seed_hits=seed_hits or None,
+        # Search mode always probes ALL sources (including the seed
+        # source, when --search was given a URL) so the JSON output
+        # surfaces a real comparable img_quality_score for every
+        # candidate. Quality skip is reserved for direct-URL
+        # --multi-source (find_alternatives_for_direct_url below),
+        # where the primary is already committed and probing it is
+        # waste. SKIP_QUALITY_PROBE class-attr handlers (currently
+        # comix) opt out unconditionally via search_orchestrator's
+        # per-source loop — no plumbing needed here.
         on_status=_status,
         seeded_only=bool(getattr(args, "seeded_only", False)),
     )
@@ -622,6 +631,21 @@ def _filter_and_rank_alt_sources(sources, *, primary_host: str = "", quality_min
     for s in sources:
         if primary_host and urlparse(s.url).netloc.lower() == primary_host:
             continue
+        # Handlers that opt out of multi-source merging entirely via the
+        # SKIP_MULTI_SOURCE class attribute (currently only comix — see
+        # sites/comix.py for the why). These are sites whose chapter-list
+        # fetch is wildly more expensive than other handlers in absolute
+        # wall-clock terms (comix runs a ~25 s bridge-DOM-scrape per
+        # candidate through a single-threaded Patchright worker), so
+        # adding them to the alternatives pool delays --multi-source
+        # alignment for the user's primary download without buying real
+        # fallback coverage — the primary site almost always has the
+        # same chapters. Treat the flag as equivalent to primary_host
+        # exclusion: drop before the quality_min check so they never
+        # reach _fetch_chapters_for_winner.
+        handler = get_handler_by_name(s.site)
+        if handler is not None and getattr(handler, "SKIP_MULTI_SOURCE", False):
+            continue
         # Sources qualify by either explicit seed_quality OR a measured
         # img_quality_score >= 0.4 (rough "ok quality" floor). A measured
         # 0.0 (CDN-poisoned probe) does NOT qualify via the img_quality
@@ -735,6 +759,17 @@ def find_alternatives_for_direct_url(
         min_match=min_match,
         probe_failure_cache=cache,
         img_quality_cache=img_cache,
+        # Direct-URL --multi-source: the primary site is committed (we're
+        # downloading from primary_url regardless). Skip its image-quality
+        # probe — the score wouldn't affect our use of it, only ranking,
+        # and the primary_host filter below drops it from alternatives
+        # anyway so its score has no effect on the multi-source merge
+        # either. On MangaFire (the canonical primary), this cuts ~30 s
+        # of chapter-VRF + image-fetch work that the probe would otherwise
+        # spend on the source we already chose.
+        skip_probe_sites=(
+            {primary_handler.name} if primary_handler is not None else None
+        ),
         on_status=on_status,
         seeded_only=bool(getattr(args, "seeded_only", False)),
     )
