@@ -7440,17 +7440,34 @@ def main():
                 # change after a 30s sleep). For ghost, we hand the
                 # decision off to multi-source alts and, if those also
                 # fail, raise ChapterGhostError (skip+continue, not abort).
+                #
+                # primary_only-aware descriptor: "ghost" alone is misleading
+                # for chapters that exist on alt sources but happen to be
+                # broken on the primary (the canonical 2026-05-27 case:
+                # mangafire chapter 1 has uniform 5051-byte 403s but is on
+                # atsumaru, mangakatana, etc.). User feedback was clear that
+                # such chapters aren't "ghosts" — they're broken-on-primary
+                # and exactly the scenario multi-source exists to fix. The
+                # three states:
+                #   primary_only=True  → genuine placeholder (no other source
+                #                        lists this chapter); skip is the
+                #                        right disposition
+                #   primary_only=False → real chapter, primary CDN broken;
+                #                        multi-source alt-fetch should rescue
+                #   primary_only=None  → multi-source disabled / alignment
+                #                        not built; can't tell
                 if reason == "ghost_chapter":
-                    primary_only_qual = (
-                        " (primary-only in alignment)"
-                        if primary_only_for_ghost is True else ""
-                    )
+                    if primary_only_for_ghost is True:
+                        descriptor = "ghost (primary-only — no other source has this chapter)"
+                    elif primary_only_for_ghost is False:
+                        descriptor = "primary unavailable (alt sources have this chapter — will rescue if possible)"
+                    else:
+                        descriptor = "uniform error on primary"
                     print(
-                        f"  [!] Chapter {n} ghost signature: "
-                        f"{pages_ok}/{pages_total} pages succeeded, every failure "
-                        f"returned an identical error response (host={host_blame or '-'})"
-                        f"{primary_only_qual}. "
-                        f"Will try alternative sources before skipping."
+                        f"  [!] Chapter {n} {descriptor}: "
+                        f"{pages_ok}/{pages_total} pages, every failure had identical "
+                        f"signature (host={host_blame or '-'}). "
+                        f"Trying alternative sources next."
                     )
                 else:
                     print(
@@ -8258,9 +8275,35 @@ def main():
                     # silently fail and waste a worker pool. Subsequent
                     # chapters resume on the primary anyway (strict wrapper's
                     # finally restores primary state).
-                    return _process_chapter(
+                    alt_result = _process_chapter(
                         alt_chapter, force_redownload=True, next_chapter=next_chapter, is_alt_source=True
                     )
+                    # Alt rescue succeeded. Record the rescue in the
+                    # cross-chapter tally so the timing summary can
+                    # surface multi-source value. Also print an explicit
+                    # "rescued" line when the primary failure was the
+                    # ghost-signature shape (the canonical case the user
+                    # said "multi-source exists exactly for this" about).
+                    # For other reasons (host_poison / time_budget /
+                    # incomplete) the existing "[Multi-source] -> X"
+                    # line + the per-chapter "CBZ saved" already make
+                    # the rescue obvious; we only need the extra line for
+                    # ghost because the in-chapter log claimed "every
+                    # failure had identical signature" and we want to
+                    # close the loop visually.
+                    multi_source_rescues.append({
+                        "chap": n_for_log,
+                        "alt_site": alt_handler.name,
+                        "primary_site": primary_state[0].name,
+                        "primary_reason": primary_err.reason,
+                    })
+                    if primary_err.reason == "ghost_chapter":
+                        print(
+                            f"    [Multi-source] ✓ Chapter {n_for_log} rescued "
+                            f"from {primary_state[0].name} ({primary_err.reason}) "
+                            f"via {alt_handler.name}"
+                        )
+                    return alt_result
                 except ChapterSkippedError as cse_alt:
                     print(
                         f"    [Multi-source] {alt_handler.name} also failed "
@@ -8385,6 +8428,17 @@ def main():
     consecutive_ghosts = 0
     GHOST_ABORT_THRESHOLD = 3
 
+    # Multi-source rescue tally: chapters whose primary source failed AND
+    # an alt source successfully delivered them. Each entry is a dict with
+    # chap, alt_site, primary_site, primary_reason. Surfaced in the
+    # end-of-run timing summary so the user can see multi-source's value
+    # at a glance. User feedback 2026-05-27: "chapter 1 isn't a ghost
+    # chapter, it's an exact target for multi-source since it's broken on
+    # MF. That's exactly why multi-source exists." The summary line makes
+    # that value tangible — without it, users may think the run "had
+    # failures" when in fact half the failures were silently rescued.
+    multi_source_rescues: List[Dict[str, Any]] = []
+
     for ch_idx, ch in enumerate(chapters):
         grp_name = handler.get_group_name(ch)
         insert_list_index = len(current_book_content)
@@ -8425,11 +8479,22 @@ def main():
             # remaining queue is the "speed and reliability compromise" the
             # user explicitly rejected.
             consecutive_ghosts += 1
-            qualifier = (
-                "primary-only ghost"
-                if cge.primary_only is True
-                else "ghost"
-            )
+            # primary_only-aware descriptor (same three-state taxonomy as
+            # the in-chapter log line ~line 7385). When this branch runs,
+            # the alt loop in _process_chapter_strict has already been
+            # tried and exhausted — so primary_only=False here means "alts
+            # exist but ALSO couldn't deliver this chapter," which is
+            # a different shape than "primary-only ghost" (genuinely fake)
+            # OR "primary unavailable, untried" (the in-chapter pre-alt
+            # message). Keep these distinct so the user can tell at a
+            # glance whether the missed chapter is a placeholder or a
+            # multi-source rescue that just didn't pan out.
+            if cge.primary_only is True:
+                descriptor = "primary-only ghost (no other source has this chapter)"
+            elif cge.primary_only is False:
+                descriptor = "primary unavailable AND all alt sources failed"
+            else:
+                descriptor = "uniform-error ghost on primary (multi-source disabled)"
             if consecutive_ghosts >= GHOST_ABORT_THRESHOLD:
                 # Escalate. Print FATAL message + record this chapter as
                 # aborted:ghost_chapter (NOT plain ghost_chapter) so the
@@ -8439,11 +8504,12 @@ def main():
                 # ChapterAbortedError branch's bookkeeping.
                 print(
                     f"\n[!] FATAL: Chapter {cge.chap} is the "
-                    f"{GHOST_ABORT_THRESHOLD}rd consecutive ghost chapter "
-                    f"(host={cge.host or '?'}). The uniform-error pattern "
-                    f"across multiple chapters indicates a host-level block "
-                    f"(auth expired, CF rule tightened, CDN broken globally) "
-                    f"rather than per-chapter placeholder absence."
+                    f"{GHOST_ABORT_THRESHOLD}rd consecutive uniform-error "
+                    f"chapter on primary (host={cge.host or '?'}; {descriptor}). "
+                    f"The uniform-error pattern across multiple chapters "
+                    f"indicates a host-level block (auth expired, CF rule "
+                    f"tightened, CDN broken globally) rather than per-chapter "
+                    f"placeholder absence."
                 )
                 print(
                     f"    Aborting run. Chapters successfully saved before "
@@ -8488,9 +8554,8 @@ def main():
                 if consecutive_ghosts > 1 else ""
             )
             print(
-                f"\n[!] Chapter {cge.chap} is a {qualifier} on "
-                f"{cge.host or '?'}: every page returned an identical "
-                f"structural error response ({cge.pages_total} pages, 0 succeeded). "
+                f"\n[!] Chapter {cge.chap}: {descriptor} on "
+                f"{cge.host or '?'} ({cge.pages_total} pages, 0 succeeded). "
                 f"Recorded as missed; the run continues.{counter_hint}"
             )
             _record_missed(
@@ -8864,6 +8929,33 @@ def main():
     print(f"  Processing       : {_fmt_time(_timing['processing'])}")
     print(f"  Other (overhead) : {_fmt_time(_timing_other)}")
     print(f"  Total            : {_fmt_time(_timing_total)}")
+
+    # --- Multi-source rescue tally ---
+    # Surfaces the value of multi-source: chapters whose primary source
+    # failed (any reason — ghost / host_poison / time_budget / incomplete)
+    # and were successfully delivered from an alternative source. The
+    # tally is built up during the main loop in _process_chapter_strict's
+    # alt-success branch. Skipped entirely when empty so single-source
+    # runs aren't polluted with a hollow header. Cross-file:
+    # multi_source_rescues declared near the top of main()'s chapter loop
+    # (~line 8355 with the consecutive_ghosts state). For why this block
+    # exists at all: user feedback 2026-05-27 emphasized that broken-on-
+    # primary chapters (chapter 1 in the Shangri-La Frontier failure case)
+    # are exactly what multi-source exists to handle — making the rescue
+    # visible in the summary closes the loop visually for the user.
+    if multi_source_rescues:
+        print(f"\n--- Multi-source Rescues ---")
+        print(
+            f"  {len(multi_source_rescues)} chapter(s) rescued from primary "
+            f"failures via alternative sources:"
+        )
+        # Stable ordering: insertion order matches chapter-loop order which
+        # is already chap-ascending after collapse-splits + filter.
+        for r in multi_source_rescues:
+            print(
+                f"    Ch {r['chap']:<8} <- {r['alt_site']:<14} "
+                f"(primary {r['primary_site']} failed: {r['primary_reason']})"
+            )
 
     # --- Skipped chapters report ---
     # Printed AFTER the timing summary but BEFORE 'Done.' so the Electron
