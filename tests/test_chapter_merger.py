@@ -648,6 +648,25 @@ def test_breakdown_rule3a_integer_plus_sequential_still_drops():
     assert sum(asdict(bd).values()) == 4
 
 
+def test_breakdown_collapse_off_keeps_rule5_parts_per_entry():
+    """collapse_splits=False (2026-05-29 review): group_chapters_for_download
+    runs in passthrough mode — 29.1/29.2/29.3 each download as their own
+    chapter, nothing is merged — so the breakdown must NOT use the Rule-5
+    merged bucket. It classifies each part per-entry against the raw
+    consensus_set instead. Here peers carry the same raw parts, so all three
+    are confirmed side entries; merged_split_fragments stays 0."""
+    bd = _classify_chapter_breakdown(
+        [_ch("29.1"), _ch("29.2"), _ch("29.3")],
+        consensus_set={29.1, 29.2, 29.3},   # raw consensus keys when collapse off
+        consensus_max=29.3,
+        collapse_splits=False,
+    )
+    assert bd.merged_split_fragments == 0
+    assert bd.consensus_side_stories == 3
+    assert bd.fragments_dropped == 0
+    assert sum(asdict(bd).values()) == 3
+
+
 def test_breakdown_shangri_la_frontier_dataset():
     """End-to-end test on the exact mangafire chapter list from the user's
     Shangri-La Frontier example (305 entries). Expected per the design
@@ -1075,6 +1094,7 @@ def test_align_collapse_consensus_set_uses_collapsed_floors():
         collapse_splits=True,
     )
     assert result.consensus_set == {29.0}
+    assert result.consensus_max == 29.0
 
 
 def test_align_collapse_rule5_breakdown_not_reported_as_dropped():
@@ -1099,7 +1119,26 @@ def test_align_collapse_rule5_breakdown_not_reported_as_dropped():
     # total_chapters stays raw (3) and the breakdown still sums to it.
     assert result.merge_diagnostics["primary"]["total_chapters"] == 3
     assert sum(bd.values()) == 3
-    assert result.consensus_max == 29.0
+
+
+def test_align_collapse_off_breakdown_has_no_merged_bucket():
+    """Complementary guard (2026-05-29 review, Codex P2 'keep split
+    diagnostics raw when collapse is off'): with collapse_splits=False the
+    chapter_map keeps 29.1/29.2/29.3 as three separate entries (passthrough
+    download) and consensus_set is keyed at the raw parts. The per-source
+    breakdown must therefore classify them per-entry — merged_split_fragments
+    stays 0 — so the UI never claims a concatenation the download didn't do."""
+    primary = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    alt = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    result = align_chapter_lists(
+        [("primary", primary), ("alt", alt)],
+        collapse_splits=False,
+    )
+    bd = result.merge_diagnostics["primary"]["breakdown"]
+    assert bd["merged_split_fragments"] == 0
+    assert bd["consensus_side_stories"] == 3   # raw parts peer-confirmed
+    assert bd["fragments_dropped"] == 0
+    assert sum(bd.values()) == 3
 
 
 def test_align_collapse_alts_payload_shape_for_strict_wrapper():

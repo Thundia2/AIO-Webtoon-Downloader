@@ -355,6 +355,7 @@ def _classify_chapter_breakdown(
     chapters: List[Dict],
     consensus_set: Optional[Set[float]],
     consensus_max: Optional[float],
+    collapse_splits: bool = True,
 ) -> ChapterBreakdown:
     """Route each chapter dict into exactly one ChapterBreakdown bucket.
 
@@ -378,6 +379,16 @@ def _classify_chapter_breakdown(
     are dropped by the download path, and a genuine source-only fragment is
     never in the collapsed-floor consensus_set, so they keep landing in
     ``fragments_dropped``.
+
+    ``collapse_splits`` MUST match the value align_chapter_lists used to build
+    ``consensus_set`` (and that group_chapters_for_download will download
+    with). When False, group_chapters_for_download is in passthrough mode —
+    X.1/X.2/X.3 each download as their own chapter, nothing is merged — so the
+    Rule-5 branch is skipped entirely and every entry is classified per-decimal
+    against the (raw, un-collapsed) consensus_set. Surfacing a
+    ``merged_split_fragments`` count in that mode would claim a concatenation
+    the download never performs. Mirrors ``_classify_main_chapters``, which
+    returns ``len(numbers)`` (no collapse) under the same flag.
 
     When ``consensus_set`` is empty / None (single-source run or no peer
     overlap), there's no signal: integers go to ``consensus_main`` (we
@@ -432,21 +443,25 @@ def _classify_chapter_breakdown(
         decimals_rel = [n - floor for n in decimals]
 
         if (
-            not integer_present
+            collapse_splits
+            and not integer_present
             and len(decimals) >= 2
             and _is_sequential_split_decimals(decimals_rel)
         ):
             # Rule 5: {X.1, X.2, X.3} with no integer X → one merged chapter
             # at floor X. Count the floor once, the rest as merged (kept).
             # Mirrors group_chapters_for_download's Rule 5 (parts combined)
-            # and _classify_main_chapters' Rule 5 (effective += 1).
+            # and _classify_main_chapters' Rule 5 (effective += 1). Gated on
+            # collapse_splits: with collapse off the download path is
+            # passthrough (no merge), so we fall through to per-entry below.
             _bucket_integer_like(float(floor))
             bd.merged_split_fragments += len(decimals) - 1
             continue
 
-        # Rule 1/2/3a/3b/4/6: classify each raw entry independently. Identical
-        # to the pre-2026-05-29 per-chapter pass, so existing bucket counts
-        # for every non-Rule-5 shape are unchanged.
+        # Rule 1/2/3a/3b/4/6 (and EVERY shape when collapse_splits=False):
+        # classify each raw entry independently. Identical to the
+        # pre-2026-05-29 per-chapter pass, so existing bucket counts for every
+        # non-Rule-5 shape — and all shapes under collapse-off — are unchanged.
         for num, _ch in entries:
             if num == floor:
                 _bucket_integer_like(num)
@@ -742,6 +757,7 @@ def align_chapter_lists(
             list(raw_nums.values()),
             consensus_set=consensus_set,
             consensus_max=consensus_max,
+            collapse_splits=collapse_splits,
         )
         diag: Dict = {
             "role": meta["role"],
