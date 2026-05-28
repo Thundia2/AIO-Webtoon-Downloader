@@ -9,6 +9,8 @@ into _process_chapter_impl's part-by-part fetch path.
 
 from __future__ import annotations
 
+from dataclasses import asdict
+
 from sites.chapter_merger import (
     AlignmentResult,
     ChapterBreakdown,
@@ -543,8 +545,8 @@ def test_breakdown_empty_input():
     assert isinstance(bd, ChapterBreakdown)
     assert all(getattr(bd, f) == 0 for f in [
         "consensus_main", "source_only_latest", "consensus_side_stories",
-        "safe_decimals", "prologue_count", "source_only_orphans",
-        "fragments_dropped", "unparseable_passthrough",
+        "safe_decimals", "prologue_count", "merged_split_fragments",
+        "source_only_orphans", "fragments_dropped", "unparseable_passthrough",
     ])
 
 
@@ -592,6 +594,60 @@ def test_breakdown_no_consensus_treats_everything_as_main_or_safe():
     assert bd.source_only_orphans == 0
 
 
+def test_breakdown_rule5_no_integer_cluster_is_merged_not_dropped():
+    """Regression for the collapsed-consensus miscount (2026-05-29 review):
+    a no-integer sequential split-cluster {29.1, 29.2, 29.3} whose FLOOR is
+    peer-confirmed (consensus keyed at 29.0) must NOT be reported as dropped
+    fragments. group_chapters_for_download Rule 5 concatenates the parts into
+    one downloaded chapter, so the floor counts once (consensus_main) and the
+    remaining two parts land in merged_split_fragments. Pre-fix this dumped
+    all three into fragments_dropped, which the UI renders as lost content."""
+    bd = _classify_chapter_breakdown(
+        [_ch("29.1"), _ch("29.2"), _ch("29.3")],
+        consensus_set={29.0},          # collapsed-floor consensus (peer has ch 29)
+        consensus_max=29.0,
+    )
+    assert bd.consensus_main == 1
+    assert bd.merged_split_fragments == 2
+    assert bd.fragments_dropped == 0
+    assert bd.safe_decimals == 0
+    assert bd.consensus_side_stories == 0
+    # Sum still equals the 3 raw entries.
+    assert sum(asdict(bd).values()) == 3
+
+
+def test_breakdown_rule5_source_only_cluster_counts_floor_once():
+    """A no-integer split-cluster the peers don't have at all: still merged
+    (Rule 5 collapses unconditionally), floor counted once by its position
+    relative to consensus_max — here 29 > max 10 so it's source_only_latest,
+    NOT dropped."""
+    bd = _classify_chapter_breakdown(
+        [_ch("29.1"), _ch("29.2"), _ch("29.3")],
+        consensus_set={10.0},          # peers top out at 10
+        consensus_max=10.0,
+    )
+    assert bd.source_only_latest == 1
+    assert bd.merged_split_fragments == 2
+    assert bd.fragments_dropped == 0
+    assert sum(asdict(bd).values()) == 3
+
+
+def test_breakdown_rule3a_integer_plus_sequential_still_drops():
+    """Guard the other side: {8, 8.1, 8.2, 8.3} (integer PRESENT + sequential
+    decimals) is Rule 3a — the download path keeps only the integer and DROPS
+    the decimals. So those three really are fragments_dropped, NOT merged.
+    Confirms the Rule-5 special-case is gated on the no-integer shape."""
+    bd = _classify_chapter_breakdown(
+        [_ch("8"), _ch("8.1"), _ch("8.2"), _ch("8.3")],
+        consensus_set={8.0},
+        consensus_max=8.0,
+    )
+    assert bd.consensus_main == 1       # the integer 8
+    assert bd.fragments_dropped == 3    # 8.1/8.2/8.3 dropped by Rule 3a
+    assert bd.merged_split_fragments == 0
+    assert sum(asdict(bd).values()) == 4
+
+
 def test_breakdown_shangri_la_frontier_dataset():
     """End-to-end test on the exact mangafire chapter list from the user's
     Shangri-La Frontier example (305 entries). Expected per the design
@@ -637,12 +693,14 @@ def test_breakdown_shangri_la_frontier_dataset():
     assert bd.consensus_side_stories == 0  # peers don't carry the .5s
     assert bd.source_only_latest == 0
     assert bd.source_only_orphans == 0
+    assert bd.merged_split_fragments == 0  # every .1 here has its integer (Rule 2/3b, not Rule 5)
     assert bd.unparseable_passthrough == 0
     # Sanity: bucket sum must equal input length.
     total = (
         bd.consensus_main + bd.source_only_latest + bd.consensus_side_stories
-        + bd.safe_decimals + bd.prologue_count + bd.source_only_orphans
-        + bd.fragments_dropped + bd.unparseable_passthrough
+        + bd.safe_decimals + bd.prologue_count + bd.merged_split_fragments
+        + bd.source_only_orphans + bd.fragments_dropped
+        + bd.unparseable_passthrough
     )
     assert total == 305
 
@@ -1017,6 +1075,30 @@ def test_align_collapse_consensus_set_uses_collapsed_floors():
         collapse_splits=True,
     )
     assert result.consensus_set == {29.0}
+
+
+def test_align_collapse_rule5_breakdown_not_reported_as_dropped():
+    """End-to-end regression (2026-05-29 review, Codex P2 'avoid marking
+    merged split parts as dropped'): cross-shape Rule-5 case — primary emits
+    chapter 29 as {29.1, 29.2, 29.3}, alt emits integer 29. The parts collapse
+    to one downloaded chapter 29 (peer-confirmed at floor 29.0), so primary's
+    diagnostics must show ONE main chapter + two merged split parts, never
+    three dropped fragments. Pre-fix the collapsed consensus_set ({29.0}) made
+    each raw .k miss consensus and inflate fragments_dropped, which
+    SearchChapterMap renders to the user as lost content."""
+    primary = [_ch("29.1"), _ch("29.2"), _ch("29.3")]
+    alt = [_ch("29")]
+    result = align_chapter_lists(
+        [("primary", primary), ("alt", alt)],
+        collapse_splits=True,
+    )
+    bd = result.merge_diagnostics["primary"]["breakdown"]
+    assert bd["fragments_dropped"] == 0
+    assert bd["merged_split_fragments"] == 2
+    assert bd["consensus_main"] == 1   # floor 29 confirmed by alt's integer
+    # total_chapters stays raw (3) and the breakdown still sums to it.
+    assert result.merge_diagnostics["primary"]["total_chapters"] == 3
+    assert sum(bd.values()) == 3
     assert result.consensus_max == 29.0
 
 

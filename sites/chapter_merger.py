@@ -162,7 +162,8 @@ class ChapterBreakdown:
       safe_decimals            — fractional > 0, source-only, value ≥ .5 (kept as side story; cannot confidently call duplicate)
       prologue_count           — chapter num ≤ 0 (chapter 0, negatives — kept but not in main count)
       source_only_orphans      — integer ≥ 1, ≤ consensus_max, NOT in consensus (suspicious re-release; kept but flagged)
-      fragments_dropped        — fractional > 0, value ∈ {.1,.2,.3,.4}, NOT in consensus (Rule 2 refinement target: dropped when collapse ON)
+      fragments_dropped        — fractional > 0, value ∈ {.1,.2,.3,.4}, NOT in consensus, AND its floor group is NOT a no-integer sequential split (Rule 2/3a/3b/6 drop target: actually dropped when collapse ON)
+      merged_split_fragments   — the (parts-1) extra rows of a no-integer sequential split-cluster (Rule 5: {X.1,X.2,X.3} with no integer X). group_chapters_for_download CONCATENATES these into one downloaded chapter at floor X — they are kept, not dropped. The floor itself is counted once in consensus_main/source_only_latest/source_only_orphans. Distinguishing this from fragments_dropped is the whole reason this bucket exists (see _classify_chapter_breakdown).
       unparseable_passthrough  — _extract_chapter_num returned None (oneshots, omakes by name only)
 
     Why this dataclass exists alongside _classify_main_chapters:
@@ -185,6 +186,9 @@ class ChapterBreakdown:
     consensus_side_stories: int = 0
     safe_decimals: int = 0
     prologue_count: int = 0
+    # MERGED — no-integer sequential split parts concatenated into one
+    # downloaded chapter (Rule 5). Kept content, NOT dropped.
+    merged_split_fragments: int = 0
     # SUSPICIOUS — kept but flagged
     source_only_orphans: int = 0
     # DROPPED when collapse ON — flagged in UI as "N fragments dropped"
@@ -358,6 +362,23 @@ def _classify_chapter_breakdown(
     fragment-shape and consensus checks) so the displayed bucket counts
     always match what the download path actually emits when collapse is on.
 
+    GROUPS BY FLOOR (like ``_classify_main_chapters``) rather than judging
+    each decimal in isolation. This is load-bearing for the collapsed-
+    consensus world (2026-05-29): ``consensus_set`` is keyed at post-collapse
+    floors, so a no-integer sequential split-cluster {X.1, X.2, X.3} (Rule 5)
+    has its floor X.0 in consensus but none of its raw parts. A naive
+    per-decimal pass would test each part against consensus, miss it, and
+    dump all parts into ``fragments_dropped`` — but ``group_chapters_for_
+    download`` Rule 5 CONCATENATES those parts into one downloaded chapter,
+    so reporting them as "dropped" tells the user peer-confirmed content was
+    lost. Instead the cluster's floor is counted once (consensus_main /
+    source_only_latest / source_only_orphans) and the remaining parts go to
+    ``merged_split_fragments`` (kept). Every OTHER shape (Rule 1/2/3a/3b/4/6)
+    is still classified per-entry exactly as before — those decimals really
+    are dropped by the download path, and a genuine source-only fragment is
+    never in the collapsed-floor consensus_set, so they keep landing in
+    ``fragments_dropped``.
+
     When ``consensus_set`` is empty / None (single-source run or no peer
     overlap), there's no signal: integers go to ``consensus_main`` (we
     can't downgrade them), decimals ≥ .5 go to ``safe_decimals``, fragment-
@@ -370,6 +391,31 @@ def _classify_chapter_breakdown(
     """
     bd = ChapterBreakdown()
     has_consensus = bool(consensus_set)
+
+    def _bucket_integer_like(value: float) -> None:
+        # An integer chapter, OR the floor of a Rule-5 merged cluster.
+        # Same classification the original per-entry integer branch used.
+        if has_consensus and value in consensus_set:
+            bd.consensus_main += 1
+        elif has_consensus and consensus_max is not None and value > consensus_max:
+            bd.source_only_latest += 1
+        elif has_consensus:
+            bd.source_only_orphans += 1
+        else:
+            bd.consensus_main += 1
+
+    def _bucket_decimal(num: float, floor: int) -> None:
+        if has_consensus and num in consensus_set:
+            bd.consensus_side_stories += 1
+        elif _is_source_only_fragment(num, floor, consensus_set):
+            # Fragment-shaped (.1-.4), source-only, peer signal exists →
+            # would be dropped by the download path when collapse ON.
+            bd.fragments_dropped += 1
+        else:
+            # Either no peer signal, or decimal ≥ .5 — kept as safe extra.
+            bd.safe_decimals += 1
+
+    by_floor: Dict[int, List[Tuple[float, Dict]]] = {}
     for ch in chapters:
         num = _extract_chapter_num(ch.get("chap"))
         if num is None:
@@ -378,30 +424,35 @@ def _classify_chapter_breakdown(
         if num <= 0:
             bd.prologue_count += 1
             continue
-        floor = int(num)
-        is_integer = (num == floor)
-        if is_integer:
-            if has_consensus and num in consensus_set:
-                bd.consensus_main += 1
-            elif has_consensus and consensus_max is not None and num > consensus_max:
-                bd.source_only_latest += 1
-            elif has_consensus:
-                # Peer signal exists but this integer is mid-range and source-only.
-                bd.source_only_orphans += 1
+        by_floor.setdefault(int(num), []).append((num, ch))
+
+    for floor, entries in by_floor.items():
+        integer_present = any(n == floor for n, _ in entries)
+        decimals = sorted(n for n, _ in entries if n != floor)
+        decimals_rel = [n - floor for n in decimals]
+
+        if (
+            not integer_present
+            and len(decimals) >= 2
+            and _is_sequential_split_decimals(decimals_rel)
+        ):
+            # Rule 5: {X.1, X.2, X.3} with no integer X → one merged chapter
+            # at floor X. Count the floor once, the rest as merged (kept).
+            # Mirrors group_chapters_for_download's Rule 5 (parts combined)
+            # and _classify_main_chapters' Rule 5 (effective += 1).
+            _bucket_integer_like(float(floor))
+            bd.merged_split_fragments += len(decimals) - 1
+            continue
+
+        # Rule 1/2/3a/3b/4/6: classify each raw entry independently. Identical
+        # to the pre-2026-05-29 per-chapter pass, so existing bucket counts
+        # for every non-Rule-5 shape are unchanged.
+        for num, _ch in entries:
+            if num == floor:
+                _bucket_integer_like(num)
             else:
-                # No peer signal — treat as main (can't downgrade without data).
-                bd.consensus_main += 1
-        else:
-            # Fractional > 0
-            if has_consensus and num in consensus_set:
-                bd.consensus_side_stories += 1
-            elif _is_source_only_fragment(num, floor, consensus_set):
-                # Fragment-shaped (.1-.4), source-only, peer signal exists →
-                # would be dropped by the download path when collapse ON.
-                bd.fragments_dropped += 1
-            else:
-                # Either no peer signal, or decimal ≥ .5 — kept as safe extra.
-                bd.safe_decimals += 1
+                _bucket_decimal(num, floor)
+
     return bd
 
 
@@ -669,15 +720,16 @@ def align_chapter_lists(
 
     # Per-source diagnostics: compute from per_source_raw_nums (RAW) so the
     # UI's "total entries" vs "effective chapters" gap stays meaningful
-    # regardless of collapse_splits. The breakdown buckets use consensus_set
-    # to classify fragment-shaped source-only decimals; consensus_set is in
-    # collapsed-floor units when collapse=True, but the per-decimal `num in
-    # consensus_set` check still works because fragment decimals are never
-    # in a collapsed-floor consensus_set (52.1 never equals 52.0). For Rule
-    # 2 (X + X.k where peer also has X.k as a true side story), peer's X.k
-    # is preserved through collapse via Rule 2's "keep both when no
-    # consensus drop" path, so X.k still lands in consensus_set when peers
-    # confirm it.
+    # regardless of collapse_splits. consensus_set is in collapsed-floor units
+    # when collapse=True, so BOTH diagnostic classifiers group raw numbers by
+    # floor before consulting it: _classify_main_chapters always has, and
+    # _classify_chapter_breakdown now does too (2026-05-29 fix). That grouping
+    # is what lets a no-integer sequential split-cluster {X.1, X.2, X.3} be
+    # recognized as the single merged chapter at floor X (peer-confirmed via
+    # X.0 in consensus_set) rather than three raw decimals that each miss the
+    # collapsed consensus and get mislabeled as dropped fragments. For Rule 2
+    # (X + X.k where the .k is a true side story) the .k survives collapse as
+    # its own group, so it still lands in consensus_set when peers confirm it.
     diagnostics: Dict[str, Dict] = {}
     for site_name, meta in per_source_meta.items():
         raw_nums = per_source_raw_nums[site_name]
