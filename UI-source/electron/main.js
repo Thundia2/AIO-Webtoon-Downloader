@@ -121,6 +121,14 @@ let defaultPythonCmd = DEV_PYTHON_CMD;
 let defaultScriptPath = DEV_SCRIPT_PATH;
 let defaultWorkingDir = DEV_WORKING_DIR;
 
+// AbortController for the in-flight `Check All` parallel sweep. Module-scoped
+// because both the check-all and cancel-check-all IPC handlers need to see
+// the same handle. Null = no scan running. The check-all handler installs a
+// fresh controller per scan and the renderer-driven cancel handler aborts it.
+// Cross-file: UI-source/electron/preload.js exposes cancelCheckAllUpdates;
+// UI-source/src/components/UpdatesCenter.jsx calls it from the Cancel button.
+let _checkAllAbortCtrl = null;
+
 // ── PATH COMPUTATION ──
 
 function computePaths() {
@@ -817,7 +825,20 @@ function setupIPC() {
   // Extracted so both check-for-updates and check-all-updates can use it.
   // Spawns Python with --list-chapters to get the current chapter list from
   // the site, compares with .aio_series.json, returns the diff.
-  async function _checkSeriesUpdates(folderPath) {
+  // Per-series chapter-update check. Spawns `aio-dl.py --list-chapters` and
+  // diffs the returned chapter set against either meta.chapters_downloaded
+  // (default) or filenames on disk (settings.useFileBasedChapterCheck).
+  //
+  // opts:
+  //   collapseSplits — when true, forwards --collapse-splits so the chapter
+  //     list mirrors what the actual download path would produce. Without
+  //     this, fragment-shaped decimals (52.1 next to 52, etc.) leak into
+  //     the diff and stick as "+N new" indefinitely.
+  //   signal — AbortSignal from the parallel "Check All" worker pool. When
+  //     aborted, the in-flight Python proc is killed and the promise
+  //     rejects with an aborted-shape error that the caller normalizes
+  //     into { error: "aborted" }.
+  async function _checkSeriesUpdates(folderPath, opts = {}) {
     const metaPath = path.join(folderPath, ".aio_series.json");
     // fs.promises.access throws on missing — translate to the no-metadata
     // sentinel without surfacing an exception. Async FS keeps the IPC handler
@@ -861,6 +882,18 @@ function setupIPC() {
         if (meta.site) {
           args.push("--site", meta.site);
         }
+        // Collapse-splits forwarding: when the user has the global
+        // collapseSplits setting on, --list-chapters now applies the same
+        // group_chapters_for_download filter the download path uses
+        // (aio-dl.py lines around `if collapse_splits_enabled:` in the
+        // --list-chapters block). Without forwarding, the emitted list
+        // would include fragment-shape decimals that would never download
+        // under collapse, causing the diff against meta.chapters_downloaded
+        // to flag them as new forever. Cross-file: settings.collapseSplits
+        // is the source of truth (SettingsTab.jsx default true).
+        if (opts.collapseSplits) {
+          args.push("--collapse-splits");
+        }
         args.push(meta.url);
 
         // Build env — Playwright path for packaged mode, plus PYTHONPATH
@@ -884,6 +917,7 @@ function setupIPC() {
 
         let stdout = "";
         let stderr = "";
+        let aborted = false;
 
         proc.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
         proc.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
@@ -893,6 +927,23 @@ function setupIPC() {
           proc.kill();
           reject(new Error("Timed out after 60 seconds"));
         }, 60000);
+
+        // Parallel "Check All" cancel path: when the worker pool's
+        // AbortController fires, kill this proc immediately and reject with
+        // an aborted sentinel that the outer await normalizes into a
+        // { error: "aborted" } result. Idempotent (proc.kill on a dead
+        // proc is a no-op). The listener is bound here, AFTER the spawn,
+        // so we don't try to kill before the proc handle exists.
+        const onAbort = () => {
+          aborted = true;
+          clearTimeout(timeout);
+          try { proc.kill(); } catch {}
+          reject(new Error("aborted"));
+        };
+        if (opts.signal) {
+          if (opts.signal.aborted) { onAbort(); return; }
+          opts.signal.addEventListener("abort", onAbort, { once: true });
+        }
 
         proc.on("close", (code) => {
           clearTimeout(timeout);
@@ -990,53 +1041,212 @@ function setupIPC() {
         },
       };
     } catch (err) {
-      return { error: "check_failed", message: err.message || String(err) };
+      // Normalize the abort-shape error from the worker-pool cancel path so
+      // the renderer can render an "aborted" pill instead of a generic
+      // "check_failed" alarm. Any other failure (timeout, non-zero exit,
+      // JSON parse) still surfaces as check_failed with the message.
+      const msg = err?.message || String(err);
+      if (msg === "aborted" || opts?.signal?.aborted) {
+        return { error: "aborted" };
+      }
+      return { error: "check_failed", message: msg };
     }
   }
 
   // ── Check for new chapters for a single series ──
   ipcMain.handle("check-for-updates", async (_event, folderPath) => {
-    return _checkSeriesUpdates(folderPath);
+    // Single-series Check uses the global collapseSplits setting so the
+    // result matches what a "Download Missing Chapters" click would produce.
+    // No abort signal here — single check completes fast and can't be
+    // user-cancelled from the DetailView (just close the panel).
+    const settings = history.getSettings();
+    const collapseSplits = settings.collapseSplits === true;
+    return _checkSeriesUpdates(folderPath, { collapseSplits });
   });
 
-  // ── Check for updates on all ongoing series ──
-  // Checks them one at a time to avoid flooding the site.
-  // Sends progress events so the UI can show "Checking 2/8..."
+  // ── Check for updates on all ongoing series (parallel) ──
+  //
+  // Worker pool, default 4 slots (settings.checkAllConcurrency, capped at
+  // 8). Provider-aware scheduling: each worker picks a job whose `site` is
+  // NOT currently held by a peer worker; falls back to FIFO only when every
+  // candidate's site is in-flight (the steady state once concurrency ≥
+  // unique-site count). This avoids piling 4 mangafire scans onto the same
+  // CDN when the user happens to have many mangafire series, without
+  // sacrificing throughput in the typical mixed-source library.
+  //
+  // Cancelable: the renderer can fire cancel-check-all-updates to stop the
+  // sweep mid-flight; the in-flight Python procs are killed via the
+  // per-call AbortSignal threaded into _checkSeriesUpdates. Tracked via the
+  // module-scoped _checkAllAbortCtrl (declared above this handler).
+  //
+  // Progress events: emits one "queued" per series upfront (renderer pre-
+  // renders rows), then "running" / "completed" per worker hop, then a
+  // final "done" event carrying total duration. The old single-counter
+  // event shape ({ current, total, title }) is gone — the new richer
+  // events are dispatched by `kind` in the renderer.
   ipcMain.handle("check-all-updates", async () => {
     const settings = history.getSettings();
     const workingDir = settings.workingDir || defaultWorkingDir;
     const mangaDir = getConfiguredOutputRoot(workingDir);
     const thumbCacheDir = path.join(app.getPath("userData"), "thumb-cache");
 
+    // Filter to series with a source URL. When checkAllIncludeCompleted is
+    // ON (default), we ignore the status field entirely — mangafire and
+    // several other aggregators are deeply unreliable about marking series
+    // "Completed" (they tag ongoing series as Completed all the time). The
+    // cost of an unnecessary check is one extra Python proc per series,
+    // negligible under the parallel pool; the cost of skipping a mislabeled
+    // series is missing months of new chapters. Cross-file: setting is
+    // declared in SettingsTab.jsx near useFileBasedChapterCheck; UI
+    // LibraryTab.jsx mirrors this filter for the toolbar button's
+    // ongoingCount badge so the count matches what we'd actually check.
     const entries = scanLibrary(mangaDir, thumbCacheDir);
+    const includeCompleted = settings.checkAllIncludeCompleted !== false;
     const checkable = entries.filter((e) => {
       if (!e.seriesMeta?.url) return false;
+      if (includeCompleted) return true;
       const status = e.seriesMeta.status;
       return !status || status === "Ongoing" || status === "Releasing";
     });
 
     if (checkable.length === 0) {
+      sendToUI("update-check-progress", {
+        kind: "done", completed: 0, total: 0, durationMs: 0, aborted: false,
+      });
       return { results: [], total: 0, checked: 0 };
     }
 
-    const results = [];
-    for (let i = 0; i < checkable.length; i++) {
-      const entry = checkable[i];
-      sendToUI("update-check-progress", {
-        current: i + 1,
-        total: checkable.length,
-        title: entry.title,
-      });
+    const concurrency = Math.max(
+      1,
+      Math.min(8, Number(settings.checkAllConcurrency) || 4),
+    );
+    const collapseSplits = settings.collapseSplits === true;
 
-      const checkResult = await _checkSeriesUpdates(entry.folderPath);
-      results.push({
-        folderPath: entry.folderPath,
-        title: entry.title,
-        ...checkResult,
+    // Fresh AbortController per scan. Replace any stale one (defensive: the
+    // previous scan's "done" event should have nulled it, but if cancel
+    // fired late or the renderer restarted, we don't want stale refs).
+    if (_checkAllAbortCtrl) {
+      try { _checkAllAbortCtrl.abort(); } catch {}
+    }
+    _checkAllAbortCtrl = new AbortController();
+    const ctrl = _checkAllAbortCtrl;
+
+    // Pre-emit a "queued" event for every series so the renderer can render
+    // the full row list immediately with placeholders. Total carried on
+    // every event so the renderer doesn't need a separate "init" message.
+    for (const e of checkable) {
+      sendToUI("update-check-progress", {
+        kind: "queued",
+        folderPath: e.folderPath,
+        title: e.title,
+        cover: e.seriesMeta?.cover || null,
+        site: e.seriesMeta?.site || null,
+        total: checkable.length,
       });
     }
 
+    const remaining = [...checkable];
+    const inFlightBySite = new Map(); // site → count of workers currently checking
+    const results = [];
+    let completed = 0;
+    const startedAt = Date.now();
+
+    // Provider-aware claim. findIndex+splice runs synchronously between
+    // awaits so two workers can never claim the same job — the JS event
+    // loop only re-enters on the next await. When every site has an
+    // in-flight worker (concurrency ≥ unique-sites), the findIndex misses
+    // and we fall through to FIFO claim (idx 0) so progress doesn't stall.
+    function claimNext() {
+      if (remaining.length === 0) return null;
+      let idx = remaining.findIndex(
+        (e) => !inFlightBySite.get(e.seriesMeta?.site || "_"),
+      );
+      if (idx === -1) idx = 0;
+      return remaining.splice(idx, 1)[0];
+    }
+
+    async function worker() {
+      while (!ctrl.signal.aborted) {
+        const entry = claimNext();
+        if (!entry) return;
+        const site = entry.seriesMeta?.site || "_";
+        inFlightBySite.set(site, (inFlightBySite.get(site) || 0) + 1);
+
+        sendToUI("update-check-progress", {
+          kind: "running",
+          folderPath: entry.folderPath,
+          title: entry.title,
+          site,
+          completed,
+          total: checkable.length,
+        });
+
+        let r;
+        try {
+          r = await _checkSeriesUpdates(entry.folderPath, {
+            collapseSplits,
+            signal: ctrl.signal,
+          });
+        } catch (err) {
+          // _checkSeriesUpdates already wraps its errors into a shape; this
+          // catch is a defensive net for anything that escapes (e.g. an
+          // out-of-band reject from the inner Promise). Normalize the same
+          // way the inner handler does so the renderer sees consistent
+          // shapes regardless of failure mode.
+          const msg = err?.message || String(err);
+          r = msg === "aborted" || ctrl.signal.aborted
+            ? { error: "aborted" }
+            : { error: "check_failed", message: msg };
+        } finally {
+          inFlightBySite.set(site, (inFlightBySite.get(site) || 1) - 1);
+        }
+
+        completed += 1;
+        const merged = {
+          folderPath: entry.folderPath,
+          title: entry.title,
+          cover: entry.seriesMeta?.cover || null,
+          site,
+          ...r,
+        };
+        results.push(merged);
+        sendToUI("update-check-progress", {
+          kind: "completed",
+          folderPath: entry.folderPath,
+          title: entry.title,
+          result: merged,
+          completed,
+          total: checkable.length,
+        });
+      }
+    }
+
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+    const aborted = ctrl.signal.aborted;
+    if (_checkAllAbortCtrl === ctrl) _checkAllAbortCtrl = null;
+    sendToUI("update-check-progress", {
+      kind: "done",
+      completed,
+      total: checkable.length,
+      durationMs: Date.now() - startedAt,
+      aborted,
+    });
+
     return { results, total: checkable.length, checked: results.length };
+  });
+
+  // ── Cancel an in-flight Check All sweep ──
+  // Aborts the per-scan AbortController which propagates into every
+  // _checkSeriesUpdates call via opts.signal. In-flight Python procs are
+  // killed; queued series never start. The handler returns { ok: false }
+  // when no sweep is running so the renderer can tell whether the cancel
+  // was a no-op (e.g. the scan finished between click and IPC).
+  ipcMain.handle("cancel-check-all-updates", async () => {
+    if (!_checkAllAbortCtrl) return { ok: false };
+    try { _checkAllAbortCtrl.abort(); } catch {}
+    _checkAllAbortCtrl = null;
+    return { ok: true };
   });
 
   // ── Save/update series metadata (manual URL entry for old downloads) ──

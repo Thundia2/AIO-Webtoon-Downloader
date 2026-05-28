@@ -6681,15 +6681,59 @@ def main():
     # Only needs the page HTML + chapter list API call — no image VRF, no downloads.
     # IMPORTANT: This runs BEFORE allocate_series_output_dir so it doesn't
     # create empty folders in manga/ just for checking.
+    #
+    # collapse-aware: when --collapse-splits is set, the emitted chapter list
+    # mirrors what `group_chapters_for_download` would actually surface for
+    # download (same function used post-filtering at the `groups = ...` call
+    # below this block). Without this, fragment-shaped decimals (mangafire's
+    # 52.1 next to 52, sequential split clusters, etc.) leak into the UI's
+    # diff against meta.chapters_downloaded and stick as "+N new" forever
+    # because no download path produces them under collapse. Cross-file: the
+    # Electron-side caller is UI-source/electron/main.js:_checkSeriesUpdates;
+    # the Library "Check All" path forwards settings.collapseSplits into the
+    # spawn so this branch fires exactly when the user has collapse on.
     if getattr(args, "list_chapters", False):
-        # Deduplicate chapter numbers (pool may have multiple versions per chapter)
+        # Deduplicate by normalized chapter label. The regular flow at
+        # `chapters_by_num` normalizes float/str chap fields with `:g` so
+        # handlers that emit 4.0 (mangathemesia subclasses) don't split
+        # from "4"-emitting peers; we mirror that here so the dedupe and
+        # the optional collapse pass see the same canonical keys.
         seen_nums = set()
-        unique_chapters = []
+        deduped_pool: List[Dict[str, Any]] = []
         for ch in pool:
             num = ch.get("chap")
-            if num is not None and num not in seen_nums:
-                seen_nums.add(num)
-                unique_chapters.append(num)
+            if num is None:
+                continue
+            if isinstance(num, (int, float)):
+                num = f"{num:g}"
+            else:
+                num = str(num)
+            if num in seen_nums:
+                continue
+            seen_nums.add(num)
+            # Carry the dict shape (group_chapters_for_download needs it) but
+            # with the normalized label injected so its `_extract_chapter_num`
+            # parse and our diff target both see the same string.
+            deduped_pool.append({**ch, "chap": num})
+
+        collapse_splits_enabled = bool(getattr(args, "collapse_splits", False))
+        if collapse_splits_enabled:
+            # Same function the actual download path uses. consensus_set is
+            # None for single-URL --list-chapters mode (no multi-source peer
+            # data); group_chapters_for_download falls through to its
+            # in-source-only Rule 2 / 3b / 6 heuristics in that case — same
+            # behavior the download would produce. Cross-file: see
+            # sites/chapter_merger.py:group_chapters_for_download for the
+            # full cluster-rule table.
+            groups = group_chapters_for_download(
+                deduped_pool,
+                collapse_splits=True,
+                consensus_set=_multi_source_consensus_set,
+            )
+            unique_chapters = [g.label for g in groups]
+        else:
+            unique_chapters = [ch["chap"] for ch in deduped_pool]
+
         # Sort numerically
         try:
             unique_chapters.sort(key=lambda x: float(x))
@@ -6707,6 +6751,7 @@ def main():
             "genres": comic_data.get("genres", []),
             "total": len(unique_chapters),
             "chapters": unique_chapters,
+            "collapse_applied": collapse_splits_enabled,
         }
         print(json.dumps(result))
         sys.exit(0)

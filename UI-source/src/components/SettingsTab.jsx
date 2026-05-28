@@ -132,6 +132,24 @@ export default function SettingsTab({ settings, onSave }) {
     // When true, update checks scan actual files on disk instead of
     // trusting .aio_series.json. Saved as a top-level setting.
     useFileBasedChapterCheck: false,
+    // ── Library Check All filter ──
+    // When true (default), "Check All" includes series marked Completed /
+    // Finished, not just Ongoing / Releasing. Many aggregators — mangafire
+    // most notoriously — slap "Completed" on actively-updating series, so
+    // skipping them by default would silently leave the user months behind
+    // on a chunk of their library. The cost of an extra check on a truly
+    // completed series is ~one Python proc (handled by the parallel pool
+    // in <1 ms of wall-time per slot saturation), vs. the cost of missing
+    // weeks of releases by trusting the bad metadata. Cross-file: the
+    // filter lives in UI-source/electron/main.js:check-all-updates handler;
+    // LibraryTab.jsx mirrors the filter for the toolbar's ongoingCount.
+    checkAllIncludeCompleted: true,
+    // Parallel "Check All" worker count. Clamped to [1, 8] by main.js. 4 is
+    // the safe sweet spot — finishes 30 series in 30-60s while keeping any
+    // single site from getting hit with 4+ concurrent --list-chapters calls
+    // (the provider-aware scheduler in main.js further fans across distinct
+    // sites when possible).
+    checkAllConcurrency: 4,
     // ── External metadata enrichment (--metadata-source family) ──
     // Top-level "global setting" semantic: applies to EVERY download
     // regardless of which tab spawned it (New / Search / Library / queue).
@@ -346,6 +364,10 @@ export default function SettingsTab({ settings, onSave }) {
       noFastDownload: false,
       logUpdateInterval: 100,
       useFileBasedChapterCheck: false,
+      // Mirror initial state: Check All includes Completed by default, four
+      // parallel workers. See rationale in the initial useState above.
+      checkAllIncludeCompleted: true,
+      checkAllConcurrency: 4,
       // Metadata enrichment defaults — mirror the initial-state block above.
       // Off/default values match the Python argparse defaults so Reset
       // produces a clean "no spawn-line metadata flags" state.
@@ -1331,6 +1353,62 @@ export default function SettingsTab({ settings, onSave }) {
           <strong>On:</strong> Scans your actual files and extracts chapter numbers from filenames.
           Catches missing or deleted files, but only works with individual chapter files
           or combined files with chapter ranges in the name.
+        </p>
+
+        {/* ── Check All — include "Completed" series ──
+            Aggregators (mangafire most notoriously) routinely mis-label
+            ongoing series as "Completed". Defaulting this ON gives a
+            forgiving scan that catches mislabeled series; opt out only if
+            your library lives on reliable status sources (MangaDex etc.)
+            AND you want to save a few seconds per scan. */}
+        <div className="flex items-center gap-2 mt-4">
+          <Checkbox
+            checked={local.checkAllIncludeCompleted !== false}
+            onCheckedChange={(v) => set("checkAllIncludeCompleted", v)}
+          />
+          <Label className="text-xs cursor-pointer">
+            Check "Completed" series too (recommended)
+          </Label>
+        </div>
+        <p className="text-[10px] text-muted-foreground mt-1 ml-6">
+          <strong>On (default):</strong> "Check All" scans every series with a saved URL, regardless
+          of status. Catches the very common case where a site (mangafire, etc.) wrongly
+          marks an ongoing series as Completed.
+          <br />
+          <strong>Off:</strong> Only scans series whose status is Ongoing or Releasing.
+          Faster, but misses mislabeled series.
+        </p>
+
+        {/* ── Check All — parallel worker count ──
+            Capped to [1, 8] in main.js. 4 is the safe sweet spot for typical
+            libraries; the provider-aware scheduler fans across distinct
+            sites at that count. Drop to 2 only if your library hits one
+            site heavily and you see throttling; bump to 6-8 only if scans
+            consistently bottleneck on a single site's per-request latency. */}
+        <div className="flex items-center gap-3 mt-4">
+          <Label className="text-xs whitespace-nowrap">
+            Parallel checks
+          </Label>
+          <Input
+            type="number"
+            min={1}
+            max={8}
+            value={local.checkAllConcurrency ?? 4}
+            onChange={(e) =>
+              set(
+                "checkAllConcurrency",
+                Math.max(1, Math.min(8, Number(e.target.value) || 4))
+              )
+            }
+            className="w-20 font-mono"
+          />
+          <Badge variant="secondary" className="text-[10px]">
+            1–8
+          </Badge>
+        </div>
+        <p className="text-[10px] text-muted-foreground mt-1">
+          How many series the "Check All" sweep checks at the same time. Workers prefer
+          jobs on different sites so no single CDN gets hammered. Default 4.
         </p>
 
         {/* Verbose */}
