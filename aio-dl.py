@@ -4051,7 +4051,13 @@ _SAVED_PARAMS_FILE = "download_params.json"
 
 
 def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
-    """Persist legacy update settings alongside the canonical .aio_series.json."""
+    """Persist legacy update settings alongside the canonical .aio_series.json.
+
+    Cross-file: _append_saved_update_options reads the same dict shape to
+    rebuild child commands during --update-all. Any key written here that
+    isn't also read there silently becomes a no-op on replay — pair every
+    new field with a matching replay branch.
+    """
     data = {
         "url": url,
         "title": title,
@@ -4076,6 +4082,25 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
         "no_cleanup": bool(getattr(args, "no_cleanup", False)),
         "verbose": bool(getattr(args, "verbose", False)),
         "debug": bool(getattr(args, "debug", False)),
+        # External metadata enrichment (--metadata-source family). Must be
+        # persisted so --update-all child commands continue to apply the
+        # AniList enrichment instead of silently downgrading to the default
+        # metadata_source=none. Without this, every newly downloaded update
+        # chapter would carry only site-derived ComicInfo tags +
+        # description, diverging from the original download's enriched
+        # ComicInfo (Tags / SpoilerTags / TagsExtended / CountryOfOrigin /
+        # MediaFormat / AnilistId / MalId). Cross-file: the argparse
+        # registration is near --enable-ml-rating (grep --metadata-source);
+        # enrichment runs in main() at the
+        # `if getattr(args, "metadata_source", "none") == "anilist":`
+        # check; the replay branch lives in _append_saved_update_options.
+        # The `or "none"` / `or 50` defenses handle the rare case where
+        # args carries the dest but with an explicit None (e.g. test
+        # harness building a Namespace by hand). Argparse default-paths
+        # always populate the string/int form.
+        "metadata_source": str(getattr(args, "metadata_source", "none") or "none"),
+        "metadata_tag_min_rank": int(getattr(args, "metadata_tag_min_rank", 50) or 50),
+        "metadata_refresh": bool(getattr(args, "metadata_refresh", False)),
     }
     if getattr(args, "format", None) == "epub":
         data["epub_layout"] = getattr(args, "epub_layout", "vertical")
@@ -4122,7 +4147,14 @@ def _load_cached_anilist_id(out_dir: str) -> Optional[int]:
 
 
 def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -> None:
-    """Replay saved per-series options for --update-all child runs."""
+    """Replay saved per-series options for --update-all child runs.
+
+    Cross-file: paired with _save_download_params which writes the dict.
+    Old download_params.json files written before a field was added will
+    silently lack the key — `params.get(...)` returns None and the
+    corresponding branch is a no-op, so this is forward-compatible
+    without an explicit migration.
+    """
     if params.get("site"):
         child_cmd.extend(["--site", str(params["site"])])
     if params.get("epub_layout"):
@@ -4157,6 +4189,29 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
     ):
         if params.get(key):
             child_cmd.append(flag)
+    # External metadata enrichment (--metadata-source family). Saved by
+    # _save_download_params; absence in older download_params.json files
+    # silently degrades to the default-off behavior (the get returns None
+    # and the gate skips). Without these branches, the original
+    # download's --metadata-source anilist intent is lost on every
+    # subsequent --update-all child — the child defaults to
+    # metadata_source=none and the newly downloaded chapters ship with
+    # site-only metadata, diverging from the parent series' enriched
+    # ComicInfo. metadata_tag_min_rank is only meaningful when
+    # enrichment is on; skip emitting "--metadata-source none" entirely
+    # (no-op but adds spawn-line noise). metadata_refresh persists the
+    # user's original intent — if they originally passed --metadata-
+    # refresh they wanted cache-bypassing fuzzy re-match on every
+    # update; the cached anilist_id in .aio_series.json still short-
+    # circuits when the flag was NOT saved (common case → fast).
+    metadata_source = params.get("metadata_source")
+    if metadata_source and metadata_source != "none":
+        child_cmd.extend(["--metadata-source", str(metadata_source)])
+        saved_rank = params.get("metadata_tag_min_rank")
+        if isinstance(saved_rank, int) and saved_rank != 50:
+            child_cmd.extend(["--metadata-tag-min-rank", str(saved_rank)])
+    if params.get("metadata_refresh"):
+        child_cmd.append("--metadata-refresh")
 
 
 def get_resumable_params(args, parser, calculated_width, calculated_aspect_ratio):
