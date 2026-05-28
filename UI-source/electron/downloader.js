@@ -168,6 +168,17 @@ function buildCliArgs(args) {
     // a separate translation step. aio-dl.py:3589 defines --seeded-only;
     // it's read inside find_alternatives_for_direct_url at line 4432.
     seededOnly: "--seeded-only",
+    // Skip the multi-source image-quality probe phase entirely. Ranking
+    // falls back to sites/quality_seed.json priors only. Designed for
+    // the Library tab's UpdatesCenter downloads where the delta is
+    // typically a few chapters and the probe (30-60+ s per series on
+    // MangaFire-class handlers) dominates the actual download. Injected
+    // by LibraryTab.jsx's buildDownloadArgsForRow when
+    // settings.updateChecksUseSeededRating is on (default). Python
+    // side: aio-dl.py near --enable-ml-rating defines the flag; read
+    // in aio_search_cli.find_alternatives_for_direct_url which passes
+    // img_quality_cache=None into search_all when set.
+    seededRatingOnly: "--seeded-rating-only",
     // LINE Webtoon WebP recompression master toggle (Phase 1, 2026-05-11).
     // Python-side gates the actual encode pass on handler.name match, so
     // emitting this flag for non-webtoons.com downloads is a safe no-op.

@@ -1026,6 +1026,21 @@ export default function LibraryTab({
   // Builds the same download args as DetailView's "Download Missing
   // Chapters" path so the user gets identical behavior whether they queue
   // from the panel or the detail view. Pulls defaults from settings.
+  //
+  // One UpdatesCenter-specific override: seededRatingOnly is injected by
+  // default. The probe phase in search_all (run when --multi-source is on)
+  // costs ~30-60 s per series on MangaFire-class handlers — Playwright VRF
+  // per sample chapter plus image-quality scoring. For an update download
+  // that's typically 1-5 new chapters, that probe cost dominates the
+  // actual download. Skipping it falls back to sites/quality_seed.json's
+  // curated per-site quality priors for ranking (which is what the
+  // multi-source picker uses as a tiebreaker anyway when title-match
+  // scores are within 0.10 of each other). Cross-file: --seeded-rating-only
+  // is defined in aio-dl.py near --enable-ml-rating; downloader.js maps it
+  // via boolMap; aio_search_cli.find_alternatives_for_direct_url honors
+  // it by passing img_quality_cache=None into search_all. Opt out per the
+  // settings.updateChecksUseSeededRating toggle for users on stable
+  // handlers who want full probe accuracy.
   const buildDownloadArgsForRow = useCallback((row, entry) => {
     const meta = entry?.seriesMeta || {};
     const rangeStr = chaptersToRangeString(row.newChapters);
@@ -1047,6 +1062,13 @@ export default function LibraryTab({
     if (d.imageWorkers && d.imageWorkers !== 3) args.imageWorkers = d.imageWorkers;
     if (d.httpTimeout && d.httpTimeout !== 30) args.httpTimeout = d.httpTimeout;
     if (d.httpMaxRetries && d.httpMaxRetries !== 6) args.httpMaxRetries = d.httpMaxRetries;
+    // Default on — settings.updateChecksUseSeededRating !== false catches
+    // both the explicit-true case and the default-undefined case. Has no
+    // effect when --multi-source isn't on (the alternatives discovery
+    // doesn't run, so there's nothing to probe in the first place).
+    if (settings?.updateChecksUseSeededRating !== false) {
+      args.seededRatingOnly = true;
+    }
     return { url: meta.url, args };
   }, [settings]);
 

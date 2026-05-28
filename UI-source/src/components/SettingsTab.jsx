@@ -150,6 +150,20 @@ export default function SettingsTab({ settings, onSave }) {
     // (the provider-aware scheduler in main.js further fans across distinct
     // sites when possible).
     checkAllConcurrency: 4,
+    // When ON (default), downloads queued from the UpdatesCenter panel get
+    // --seeded-rating-only injected so the multi-source rating skips its
+    // image-quality probe phase and ranks alternatives from
+    // sites/quality_seed.json's per-site priors instead. Saves 30-60+ s
+    // per series on MangaFire-class handlers (the probe runs Playwright
+    // VRF per sample chapter plus image-quality scoring). For a 1-5
+    // chapter update delta, the probe cost dwarfs the actual download.
+    // Off restores full probe accuracy at the per-download cost — pick
+    // off only if you've tuned multi-source ranking carefully and want
+    // every download to use measured scores. Read in LibraryTab.jsx's
+    // buildDownloadArgsForRow; flag plumbed via downloader.js's
+    // seededRatingOnly boolMap entry; honored in aio_search_cli.
+    // find_alternatives_for_direct_url.
+    updateChecksUseSeededRating: true,
     // ── External metadata enrichment (--metadata-source family) ──
     // Top-level "global setting" semantic: applies to EVERY download
     // regardless of which tab spawned it (New / Search / Library / queue).
@@ -368,6 +382,7 @@ export default function SettingsTab({ settings, onSave }) {
       // parallel workers. See rationale in the initial useState above.
       checkAllIncludeCompleted: true,
       checkAllConcurrency: 4,
+      updateChecksUseSeededRating: true,
       // Metadata enrichment defaults — mirror the initial-state block above.
       // Off/default values match the Python argparse defaults so Reset
       // produces a clean "no spawn-line metadata flags" state.
@@ -1409,6 +1424,39 @@ export default function SettingsTab({ settings, onSave }) {
         <p className="text-[10px] text-muted-foreground mt-1">
           How many series the "Check All" sweep checks at the same time. Workers prefer
           jobs on different sites so no single CDN gets hammered. Default 4.
+        </p>
+
+        {/* ── Update-check downloads: skip image-quality probe ──
+            Multi-source ranks alternatives by running an image-quality probe
+            (download sample images, score them). On MangaFire-class handlers
+            the probe burns ~30-60+ s per series. For a 1-5 chapter update
+            delta that probe cost dwarfs the actual download. With this on
+            (default), the multi-source picker uses sites/quality_seed.json
+            priors as the ranking signal instead of running the probe. The
+            picker's tiebreaker logic ALREADY falls back to the seed when
+            probe scores are equal, so the seed-only mode is a "trust the
+            curated priors" shortcut. Only affects downloads queued from
+            the UpdatesCenter; regular New-tab downloads still get full
+            probe accuracy. */}
+        <div className="flex items-center gap-2 mt-4">
+          <Checkbox
+            checked={local.updateChecksUseSeededRating !== false}
+            onCheckedChange={(v) => set("updateChecksUseSeededRating", v)}
+          />
+          <Label className="text-xs cursor-pointer">
+            Update-check downloads use fast seed-based rating (recommended)
+          </Label>
+        </div>
+        <p className="text-[10px] text-muted-foreground mt-1 ml-6">
+          <strong>On (default):</strong> Downloads queued from the Updates Center skip the
+          multi-source image-quality probe (which runs Playwright + per-source image scoring
+          and adds ~30-60+ seconds per series). Ranking falls back to the curated quality
+          priors in <code className="font-mono text-[9px]">sites/quality_seed.json</code>.
+          For a typical 1-5 chapter update delta the probe takes ~10× longer than the
+          actual download.
+          <br />
+          <strong>Off:</strong> Update-check downloads run the full probe like any other
+          multi-source download. More accurate per-source ranking; significantly slower.
         </p>
 
         {/* Verbose */}

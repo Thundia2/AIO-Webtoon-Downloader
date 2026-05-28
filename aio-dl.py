@@ -5312,6 +5312,28 @@ def main():
              "Honors AIO_ENABLE_ML_RATING=1 env var so power users can "
              "set the preference once.",
     )
+    p.add_argument(
+        "--seeded-rating-only",
+        action="store_true",
+        help="Skip the image-quality probe phase entirely when --multi-source "
+             "is set on a direct URL. The orchestrator ranks alternatives "
+             "purely from sites/quality_seed.json's curated per-site priors "
+             "(0.0-1.0 quality numbers per host). Trades ~5-10%% ranking "
+             "accuracy for a ~30-60+ second savings per series (probe phase "
+             "downloads sample images from each alt candidate and runs T1 "
+             "pixel-level scoring; with --enable-ml-rating it adds T2/T3 "
+             "model inference on top of that, multiplying the savings). "
+             "Designed for the Library tab's update-check downloads, where "
+             "the delta is typically 1-5 new chapters and the probe cost "
+             "dominates the actual download time. Cross-file: read in "
+             "aio_search_cli.find_alternatives_for_direct_url; when True, "
+             "passes img_quality_cache=None to sites.search_orchestrator."
+             "search_all so the probe phase at the `if img_cache is not "
+             "None and candidates:` gate is skipped. The _quality_for "
+             "comparator falls back to seed_quality cleanly. Has no effect "
+             "without --multi-source or in --multi-source-prefetched mode "
+             "(the prefetched path never runs the probe).",
+    )
     # --- External metadata enrichment (opt-in, single-source AniList) ---
     # When enabled, queries https://graphql.anilist.co for ranked
     # categorized tags + plaintext description + country/format +
