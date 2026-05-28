@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Button, Input, Badge } from "@/components/ui/primitives";
 import {
   Search,
@@ -23,6 +23,7 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import UpdatesCenter from "./UpdatesCenter";
 
 // Convert a Windows file path to a localfile:// URL the renderer can load.
 function fileToUrl(filePath) {
@@ -820,12 +821,36 @@ export default function LibraryTab({
   const [selectedEntry, setSelectedEntry] = useState(null);
 
   // New chapter counts per series (folderPath → count).
-  // Populated by "Check All" or individual checks.
+  // Populated by "Check All" or individual checks. Drives the orange "+N
+  // new" badge on each MangaCard, so dismissing a card must mutate this so
+  // the badge clears.
   const [newChapterCounts, setNewChapterCounts] = useState({});
 
-  // Check-all state
-  const [checkingAll, setCheckingAll] = useState(false);
-  const [checkProgress, setCheckProgress] = useState(null);
+  // ── Updates Center state ──
+  // `seriesStates` is the live Map<folderPath, SeriesState> the panel
+  // renders. SeriesState shape:
+  //   {
+  //     folderPath, title, cover, site,
+  //     state: "queued" | "running" | "found" | "uptodate" | "error",
+  //     newChapters?: string[],   // when state === "found"
+  //     total?: number,           // total chapters on site (uptodate/found)
+  //     error?: string,           // shorthand sentinel (uptodate/error)
+  //     errorMessage?: string,    // full message
+  //     enqueuedAt: number,       // monotonic for stable section sort
+  //   }
+  // We keep it as a useRef + a forced bump counter so frequent IPC events
+  // don't re-mount the panel — the actual Map identity churn is throttled.
+  // Frequent re-renders during 30-series scans got janky when state was a
+  // plain object; the Map+bump pattern keeps each update O(1) without
+  // copying the whole structure.
+  const seriesStatesRef = useRef(new Map());
+  const [seriesStateVersion, setSeriesStateVersion] = useState(0);
+  const bumpStates = useCallback(() => setSeriesStateVersion((v) => v + 1), []);
+
+  // Scan-level state for the panel header / progress bar.
+  const [scanState, setScanState] = useState("idle"); // "idle" | "running" | "done"
+  const [scanStats, setScanStats] = useState({ completed: 0, total: 0, durationMs: 0 });
+  const [updatesPanelOpen, setUpdatesPanelOpen] = useState(false);
 
   // ── Load library on first mount only ──
   // libraryEntries is the null sentinel until the first scan completes.
@@ -838,62 +863,297 @@ export default function LibraryTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Listen for check-all-updates progress ──
+  // ── Listen for check-all-updates progress (richer event shape) ──
+  // Events come tagged by `kind`. The Map mutation is in-place (we read the
+  // ref, mutate it, then bump a version counter) so React re-renders the
+  // panel without copying every entry on every event — critical when 30+
+  // series each emit 3 events (queued, running, completed) in <60s.
   useEffect(() => {
     if (!window.electronAPI?.onUpdateCheckProgress) return;
-    const unsub = window.electronAPI.onUpdateCheckProgress((progress) => {
-      setCheckProgress(progress);
+    const unsub = window.electronAPI.onUpdateCheckProgress((event) => {
+      const map = seriesStatesRef.current;
+      switch (event.kind) {
+        case "queued": {
+          // Existing entry might be a previous scan's result — overwrite.
+          map.set(event.folderPath, {
+            folderPath: event.folderPath,
+            title: event.title,
+            cover: event.cover,
+            site: event.site,
+            state: "queued",
+            enqueuedAt: Date.now(),
+          });
+          setScanState("running");
+          setScanStats({ completed: 0, total: event.total, durationMs: 0 });
+          bumpStates();
+          break;
+        }
+        case "running": {
+          const prev = map.get(event.folderPath) || {
+            folderPath: event.folderPath,
+            title: event.title,
+            enqueuedAt: Date.now(),
+          };
+          map.set(event.folderPath, {
+            ...prev,
+            state: "running",
+            site: event.site || prev.site,
+          });
+          setScanStats((s) => ({ ...s, completed: event.completed, total: event.total }));
+          bumpStates();
+          break;
+        }
+        case "completed": {
+          const prev = map.get(event.folderPath) || {};
+          const r = event.result || {};
+          let state;
+          let extra = {};
+          if (r.error === "aborted") {
+            state = "error";
+            extra = { error: "aborted", errorMessage: "cancelled" };
+          } else if (r.error) {
+            state = "error";
+            extra = { error: r.error, errorMessage: r.message || r.error };
+          } else if (r.newChapters && r.newChapters.length > 0) {
+            state = "found";
+            extra = { newChapters: r.newChapters, total: r.total };
+          } else {
+            state = "uptodate";
+            extra = { total: r.total };
+          }
+          map.set(event.folderPath, {
+            ...prev,
+            folderPath: event.folderPath,
+            title: event.title || prev.title,
+            cover: r.cover || prev.cover,
+            site: r.site || prev.site,
+            state,
+            ...extra,
+          });
+          setScanStats((s) => ({ ...s, completed: event.completed, total: event.total }));
+
+          // Mirror "found" rows into newChapterCounts so the grid badges
+          // light up live as the scan progresses (matches the legacy
+          // behavior where the badge only appeared post-scan).
+          if (state === "found") {
+            setNewChapterCounts((prev) => ({
+              ...prev,
+              [event.folderPath]: r.newChapters.length,
+            }));
+          }
+
+          // Splice fresh metadata (status / authors / cover / genres) back
+          // into the entries list so the grid card + detail view reflect
+          // the live data without a manual Refresh. Same merge semantics
+          // as the legacy handler — only overwrite fields the live check
+          // populated, never drop chapters_downloaded etc.
+          if (r.updatedMeta) {
+            setEntries((entries) =>
+              entries.map((e) => {
+                if (e.folderPath !== event.folderPath) return e;
+                const merged = { ...e.seriesMeta };
+                for (const [k, v] of Object.entries(r.updatedMeta)) {
+                  if (v !== undefined && v !== null) merged[k] = v;
+                }
+                return { ...e, seriesMeta: merged };
+              })
+            );
+          }
+          bumpStates();
+          break;
+        }
+        case "done": {
+          setScanState("done");
+          setScanStats({
+            completed: event.completed,
+            total: event.total,
+            durationMs: event.durationMs,
+          });
+          bumpStates();
+          break;
+        }
+        default:
+          // Unknown event shape (e.g. an old main.js firing the legacy
+          // { current, total, title } payload). Ignore silently — when
+          // both ends are upgraded this branch is never reached.
+          break;
+      }
     });
     return unsub;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Check all ongoing series for updates ──
+  // ── Trigger a fresh scan ──
+  // Opens the panel (if closed), clears any previous scan results, and
+  // calls the IPC. The Promise return value is intentionally ignored — the
+  // event stream is the source of truth for the UI; the Promise just tells
+  // us when the sweep is fully drained (sectioned dispatch already handled
+  // by the "done" event).
   const handleCheckAll = useCallback(async () => {
     if (!window.electronAPI?.checkAllUpdates) return;
-    setCheckingAll(true);
-    setCheckProgress(null);
+    // Wipe last scan's bookkeeping so the panel reflects only this run.
+    seriesStatesRef.current = new Map();
+    bumpStates();
+    setScanState("running");
+    setScanStats({ completed: 0, total: 0, durationMs: 0 });
+    setUpdatesPanelOpen(true);
     try {
-      const res = await window.electronAPI.checkAllUpdates();
-      if (res.results) {
-        const counts = {};
-        // Each result also carries `updatedMeta` (status, authors, cover,
-        // genres) from the live --list-chapters call. Splice it back into
-        // entries so the grid + detail view reflect fresh metadata
-        // without requiring a manual Refresh after Check All.
-        const updatedMetas = {};
-        for (const r of res.results) {
-          if (!r.ok) continue;
-          if (r.newChapters?.length > 0) {
-            counts[r.folderPath] = r.newChapters.length;
-          }
-          if (r.updatedMeta) {
-            updatedMetas[r.folderPath] = r.updatedMeta;
-          }
-        }
-        setNewChapterCounts((prev) => ({ ...prev, ...counts }));
-        if (Object.keys(updatedMetas).length > 0) {
-          setEntries((prev) =>
-            prev.map((e) => {
-              const fresh = updatedMetas[e.folderPath];
-              if (!fresh) return e;
-              // Merge so we keep fields the live check didn't fetch
-              // (e.g. chapters_downloaded, hid, url) and only overwrite
-              // the metadata fields the live check actually returned.
-              const mergedMeta = { ...e.seriesMeta };
-              for (const [k, v] of Object.entries(fresh)) {
-                if (v !== undefined && v !== null) mergedMeta[k] = v;
-              }
-              return { ...e, seriesMeta: mergedMeta };
-            })
-          );
-        }
-      }
+      await window.electronAPI.checkAllUpdates();
     } catch (err) {
       console.error("Check all updates failed:", err);
+      setScanState("done");
     }
-    setCheckingAll(false);
-    setCheckProgress(null);
+  }, [bumpStates]);
+
+  // ── Open the panel without rescanning ──
+  // Used by the toolbar button when a previous scan's results are still
+  // in memory — clicking shouldn't blow them away just to re-open the view.
+  const handleOpenPanel = useCallback(() => {
+    setUpdatesPanelOpen(true);
   }, []);
+
+  // ── Cancel an in-flight scan ──
+  const handleCancelScan = useCallback(async () => {
+    if (!window.electronAPI?.cancelCheckAllUpdates) return;
+    try {
+      await window.electronAPI.cancelCheckAllUpdates();
+    } catch (err) {
+      console.error("Cancel check-all failed:", err);
+    }
+  }, []);
+
+  // ── Per-row queue (called from the panel) ──
+  // Builds the same download args as DetailView's "Download Missing
+  // Chapters" path so the user gets identical behavior whether they queue
+  // from the panel or the detail view. Pulls defaults from settings.
+  //
+  // One UpdatesCenter-specific override: seededRatingOnly is injected by
+  // default. The probe phase in search_all (run when --multi-source is on)
+  // costs ~30-60 s per series on MangaFire-class handlers — Playwright VRF
+  // per sample chapter plus image-quality scoring. For an update download
+  // that's typically 1-5 new chapters, that probe cost dominates the
+  // actual download. Skipping it falls back to sites/quality_seed.json's
+  // curated per-site quality priors for ranking (which is what the
+  // multi-source picker uses as a tiebreaker anyway when title-match
+  // scores are within 0.10 of each other). Cross-file: --seeded-rating-only
+  // is defined in aio-dl.py near --enable-ml-rating; downloader.js maps it
+  // via boolMap; aio_search_cli.find_alternatives_for_direct_url honors
+  // it by passing img_quality_cache=None into search_all. Opt out per the
+  // settings.updateChecksUseSeededRating toggle for users on stable
+  // handlers who want full probe accuracy.
+  const buildDownloadArgsForRow = useCallback((row, entry) => {
+    const meta = entry?.seriesMeta || {};
+    const rangeStr = chaptersToRangeString(row.newChapters);
+    const d = settings?.defaults || {};
+    const args = {
+      format: meta.format || d.format || "pdf",
+      quality: d.quality ?? 85,
+      chapters: rangeStr,
+      language: meta.language || "en",
+      site: meta.site || undefined,
+      verbose: settings?.verboseAlways ?? true,
+    };
+    if (d.scaling && d.scaling !== 100) args.scaling = d.scaling;
+    if (d.keepChapters) args.keepChapters = true;
+    if (d.noFinalFile) args.noFinalFile = true;
+    if (d.keepImages) args.keepImages = true;
+    if (d.noProcessing) args.noProcessing = true;
+    if (d.noCleanup) args.noCleanup = true;
+    if (d.imageWorkers && d.imageWorkers !== 3) args.imageWorkers = d.imageWorkers;
+    if (d.httpTimeout && d.httpTimeout !== 30) args.httpTimeout = d.httpTimeout;
+    if (d.httpMaxRetries && d.httpMaxRetries !== 6) args.httpMaxRetries = d.httpMaxRetries;
+    // Default on — settings.updateChecksUseSeededRating !== false catches
+    // both the explicit-true case and the default-undefined case. Has no
+    // effect when --multi-source isn't on (the alternatives discovery
+    // doesn't run, so there's nothing to probe in the first place).
+    if (settings?.updateChecksUseSeededRating !== false) {
+      args.seededRatingOnly = true;
+    }
+    return { url: meta.url, args };
+  }, [settings]);
+
+  const handleQueueRow = useCallback((row) => {
+    const entry = entries.find((e) => e.folderPath === row.folderPath);
+    if (!entry?.seriesMeta?.url) return;
+    const { url, args } = buildDownloadArgsForRow(row, entry);
+    onStartDownload(url, args);
+    // Clear the badge for the queued row — the user committed; if a new
+    // scan finds more later, the count will repopulate.
+    setNewChapterCounts((prev) => {
+      const next = { ...prev };
+      delete next[row.folderPath];
+      return next;
+    });
+    // Also strip the row from seriesStates so the "Updates Found" section
+    // shrinks. Keep an "uptodate" placeholder so the user sees feedback
+    // that the row was actioned (rather than vanishing without a trace).
+    const map = seriesStatesRef.current;
+    const existing = map.get(row.folderPath);
+    if (existing) {
+      map.set(row.folderPath, {
+        ...existing,
+        state: "uptodate",
+        newChapters: undefined,
+      });
+      bumpStates();
+    }
+  }, [entries, buildDownloadArgsForRow, onStartDownload, bumpStates]);
+
+  const handleQueueAll = useCallback(() => {
+    const map = seriesStatesRef.current;
+    const founds = [];
+    for (const row of map.values()) {
+      if (row.state === "found") founds.push(row);
+    }
+    for (const row of founds) {
+      const entry = entries.find((e) => e.folderPath === row.folderPath);
+      if (!entry?.seriesMeta?.url) continue;
+      const { url, args } = buildDownloadArgsForRow(row, entry);
+      onStartDownload(url, args);
+    }
+    // Bulk-clear all queued badges + downgrade rows to up-to-date.
+    setNewChapterCounts((prev) => {
+      const next = { ...prev };
+      for (const r of founds) delete next[r.folderPath];
+      return next;
+    });
+    for (const r of founds) {
+      const existing = map.get(r.folderPath);
+      if (existing) {
+        map.set(r.folderPath, {
+          ...existing,
+          state: "uptodate",
+          newChapters: undefined,
+        });
+      }
+    }
+    bumpStates();
+    onSwitchTab("queue");
+    setUpdatesPanelOpen(false);
+  }, [entries, buildDownloadArgsForRow, onStartDownload, onSwitchTab, bumpStates]);
+
+  // Clear badges for the given folderPaths without queueing anything.
+  // Used by the "Dismiss" buttons (per-row + bulk). The row itself stays in
+  // the panel as "uptodate" so the user can see the dismiss took effect.
+  const handleDismiss = useCallback((folderPaths) => {
+    setNewChapterCounts((prev) => {
+      const next = { ...prev };
+      for (const p of folderPaths) delete next[p];
+      return next;
+    });
+    const map = seriesStatesRef.current;
+    for (const p of folderPaths) {
+      const existing = map.get(p);
+      if (existing) {
+        map.set(p, {
+          ...existing,
+          state: "uptodate",
+          newChapters: undefined,
+        });
+      }
+    }
+    bumpStates();
+  }, [bumpStates]);
 
   const handleRefresh = useCallback(() => {
     setSelectedEntry(null);
@@ -936,11 +1196,46 @@ export default function LibraryTab({
     return copy;
   }, [filtered, sortBy]);
 
-  // Count how many series are eligible for "Check All"
+  // Count how many series are eligible for "Check All".
+  // Must mirror main.js's checkable filter — see the comment there. When
+  // settings.checkAllIncludeCompleted is on (default), Completed/Finished
+  // series count too because aggregators (notably mangafire) lie about
+  // status. If the user has opted out via Settings, restore the legacy
+  // ongoing-only filter.
+  const includeCompletedInCheck = settings?.checkAllIncludeCompleted !== false;
   const ongoingCount = entries.filter((e) => {
-    const s = e.seriesMeta?.status;
-    return e.seriesMeta?.url && (!s || s === "Ongoing" || s === "Releasing");
+    if (!e.seriesMeta?.url) return false;
+    if (includeCompletedInCheck) return true;
+    const s = e.seriesMeta.status;
+    return !s || s === "Ongoing" || s === "Releasing";
   }).length;
+
+  // Total updates found in the current/last scan. Drives the badge on the
+  // toolbar button so users see at a glance how many actionable updates
+  // are waiting in the panel.
+  // The dep on seriesStateVersion forces this to recompute when the Map
+  // mutates (the Ref's reference identity never changes).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const updatesFoundCount = useMemo(() => {
+    let n = 0;
+    for (const r of seriesStatesRef.current.values()) {
+      if (r.state === "found") n += 1;
+    }
+    return n;
+  }, [seriesStateVersion]);
+
+  // Shallow-cloned copy of the series-state Map. The ref's Map identity
+  // never changes (we mutate in place to avoid copy cost on every IPC
+  // event), but the UpdatesCenter panel's useMemo over seriesStates needs
+  // a fresh identity to recompute its grouping. Cloning once per version
+  // bump here gives the panel a stable "input changed" signal at the
+  // expense of one O(N) Map iteration per LibraryTab render — trivial
+  // for N ≤ a few hundred.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const seriesStatesSnapshot = useMemo(
+    () => new Map(seriesStatesRef.current),
+    [seriesStateVersion]
+  );
 
   // ── Detail view ──
   if (selectedEntry) {
@@ -989,22 +1284,63 @@ export default function LibraryTab({
           </select>
         </div>
 
-        {/* Check All Updates button — only shows when there are ongoing series */}
+        {/* Updates Center button.
+            Three label states:
+              - Scanning N/M  (during a sweep)
+              - Updates ●N    (after a sweep with N found, distinct accent)
+              - Check All     (fresh / no results to show)
+            Click behavior:
+              - While scanning: opens the panel (visible progress)
+              - After a sweep with results: opens the panel WITHOUT
+                re-scanning (the user just wants to see what's there)
+              - Otherwise: triggers a new scan AND opens the panel
+            Cross-file: UpdatesCenter.jsx is the rendered panel; its scan
+            state is owned here in LibraryTab. */}
         {ongoingCount > 0 && (
           <Button
             variant="outline"
             size="sm"
-            onClick={handleCheckAll}
-            disabled={checkingAll || loading}
-            className="gap-1.5 text-xs"
-            title={`Check ${ongoingCount} ongoing series for new chapters`}
+            onClick={() => {
+              if (scanState === "running") {
+                handleOpenPanel();
+              } else if (scanState === "done" && updatesFoundCount > 0) {
+                handleOpenPanel();
+              } else {
+                handleCheckAll();
+              }
+            }}
+            disabled={loading}
+            className={cn(
+              "gap-1.5 text-xs relative",
+              scanState === "done" && updatesFoundCount > 0 && [
+                "border-orange-500/50 text-orange-300",
+                "hover:bg-orange-500/10 hover:text-orange-200 hover:border-orange-500/60",
+              ]
+            )}
+            title={
+              scanState === "running"
+                ? `Scanning ${scanStats.completed} of ${scanStats.total}…`
+                : updatesFoundCount > 0
+                ? `${updatesFoundCount} series have new chapters — click to view`
+                : `Check ${ongoingCount} ongoing series for new chapters`
+            }
           >
-            {checkingAll
-              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              : <Bell className="w-3.5 h-3.5" />}
-            {checkingAll
-              ? (checkProgress ? `${checkProgress.current}/${checkProgress.total}` : "Checking…")
+            {scanState === "running" ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <Bell className="w-3.5 h-3.5" />
+            )}
+            {scanState === "running"
+              ? `Scanning ${scanStats.completed}/${scanStats.total}`
+              : scanState === "done" && updatesFoundCount > 0
+              ? `Updates ${updatesFoundCount}`
               : "Check All"}
+            {scanState === "done" && updatesFoundCount > 0 && (
+              <span
+                aria-hidden
+                className="absolute -top-0.5 -right-0.5 w-1.5 h-1.5 rounded-full bg-orange-400 shadow-[0_0_6px_rgba(249,115,22,0.8)]"
+              />
+            )}
           </Button>
         )}
 
@@ -1062,6 +1398,22 @@ export default function LibraryTab({
           </div>
         )}
       </div>
+
+      {/* ── Updates Center side-sheet ──
+          Rendered last so it overlays the grid + toolbar. */}
+      <UpdatesCenter
+        open={updatesPanelOpen}
+        onClose={() => setUpdatesPanelOpen(false)}
+        seriesStates={seriesStatesSnapshot}
+        scanState={scanState}
+        scanStats={scanStats}
+        onRescan={handleCheckAll}
+        onCancel={handleCancelScan}
+        onQueueRow={handleQueueRow}
+        onQueueAll={handleQueueAll}
+        onDismiss={handleDismiss}
+        hasCheckableSeries={ongoingCount > 0}
+      />
     </div>
   );
 }

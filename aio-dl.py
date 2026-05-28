@@ -2914,6 +2914,43 @@ def _media(path: str):
     return "image/jpeg"
 
 
+def _emit_tags_extended(tags: List[Any], indent: str = "  ") -> str:
+    """Render an AniList tag list as a <TagsExtended> XML block.
+
+    Empty list returns empty string so the caller can do
+    `if block: out.append(block)`. Categories and names are XML-escaped
+    (quoteattr for attribute values, escape for text content); numeric
+    and boolean attributes are rendered without quoting concerns.
+
+    `tags` is duck-typed as iterable of sites.external_metadata.AnilistTag
+    instances (name/category/rank/is_media_spoiler/is_general_spoiler).
+
+    Custom non-standard ComicInfo element — used by the user's own
+    reader for category/rank/spoiler-aware tag display. Standard
+    readers (Komga, Kavita) silently drop unknown elements per the
+    ComicInfo lenient-parsing convention. Cross-file:
+    sites/external_metadata.py:AnilistTag is the source dataclass; the
+    parallel comma-separated <Tags>/<SpoilerTags> emit alongside this
+    for standard-reader compat.
+    """
+    if not tags:
+        return ""
+    lines = [f"{indent}<TagsExtended>"]
+    for t in tags:
+        cat_attr = xml.sax.saxutils.quoteattr(getattr(t, "category", "") or "")
+        rank_attr = int(getattr(t, "rank", 0) or 0)
+        gen_spoiler = "true" if getattr(t, "is_general_spoiler", False) else "false"
+        med_spoiler = "true" if getattr(t, "is_media_spoiler", False) else "false"
+        name = xml.sax.saxutils.escape(str(getattr(t, "name", "") or ""))
+        lines.append(
+            f'{indent}  <Tag category={cat_attr} rank="{rank_attr}" '
+            f'generalSpoiler="{gen_spoiler}" mediaSpoiler="{med_spoiler}">'
+            f'{name}</Tag>'
+        )
+    lines.append(f"{indent}</TagsExtended>")
+    return "\n".join(lines)
+
+
 def build_comic_info_xml(
     title: str,
     comic_info: Dict,
@@ -2921,7 +2958,15 @@ def build_comic_info_xml(
     lang: str,
     page_count: int,
 ) -> str:
-    """Generates the ComicInfo.xml string for CBZ files."""
+    """Generates the ComicInfo.xml string for CBZ files.
+
+    Standard ComicInfo.xml elements are always emitted. Custom non-
+    standard elements (<Tags>/<SpoilerTags>/<TagsExtended>/
+    <CountryOfOrigin>/<MediaFormat>/<AnilistId>/<MalId>) are emitted
+    only when populated by --metadata-source=anilist enrichment (see
+    sites/external_metadata.py). Standard readers like Komga and
+    Kavita silently drop the custom ones.
+    """
 
     def escape(s):
         return xml.sax.saxutils.escape(s) if s else ""
@@ -2937,21 +2982,60 @@ def build_comic_info_xml(
             tags.extend(comic_info[key])
     genre = ", ".join(set(tags))
 
-    xml_template = f'''<?xml version="1.0" encoding="utf-8"?>
-<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-    <Title>{escape(title)}</Title>
-    <Series>{escape(title)}</Series>
-    <Summary>{escape(description)}</Summary>
-    <Writer>{escape(authors)}</Writer>
-    <Penciller>{escape(artists)}</Penciller>
-    <Publisher>{escape(publisher)}</Publisher>
-    <Genre>{escape(genre)}</Genre>
-    <LanguageISO>{escape(lang)}</LanguageISO>
-    <PageCount>{page_count}</PageCount>
-    <ScanInformation>{escape(publisher)}</ScanInformation>
-</ComicInfo>
-'''
-    return xml_template
+    # AniList enrichment fields — populated only when
+    # --metadata-source=anilist found a confident match (else absent).
+    # See sites/external_metadata.py for the field provenance.
+    anilist_tags = comic_info.get("anilist_tags") or []
+    anilist_spoiler_tags = comic_info.get("anilist_spoiler_tags") or []
+    country = comic_info.get("country_of_origin")
+    media_format = comic_info.get("media_format")
+    anilist_id = comic_info.get("anilist_id")
+    mal_id = comic_info.get("mal_id")
+
+    lines: List[str] = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">',
+        f'    <Title>{escape(title)}</Title>',
+        f'    <Series>{escape(title)}</Series>',
+        f'    <Summary>{escape(description)}</Summary>',
+        f'    <Writer>{escape(authors)}</Writer>',
+        f'    <Penciller>{escape(artists)}</Penciller>',
+        f'    <Publisher>{escape(publisher)}</Publisher>',
+        f'    <Genre>{escape(genre)}</Genre>',
+    ]
+
+    if anilist_tags:
+        comma_tags = ", ".join(t.name for t in anilist_tags)
+        lines.append(f'    <Tags>{escape(comma_tags)}</Tags>')
+    if anilist_spoiler_tags:
+        comma_spoilers = ", ".join(t.name for t in anilist_spoiler_tags)
+        lines.append(f'    <SpoilerTags>{escape(comma_spoilers)}</SpoilerTags>')
+    if anilist_tags or anilist_spoiler_tags:
+        # Combine into one <TagsExtended> block — the per-tag
+        # mediaSpoiler/generalSpoiler attributes preserve the split.
+        block = _emit_tags_extended(
+            list(anilist_tags) + list(anilist_spoiler_tags),
+            indent="    ",
+        )
+        if block:
+            lines.append(block)
+
+    lines.append(f'    <LanguageISO>{escape(lang)}</LanguageISO>')
+    lines.append(f'    <PageCount>{page_count}</PageCount>')
+    lines.append(f'    <ScanInformation>{escape(publisher)}</ScanInformation>')
+
+    if country:
+        lines.append(f'    <CountryOfOrigin>{escape(country)}</CountryOfOrigin>')
+    if media_format:
+        lines.append(f'    <MediaFormat>{escape(media_format)}</MediaFormat>')
+    if anilist_id is not None:
+        lines.append(f'    <AnilistId>{int(anilist_id)}</AnilistId>')
+    if mal_id is not None:
+        lines.append(f'    <MalId>{int(mal_id)}</MalId>')
+
+    lines.append('</ComicInfo>')
+    return "\n".join(lines) + "\n"
 
 
 # -----------------------------------------------------------
@@ -3096,6 +3180,28 @@ def build_per_chapter_comic_info_xml(
         lines.append(f'  <Translator>{escape(scanlator)}</Translator>')
     if genre:
         lines.append(f'  <Genre>{escape(genre)}</Genre>')
+
+    # AniList enrichment fields — emitted only when --metadata-source=
+    # anilist produced a confident match for this series. See
+    # sites/external_metadata.py + the enrichment block in main() right
+    # after allocate_series_output_dir. Standard ComicInfo readers
+    # (Komga, Kavita) drop unknown elements silently.
+    anilist_tags = comic_info.get("anilist_tags") or []
+    anilist_spoiler_tags = comic_info.get("anilist_spoiler_tags") or []
+    if anilist_tags:
+        comma_tags = ", ".join(t.name for t in anilist_tags)
+        lines.append(f'  <Tags>{escape(comma_tags)}</Tags>')
+    if anilist_spoiler_tags:
+        comma_spoilers = ", ".join(t.name for t in anilist_spoiler_tags)
+        lines.append(f'  <SpoilerTags>{escape(comma_spoilers)}</SpoilerTags>')
+    if anilist_tags or anilist_spoiler_tags:
+        block = _emit_tags_extended(
+            list(anilist_tags) + list(anilist_spoiler_tags),
+            indent="  ",
+        )
+        if block:
+            lines.append(block)
+
     if web_url:
         lines.append(f'  <Web>{escape(web_url)}</Web>')
     if lang:
@@ -3105,6 +3211,23 @@ def build_per_chapter_comic_info_xml(
         lines.append(f'  <Month>{month}</Month>')
         lines.append(f'  <Day>{day}</Day>')
     lines.append(f'  <PageCount>{int(page_count) if page_count else 0}</PageCount>')
+
+    # AniList enrichment singletons. Placed at the end (after <PageCount>)
+    # so the standard ComicInfo block stays first and structurally intact
+    # for any reader that scans top-to-bottom.
+    country = comic_info.get("country_of_origin")
+    media_format = comic_info.get("media_format")
+    anilist_id = comic_info.get("anilist_id")
+    mal_id = comic_info.get("mal_id")
+    if country:
+        lines.append(f'  <CountryOfOrigin>{escape(country)}</CountryOfOrigin>')
+    if media_format:
+        lines.append(f'  <MediaFormat>{escape(media_format)}</MediaFormat>')
+    if anilist_id is not None:
+        lines.append(f'  <AnilistId>{int(anilist_id)}</AnilistId>')
+    if mal_id is not None:
+        lines.append(f'  <MalId>{int(mal_id)}</MalId>')
+
     lines.append('</ComicInfo>')
     return "\n".join(lines) + "\n"
 
@@ -3928,7 +4051,13 @@ _SAVED_PARAMS_FILE = "download_params.json"
 
 
 def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
-    """Persist legacy update settings alongside the canonical .aio_series.json."""
+    """Persist legacy update settings alongside the canonical .aio_series.json.
+
+    Cross-file: _append_saved_update_options reads the same dict shape to
+    rebuild child commands during --update-all. Any key written here that
+    isn't also read there silently becomes a no-op on replay — pair every
+    new field with a matching replay branch.
+    """
     data = {
         "url": url,
         "title": title,
@@ -3953,6 +4082,25 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
         "no_cleanup": bool(getattr(args, "no_cleanup", False)),
         "verbose": bool(getattr(args, "verbose", False)),
         "debug": bool(getattr(args, "debug", False)),
+        # External metadata enrichment (--metadata-source family). Must be
+        # persisted so --update-all child commands continue to apply the
+        # AniList enrichment instead of silently downgrading to the default
+        # metadata_source=none. Without this, every newly downloaded update
+        # chapter would carry only site-derived ComicInfo tags +
+        # description, diverging from the original download's enriched
+        # ComicInfo (Tags / SpoilerTags / TagsExtended / CountryOfOrigin /
+        # MediaFormat / AnilistId / MalId). Cross-file: the argparse
+        # registration is near --enable-ml-rating (grep --metadata-source);
+        # enrichment runs in main() at the
+        # `if getattr(args, "metadata_source", "none") == "anilist":`
+        # check; the replay branch lives in _append_saved_update_options.
+        # The `or "none"` / `or 50` defenses handle the rare case where
+        # args carries the dest but with an explicit None (e.g. test
+        # harness building a Namespace by hand). Argparse default-paths
+        # always populate the string/int form.
+        "metadata_source": str(getattr(args, "metadata_source", "none") or "none"),
+        "metadata_tag_min_rank": int(getattr(args, "metadata_tag_min_rank", 50) or 50),
+        "metadata_refresh": bool(getattr(args, "metadata_refresh", False)),
     }
     if getattr(args, "format", None) == "epub":
         data["epub_layout"] = getattr(args, "epub_layout", "vertical")
@@ -3965,8 +4113,48 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
         print(f"  Warning: could not save download parameters: {exc}")
 
 
+def _load_cached_anilist_id(out_dir: str) -> Optional[int]:
+    """Read anilist_id from an existing .aio_series.json in `out_dir`.
+
+    Returns the cached AniList ID as int, or None when absent /
+    malformed / unparseable. Tolerant to every failure mode (no file,
+    bad JSON, missing key, non-numeric value) since this is a best-
+    effort fast path — callers fall through to a fresh AniList search
+    when this returns None.
+
+    Cross-file: consumed by the --metadata-source=anilist enrichment
+    hook in main() right after allocate_series_output_dir. Written by
+    the .aio_series.json writer at the end of main(). The key name
+    `anilist_id` must match the writer (grep '"anilist_id"').
+    """
+    if not out_dir:
+        return None
+    path = os.path.join(out_dir, ".aio_series.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    value = data.get("anilist_id")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -> None:
-    """Replay saved per-series options for --update-all child runs."""
+    """Replay saved per-series options for --update-all child runs.
+
+    Cross-file: paired with _save_download_params which writes the dict.
+    Old download_params.json files written before a field was added will
+    silently lack the key — `params.get(...)` returns None and the
+    corresponding branch is a no-op, so this is forward-compatible
+    without an explicit migration.
+    """
     if params.get("site"):
         child_cmd.extend(["--site", str(params["site"])])
     if params.get("epub_layout"):
@@ -4001,6 +4189,29 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
     ):
         if params.get(key):
             child_cmd.append(flag)
+    # External metadata enrichment (--metadata-source family). Saved by
+    # _save_download_params; absence in older download_params.json files
+    # silently degrades to the default-off behavior (the get returns None
+    # and the gate skips). Without these branches, the original
+    # download's --metadata-source anilist intent is lost on every
+    # subsequent --update-all child — the child defaults to
+    # metadata_source=none and the newly downloaded chapters ship with
+    # site-only metadata, diverging from the parent series' enriched
+    # ComicInfo. metadata_tag_min_rank is only meaningful when
+    # enrichment is on; skip emitting "--metadata-source none" entirely
+    # (no-op but adds spawn-line noise). metadata_refresh persists the
+    # user's original intent — if they originally passed --metadata-
+    # refresh they wanted cache-bypassing fuzzy re-match on every
+    # update; the cached anilist_id in .aio_series.json still short-
+    # circuits when the flag was NOT saved (common case → fast).
+    metadata_source = params.get("metadata_source")
+    if metadata_source and metadata_source != "none":
+        child_cmd.extend(["--metadata-source", str(metadata_source)])
+        saved_rank = params.get("metadata_tag_min_rank")
+        if isinstance(saved_rank, int) and saved_rank != 50:
+            child_cmd.extend(["--metadata-tag-min-rank", str(saved_rank)])
+    if params.get("metadata_refresh"):
+        child_cmd.append("--metadata-refresh")
 
 
 def get_resumable_params(args, parser, calculated_width, calculated_aspect_ratio):
@@ -5155,6 +5366,70 @@ def main():
              "hosts with a degraded WMI service, hanging --search forever. "
              "Honors AIO_ENABLE_ML_RATING=1 env var so power users can "
              "set the preference once.",
+    )
+    p.add_argument(
+        "--seeded-rating-only",
+        action="store_true",
+        help="Skip the image-quality probe phase entirely when --multi-source "
+             "is set on a direct URL. The orchestrator ranks alternatives "
+             "purely from sites/quality_seed.json's curated per-site priors "
+             "(0.0-1.0 quality numbers per host). Trades ~5-10%% ranking "
+             "accuracy for a ~30-60+ second savings per series (probe phase "
+             "downloads sample images from each alt candidate and runs T1 "
+             "pixel-level scoring; with --enable-ml-rating it adds T2/T3 "
+             "model inference on top of that, multiplying the savings). "
+             "Designed for the Library tab's update-check downloads, where "
+             "the delta is typically 1-5 new chapters and the probe cost "
+             "dominates the actual download time. Cross-file: read in "
+             "aio_search_cli.find_alternatives_for_direct_url; when True, "
+             "passes img_quality_cache=None to sites.search_orchestrator."
+             "search_all so the probe phase at the `if img_cache is not "
+             "None and candidates:` gate is skipped. The _quality_for "
+             "comparator falls back to seed_quality cleanly. Has no effect "
+             "without --multi-source or in --multi-source-prefetched mode "
+             "(the prefetched path never runs the probe).",
+    )
+    # --- External metadata enrichment (opt-in, single-source AniList) ---
+    # When enabled, queries https://graphql.anilist.co for ranked
+    # categorized tags + plaintext description + country/format +
+    # MAL cross-reference per series. Results merge into comic_data
+    # and propagate to ComicInfo.xml (new <Tags>/<SpoilerTags>/
+    # <TagsExtended>/<CountryOfOrigin>/<MediaFormat>/<AnilistId>/
+    # <MalId> elements) and .aio_series.json (cached IDs so resume
+    # short-circuits the fuzzy title-match step). Default off; opt-in
+    # via flag or AIO_METADATA_SOURCE env var. The flags are NOT in
+    # _RESUME_GATING_DESTS — they affect metadata only, not image
+    # bytes. Cross-file: sites/external_metadata.py owns the client.
+    p.add_argument(
+        "--metadata-source",
+        choices=["none", "anilist"],
+        default=os.environ.get("AIO_METADATA_SOURCE", "none"),
+        help="Enrich tags + description + country/format from an "
+             "external API. 'anilist' uses the free AniList GraphQL "
+             "API (graphql.anilist.co, 90 req/min, no auth). Default: "
+             "none. Honors AIO_METADATA_SOURCE env var. The matched "
+             "AniList + MAL IDs are cached in .aio_series.json so "
+             "resume + --update-all runs skip the fuzzy title-match "
+             "search step.",
+    )
+    p.add_argument(
+        "--metadata-tag-min-rank",
+        type=int,
+        default=50,
+        help="When --metadata-source=anilist, only include tags whose "
+             "AniList relevance rank (0-100) meets this threshold in "
+             "ComicInfo.xml <Tags>/<SpoilerTags>/<TagsExtended> and "
+             ".aio_series.json. Default: 50 (moderately relevant). Set "
+             "to 0 to include every tag; 80 for very-relevant-only.",
+    )
+    p.add_argument(
+        "--metadata-refresh",
+        action="store_true",
+        help="Force re-fetch from the configured --metadata-source "
+             "even when an external ID is already cached in "
+             ".aio_series.json. Use after AniList re-tags a series, "
+             "or to backfill an existing library where the cached ID "
+             "is known stale.",
     )
     p.add_argument(
         "--prefetch-image-workers",
@@ -6483,15 +6758,59 @@ def main():
     # Only needs the page HTML + chapter list API call — no image VRF, no downloads.
     # IMPORTANT: This runs BEFORE allocate_series_output_dir so it doesn't
     # create empty folders in manga/ just for checking.
+    #
+    # collapse-aware: when --collapse-splits is set, the emitted chapter list
+    # mirrors what `group_chapters_for_download` would actually surface for
+    # download (same function used post-filtering at the `groups = ...` call
+    # below this block). Without this, fragment-shaped decimals (mangafire's
+    # 52.1 next to 52, sequential split clusters, etc.) leak into the UI's
+    # diff against meta.chapters_downloaded and stick as "+N new" forever
+    # because no download path produces them under collapse. Cross-file: the
+    # Electron-side caller is UI-source/electron/main.js:_checkSeriesUpdates;
+    # the Library "Check All" path forwards settings.collapseSplits into the
+    # spawn so this branch fires exactly when the user has collapse on.
     if getattr(args, "list_chapters", False):
-        # Deduplicate chapter numbers (pool may have multiple versions per chapter)
+        # Deduplicate by normalized chapter label. The regular flow at
+        # `chapters_by_num` normalizes float/str chap fields with `:g` so
+        # handlers that emit 4.0 (mangathemesia subclasses) don't split
+        # from "4"-emitting peers; we mirror that here so the dedupe and
+        # the optional collapse pass see the same canonical keys.
         seen_nums = set()
-        unique_chapters = []
+        deduped_pool: List[Dict[str, Any]] = []
         for ch in pool:
             num = ch.get("chap")
-            if num is not None and num not in seen_nums:
-                seen_nums.add(num)
-                unique_chapters.append(num)
+            if num is None:
+                continue
+            if isinstance(num, (int, float)):
+                num = f"{num:g}"
+            else:
+                num = str(num)
+            if num in seen_nums:
+                continue
+            seen_nums.add(num)
+            # Carry the dict shape (group_chapters_for_download needs it) but
+            # with the normalized label injected so its `_extract_chapter_num`
+            # parse and our diff target both see the same string.
+            deduped_pool.append({**ch, "chap": num})
+
+        collapse_splits_enabled = bool(getattr(args, "collapse_splits", False))
+        if collapse_splits_enabled:
+            # Same function the actual download path uses. consensus_set is
+            # None for single-URL --list-chapters mode (no multi-source peer
+            # data); group_chapters_for_download falls through to its
+            # in-source-only Rule 2 / 3b / 6 heuristics in that case — same
+            # behavior the download would produce. Cross-file: see
+            # sites/chapter_merger.py:group_chapters_for_download for the
+            # full cluster-rule table.
+            groups = group_chapters_for_download(
+                deduped_pool,
+                collapse_splits=True,
+                consensus_set=_multi_source_consensus_set,
+            )
+            unique_chapters = [g.label for g in groups]
+        else:
+            unique_chapters = [ch["chap"] for ch in deduped_pool]
+
         # Sort numerically
         try:
             unique_chapters.sort(key=lambda x: float(x))
@@ -6509,6 +6828,7 @@ def main():
             "genres": comic_data.get("genres", []),
             "total": len(unique_chapters),
             "chapters": unique_chapters,
+            "collapse_applied": collapse_splits_enabled,
         }
         print(json.dumps(result))
         sys.exit(0)
@@ -6533,6 +6853,69 @@ def main():
     if epub_dir_base:
         epub_out_dir = allocate_series_output_dir(title, hid, root=epub_dir_base)
         setattr(args, "epub_dir", epub_out_dir)
+
+    # --- External metadata enrichment (--metadata-source anilist) ---
+    # Runs AFTER allocate_series_output_dir so the cache lookup uses the
+    # final per-series path (.aio_series.json lives there). The fields
+    # enrichment writes into comic_data propagate to every downstream
+    # sink: ComicInfo.xml builders (build_comic_info_xml +
+    # build_per_chapter_comic_info_xml), Komikku details.json writer
+    # (genres union), and .aio_series.json writer (full ID + tag persist).
+    # Failures are swallowed — site-only metadata is the fallback path.
+    # Cross-file: sites/external_metadata.py owns the client; CLI flags
+    # registered near --enable-ml-rating; cache key in .aio_series.json
+    # is "anilist_id" (must match _load_cached_anilist_id reader).
+    if getattr(args, "metadata_source", "none") == "anilist":
+        try:
+            from sites.external_metadata import enrich_from_anilist
+            cached_id = _load_cached_anilist_id(out_dir)
+            year_hint: Optional[int] = None
+            try:
+                if comic_data.get("year"):
+                    year_hint = int(comic_data["year"])
+            except (TypeError, ValueError):
+                year_hint = None
+            comic_data = enrich_from_anilist(
+                comic_data,
+                hid=hid,
+                handler_name=handler.name,
+                year=year_hint,
+                cover_url=comic_data.get("cover"),
+                tag_min_rank=int(getattr(args, "metadata_tag_min_rank", 50)),
+                force_refresh=bool(getattr(args, "metadata_refresh", False)),
+                cached_anilist_id=cached_id,
+            )
+            if comic_data.get("anilist_id"):
+                refresh = bool(getattr(args, "metadata_refresh", False))
+                if cached_id and not refresh:
+                    cache_note = " (cache hit by AniList ID)"
+                elif refresh:
+                    cache_note = " (refresh forced)"
+                else:
+                    cache_note = ""
+                log_verbose(
+                    f"  AniList enrichment: matched id="
+                    f"{comic_data['anilist_id']} "
+                    f"mal_id={comic_data.get('mal_id', 'n/a')} "
+                    f"country={comic_data.get('country_of_origin', '?')} "
+                    f"format={comic_data.get('media_format', '?')} "
+                    f"({len(comic_data.get('anilist_tags', []))} tags, "
+                    f"{len(comic_data.get('anilist_spoiler_tags', []))} "
+                    f"spoiler-tags){cache_note}"
+                )
+            else:
+                best_score = comic_data.pop("_anilist_best_score", 0.0) or 0.0
+                log_verbose(
+                    f"  AniList enrichment: no confident match for "
+                    f"'{comic_data.get('title', '?')}' "
+                    f"(best rapidfuzz score {best_score:.1f} < 75 "
+                    f"threshold) — continuing with site-only metadata"
+                )
+        except Exception as exc:
+            log_verbose(
+                f"  AniList enrichment failed (continuing with "
+                f"site-only data): {type(exc).__name__}: {exc}"
+            )
 
     # --- Chapter Selection Logic ---
     log_verbose("Filtering chapters based on preferences...")
@@ -8974,6 +9357,22 @@ def main():
             key=lambda x: float(x),
         )
 
+        # Serialize AniList tags as dicts (the AnilistTag dataclass
+        # doesn't survive json.dump). Empty lists when enrichment was
+        # off or no confident match — keeps the schema uniform so the
+        # library UI / user's reader can rely on the field always
+        # existing. Cross-file: sites/external_metadata.py:AnilistTag
+        # is the source; aio-dl.py:_load_cached_anilist_id reads
+        # "anilist_id" back on subsequent runs.
+        def _tag_to_dict(t: Any) -> Dict[str, Any]:
+            return {
+                "name": getattr(t, "name", ""),
+                "category": getattr(t, "category", ""),
+                "rank": int(getattr(t, "rank", 0) or 0),
+                "is_media_spoiler": bool(getattr(t, "is_media_spoiler", False)),
+                "is_general_spoiler": bool(getattr(t, "is_general_spoiler", False)),
+            }
+
         series_meta = {
             "url": args.comic_url,
             "hid": hid,
@@ -8989,6 +9388,22 @@ def main():
             "chapters_downloaded": merged_downloaded,
             "total_available_at_download": len(pool),
             "last_downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            # --- AniList enrichment fields (--metadata-source=anilist) ---
+            # Populated when enrichment matched a series confidently;
+            # null/empty when no match or feature disabled. The cached
+            # IDs let resume + --update-all runs short-circuit the
+            # fuzzy title-match step. See sites/external_metadata.py.
+            "anilist_id": comic_data.get("anilist_id"),
+            "mal_id": comic_data.get("mal_id"),
+            "country_of_origin": comic_data.get("country_of_origin"),
+            "media_format": comic_data.get("media_format"),
+            "anilist_synonyms": list(comic_data.get("anilist_synonyms") or []),
+            "anilist_tags": [
+                _tag_to_dict(t) for t in (comic_data.get("anilist_tags") or [])
+            ],
+            "anilist_spoiler_tags": [
+                _tag_to_dict(t) for t in (comic_data.get("anilist_spoiler_tags") or [])
+            ],
         }
 
         with open(series_meta_path, "w", encoding="utf-8") as f:

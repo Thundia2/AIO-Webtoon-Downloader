@@ -134,6 +134,16 @@ function buildCliArgs(args) {
     jobRetries: "--job-retries",
     jobSpawnGap: "--job-spawn-gap",
     coordDir: "--coord-dir",
+    // External metadata enrichment (--metadata-source family).
+    // Surfaced as top-level settings in SettingsTab → Metadata Enrichment;
+    // useDownloader.queueDownload only injects metadataSource when the user
+    // turned the master toggle on (i.e. value != "none"), so the natural
+    // "skip empty/null/undefined" filter below already keeps the
+    // default-off spawn clean. metadataTagMinRank is similarly only
+    // injected when it differs from the Python argparse default (50).
+    // Python side: aio-dl.py near --enable-ml-rating + sites/external_metadata.py.
+    metadataSource: "--metadata-source",
+    metadataTagMinRank: "--metadata-tag-min-rank",
   };
 
   // ── Boolean flags (no value, just present or absent) ──
@@ -158,6 +168,17 @@ function buildCliArgs(args) {
     // a separate translation step. aio-dl.py:3589 defines --seeded-only;
     // it's read inside find_alternatives_for_direct_url at line 4432.
     seededOnly: "--seeded-only",
+    // Skip the multi-source image-quality probe phase entirely. Ranking
+    // falls back to sites/quality_seed.json priors only. Designed for
+    // the Library tab's UpdatesCenter downloads where the delta is
+    // typically a few chapters and the probe (30-60+ s per series on
+    // MangaFire-class handlers) dominates the actual download. Injected
+    // by LibraryTab.jsx's buildDownloadArgsForRow when
+    // settings.updateChecksUseSeededRating is on (default). Python
+    // side: aio-dl.py near --enable-ml-rating defines the flag; read
+    // in aio_search_cli.find_alternatives_for_direct_url which passes
+    // img_quality_cache=None into search_all when set.
+    seededRatingOnly: "--seeded-rating-only",
     // LINE Webtoon WebP recompression master toggle (Phase 1, 2026-05-11).
     // Python-side gates the actual encode pass on handler.name match, so
     // emitting this flag for non-webtoons.com downloads is a safe no-op.
@@ -180,6 +201,13 @@ function buildCliArgs(args) {
     // of their per-handler SUPPORTS_FAST_DOWNLOAD flag. Useful for
     // curl_cffi version bugs or CDN-vs-impersonation issues.
     noFastDownload: "--no-fast-download",
+    // External metadata force-refresh — companion to the valued
+    // metadataSource flag above. Only injected by queueDownload when
+    // metadataSource !== "none" AND the user explicitly turned the
+    // refresh switch on in Settings → Metadata Enrichment. Python-side
+    // bypasses the cached-AniList-ID fast path and re-runs the fuzzy
+    // title-match search on every download. See sites/external_metadata.py.
+    metadataRefresh: "--metadata-refresh",
   };
 
   // Add valued arguments

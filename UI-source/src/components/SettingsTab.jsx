@@ -132,6 +132,51 @@ export default function SettingsTab({ settings, onSave }) {
     // When true, update checks scan actual files on disk instead of
     // trusting .aio_series.json. Saved as a top-level setting.
     useFileBasedChapterCheck: false,
+    // ── Library Check All filter ──
+    // When true (default), "Check All" includes series marked Completed /
+    // Finished, not just Ongoing / Releasing. Many aggregators — mangafire
+    // most notoriously — slap "Completed" on actively-updating series, so
+    // skipping them by default would silently leave the user months behind
+    // on a chunk of their library. The cost of an extra check on a truly
+    // completed series is ~one Python proc (handled by the parallel pool
+    // in <1 ms of wall-time per slot saturation), vs. the cost of missing
+    // weeks of releases by trusting the bad metadata. Cross-file: the
+    // filter lives in UI-source/electron/main.js:check-all-updates handler;
+    // LibraryTab.jsx mirrors the filter for the toolbar's ongoingCount.
+    checkAllIncludeCompleted: true,
+    // Parallel "Check All" worker count. Clamped to [1, 8] by main.js. 4 is
+    // the safe sweet spot — finishes 30 series in 30-60s while keeping any
+    // single site from getting hit with 4+ concurrent --list-chapters calls
+    // (the provider-aware scheduler in main.js further fans across distinct
+    // sites when possible).
+    checkAllConcurrency: 4,
+    // When ON (default), downloads queued from the UpdatesCenter panel get
+    // --seeded-rating-only injected so the multi-source rating skips its
+    // image-quality probe phase and ranks alternatives from
+    // sites/quality_seed.json's per-site priors instead. Saves 30-60+ s
+    // per series on MangaFire-class handlers (the probe runs Playwright
+    // VRF per sample chapter plus image-quality scoring). For a 1-5
+    // chapter update delta, the probe cost dwarfs the actual download.
+    // Off restores full probe accuracy at the per-download cost — pick
+    // off only if you've tuned multi-source ranking carefully and want
+    // every download to use measured scores. Read in LibraryTab.jsx's
+    // buildDownloadArgsForRow; flag plumbed via downloader.js's
+    // seededRatingOnly boolMap entry; honored in aio_search_cli.
+    // find_alternatives_for_direct_url.
+    updateChecksUseSeededRating: true,
+    // ── External metadata enrichment (--metadata-source family) ──
+    // Top-level "global setting" semantic: applies to EVERY download
+    // regardless of which tab spawned it (New / Search / Library / queue).
+    // useDownloader.queueDownload injects these into args for every
+    // electronAPI.startDownload, so it's a true app-wide preference rather
+    // than a per-download form value. Defaults match the Python argparse
+    // defaults so a Save with the section untouched is a no-op for the
+    // spawn line. Python side: aio-dl.py near --enable-ml-rating (flag
+    // registration) + sites/external_metadata.py (the AniList GraphQL
+    // client). Grep cross-file: metadataSource, metadata-source.
+    metadataSource: "none",
+    metadataTagMinRank: 50,
+    metadataRefresh: false,
     // Whether the app is running from an installed .exe (bundled mode)
     // or from source (dev mode). Set by main.js, read-only here.
     isPackaged: false,
@@ -333,6 +378,17 @@ export default function SettingsTab({ settings, onSave }) {
       noFastDownload: false,
       logUpdateInterval: 100,
       useFileBasedChapterCheck: false,
+      // Mirror initial state: Check All includes Completed by default, four
+      // parallel workers. See rationale in the initial useState above.
+      checkAllIncludeCompleted: true,
+      checkAllConcurrency: 4,
+      updateChecksUseSeededRating: true,
+      // Metadata enrichment defaults — mirror the initial-state block above.
+      // Off/default values match the Python argparse defaults so Reset
+      // produces a clean "no spawn-line metadata flags" state.
+      metadataSource: "none",
+      metadataTagMinRank: 50,
+      metadataRefresh: false,
       defaults: {
         format: "pdf",
         language: "en",
@@ -671,6 +727,118 @@ export default function SettingsTab({ settings, onSave }) {
             checked={!!local.defaults.komikku}
             onCheckedChange={(v) => setDefault("komikku", v)}
           />
+        </div>
+
+        {/* Metadata Enrichment ────────────────────────────────────
+            Opt-in global setting — when on, every download spawn injects
+            --metadata-source anilist into the CLI args. useDownloader.
+            queueDownload reads from settingsRef.current and adds the
+            flag for every electronAPI.startDownload, so the toggle
+            applies app-wide (New / Search / Library / queue). The two
+            sub-options (tag rank floor, force-refresh) only emit on
+            spawn when source !== "none" AND the value differs from
+            Python argparse defaults, keeping the spawn line clean.
+            Python side: aio-dl.py near --enable-ml-rating registers the
+            three flags; sites/external_metadata.py runs the AniList
+            GraphQL client. Cross-file: useDownloader.queueDownload
+            injection + electron/downloader.js:buildCliArgs:flagMap+boolMap
+            CLI translation. */}
+        <SectionHeader>Metadata Enrichment</SectionHeader>
+        <p className="text-[10px] text-muted-foreground -mt-1 mb-2 leading-snug">
+          Pull normalized tags, descriptions, and country/format from the free{" "}
+          <a
+            href="https://anilist.co"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-mono underline decoration-dotted underline-offset-2 hover:text-foreground"
+          >
+            AniList GraphQL API
+          </a>{" "}
+          (90 req/min, no auth, no account). Results merge into{" "}
+          <span className="font-mono">ComicInfo.xml</span> and{" "}
+          <span className="font-mono">.aio_series.json</span> on every download —
+          ID-cached so resume / update runs do a single fetch-by-id instead of
+          re-searching. Off by default; opt in if you want filterable, ranked,
+          spoiler-aware tags in your reader.
+        </p>
+        <div className="space-y-3">
+          <div className="flex items-start gap-3">
+            <Switch
+              checked={local.metadataSource === "anilist"}
+              onCheckedChange={(v) => set("metadataSource", v ? "anilist" : "none")}
+              className="mt-0.5"
+            />
+            <div className="flex-1">
+              <Label className="text-xs cursor-pointer">
+                Enable AniList enrichment
+              </Label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Adds 1 GraphQL round-trip per series (first download) or 1
+                fetch-by-id (cached afterwards). Failures are non-fatal — the
+                download continues with site-only metadata and logs a single
+                warning line.
+              </p>
+            </div>
+          </div>
+          {local.metadataSource === "anilist" && (
+            <div className="pl-12 animate-slide-up space-y-3">
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs">Tag relevance threshold</Label>
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    {local.metadataTagMinRank ?? 50}
+                  </Badge>
+                </div>
+                <Slider
+                  value={local.metadataTagMinRank ?? 50}
+                  onValueChange={(v) => set("metadataTagMinRank", v)}
+                  min={0}
+                  max={100}
+                  step={5}
+                />
+                <div className="flex justify-between mt-1 px-0.5">
+                  <span className="text-[10px] text-muted-foreground">
+                    0 — every tag
+                  </span>
+                  <span className="text-[10px] text-muted-foreground">
+                    50 — default
+                  </span>
+                  <span className="text-[10px] text-muted-foreground">
+                    100 — only top-rank
+                  </span>
+                </div>
+                <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                  AniList scores each tag <span className="font-mono">0–100</span> by
+                  relevance. Tags below this floor are dropped from{" "}
+                  <span className="font-mono">{"<Tags>"}</span> /{" "}
+                  <span className="font-mono">{"<SpoilerTags>"}</span> /{" "}
+                  <span className="font-mono">{"<TagsExtended>"}</span> in the
+                  ComicInfo.xml. At <span className="font-mono">50</span> a typical
+                  manga has ~15–25 tags; at <span className="font-mono">80</span>{" "}
+                  ~3–6 tags.
+                </p>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex-1">
+                  <Label className="text-xs cursor-pointer">
+                    Always re-fetch (skip the AniList ID cache)
+                  </Label>
+                  <p className="text-[10px] text-muted-foreground mt-0.5">
+                    Force a fresh AniList lookup on every download — even when
+                    an AniList ID is already cached in{" "}
+                    <span className="font-mono">.aio_series.json</span>. Useful
+                    when backfilling a library or after AniList re-tags a
+                    series upstream. Costs one extra round-trip per download;
+                    leave off unless you specifically need fresh data.
+                  </p>
+                </div>
+                <Switch
+                  checked={!!local.metadataRefresh}
+                  onCheckedChange={(v) => set("metadataRefresh", v)}
+                />
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Default Toggles */}
@@ -1200,6 +1368,95 @@ export default function SettingsTab({ settings, onSave }) {
           <strong>On:</strong> Scans your actual files and extracts chapter numbers from filenames.
           Catches missing or deleted files, but only works with individual chapter files
           or combined files with chapter ranges in the name.
+        </p>
+
+        {/* ── Check All — include "Completed" series ──
+            Aggregators (mangafire most notoriously) routinely mis-label
+            ongoing series as "Completed". Defaulting this ON gives a
+            forgiving scan that catches mislabeled series; opt out only if
+            your library lives on reliable status sources (MangaDex etc.)
+            AND you want to save a few seconds per scan. */}
+        <div className="flex items-center gap-2 mt-4">
+          <Checkbox
+            checked={local.checkAllIncludeCompleted !== false}
+            onCheckedChange={(v) => set("checkAllIncludeCompleted", v)}
+          />
+          <Label className="text-xs cursor-pointer">
+            Check "Completed" series too (recommended)
+          </Label>
+        </div>
+        <p className="text-[10px] text-muted-foreground mt-1 ml-6">
+          <strong>On (default):</strong> "Check All" scans every series with a saved URL, regardless
+          of status. Catches the very common case where a site (mangafire, etc.) wrongly
+          marks an ongoing series as Completed.
+          <br />
+          <strong>Off:</strong> Only scans series whose status is Ongoing or Releasing.
+          Faster, but misses mislabeled series.
+        </p>
+
+        {/* ── Check All — parallel worker count ──
+            Capped to [1, 8] in main.js. 4 is the safe sweet spot for typical
+            libraries; the provider-aware scheduler fans across distinct
+            sites at that count. Drop to 2 only if your library hits one
+            site heavily and you see throttling; bump to 6-8 only if scans
+            consistently bottleneck on a single site's per-request latency. */}
+        <div className="flex items-center gap-3 mt-4">
+          <Label className="text-xs whitespace-nowrap">
+            Parallel checks
+          </Label>
+          <Input
+            type="number"
+            min={1}
+            max={8}
+            value={local.checkAllConcurrency ?? 4}
+            onChange={(e) =>
+              set(
+                "checkAllConcurrency",
+                Math.max(1, Math.min(8, Number(e.target.value) || 4))
+              )
+            }
+            className="w-20 font-mono"
+          />
+          <Badge variant="secondary" className="text-[10px]">
+            1–8
+          </Badge>
+        </div>
+        <p className="text-[10px] text-muted-foreground mt-1">
+          How many series the "Check All" sweep checks at the same time. Workers prefer
+          jobs on different sites so no single CDN gets hammered. Default 4.
+        </p>
+
+        {/* ── Update-check downloads: skip image-quality probe ──
+            Multi-source ranks alternatives by running an image-quality probe
+            (download sample images, score them). On MangaFire-class handlers
+            the probe burns ~30-60+ s per series. For a 1-5 chapter update
+            delta that probe cost dwarfs the actual download. With this on
+            (default), the multi-source picker uses sites/quality_seed.json
+            priors as the ranking signal instead of running the probe. The
+            picker's tiebreaker logic ALREADY falls back to the seed when
+            probe scores are equal, so the seed-only mode is a "trust the
+            curated priors" shortcut. Only affects downloads queued from
+            the UpdatesCenter; regular New-tab downloads still get full
+            probe accuracy. */}
+        <div className="flex items-center gap-2 mt-4">
+          <Checkbox
+            checked={local.updateChecksUseSeededRating !== false}
+            onCheckedChange={(v) => set("updateChecksUseSeededRating", v)}
+          />
+          <Label className="text-xs cursor-pointer">
+            Update-check downloads use fast seed-based rating (recommended)
+          </Label>
+        </div>
+        <p className="text-[10px] text-muted-foreground mt-1 ml-6">
+          <strong>On (default):</strong> Downloads queued from the Updates Center skip the
+          multi-source image-quality probe (which runs Playwright + per-source image scoring
+          and adds ~30-60+ seconds per series). Ranking falls back to the curated quality
+          priors in <code className="font-mono text-[9px]">sites/quality_seed.json</code>.
+          For a typical 1-5 chapter update delta the probe takes ~10× longer than the
+          actual download.
+          <br />
+          <strong>Off:</strong> Update-check downloads run the full probe like any other
+          multi-source download. More accurate per-source ranking; significantly slower.
         </p>
 
         {/* Verbose */}

@@ -96,13 +96,28 @@ contextBridge.exposeInMainWorld("electronAPI", {
   },
 
   // ── Library update checking ──
-  // Check a single series for new chapters (spawns Python --list-chapters)
+  // Check a single series for new chapters (spawns Python --list-chapters).
+  // Now honors settings.collapseSplits so the diff matches the download path.
   checkForUpdates: (folderPath) => ipcRenderer.invoke("check-for-updates", folderPath),
-  // Check all ongoing series for new chapters (sequential, one at a time)
+  // Check ALL ongoing series for new chapters. Runs in a bounded parallel
+  // worker pool (default 4 slots, settings.checkAllConcurrency-overridable)
+  // with provider-aware scheduling — same-site jobs don't pile onto the
+  // same CDN unless every other site is also in-flight. Emits per-series
+  // progress via onUpdateCheckProgress (events tagged by `kind`).
   checkAllUpdates: () => ipcRenderer.invoke("check-all-updates"),
+  // Abort an in-flight Check All sweep. Kills any running Python procs and
+  // prevents queued series from starting. Returns { ok: true } when a scan
+  // was active, { ok: false } when no-op (e.g. raced with completion).
+  cancelCheckAllUpdates: () => ipcRenderer.invoke("cancel-check-all-updates"),
   // Save or update .aio_series.json (manual URL entry for old downloads)
   saveSeriesMeta: (folderPath, metaData) => ipcRenderer.invoke("save-series-meta", folderPath, metaData),
-  // Progress events during check-all-updates ("Checking 2/8...")
+  // Progress events during check-all-updates. Payload shape varies by
+  // `kind`:
+  //   { kind: "queued",    folderPath, title, cover, site, total }
+  //   { kind: "running",   folderPath, title, site, completed, total }
+  //   { kind: "completed", folderPath, title, result, completed, total }
+  //   { kind: "done",      completed, total, durationMs, aborted }
+  // The renderer dispatches on `kind` — see UpdatesCenter.jsx.
   onUpdateCheckProgress: (callback) => {
     const handler = (_event, data) => callback(data);
     ipcRenderer.on("update-check-progress", handler);
