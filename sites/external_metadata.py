@@ -436,20 +436,28 @@ def _split_tags(
     return non_spoiler, spoiler
 
 
-def _union_genres(
-    site_genres: List[str], anilist_genres: List[str]
-) -> List[str]:
-    """Union site + AniList genres, case-insensitive dedupe, site order first.
+def _dedupe_genres(*genre_lists: List[str]) -> List[str]:
+    """Concatenate genre/tag-name lists with case-insensitive dedupe.
 
-    Site genres often have site-specific casing or wording (e.g.
-    "Action", "Sci-fi" vs AniList's "Action", "Sci-Fi"). The lower-case
-    dedupe keeps the first-seen casing, which is the site's — preserves
-    the user-recognizable display form when both sources agree.
+    Order: earlier lists win; first-seen casing is preserved, so the
+    leading list dictates the display form when two sources spell a genre
+    differently. Empty/blank entries are dropped.
+
+    Used by _apply_anilist_match to build the normalized visible genre
+    field = AniList genres (coarse buckets) followed by AniList high-rank
+    tag names (fine descriptors).
+
+    Renamed from _union_genres (2026-06-06): the merge is no longer
+    site ∪ AniList. On a confident match AniList is authoritative and the
+    site's own genre list is dropped entirely — it was the source of the
+    50+-tag taxonomy dumps (e.g. mangakatana leaking its whole nav genre
+    dropdown). See the REPLACE semantics documented in
+    _apply_anilist_match. grep callers: only _apply_anilist_match.
     """
     out: List[str] = []
     seen_lower = set()
-    for genre_list in (site_genres or [], anilist_genres or []):
-        for src in genre_list:
+    for genre_list in genre_lists:
+        for src in genre_list or []:
             if not src:
                 continue
             key = str(src).strip().lower()
@@ -471,8 +479,12 @@ def _apply_anilist_match(
     Field merge semantics (per plan-locked user decisions):
       - desc: REPLACE with AniList description (per user choice — max
         uniformity for filtering)
-      - genres: UNION (site first, AniList appended, case-insensitive
-        dedupe — preserves site display casing)
+      - genres: REPLACE with AniList genres + high-rank non-spoiler tag
+        names (case-insensitive dedupe via _dedupe_genres). The site's
+        genre list is dropped on a confident match — it's the source of
+        the 50+-tag taxonomy dumps. Spoilers are excluded from this
+        visible field. Falls back to the site genres only when AniList
+        contributed nothing (changed from UNION 2026-06-06 per user req).
       - authors / artists: FILL-MISSING (v1 doesn't fetch AniList
         staff{} connection so this is effectively a no-op today; the
         semantic is documented for future expansion)
@@ -496,10 +508,29 @@ def _apply_anilist_match(
     if cleaned_desc:
         comic_data["desc"] = cleaned_desc
 
-    comic_data["genres"] = _union_genres(
-        comic_data.get("genres") or [],
+    non_spoiler, spoiler = _split_tags(media.get("tags") or [], tag_min_rank)
+    comic_data["anilist_tags"] = non_spoiler
+    comic_data["anilist_spoiler_tags"] = spoiler
+
+    # REPLACE the visible genre list with AniList's curated set: AniList
+    # genres (coarse buckets) followed by the high-rank non-spoiler tag
+    # names (fine descriptors). The site's own genre list is dropped on a
+    # confident match — many sites (mangakatana especially) leak their
+    # entire genre taxonomy into this field, and the previous union-merge
+    # preserved that garbage. Spoiler tags are deliberately excluded so the
+    # default-visible genre field never leaks spoilers (they stay in
+    # anilist_spoiler_tags / <SpoilerTags>). Only fall back to the existing
+    # site genres if AniList contributed nothing at all (pathological:
+    # matched but zero genres AND zero tags above tag_min_rank) — never
+    # blank the field. Cross-file: flows to ComicInfo <Genre> (aio-dl.py
+    # build_comic_info_xml / build_per_chapter_comic_info_xml) and Komikku
+    # details.json `genre` (aio-dl.py, grep '"genre": list(comic_data').
+    normalized_genres = _dedupe_genres(
         media.get("genres") or [],
+        [t.name for t in non_spoiler],
     )
+    if normalized_genres:
+        comic_data["genres"] = normalized_genres
 
     if media.get("status"):
         comic_data["status"] = str(media["status"])
@@ -512,10 +543,6 @@ def _apply_anilist_match(
         comic_data["media_format"] = media_format
 
     comic_data["anilist_synonyms"] = list(media.get("synonyms") or [])
-
-    non_spoiler, spoiler = _split_tags(media.get("tags") or [], tag_min_rank)
-    comic_data["anilist_tags"] = non_spoiler
-    comic_data["anilist_spoiler_tags"] = spoiler
 
 
 # --- Public entry point ----------------------------------------------------
