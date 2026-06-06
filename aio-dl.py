@@ -5076,6 +5076,384 @@ def _consume_image_prefetch(chap_label: str) -> None:
         _image_prefetch_done.pop(chap_label, None)
 
 
+# ---------------------------------------------------------------------------
+# --refresh-library-metadata mode (in-place AniList re-enrichment)
+# ---------------------------------------------------------------------------
+# Repairs an existing library WITHOUT re-downloading images: re-pulls AniList
+# metadata for each already-downloaded series and rewrites details.json +
+# .aio_series.json (and optionally each CBZ's ComicInfo.xml). Exists because
+# the genre-normalization fix (external_metadata REPLACE semantics + the
+# mangakatana selector scoping, 2026-06-06) only affects FUTURE downloads;
+# series grabbed before the fix keep their 50+-tag taxonomy dumps on disk
+# until refreshed. Dispatched from main() right after --update-all.
+
+def _serialize_anilist_tag(t: Any) -> Dict[str, Any]:
+    """AnilistTag dataclass -> .aio_series.json tag dict.
+
+    Schema parity with the live-download writer (grep '_tag_to_dict' /
+    'anilist_tags' near series_meta). Duck-typed via getattr so a plain
+    dict already in the right shape would also pass through.
+    """
+    return {
+        "name": getattr(t, "name", "") or "",
+        "category": getattr(t, "category", "") or "",
+        "rank": int(getattr(t, "rank", 0) or 0),
+        "is_media_spoiler": bool(getattr(t, "is_media_spoiler", False)),
+        "is_general_spoiler": bool(getattr(t, "is_general_spoiler", False)),
+    }
+
+
+def _rewrite_cbz_comicinfo(
+    folder: str,
+    comic_data: Dict[str, Any],
+    series_title: str,
+    lang_default: str,
+) -> int:
+    """Rewrite enrichment elements in every chapter CBZ's ComicInfo.xml, in
+    place, preserving all per-chapter fields. Returns the count updated.
+
+    Used only by _refresh_library_metadata when --refresh-rewrite-cbz is set.
+    For each .cbz: parse the per-chapter fields we must NOT lose
+    (Title/Number/Volume/Translator/Web/Year-Month-Day/LanguageISO/PageCount/
+    Publisher), then rebuild the whole ComicInfo via
+    build_per_chapter_comic_info_xml with the enriched series-level
+    comic_data — so <Genre>/<Tags>/<SpoilerTags>/<TagsExtended>/<Summary>/
+    <CountryOfOrigin>/<MediaFormat>/<AnilistId>/<MalId> come out normalized,
+    byte-identical in shape to a fresh download. Per-member ZIP
+    compression is preserved (we don't re-deflate already-compressed art).
+    grep caller: _refresh_library_metadata.
+    """
+    import calendar
+    import xml.etree.ElementTree as ET
+
+    updated = 0
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return 0
+    for name in names:
+        if not name.lower().endswith(".cbz"):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            with zipfile.ZipFile(path) as zin:
+                infos = zin.infolist()
+                blobs = {zi.filename: zin.read(zi.filename) for zi in infos}
+        except (OSError, zipfile.BadZipFile):
+            continue
+
+        ci_name = next(
+            (zi.filename for zi in infos
+             if os.path.basename(zi.filename).lower() == "comicinfo.xml"),
+            None,
+        )
+
+        chap_title = number = volume = translator = web = lang = None
+        writer = penciller = None
+        page_count = 0
+        uploaded_epoch: Optional[int] = None
+        publishers: List[str] = []
+        if ci_name and blobs.get(ci_name):
+            root = None
+            try:
+                root = ET.fromstring(blobs[ci_name].decode("utf-8", "replace"))
+            except ET.ParseError:
+                root = None
+            if root is not None:
+                def _gx(tag: str) -> Optional[str]:
+                    el = root.find(tag)
+                    return el.text if (el is not None and el.text) else None
+                chap_title = _gx("Title")
+                number = _gx("Number")
+                volume = _gx("Volume")
+                translator = _gx("Translator")
+                web = _gx("Web")
+                lang = _gx("LanguageISO")
+                writer = _gx("Writer")
+                penciller = _gx("Penciller")
+                pub = _gx("Publisher")
+                if pub:
+                    publishers = [pub]
+                pc = _gx("PageCount")
+                if pc:
+                    try:
+                        page_count = int(pc)
+                    except ValueError:
+                        page_count = 0
+                y, m, d = _gx("Year"), _gx("Month"), _gx("Day")
+                if y and m and d:
+                    try:
+                        uploaded_epoch = calendar.timegm(
+                            (int(y), int(m), int(d), 0, 0, 0, 0, 0, 0)
+                        )
+                    except (ValueError, OverflowError):
+                        uploaded_epoch = None
+
+        # Preserve the archive's existing Writer/Penciller (authors/artists).
+        # AniList v1 supplies no staff, so the refresh must carry author/artist
+        # metadata through unchanged rather than dropping <Penciller> (Codex
+        # review on PR #47). Prefer the CBZ's own values; fall back to the
+        # series-level comic_data (seeded from details.json in
+        # _refresh_library_metadata).
+        per_cbz: Dict[str, Any] = dict(comic_data)
+        if writer:
+            per_cbz["authors"] = [s.strip() for s in writer.split(",") if s.strip()]
+        if penciller:
+            per_cbz["artists"] = [s.strip() for s in penciller.split(",") if s.strip()]
+        new_ci = build_per_chapter_comic_info_xml(
+            series_title=series_title,
+            chapter_title=chap_title,
+            chapter_num=number,
+            volume=volume,
+            scanlator=translator,
+            web_url=web,
+            uploaded_epoch=uploaded_epoch,
+            comic_info=per_cbz,
+            publishers=publishers,
+            lang=lang or lang_default or "",
+            page_count=page_count,
+        )
+        target = ci_name or "ComicInfo.xml"
+        had_ci = target in blobs
+        blobs[target] = new_ci.encode("utf-8")
+
+        tmp = path + ".refresh.tmp"
+        try:
+            with zipfile.ZipFile(tmp, "w") as zout:
+                for zi in infos:
+                    # writestr(ZipInfo, ...) keeps the member's original
+                    # compress_type — no re-deflating already-compressed art.
+                    zout.writestr(zi, blobs[zi.filename])
+                if not had_ci:
+                    zout.writestr(target, blobs[target])
+            os.replace(tmp, path)
+            updated += 1
+        except OSError:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+    return updated
+
+
+def _refresh_library_metadata(args) -> int:
+    """--refresh-library-metadata mode. Returns a process exit code.
+
+    Re-pull AniList metadata for every already-downloaded series under
+    --output-dir and rewrite the on-disk metadata sinks WITHOUT
+    re-downloading images. Per series folder carrying a .aio_series.json:
+
+      1. Seed comic_data from the existing .aio_series.json (title, site
+         genres, authors, status, cached anilist_id, synonyms) + the
+         details.json description (so a failed match never blanks it).
+      2. enrich_from_anilist — cached-ID fast path; falls back to a title
+         search for series predating enrichment. Honors --metadata-refresh
+         (cache-bypass) and --metadata-tag-min-rank. Same merge as a live
+         download, so genres get the REPLACE normalization.
+      3. On a confident match: rewrite details.json + .aio_series.json; with
+         --refresh-rewrite-cbz also rewrite each CBZ's ComicInfo.xml.
+      4. On no match / error: leave the series untouched.
+
+    Cross-file: sites/external_metadata.enrich_from_anilist,
+    library_state.scan_library, _rewrite_cbz_comicinfo,
+    _komikku_status_to_digit, _serialize_anilist_tag.
+    """
+    from library_state import scan_library, SERIES_META_FILE
+    from sites.external_metadata import enrich_from_anilist
+
+    root = os.path.abspath(args.output_dir)
+    all_entries = scan_library(root)
+
+    # Optional positional filters: restrict to series whose folder name or
+    # source URL contains any of the given substrings (case-insensitive).
+    # Lets the user repair one series — `--refresh-library-metadata "Eleceed"`
+    # — instead of the whole library. Empty = every series.
+    filters = [
+        str(s).strip().lower()
+        for s in (getattr(args, "comic_url", None) or [])
+        if str(s).strip()
+    ]
+
+    def _matches(entry: Dict[str, Any]) -> bool:
+        if not filters:
+            return True
+        hay = (
+            str(entry.get("name", ""))
+            + " "
+            + str((entry.get("series_meta") or {}).get("url", ""))
+        ).lower()
+        return any(f in hay for f in filters)
+
+    entries = [e for e in all_entries if e.get("series_meta") and _matches(e)]
+    no_meta = (
+        [e for e in all_entries if not e.get("series_meta")]
+        if not filters
+        else []
+    )
+    if not entries:
+        scope = f" matching {filters}" if filters else ""
+        print(f"No series with .aio_series.json found in {root}{scope}.")
+        return 0
+
+    tag_min_rank = int(getattr(args, "metadata_tag_min_rank", 50) or 50)
+    force_refresh = bool(getattr(args, "metadata_refresh", False))
+    rewrite_cbz = bool(getattr(args, "refresh_rewrite_cbz", False))
+    print(
+        f"[*] Refreshing AniList metadata for {len(entries)} series in {root}"
+        + (" (+CBZ ComicInfo rewrite)" if rewrite_cbz else "")
+        + (" (cache-bypass)" if force_refresh else "")
+    )
+
+    matched: List[str] = []
+    skipped: List[str] = []
+    failed: List[str] = []
+
+    for e in entries:
+        folder = e["folder"]
+        meta = dict(e.get("series_meta") or {})
+        title = meta.get("title") or e.get("name") or ""
+        if not title:
+            skipped.append(e.get("name", "?"))
+            continue
+
+        comic_data: Dict[str, Any] = {
+            "title": title,
+            "hid": meta.get("hid", ""),
+            "authors": list(meta.get("authors") or []),
+            "genres": list(meta.get("genres") or []),
+            "status": meta.get("status"),
+            "cover": meta.get("cover"),
+        }
+        syn = list(meta.get("anilist_synonyms") or [])
+        if syn:
+            comic_data["alt_names"] = syn
+
+        details_path = os.path.join(folder, "details.json")
+        existing_details: Dict[str, Any] = {}
+        try:
+            with open(details_path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                existing_details = loaded
+        except (OSError, ValueError):
+            existing_details = {}
+        if existing_details.get("description"):
+            comic_data["desc"] = existing_details["description"]
+        # Seed artists from details.json's preserved `artist` field. AniList
+        # v1 fetches no staff, so without this the CBZ rewrite would emit an
+        # empty <Penciller> and drop artist metadata. _rewrite_cbz_comicinfo
+        # still prefers each archive's own <Penciller> when present; this is
+        # the fallback (and the recovery path for CBZs whose <Penciller> was
+        # already stripped by the pre-fix run). authors come from
+        # .aio_series.json above.
+        if existing_details.get("artist"):
+            comic_data["artists"] = [
+                s.strip()
+                for s in str(existing_details["artist"]).split(",")
+                if s.strip()
+            ]
+
+        try:
+            enrich_from_anilist(
+                comic_data,
+                hid=comic_data["hid"],
+                handler_name=meta.get("site", ""),
+                year=None,
+                cover_url=comic_data.get("cover"),
+                tag_min_rank=tag_min_rank,
+                force_refresh=force_refresh,
+                cached_anilist_id=meta.get("anilist_id"),
+            )
+        except Exception as exc:
+            print(f"  [!] {title}: enrichment error {type(exc).__name__}: {exc}")
+            failed.append(title)
+            continue
+
+        if not comic_data.get("anilist_id"):
+            best = comic_data.pop("_anilist_best_score", 0.0) or 0.0
+            print(
+                f"  [-] {title}: no confident AniList match "
+                f"(best {best:.0f}) — left unchanged"
+            )
+            skipped.append(title)
+            continue
+
+        # Rewrite Komikku details.json (preserve extra keys + existing artist).
+        new_details = dict(existing_details)
+        new_details["title"] = title
+        new_details["author"] = ", ".join(comic_data.get("authors") or [])
+        new_details.setdefault("artist", existing_details.get("artist", ""))
+        new_details["description"] = (
+            comic_data.get("desc") or existing_details.get("description", "")
+        )
+        new_details["genre"] = list(comic_data.get("genres") or [])
+        new_details["status"] = _komikku_status_to_digit(comic_data.get("status"))
+        try:
+            with open(details_path, "w", encoding="utf-8") as f:
+                json.dump(new_details, f, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            print(f"  [!] {title}: details.json write failed: {exc}")
+            failed.append(title)
+            continue
+
+        # Rewrite .aio_series.json enrichment fields (preserve the rest).
+        meta["genres"] = list(comic_data.get("genres") or [])
+        if comic_data.get("status"):
+            meta["status"] = comic_data["status"]
+        meta["anilist_id"] = comic_data.get("anilist_id")
+        meta["mal_id"] = comic_data.get("mal_id")
+        meta["country_of_origin"] = comic_data.get("country_of_origin")
+        meta["media_format"] = comic_data.get("media_format")
+        meta["anilist_synonyms"] = list(comic_data.get("anilist_synonyms") or [])
+        meta["anilist_tags"] = [
+            _serialize_anilist_tag(t)
+            for t in (comic_data.get("anilist_tags") or [])
+        ]
+        meta["anilist_spoiler_tags"] = [
+            _serialize_anilist_tag(t)
+            for t in (comic_data.get("anilist_spoiler_tags") or [])
+        ]
+        try:
+            with open(
+                os.path.join(folder, SERIES_META_FILE), "w", encoding="utf-8"
+            ) as f:
+                json.dump(meta, f, indent=2)
+        except OSError as exc:
+            print(f"  [!] {title}: .aio_series.json write failed: {exc}")
+            failed.append(title)
+            continue
+
+        cbz_note = ""
+        if rewrite_cbz:
+            n = _rewrite_cbz_comicinfo(
+                folder,
+                comic_data,
+                title,
+                meta.get("language") or existing_details.get("language") or "",
+            )
+            cbz_note = f", {n} CBZ rewritten"
+
+        matched.append(title)
+        print(
+            f"  [+] {title}: matched id={comic_data['anilist_id']} "
+            f"({len(comic_data.get('anilist_tags', []))} tags, "
+            f"{len(comic_data.get('genres', []))} genres) "
+            f"— details.json + .aio_series.json{cbz_note}"
+        )
+
+    print(
+        f"\nRefresh complete: {len(matched)} updated, "
+        f"{len(skipped)} skipped, {len(failed)} failed"
+        + (
+            f", {len(no_meta)} folders without .aio_series.json ignored"
+            if no_meta
+            else ""
+        )
+    )
+    return 1 if failed else 0
+
+
 def main():
     p = argparse.ArgumentParser("comic downloader")
     p.add_argument("comic_url", nargs="*", help="One or more comic/manga URLs")
@@ -5541,6 +5919,29 @@ def main():
         help="Scan --output-dir for saved series metadata and download new chapters for each series.",
     )
     p.add_argument(
+        "--refresh-library-metadata",
+        action="store_true",
+        help="Re-pull AniList metadata for every already-downloaded series "
+             "under --output-dir and rewrite details.json + .aio_series.json "
+             "in place, WITHOUT re-downloading images. Pass a positional "
+             "substring (folder name or URL) to restrict to one series, e.g. "
+             "--refresh-library-metadata \"Eleceed\". Honors "
+             "--metadata-tag-min-rank and --metadata-refresh (cache-bypass). "
+             "Repairs libraries grabbed before the genre-normalization fix. "
+             "Add --refresh-rewrite-cbz to also rewrite chapter CBZ ComicInfo. "
+             "Then exits.",
+    )
+    p.add_argument(
+        "--refresh-rewrite-cbz",
+        action="store_true",
+        help="With --refresh-library-metadata, also rewrite the enrichment "
+             "elements inside each chapter CBZ's ComicInfo.xml "
+             "(<Genre>/<Tags>/<SpoilerTags>/<TagsExtended>/<Summary>/"
+             "<CountryOfOrigin>/<MediaFormat>/<AnilistId>/<MalId>). Per-chapter "
+             "fields are preserved. I/O-heavy (repackages every CBZ); "
+             "off by default.",
+    )
+    p.add_argument(
         "--serve",
         action="store_true",
         help="Start the FastAPI REST server instead of downloading.",
@@ -5921,6 +6322,11 @@ def main():
             print(f"Failed: {', '.join(failed)}")
             sys.exit(1)
         return
+
+    if getattr(args, "refresh_library_metadata", False):
+        # In-place AniList re-enrichment of an existing library; no
+        # downloads. Defined just above main(). Exits with its own code.
+        sys.exit(_refresh_library_metadata(args))
 
     # Phase B (2026-05-07) / Phase H follow-up (2026-05-16): snapshot which CLI
     # flags the user explicitly set on THIS invocation, BEFORE any later
@@ -6860,7 +7266,9 @@ def main():
     # enrichment writes into comic_data propagate to every downstream
     # sink: ComicInfo.xml builders (build_comic_info_xml +
     # build_per_chapter_comic_info_xml), Komikku details.json writer
-    # (genres union), and .aio_series.json writer (full ID + tag persist).
+    # (genres REPLACED by AniList's curated set on a confident match — see
+    # _apply_anilist_match), and .aio_series.json writer (full ID + tag
+    # persist).
     # Failures are swallowed — site-only metadata is the fallback path.
     # Cross-file: sites/external_metadata.py owns the client; CLI flags
     # registered near --enable-ml-rating; cache key in .aio_series.json

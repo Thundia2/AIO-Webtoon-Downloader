@@ -72,6 +72,12 @@ ANILIST_TIMEOUT_S = 15
 
 ANILIST_MAX_RETRIES = 3
 
+# Cap on AniList search requests per series on the no-match path. The search
+# tries each source title (full + bracket-stripped variant); this bounds the
+# fan-out so a series that genuinely isn't on AniList can't trigger a request
+# storm. 4 = primary + cleaned-primary + one alt + its cleaned form.
+_MAX_SEARCH_QUERIES = 4
+
 # Drop candidates with these formats from the search-result pool. NOVEL
 # poisons comic enrichment (light novels share titles with their manga
 # adaptations and AniList lists them as separate Media entries). ONE_SHOT
@@ -306,6 +312,32 @@ def _strip_anilist_html(desc: Optional[str]) -> str:
 
 # --- Internal: matching ----------------------------------------------------
 
+# Bracket/tilde families that wrap subtitle noise AniList's search index
+# chokes on. Stripped (not split) so the core title survives; see
+# _clean_search_title.
+_TITLE_NOISE_RE = re.compile(r"~[^~]*~|\([^)]*\)|\[[^\]]*\]|[【「][^】」]*[】」]")
+
+
+def _clean_search_title(title: str) -> str:
+    """Return `title` with bracketed/tilde subtitle segments stripped.
+
+    e.g. "Shangri-La Frontier ~ Kusoge Hunter, Kamige ni Idoman to su~"
+    -> "Shangri-La Frontier". Used as a fallback AniList search query (and
+    scoring title) when the full stored title returns no candidates — some
+    sites bake a ~...~ or (...) subtitle into the title that defeats
+    AniList's search index. Deliberately does NOT split on ':' / ' - '
+    subtitle separators: that would surface a parent series for a spinoff
+    (e.g. "...Spoils Me Rotten: After the Rain") and risk a wrong match even
+    with full-title scoring. May return a string equal to the input (caller
+    dedupes) or "" if nothing survives. Cross-file: called only from
+    enrich_from_anilist's search path.
+    """
+    if not title:
+        return ""
+    s = _TITLE_NOISE_RE.sub(" ", str(title))
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def _candidate_titles(media: Dict[str, Any]) -> List[str]:
     """All title variants a candidate exposes — used for fuzzy matching."""
     title_block = media.get("title") or {}
@@ -436,20 +468,28 @@ def _split_tags(
     return non_spoiler, spoiler
 
 
-def _union_genres(
-    site_genres: List[str], anilist_genres: List[str]
-) -> List[str]:
-    """Union site + AniList genres, case-insensitive dedupe, site order first.
+def _dedupe_genres(*genre_lists: List[str]) -> List[str]:
+    """Concatenate genre/tag-name lists with case-insensitive dedupe.
 
-    Site genres often have site-specific casing or wording (e.g.
-    "Action", "Sci-fi" vs AniList's "Action", "Sci-Fi"). The lower-case
-    dedupe keeps the first-seen casing, which is the site's — preserves
-    the user-recognizable display form when both sources agree.
+    Order: earlier lists win; first-seen casing is preserved, so the
+    leading list dictates the display form when two sources spell a genre
+    differently. Empty/blank entries are dropped.
+
+    Used by _apply_anilist_match to build the normalized visible genre
+    field = AniList genres (coarse buckets) followed by AniList high-rank
+    tag names (fine descriptors).
+
+    Renamed from _union_genres (2026-06-06): the merge is no longer
+    site ∪ AniList. On a confident match AniList is authoritative and the
+    site's own genre list is dropped entirely — it was the source of the
+    50+-tag taxonomy dumps (e.g. mangakatana leaking its whole nav genre
+    dropdown). See the REPLACE semantics documented in
+    _apply_anilist_match. grep callers: only _apply_anilist_match.
     """
     out: List[str] = []
     seen_lower = set()
-    for genre_list in (site_genres or [], anilist_genres or []):
-        for src in genre_list:
+    for genre_list in genre_lists:
+        for src in genre_list or []:
             if not src:
                 continue
             key = str(src).strip().lower()
@@ -471,8 +511,12 @@ def _apply_anilist_match(
     Field merge semantics (per plan-locked user decisions):
       - desc: REPLACE with AniList description (per user choice — max
         uniformity for filtering)
-      - genres: UNION (site first, AniList appended, case-insensitive
-        dedupe — preserves site display casing)
+      - genres: REPLACE with AniList genres + high-rank non-spoiler tag
+        names (case-insensitive dedupe via _dedupe_genres). The site's
+        genre list is dropped on a confident match — it's the source of
+        the 50+-tag taxonomy dumps. Spoilers are excluded from this
+        visible field. Falls back to the site genres only when AniList
+        contributed nothing (changed from UNION 2026-06-06 per user req).
       - authors / artists: FILL-MISSING (v1 doesn't fetch AniList
         staff{} connection so this is effectively a no-op today; the
         semantic is documented for future expansion)
@@ -496,10 +540,29 @@ def _apply_anilist_match(
     if cleaned_desc:
         comic_data["desc"] = cleaned_desc
 
-    comic_data["genres"] = _union_genres(
-        comic_data.get("genres") or [],
+    non_spoiler, spoiler = _split_tags(media.get("tags") or [], tag_min_rank)
+    comic_data["anilist_tags"] = non_spoiler
+    comic_data["anilist_spoiler_tags"] = spoiler
+
+    # REPLACE the visible genre list with AniList's curated set: AniList
+    # genres (coarse buckets) followed by the high-rank non-spoiler tag
+    # names (fine descriptors). The site's own genre list is dropped on a
+    # confident match — many sites (mangakatana especially) leak their
+    # entire genre taxonomy into this field, and the previous union-merge
+    # preserved that garbage. Spoiler tags are deliberately excluded so the
+    # default-visible genre field never leaks spoilers (they stay in
+    # anilist_spoiler_tags / <SpoilerTags>). Only fall back to the existing
+    # site genres if AniList contributed nothing at all (pathological:
+    # matched but zero genres AND zero tags above tag_min_rank) — never
+    # blank the field. Cross-file: flows to ComicInfo <Genre> (aio-dl.py
+    # build_comic_info_xml / build_per_chapter_comic_info_xml) and Komikku
+    # details.json `genre` (aio-dl.py, grep '"genre": list(comic_data').
+    normalized_genres = _dedupe_genres(
         media.get("genres") or [],
+        [t.name for t in non_spoiler],
     )
+    if normalized_genres:
+        comic_data["genres"] = normalized_genres
 
     if media.get("status"):
         comic_data["status"] = str(media["status"])
@@ -512,10 +575,6 @@ def _apply_anilist_match(
         comic_data["media_format"] = media_format
 
     comic_data["anilist_synonyms"] = list(media.get("synonyms") or [])
-
-    non_spoiler, spoiler = _split_tags(media.get("tags") or [], tag_min_rank)
-    comic_data["anilist_tags"] = non_spoiler
-    comic_data["anilist_spoiler_tags"] = spoiler
 
 
 # --- Public entry point ----------------------------------------------------
@@ -568,25 +627,54 @@ def enrich_from_anilist(
         # search step also fails, comic_data ends up unchanged and the
         # caller logs accordingly.
 
-    # Search path.
+    # Search path. Build an ordered, deduped title list: each source title
+    # plus its bracket/tilde-stripped variant. Some sites bake a ~...~ or
+    # (...) subtitle into the title that defeats AniList's search index
+    # (e.g. "Shangri-La Frontier ~ Kusoge Hunter, ...~" returns nothing, but
+    # "Shangri-La Frontier" matches id 122063). The cleaned variant is used
+    # both as an extra search query AND for scoring — bracket content is
+    # genuine noise, so a candidate matching the cleaned form is a real match.
     source_titles: List[str] = []
+    seen_titles = set()
+    raw_titles: List[str] = []
     if comic_data.get("title"):
-        source_titles.append(str(comic_data["title"]))
+        raw_titles.append(str(comic_data["title"]))
     for alt in comic_data.get("alt_names") or []:
         if alt:
-            source_titles.append(str(alt))
+            raw_titles.append(str(alt))
+    for raw in raw_titles:
+        for variant in (raw, _clean_search_title(raw)):
+            v = variant.strip()
+            key = v.lower()
+            if v and key not in seen_titles:
+                seen_titles.add(key)
+                source_titles.append(v)
     if not source_titles:
         return comic_data
 
-    candidates = _search_candidates(source_titles[0])
-    if not candidates:
-        # Empty pool (network failure / 0 hits / API rate-limit exhausted).
-        # Set the best-score sentinel so the caller's log line is uniform
-        # across "no hits" and "hits but all below threshold" branches.
-        comic_data["_anilist_best_score"] = 0.0
-        return comic_data
+    # Query AniList with each title (full first, then cleaned/alt variants),
+    # accumulating candidates deduped by id; stop early once a candidate
+    # clears the match threshold. Bounded to _MAX_SEARCH_QUERIES requests so
+    # a series that genuinely isn't on AniList can't fan out into a storm.
+    # best_score stays 0.0 across the "no hits" and "hits but all below
+    # threshold" branches so the caller's log line is uniform.
+    pool: List[Dict[str, Any]] = []
+    seen_ids = set()
+    best: Optional[Dict[str, Any]] = None
+    score = 0.0
+    for query in source_titles[:_MAX_SEARCH_QUERIES]:
+        for cand in _search_candidates(query):
+            cid = cand.get("id")
+            if cid is not None and cid in seen_ids:
+                continue
+            if cid is not None:
+                seen_ids.add(cid)
+            pool.append(cand)
+        if pool:
+            best, score = _pick_best_candidate(source_titles, pool)
+            if best is not None:
+                break
 
-    best, score = _pick_best_candidate(source_titles, candidates)
     comic_data["_anilist_best_score"] = score
     if best is None:
         return comic_data
