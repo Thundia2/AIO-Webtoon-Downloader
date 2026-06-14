@@ -72,11 +72,14 @@ ANILIST_TIMEOUT_S = 15
 
 ANILIST_MAX_RETRIES = 3
 
-# Cap on AniList search requests per series on the no-match path. The search
-# tries each source title (full + bracket-stripped variant); this bounds the
-# fan-out so a series that genuinely isn't on AniList can't trigger a request
-# storm. 4 = primary + cleaned-primary + one alt + its cleaned form.
-_MAX_SEARCH_QUERIES = 4
+# Cap on AniList search requests per series on the no-match path. Each source
+# title now expands to up to four queries (full, bracket-cleaned, trailing
+# subtitle segment, shortened prefix — see enrich_from_anilist), so 6 leaves
+# room for the primary's variants plus an alt's. Early-stop means the common
+# case (full title matches on query 1) still costs a single request; this cap
+# only bounds the worst case so a series genuinely absent from AniList can't
+# trigger a request storm.
+_MAX_SEARCH_QUERIES = 6
 
 # Drop candidates with these formats from the search-result pool. NOVEL
 # poisons comic enrichment (light novels share titles with their manga
@@ -98,9 +101,12 @@ class AnilistTag:
     "Time Travel" is broadly spoilerish for any story). Either flag puts
     the tag into the spoiler bucket — the user's reader can decide
     granularity at display time using the per-tag attributes preserved
-    in the ComicInfo.xml <TagsExtended> block and .aio_series.json.
+    in the ComicInfo.xml <TagsExtended> block, the Komikku details.json
+    (flat `anilist_tags` / `anilist_spoiler_tags` keys), and
+    .aio_series.json.
 
-    Cross-file: serialized to dict in aio-dl.py's .aio_series.json writer
+    Cross-file: serialized to dict in aio-dl.py's details.json writer (grep
+    _build_aio_reader_extras) and .aio_series.json writer (grep _tag_to_dict),
     and to XML in aio-dl.py:_emit_tags_extended.
     """
     name: str
@@ -330,12 +336,55 @@ def _clean_search_title(title: str) -> str:
     (e.g. "...Spoils Me Rotten: After the Rain") and risk a wrong match even
     with full-title scoring. May return a string equal to the input (caller
     dedupes) or "" if nothing survives. Cross-file: called only from
-    enrich_from_anilist's search path.
+    enrich_from_anilist's search path. Subtitle-separator SPLITTING does
+    happen — but in _subtitle_segment, which is search-query-only (never a
+    scoring title), so the parent-match risk above doesn't apply to it.
     """
     if not title:
         return ""
     s = _TITLE_NOISE_RE.sub(" ", str(title))
     return re.sub(r"\s+", " ", s).strip()
+
+
+# Subtitle/volume separators: a ':' or a SPACED dash. Used to pull the trailing
+# distinctive segment out of titles AniList's search can't match whole — e.g.
+# "JoJo no Kimyou na Bouken: Part 4 - Diamond wa Kudakenai" (0 results) vs the
+# trailing "Diamond wa Kudakenai" (id 33006). Hyphens WITHOUT surrounding
+# spaces ("Shangri-La", "Boku-tachi") are deliberately NOT separators.
+_SUBTITLE_SPLIT_RE = re.compile(r":\s+|\s+[-–—]\s+")
+
+
+def _subtitle_segment(title: str) -> str:
+    """Trailing segment after the last subtitle separator — a SEARCH query only,
+    never a scoring title. "" when there's no separator or the trailing part is
+    a <2-word fragment (too generic to anchor a search). Because the match is
+    still gated by scoring against the FULL title in enrich_from_anilist,
+    pulling a parent/other series into the candidate pool here is harmless: it
+    fails the 75 threshold. grep caller: enrich_from_anilist.
+    """
+    parts = [p.strip() for p in _SUBTITLE_SPLIT_RE.split(str(title or "")) if p.strip()]
+    if len(parts) < 2:
+        return ""
+    seg = parts[-1]
+    return seg if len(seg.split()) >= 2 else ""
+
+
+def _shortened_prefix(title: str, words: int = 4) -> str:
+    """First `words` tokens of a LONG, separator-less title — a SEARCH query
+    only. "" when the title has a subtitle separator (use _subtitle_segment
+    instead) or is short enough (≤5 words) that the full-title query already
+    covers it. Rescues long romaji whose spelling drifts between the site and
+    AniList — e.g. AnoHana's "...Namae o Boku-tachi..." vs AniList's
+    "...Namae wo Bokutachi..." returns nothing whole, but "Ano Hi Mita Hana"
+    matches id 65733. grep caller: enrich_from_anilist.
+    """
+    s = str(title or "")
+    if _SUBTITLE_SPLIT_RE.search(s):
+        return ""
+    toks = s.split()
+    if len(toks) <= max(words, 5):
+        return ""
+    return " ".join(toks[:words])
 
 
 def _candidate_titles(media: Dict[str, Any]) -> List[str]:
@@ -355,7 +404,8 @@ def _candidate_titles(media: Dict[str, Any]) -> List[str]:
 def _score_candidate(
     source_titles: List[str], candidate: Dict[str, Any]
 ) -> float:
-    """Best (max) rapidfuzz WRatio across all (source x candidate) pairs.
+    """Best (max) rapidfuzz WRatio across all (source x candidate) pairs,
+    compared case/punctuation-insensitively via default_process.
 
     rapidfuzz is project-wide required for cross-site search; this lazy
     import keeps the failure mode consistent (clear ImportError naming
@@ -363,6 +413,7 @@ def _score_candidate(
     """
     try:
         from rapidfuzz import fuzz
+        from rapidfuzz.utils import default_process
     except ImportError as exc:
         raise ImportError(
             "rapidfuzz is required for --metadata-source enrichment. "
@@ -373,10 +424,17 @@ def _score_candidate(
     cand_titles = _candidate_titles(candidate)
     if not cand_titles:
         return 0.0
+    # processor=default_process lowercases, trims, and strips non-alphanumerics
+    # on both sides before scoring. Without it WRatio is brutally case-sensitive:
+    # "FULL METAL ALCHEMIST" vs the synonym "Full Metal Alchemist" scores 25 raw
+    # but 100 processed (verified against id 30025), while the unrelated romaji
+    # "Hagane no Renkinjutsushi" sits at 26 processed. So the 75 threshold still
+    # separates cleanly — processing rescues case/punctuation drift without
+    # inventing matches.
     best = 0.0
     for s in source_titles:
         for c in cand_titles:
-            score = float(fuzz.WRatio(s, c))
+            score = float(fuzz.WRatio(s, c, processor=default_process))
             if score > best:
                 best = score
     return best
@@ -528,6 +586,14 @@ def _apply_anilist_match(
         NOT_YET_RELEASED → falls through to "0"). No helper change
         needed.
       - anilist_tags / anilist_spoiler_tags: SET (AniList-only fields)
+      - cover: REPLACE with AniList coverImage (extraLarge → large) for
+        cross-library cover normalization — every enriched series ends up
+        with one cover source/quality/aspect. The site's own cover is
+        stashed under `site_cover` (aio-dl.py's cover-download path falls
+        back to it if the AniList CDN fetch fails) and the AniList URL is
+        also mirrored to `anilist_cover` (read by --refresh-library-metadata
+        to decide cover.jpg re-download). Only set when AniList actually
+        supplied a cover.
       - country_of_origin / media_format / anilist_id / mal_id /
         anilist_synonyms: SET
     """
@@ -573,6 +639,31 @@ def _apply_anilist_match(
     media_format = _derive_media_format(country)
     if media_format:
         comic_data["media_format"] = media_format
+
+    # Cover normalization: REPLACE the series cover with AniList's so the
+    # whole library shares one cover source/quality/aspect. extraLarge is
+    # AniList's highest-res variant; large is the smaller fallback. Stash the
+    # site's own cover under `site_cover` so aio-dl.py's cover-download block
+    # can fall back to it when the AniList CDN fetch fails (dl_image returns
+    # None, never raises). Cross-file: aio-dl.py cover-download block (grep
+    # 'site_cover'); the chosen cover flows to cover.jpg, the .aio_series.json
+    # `cover` field, and the UI thumbnail cache (library.js keys on
+    # seriesMeta.cover).
+    cover_block = media.get("coverImage") or {}
+    anilist_cover = cover_block.get("extraLarge") or cover_block.get("large")
+    if anilist_cover:
+        anilist_cover = str(anilist_cover)
+        existing_cover = comic_data.get("cover")
+        if existing_cover and existing_cover != anilist_cover:
+            comic_data["site_cover"] = existing_cover
+        comic_data["cover"] = anilist_cover
+        # Record the AniList cover URL explicitly (parallel to anilist_id).
+        # Not written to any sink today — cover.jpg + the `cover` field carry
+        # it — but --refresh-library-metadata reads it to decide whether to
+        # re-download cover.jpg, so it stays truthy ONLY when AniList actually
+        # supplied a cover (not merely when a site cover is present). grep
+        # anilist_cover in aio-dl.py.
+        comic_data["anilist_cover"] = anilist_cover
 
     comic_data["anilist_synonyms"] = list(media.get("synonyms") or [])
 
@@ -627,15 +718,41 @@ def enrich_from_anilist(
         # search step also fails, comic_data ends up unchanged and the
         # caller logs accordingly.
 
-    # Search path. Build an ordered, deduped title list: each source title
-    # plus its bracket/tilde-stripped variant. Some sites bake a ~...~ or
-    # (...) subtitle into the title that defeats AniList's search index
-    # (e.g. "Shangri-La Frontier ~ Kusoge Hunter, ...~" returns nothing, but
-    # "Shangri-La Frontier" matches id 122063). The cleaned variant is used
-    # both as an extra search query AND for scoring — bracket content is
-    # genuine noise, so a candidate matching the cleaned form is a real match.
-    source_titles: List[str] = []
-    seen_titles = set()
+    # Search path. Two deliberately decoupled lists:
+    #   scoring_titles — the identity set: each source title + its bracket/
+    #     tilde-cleaned variant. The match is ALWAYS gated by scoring against
+    #     these full forms (75 threshold), so nothing below can admit a wrong
+    #     series no matter how broad the search net gets.
+    #   search_queries — the broader net used only to FIND candidates: the
+    #     scoring titles plus two derived fallbacks per title — the trailing
+    #     subtitle segment (_subtitle_segment) and a shortened prefix
+    #     (_shortened_prefix). These rescue titles AniList returns nothing for
+    #     on the full string: subtitle-prefixed romaji ("...Gaiden: Toaru
+    #     Kagaku no Railgun" → id 37776), long romaji with spelling drift
+    #     (AnoHana → id 65733), and ~...~/(...)-suffixed titles (Shangri-La
+    #     Frontier → id 122063).
+    # Per-title order is full → cleaned → subtitle → shortened so precise forms
+    # are tried before loose fallbacks; early-stop means the common case (full
+    # title matches) never fires a fallback query.
+    scoring_titles: List[str] = []
+    search_queries: List[str] = []
+    seen_scoring = set()
+    seen_query = set()
+
+    def _add_scoring(v: str) -> None:
+        v = (v or "").strip()
+        k = v.lower()
+        if v and k not in seen_scoring:
+            seen_scoring.add(k)
+            scoring_titles.append(v)
+
+    def _add_query(v: str) -> None:
+        v = (v or "").strip()
+        k = v.lower()
+        if v and k not in seen_query:
+            seen_query.add(k)
+            search_queries.append(v)
+
     raw_titles: List[str] = []
     if comic_data.get("title"):
         raw_titles.append(str(comic_data["title"]))
@@ -643,18 +760,19 @@ def enrich_from_anilist(
         if alt:
             raw_titles.append(str(alt))
     for raw in raw_titles:
-        for variant in (raw, _clean_search_title(raw)):
-            v = variant.strip()
-            key = v.lower()
-            if v and key not in seen_titles:
-                seen_titles.add(key)
-                source_titles.append(v)
-    if not source_titles:
+        cleaned = _clean_search_title(raw)
+        _add_scoring(raw)
+        _add_scoring(cleaned)
+        _add_query(raw)
+        _add_query(cleaned)
+        _add_query(_subtitle_segment(cleaned or raw))
+        _add_query(_shortened_prefix(cleaned or raw))
+    if not scoring_titles:
         return comic_data
 
-    # Query AniList with each title (full first, then cleaned/alt variants),
-    # accumulating candidates deduped by id; stop early once a candidate
-    # clears the match threshold. Bounded to _MAX_SEARCH_QUERIES requests so
+    # Query AniList with each search query in priority order, accumulating
+    # candidates deduped by id; stop early once one clears the threshold when
+    # scored against scoring_titles. Bounded to _MAX_SEARCH_QUERIES requests so
     # a series that genuinely isn't on AniList can't fan out into a storm.
     # best_score stays 0.0 across the "no hits" and "hits but all below
     # threshold" branches so the caller's log line is uniform.
@@ -662,7 +780,7 @@ def enrich_from_anilist(
     seen_ids = set()
     best: Optional[Dict[str, Any]] = None
     score = 0.0
-    for query in source_titles[:_MAX_SEARCH_QUERIES]:
+    for query in search_queries[:_MAX_SEARCH_QUERIES]:
         for cand in _search_candidates(query):
             cid = cand.get("id")
             if cid is not None and cid in seen_ids:
@@ -671,7 +789,7 @@ def enrich_from_anilist(
                 seen_ids.add(cid)
             pool.append(cand)
         if pool:
-            best, score = _pick_best_candidate(source_titles, pool)
+            best, score = _pick_best_candidate(scoring_titles, pool)
             if best is not None:
                 break
 

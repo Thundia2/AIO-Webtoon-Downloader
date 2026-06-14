@@ -5149,6 +5149,69 @@ def _serialize_anilist_tag(t: Any) -> Dict[str, Any]:
     }
 
 
+def _build_aio_reader_extras(
+    comic_data: Dict[str, Any],
+    *,
+    source_site: Optional[str],
+    source_url: Optional[str],
+    language: Optional[str],
+) -> Dict[str, Any]:
+    """Reader-facing enrichment block merged into details.json as flat,
+    top-level keys. Returns a dict the caller `.update()`s onto the Komikku
+    payload AFTER the six canonical keys, so those stay first on disk.
+
+    WHY this exists: details.json is the only metadata file a *reader*
+    (Komikku, or the user's own reader) actually reads. .aio_series.json is
+    internal bookkeeping — the update-checker chapter list + the cached
+    anilist_id fast path (grep _load_cached_anilist_id) — and no reader ever
+    opens it. So everything a reader might surface has to live in
+    details.json. Komikku parses details.json with kotlinx
+    Json{ignoreUnknownKeys=true} (verified: `git show 1f17a20^:komikkuspec.md`
+    §6.1 — "extra keys are tolerated"), so these extra keys are silently
+    dropped by Komikku and read by the user's reader; no namespacing needed
+    for Komikku-safety.
+
+    Key names deliberately dodge Komikku's reserved set
+    (title/author/artist/description/genre/status) AND the TachiyomiSY keys
+    Komikku currently ignores but could one day wire up
+    (url/lang/tags/categories/alt_titles/thumbnail_url): hence
+    source_url/source_site (not bare url/site) and anilist_tags (not tags).
+    The anilist_*/country_of_origin/media_format names mirror
+    .aio_series.json's schema (grep 'series_meta =') so the two on-disk files
+    stay name-consistent for anything that reads both. Rich-tag dict shape ==
+    _serialize_anilist_tag == ComicInfo <TagsExtended> (name/category/rank +
+    the two spoiler flags), so a reader can render spoiler-aware chips off
+    any of the three artifacts identically.
+
+    Every key is emitted unconditionally (null / [] / "" when enrichment was
+    off or found no confident match) so the reader can rely on a stable
+    schema. comic_data's anilist_tags/anilist_spoiler_tags are AnilistTag
+    dataclass instances in both call sites (set by enrich_from_anilist →
+    _apply_anilist_match); _serialize_anilist_tag is getattr-based so that
+    holds. Cross-file callers: the two details.json writers — live-download
+    (grep 'details_payload.update') and --refresh-library-metadata (grep
+    'new_details.update').
+    """
+    return {
+        "anilist_id": comic_data.get("anilist_id"),
+        "mal_id": comic_data.get("mal_id"),
+        "country_of_origin": comic_data.get("country_of_origin"),
+        "media_format": comic_data.get("media_format"),
+        "anilist_synonyms": list(comic_data.get("anilist_synonyms") or []),
+        "anilist_tags": [
+            _serialize_anilist_tag(t)
+            for t in (comic_data.get("anilist_tags") or [])
+        ],
+        "anilist_spoiler_tags": [
+            _serialize_anilist_tag(t)
+            for t in (comic_data.get("anilist_spoiler_tags") or [])
+        ],
+        "source_site": source_site or "",
+        "source_url": source_url or "",
+        "language": language or "",
+    }
+
+
 def _rewrite_cbz_comicinfo(
     folder: str,
     comic_data: Dict[str, Any],
@@ -5283,6 +5346,43 @@ def _rewrite_cbz_comicinfo(
     return updated
 
 
+def _refresh_cover_jpg(
+    folder: str, url: str, fallback_url: Optional[str], scraper
+) -> bool:
+    """Re-download a series cover to <folder>/cover.jpg for
+    --refresh-library-metadata's always-normalize-covers path. Returns True
+    iff cover.jpg was (re)written.
+
+    dl_image sniffs the real image format and may produce cover_orig.<ext>;
+    we copy whatever it produced to the canonical Komikku name cover.jpg
+    (Komikku decodes by content, not extension — komikkuspec §5). Tries `url`
+    (the AniList cover) first, then `fallback_url` (the stashed site cover)
+    when the AniList CDN fetch returns None. On total failure the existing
+    cover.jpg is left untouched (never blanked). Download work happens in a
+    throwaway temp dir so a partial/aborted fetch can't litter the series
+    folder. dl_image is safe here: its watchdog/host-poison checks are no-ops
+    outside the chapter loop. grep caller: _refresh_library_metadata.
+    """
+    import tempfile
+
+    tmp_dir = tempfile.mkdtemp(prefix="aio_cover_")
+    try:
+        got = dl_image(url, tmp_dir, "cover_orig.jpg", scraper, cleanup=True)
+        if got is None and fallback_url and fallback_url != url:
+            got = dl_image(
+                fallback_url, tmp_dir, "cover_orig.jpg", scraper, cleanup=True
+            )
+        if got and os.path.exists(got):
+            shutil.copy2(got, os.path.join(folder, "cover.jpg"))
+            return True
+        return False
+    except Exception:
+        # Best-effort: a cover refresh must never abort the whole library run.
+        return False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def _refresh_library_metadata(args) -> int:
     """--refresh-library-metadata mode. Returns a process exit code.
 
@@ -5297,8 +5397,10 @@ def _refresh_library_metadata(args) -> int:
          search for series predating enrichment. Honors --metadata-refresh
          (cache-bypass) and --metadata-tag-min-rank. Same merge as a live
          download, so genres get the REPLACE normalization.
-      3. On a confident match: rewrite details.json + .aio_series.json; with
-         --refresh-rewrite-cbz also rewrite each CBZ's ComicInfo.xml.
+      3. On a confident match: rewrite details.json + .aio_series.json,
+         repoint the cover URL to AniList's, and re-download cover.jpg from
+         AniList (normalize the on-disk cover); with --refresh-rewrite-cbz
+         also rewrite each CBZ's ComicInfo.xml.
       4. On no match / error: leave the series untouched.
 
     Cross-file: sites/external_metadata.enrich_from_anilist,
@@ -5345,10 +5447,25 @@ def _refresh_library_metadata(args) -> int:
     tag_min_rank = int(getattr(args, "metadata_tag_min_rank", 50) or 50)
     force_refresh = bool(getattr(args, "metadata_refresh", False))
     rewrite_cbz = bool(getattr(args, "refresh_rewrite_cbz", False))
+    # Cover normalization (user-chosen "always re-download" on refresh): one
+    # shared HTTP session reused for every matched series' cover.jpg fetch.
+    # cloudscraper when available (a site-cover fallback may sit behind
+    # Cloudflare); AniList's own CDN is plain and works with either.
+    cover_scraper = None
+    try:
+        if cloudscraper is not None and sys.version_info >= (3, 7):
+            cover_scraper = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "darwin", "mobile": False}
+            )
+    except Exception:
+        cover_scraper = None
+    if cover_scraper is None:
+        cover_scraper = requests.Session()
     print(
         f"[*] Refreshing AniList metadata for {len(entries)} series in {root}"
         + (" (+CBZ ComicInfo rewrite)" if rewrite_cbz else "")
         + (" (cache-bypass)" if force_refresh else "")
+        + " (+cover.jpg re-download)"
     )
 
     matched: List[str] = []
@@ -5435,6 +5552,19 @@ def _refresh_library_metadata(args) -> int:
         )
         new_details["genre"] = list(comic_data.get("genres") or [])
         new_details["status"] = _komikku_status_to_digit(comic_data.get("status"))
+        # Reader-facing extension keys (flat top-level; Komikku ignores
+        # unknown keys). Mirrors the live-download writer (grep
+        # 'details_payload.update'). Provenance comes from the existing
+        # .aio_series.json (meta), authoritative on an in-place refresh;
+        # language falls back to any value the prior details.json carried.
+        new_details.update(
+            _build_aio_reader_extras(
+                comic_data,
+                source_site=meta.get("site"),
+                source_url=meta.get("url"),
+                language=meta.get("language") or existing_details.get("language"),
+            )
+        )
         try:
             with open(details_path, "w", encoding="utf-8") as f:
                 json.dump(new_details, f, ensure_ascii=False, indent=2)
@@ -5447,6 +5577,12 @@ def _refresh_library_metadata(args) -> int:
         meta["genres"] = list(comic_data.get("genres") or [])
         if comic_data.get("status"):
             meta["status"] = comic_data["status"]
+        # Repoint the cover URL to AniList's when enrichment supplied one so
+        # .aio_series.json + the UI thumbnail (library.js keys on
+        # seriesMeta.cover) normalize too. comic_data["cover"] is the AniList
+        # URL after enrich, or the unchanged site cover when AniList had none
+        # — safe to assign unconditionally.
+        meta["cover"] = comic_data.get("cover")
         meta["anilist_id"] = comic_data.get("anilist_id")
         meta["mal_id"] = comic_data.get("mal_id")
         meta["country_of_origin"] = comic_data.get("country_of_origin")
@@ -5470,6 +5606,22 @@ def _refresh_library_metadata(args) -> int:
             failed.append(title)
             continue
 
+        # Re-download cover.jpg from AniList (user chose always-normalize on
+        # refresh). Guarded on anilist_cover so we ONLY overwrite the on-disk
+        # cover when AniList actually supplied one — never clobber a custom
+        # cover.jpg with a re-fetched site cover in the rare matched-but-no-
+        # AniList-cover case. Falls back to the stashed site cover if the
+        # AniList CDN fetch fails. grep _refresh_cover_jpg.
+        cover_note = ""
+        if comic_data.get("anilist_cover"):
+            if _refresh_cover_jpg(
+                folder,
+                comic_data["cover"],
+                comic_data.get("site_cover"),
+                cover_scraper,
+            ):
+                cover_note = ", cover.jpg"
+
         cbz_note = ""
         if rewrite_cbz:
             n = _rewrite_cbz_comicinfo(
@@ -5485,7 +5637,7 @@ def _refresh_library_metadata(args) -> int:
             f"  [+] {title}: matched id={comic_data['anilist_id']} "
             f"({len(comic_data.get('anilist_tags', []))} tags, "
             f"{len(comic_data.get('genres', []))} genres) "
-            f"— details.json + .aio_series.json{cbz_note}"
+            f"— details.json + .aio_series.json{cover_note}{cbz_note}"
         )
 
     print(
@@ -7639,6 +7791,22 @@ def main():
             original_cover_path = dl_image(
                 cover_url, main_tmp_dir, "cover_orig.jpg", scraper, cleanup=not args.no_cleanup
             )
+            # AniList cover normalization (--metadata-source=anilist): the
+            # enrichment step (sites/external_metadata.py:_apply_anilist_match)
+            # overwrote comic_data["cover"] with the AniList cover and stashed
+            # the site's own cover under `site_cover`. If the AniList CDN fetch
+            # failed (dl_image → None), fall back to the site cover so an
+            # enriched run is never worse than an un-enriched one.
+            if original_cover_path is None:
+                site_cover = comic_data.get("site_cover")
+                if site_cover and site_cover != cover_url:
+                    log_verbose(
+                        "  AniList cover fetch failed; falling back to site cover"
+                    )
+                    original_cover_path = dl_image(
+                        site_cover, main_tmp_dir, "cover_orig.jpg", scraper,
+                        cleanup=not args.no_cleanup,
+                    )
             if args.format == "cbz" and original_cover_path:
                 current_book_content.append(
                     {"type": "image", "path": original_cover_path}
@@ -7676,12 +7844,30 @@ def main():
                 "genre": list(comic_data.get("genres", []) or []),
                 "status": _komikku_status_to_digit(comic_data.get("status")),
             }
+            # Reader-facing extension keys (flat, top-level). Komikku parses
+            # details.json with Json{ignoreUnknownKeys=true} (git show
+            # 1f17a20^:komikkuspec.md §6.1), so these are dropped by Komikku
+            # and read by the user's own reader. The AniList rich tags /
+            # ids / format / synonyms + source provenance only reach a reader
+            # via this file — .aio_series.json is never read by one. Field
+            # contract + name-collision rationale: _build_aio_reader_extras.
+            # Provenance values mirror the .aio_series.json writer below
+            # (grep '"site": handler.name').
+            details_payload.update(
+                _build_aio_reader_extras(
+                    comic_data,
+                    source_site=handler.name,
+                    source_url=args.comic_url,
+                    language=args.language,
+                )
+            )
             details_path = os.path.join(out_dir, "details.json")
             with open(details_path, "w", encoding="utf-8") as f:
                 json.dump(details_payload, f, ensure_ascii=False, indent=2)
             log_verbose(
                 f"  Komikku: wrote details.json (status={details_payload['status']}, "
-                f"{len(details_payload['genre'])} genre tags)"
+                f"{len(details_payload['genre'])} genre tags, "
+                f"{len(details_payload['anilist_tags'])} anilist tags)"
             )
         except OSError as exc:
             # Don't fail the whole run for a metadata-write error. The
