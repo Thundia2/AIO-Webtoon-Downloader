@@ -595,16 +595,25 @@ def _pick_best_candidate(
          fluke author/popularity hit (site "Solo Leveling" = 100 on the main
          series but 90 on "Solo Leveling: Ragnarok", whose staff the site's
          "Redice Studio" credit happens to match).
-      1. author_matched — site author == candidate AniList staff (>= 85
-         token_set_ratio). The decisive signal WITHIN a band: identically-titled
-         series ("Fly Me to the Moon" returns 6 entries all scoring 100; "Fairy
-         Tail" returns the real series + a same-titled Hentai doujin) are
-         otherwise indistinguishable by title. Author is what separates them.
-      2. primary_hit    — title matched on a PRIMARY title, not synonym-only
-         (kills the doujin-synonym hijack even when author data is absent).
-      3. year_matched   — startDate.year == site year hint (when provided).
-      4. popularity     — AniList popularity; canonical entries dwarf parody/
-         duplicate ones (Fly Me: 40474 vs 1669).
+      1. primary_hit    — title matched on a PRIMARY title, not synonym-only
+         (kills the doujin-synonym hijack: the Hentai "Fairy Tail" carries the
+         title only as a SYNONYM, so it loses to the real series here even when
+         author data is absent).
+      2. year_matched   — startDate.year == site year hint (when provided).
+      3. popularity     — AniList popularity; canonical entries dwarf parody/
+         duplicate/obscure same-title ones (Fly Me: 40474 vs 1669). This is the
+         main same-title disambiguator on a FRESH search (no cached id).
+      4. author_matched — site author == candidate AniList staff (>= 85
+         token_set_ratio). A TIEBREAK/booster that sits BELOW popularity, NOT a
+         lever that overrides it: identically-titled series ("Fly Me to the Moon"
+         returns 6 entries all scoring 100; "Fairy Tail" the real series + a
+         same-titled doujin) are separated by popularity first, and a fuzzy
+         author-string hit on an obscure franchise/studio entry must never
+         outrank a far more popular in-band candidate whose author the site
+         merely romanizes differently. Mirrors the self-heal popularity guard
+         (grep 'best_pop >= cached_pop'); author's decisive role lives in the
+         cached self-heal detection + tail override (enrich_from_anilist), not
+         here.
       5. title_score    — raw WRatio, last resort.
 
     The 75 title floor stays a HARD gate, so the band/author/popularity tiebreaks
@@ -639,17 +648,26 @@ def _pick_best_candidate(
     if not gated:
         return None, best_seen
     # Primary key is the TITLE BAND: only candidates whose title score is within
-    # _TITLE_BAND_DELTA of the best title score compete on author/popularity, so a
+    # _TITLE_BAND_DELTA of the best title score compete on the keys below, so a
     # less-similar entry can't win on a spurious author/popularity hit (the
-    # Solo-Leveling-vs-Ragnarok fix). Within the band: author match > primary-
-    # title hit > year > popularity > title score. Python's stable sort preserves
+    # Solo-Leveling-vs-Ragnarok fix). Within the band: primary-title hit > year >
+    # popularity > author match > title score. Python's stable sort preserves
     # AniList return order for exact all-key ties.
     best_title = max(r[4] for r in gated)
 
     def _rank_key(r: Tuple[bool, bool, bool, int, float, Dict[str, Any]]):
         author_matched, primary_hit, year_matched, popularity, title_score, _cand = r
         in_band = title_score >= best_title - _TITLE_BAND_DELTA
-        return (in_band, author_matched, primary_hit, year_matched, popularity, title_score)
+        # popularity OUTRANKS author_matched: on a fresh search (no cached id to
+        # apply the self-heal popularity guard) a coincidental author-string hit
+        # on an obscure franchise/studio entry would otherwise beat a far more
+        # popular same-title candidate whose author the site romanizes
+        # differently. Canonical entries dominate popularity, so the same-title
+        # fixes (Fly Me, Fairy Tail) hold on popularity (+ primary_hit) without
+        # leaning on author here; author stays a final tiebreak/booster. This is
+        # the fresh-path analogue of enrich_from_anilist's 'best_pop >=
+        # cached_pop' guard — author must never DOWNGRADE popularity.
+        return (in_band, primary_hit, year_matched, popularity, author_matched, title_score)
 
     gated.sort(key=_rank_key, reverse=True)
     chosen = gated[0]

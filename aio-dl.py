@@ -3066,6 +3066,17 @@ def recompress_chapter_images_modern(
             import pillow_jxl  # noqa: F401
         except ImportError:
             pass
+    if policy != "jxl":
+        # AVIF is native in Pillow >= 12; the pillow-avif-plugin fallback for
+        # older Pillow only registers on import (Image.init() won't trigger it).
+        # Best-effort so an avif/auto/jxl+avif policy works on pre-12 Pillow too,
+        # mirroring the pillow_jxl import and the parse-time gate (grep
+        # 'import pillow_avif'). Missing -> the AVIF save fails per-page and the
+        # original is kept (broad catch in _convert_one).
+        try:
+            import pillow_avif  # noqa: F401
+        except ImportError:
+            pass
     # Register plugins once, single-threaded, before the worker pool starts.
     # The native AVIF plugin registers lazily on first save; letting parallel
     # workers trigger that registration concurrently is a data race. Idempotent.
@@ -7152,6 +7163,18 @@ def main():
                     "(or use --modernize-format avif for AVIF-only)."
                 )
         if _mpolicy in ("auto", "avif", "jxl+avif"):
+            # AVIF is native in Pillow >= 12 (Image.init() registers it). On
+            # OLDER Pillow the pillow-avif-plugin fallback advertised in the
+            # error below registers AVIF only when its module is IMPORTED —
+            # Image.init() does not load it — so try that import first or we'd
+            # reject a working install. Best-effort, mirrors the pillow_jxl
+            # import above. The same import is repeated in
+            # recompress_chapter_images_modern so the encoder is present at
+            # encode time too (grep 'import pillow_avif').
+            try:
+                import pillow_avif  # noqa: F401  (registers AVIF in PIL.Image.SAVE)
+            except ImportError:
+                pass
             Image.init()  # native AVIF plugin registers lazily
             if "AVIF" not in Image.SAVE:
                 p.error(
