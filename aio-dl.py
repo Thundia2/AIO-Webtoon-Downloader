@@ -3098,12 +3098,20 @@ def recompress_chapter_images_modern(
                 candidates: List[Tuple[int, str]] = []
                 if target in ("jxl", "both"):
                     jxl_path = base + ".jxl"
-                    # Encode as-is (no convert("L") — see header). Only normalize
-                    # exotic modes pillow_jxl can't take (P/CMYK/I/...).
-                    jxl_src = (
-                        im if im.mode in ("L", "LA", "RGB", "RGBA")
-                        else im.convert("RGB")
-                    )
+                    # Encode as-is (no convert("L") — see header). Keep alpha-
+                    # capable modes (JXL carries alpha); map paletted
+                    # transparency to RGBA so palette alpha isn't flattened; only
+                    # widen truly exotic modes pillow_jxl can't take (opaque P /
+                    # CMYK / I / ...) to RGB. Mirrors the AVIF branch's no-flatten
+                    # rule (grep 'AVIF carries alpha').
+                    if im.mode in ("L", "LA", "RGB", "RGBA"):
+                        jxl_src = im
+                    elif im.mode == "PA" or (
+                        im.mode == "P" and "transparency" in im.info
+                    ):
+                        jxl_src = im.convert("RGBA")
+                    else:
+                        jxl_src = im.convert("RGB")
                     # JPEG quirk (measured on file-based sources, which is all
                     # we get): pillow_jxl's default lossless_jpeg=True does
                     # bit-exact JPEG *reconstruction* and SILENTLY IGNORES
@@ -3127,9 +3135,23 @@ def recompress_chapter_images_modern(
                     candidates.append((os.path.getsize(jxl_path), jxl_path))
                 if target in ("avif", "both"):
                     avif_path = base + ".avif"
-                    avif_src = (
-                        im if im.mode in ("RGB", "L") else im.convert("RGB")
-                    )
+                    # AVIF carries alpha — never flatten it. The CBZ byte-
+                    # passthrough fast path this rides preserved the original PNG,
+                    # so a transparent page (RGBA / LA / paletted-transparency)
+                    # must stay transparent; converting it to RGB here would make
+                    # the background opaque. Map every alpha-bearing source to
+                    # RGBA and widen the rest (L / opaque-P / CMYK / ...) to RGB.
+                    # Grayscale color-routed pages are rare (auto sends B&W to
+                    # JXL), so the L->RGB widening only bites forced
+                    # --modernize-format avif / jxl+avif.
+                    if im.mode == "RGB":
+                        avif_src = im
+                    elif im.mode in ("RGBA", "LA", "PA") or (
+                        im.mode == "P" and "transparency" in im.info
+                    ):
+                        avif_src = im.convert("RGBA")
+                    else:
+                        avif_src = im.convert("RGB")
                     avif_src.save(
                         avif_path, format="AVIF", quality=color_quality, speed=6
                     )
@@ -4416,6 +4438,26 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
         "metadata_source": str(getattr(args, "metadata_source", "none") or "none"),
         "metadata_tag_min_rank": int(getattr(args, "metadata_tag_min_rank", 50) or 50),
         "metadata_refresh": bool(getattr(args, "metadata_refresh", False)),
+        # Content-aware JXL/AVIF transcode (--modernize family). Persisted so
+        # --update-all child runs keep transcoding newly downloaded chapters;
+        # without this a series first grabbed with --save-params --modernize
+        # would get plain JPEG/PNG pages on every update, leaving the library
+        # half-modernized. Replay branch: _append_saved_update_options. NOTE: no
+        # `or` defaults on distance/min_saving — 0.0 distance (JXL lossless) is a
+        # valid value that `or` would silently clobber to the default.
+        "modernize": bool(getattr(args, "modernize", False)),
+        "modernize_format": str(getattr(args, "modernize_format", "auto") or "auto"),
+        "modernize_quality": int(getattr(args, "modernize_quality", 90) or 90),
+        "modernize_distance": float(
+            getattr(args, "modernize_distance", 1.0)
+            if getattr(args, "modernize_distance", 1.0) is not None
+            else 1.0
+        ),
+        "modernize_min_saving": float(
+            getattr(args, "modernize_min_saving", 0.92)
+            if getattr(args, "modernize_min_saving", 0.92) is not None
+            else 0.92
+        ),
     }
     if getattr(args, "format", None) == "epub":
         data["epub_layout"] = getattr(args, "epub_layout", "vertical")
@@ -4474,12 +4516,22 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
         child_cmd.extend(["--site", str(params["site"])])
     if params.get("epub_layout"):
         child_cmd.extend(["--epub-layout", str(params["epub_layout"])])
-    if params.get("width"):
+    # --modernize rides the CBZ byte-passthrough fast-path and HARD-errors at
+    # parse time on an explicit --width / --aspect-ratio / --quality (grep
+    # '--modernize compatibility checks'). When replaying a modernize series we
+    # must NOT re-emit those — the saved values are just the cbz defaults the
+    # original run never set explicitly (e.g. width=1500), and emitting them
+    # would flip the child's _user_set_* sentinels and make it self-reject. The
+    # original run required scaling==100, so the saved scaling is 100 and
+    # emitting it stays compatible.
+    _replay_modernize = bool(params.get("modernize"))
+    if params.get("width") and not _replay_modernize:
         child_cmd.extend(["--width", str(params["width"])])
-    if params.get("aspect_ratio"):
+    if params.get("aspect_ratio") and not _replay_modernize:
         child_cmd.extend(["--aspect-ratio", str(params["aspect_ratio"])])
     if not params.get("no_processing"):
-        child_cmd.extend(["--quality", str(params.get("quality", 85))])
+        if not _replay_modernize:
+            child_cmd.extend(["--quality", str(params.get("quality", 85))])
         child_cmd.extend(["--scaling", str(params.get("scaling", 100))])
     if params.get("cookies"):
         child_cmd.extend(["--cookies", str(params["cookies"])])
@@ -4525,6 +4577,29 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
         saved_rank = params.get("metadata_tag_min_rank")
         if isinstance(saved_rank, int) and saved_rank != 50:
             child_cmd.extend(["--metadata-tag-min-rank", str(saved_rank)])
+
+    # Content-aware JXL/AVIF transcode (--modernize family). Mirrors the
+    # metadata_source replay above: saved by _save_download_params, absent in
+    # older download_params.json (get → None → skipped, forward-compatible).
+    # Emit the master flag + only NON-default knobs (argparse defaults:
+    # format=auto, quality=90, distance=1.0, min-saving=0.92) to keep the spawn
+    # line clean. The child re-runs the parse-time compat checks; because the
+    # width/aspect/quality emissions above are suppressed under _replay_modernize
+    # and --format cbz / --scaling 100 are replayed, it satisfies the fast-path.
+    if _replay_modernize:
+        child_cmd.append("--modernize")
+        mfmt = params.get("modernize_format")
+        if mfmt and mfmt != "auto":
+            child_cmd.extend(["--modernize-format", str(mfmt)])
+        mq = params.get("modernize_quality")
+        if isinstance(mq, (int, float)) and int(mq) != 90:
+            child_cmd.extend(["--modernize-quality", str(int(mq))])
+        md = params.get("modernize_distance")
+        if isinstance(md, (int, float)) and float(md) != 1.0:
+            child_cmd.extend(["--modernize-distance", str(md)])
+        mms = params.get("modernize_min_saving")
+        if isinstance(mms, (int, float)) and float(mms) != 0.92:
+            child_cmd.extend(["--modernize-min-saving", str(mms)])
     if params.get("metadata_refresh"):
         child_cmd.append("--metadata-refresh")
 
@@ -9160,19 +9235,43 @@ def main():
             _pdf_source_paths: Optional[List[Optional[str]]] = None
 
             if raw_image_paths:
+                # Phase B (2026-05-07): CBZ fast-path. When the user is on
+                # default --scaling 100 with no width/aspect/quality override,
+                # we put the original wire bytes straight into the archive —
+                # no PIL decode, no recombine, no JPEG re-encode. The archive
+                # layer (build_cbz / build_cbz_from_content) preserves
+                # per-file extensions on the arcname, so .webp downloads stay
+                # .webp, .png stay .png, etc. Phase A made raw_image_paths
+                # land with correct extensions which is what makes this work.
+                # Computed BEFORE the --modernize block so modernize gates on the
+                # exact same condition (see below).
+                cbz_fast_path = (
+                    args.format == "cbz"
+                    and not args.no_processing
+                    and not getattr(args, "no_cbz_preserve_originals", False)
+                    and scale_factor == 1.0
+                    and not getattr(args, "_user_set_width", False)
+                    and not getattr(args, "_user_set_aspect_ratio", False)
+                    and not getattr(args, "_user_set_quality", False)
+                )
                 # --modernize (opt-in, CBZ-only): content-aware JXL/AVIF
                 # transcode of the downloaded pages, in place, BEFORE the CBZ
-                # fast-path below consumes raw_image_paths. Hard-gated at parse
-                # time to the byte-passthrough fast-path (grep '--modernize
-                # compatibility checks'), so the new .jxl/.avif bytes flow
-                # straight into build_cbz with correct extensions and never
-                # reach the slow save_final_images path (which would re-encode
-                # them to PNG). Runs after the webtoon-recompress block above
-                # (so pages already converted to .webp are skipped) and after
-                # the prefetch-chain kickoff (so the CPU-bound encode overlaps
-                # the next chapters' downloads). See
+                # fast-path consumes raw_image_paths — so the new .jxl/.avif
+                # bytes flow straight into build_cbz with correct extensions and
+                # never reach the slow save_final_images path (which would
+                # re-encode them to PNG). Gated on cbz_fast_path itself, NOT just
+                # format==cbz: the parse-time hard errors (grep '--modernize
+                # compatibility checks') are SKIPPED on a --restore-parameters
+                # resume (the bare resume CLI omits --modernize, so that block
+                # never runs, then run_params.json restores modernize=True). A
+                # resume that re-adds a fast-path-breaking override
+                # (--no-processing / --width / --scaling) would otherwise smuggle
+                # .jxl/.avif into the slow path; riding cbz_fast_path closes that
+                # hole. Runs after the webtoon-recompress block above (so .webp
+                # pages are skipped) and after the prefetch kickoff (CPU encode
+                # overlaps the next downloads). See
                 # recompress_chapter_images_modern().
-                if getattr(args, "modernize", False) and args.format == "cbz":
+                if getattr(args, "modernize", False) and cbz_fast_path:
                     _t0_modernize = time.monotonic()
                     log_verbose(
                         f"  [modernize] Transcoding {len(raw_image_paths)} pages "
@@ -9189,23 +9288,17 @@ def main():
                         f"  [modernize] Done in "
                         f"{time.monotonic() - _t0_modernize:.1f}s."
                     )
-                # Phase B (2026-05-07): CBZ fast-path. When the user is on
-                # default --scaling 100 with no width/aspect/quality override,
-                # we put the original wire bytes straight into the archive —
-                # no PIL decode, no recombine, no JPEG re-encode. The archive
-                # layer (build_cbz / build_cbz_from_content) preserves
-                # per-file extensions on the arcname, so .webp downloads stay
-                # .webp, .png stay .png, etc. Phase A made raw_image_paths
-                # land with correct extensions which is what makes this work.
-                cbz_fast_path = (
-                    args.format == "cbz"
-                    and not args.no_processing
-                    and not getattr(args, "no_cbz_preserve_originals", False)
-                    and scale_factor == 1.0
-                    and not getattr(args, "_user_set_width", False)
-                    and not getattr(args, "_user_set_aspect_ratio", False)
-                    and not getattr(args, "_user_set_quality", False)
-                )
+                elif getattr(args, "modernize", False):
+                    # Requested but the fast-path is disabled — almost always a
+                    # resume with a fast-path-breaking override. Skip (don't feed
+                    # .jxl/.avif into the re-encode path) and say so, rather than
+                    # hard-erroring and aborting the whole resume.
+                    log_verbose(
+                        "  [modernize] skipped: effective settings disable the "
+                        "CBZ byte-passthrough fast-path (e.g. a "
+                        "--restore-parameters resume adding --no-processing, "
+                        "--width, or --scaling). Pages left as-is."
+                    )
                 if cbz_fast_path:
                     processed_page_images = list(raw_image_paths)
                     log_verbose(
