@@ -2949,6 +2949,298 @@ def recompress_chapter_images_to_webp(
 
 
 # -----------------------------------------------------------
+# Content-aware JXL/AVIF recompression (opt-in via --modernize)
+# -----------------------------------------------------------
+# Structural twin of recompress_chapter_images_to_webp (above): same cpu//2
+# ThreadPool, same write-temp-then-os.remove-original atomicity, same broad-
+# catch keep-original-on-failure. Differences:
+#   * Content-aware per-page routing: B&W line art -> JXL, color -> AVIF.
+#     Routing is a SIZE decision ONLY — we never convert("L") (empirically 0%
+#     gain at distance 1.0, since libjxl already zeroes imperceptible chroma,
+#     and it would be the one irreversible op), so a misroute costs bytes,
+#     never pixels.
+#   * A per-page min_saving guard: adopt the new file only if it's smaller than
+#     orig*min_saving, else keep the original byte-for-byte. Never bloats, and
+#     self-corrects a gray->AVIF misroute (AVIF on line art is ~95% of source,
+#     above the 0.92 guard, so the original is kept).
+#   * Skips WEBP/AVIF/GIF/JXL sources (already efficient / animated / already
+#     modern) so re-runs are idempotent.
+# Cross-file: gated call site at the top of the `if raw_image_paths:` block in
+# the chapter pipeline (grep 'recompress_chapter_images_modern('), which runs
+# BEFORE cbz_fast_path so the new bytes flow straight into build_cbz with
+# correct per-file extensions (build_cbz arcname preserves splitext, ~line
+# 3389). --modernize is hard-gated at parse time to the CBZ byte-passthrough
+# fast-path (grep '--modernize compatibility checks'): every fast-path-
+# disabling flag is a p.error(), because the slow save_final_images path only
+# understands WEBP/JPEG and would re-encode .jxl/.avif to PNG. Resume: the
+# --modernize* dests are in _RESUME_GATING_DESTS so changing them re-transcodes.
+
+# Pages larger than this in either dimension route to JXL regardless of color:
+# AVIF encodes them fine but its on-device (Android) decode at extreme heights
+# (long-strip webtoons up to ~15000px) is unverified, and JXL ties AVIF on size
+# for tall strips while decoding large dimensions more robustly. Under an
+# avif-only policy the user opted out of JXL, so oversized pages are skipped
+# (original kept) instead of emitting an unasked-for format.
+_MODERNIZE_MAX_DIM = 8192
+
+# Source formats with no re-encode headroom (already efficient, animated, or
+# already a modern codec). Matched against PIL's reported Image.format.
+_MODERN_SKIP_FORMATS = frozenset({"WEBP", "AVIF", "GIF", "JXL"})
+
+# In strict-lossless mode (--modernize-distance 0.0) pillow_jxl does our
+# intended bit-exact JPEG->JXL reconstruction and warns once per page
+# suggesting lossless_jpeg — pure noise, since reconstruction is exactly what
+# we want there. Silence that one specific message process-wide. Set at import
+# (not in recompress_chapter_images_modern, which would re-append to the global
+# filter list every chapter) and only matches our own JXL save, so nothing else
+# is affected. The lossy default path passes lossless_jpeg=False and never
+# triggers it. Grep 'lossless_jpeg' for the matching save site.
+import warnings as _warnings  # noqa: E402
+
+_warnings.filterwarnings(
+    "ignore", message="Using JPEG reconstruction", category=UserWarning
+)
+
+
+def _page_is_grayscale(im, chroma_thresh: int = 16, area_frac: float = 0.005) -> bool:
+    """True if a page should route to JXL (grayscale) vs AVIF (color).
+
+    ROUTING ONLY — never a pixel decision. Because recompress_chapter_images_
+    modern never reduces a page to mode L, a wrong verdict here only changes
+    which codec is tried (a size trade-off), never destroys color.
+
+    Full-resolution colored-area fraction, not a downscaled probe: a small but
+    real color element (e.g. a 5%-area panel) survives at full res but gets
+    averaged away by a 20x20 thumbnail — which is why we do NOT reuse
+    sites.search_orchestrator._is_grayscale_pil (its p90/thumbnail probe was
+    built for whole-series classification, not per-page color preservation, and
+    importing it would couple this hot path to the search/ML module). Counting
+    the fraction of pixels whose channel spread exceeds chroma_thresh is robust
+    to JPEG chroma ringing on B&W scans (low-amplitude, sub-threshold) yet
+    catches genuine local color. Thresholds are starting points — tune against
+    the real library if routing drifts (grep '_page_is_grayscale').
+    """
+    if getattr(im, "mode", None) in ("L", "LA", "1"):
+        return True
+    import numpy as np  # hard dep (requirements.txt); lazy like _is_grayscale_pil
+    arr = np.asarray(im.convert("RGB"), dtype=np.int16)
+    chroma = arr.max(axis=2) - arr.min(axis=2)  # per-pixel max channel spread
+    return float((chroma > chroma_thresh).mean()) < area_frac
+
+
+def recompress_chapter_images_modern(
+    raw_paths: List[str],
+    *,
+    policy: str,
+    gray_quality: float,
+    color_quality: int,
+    min_saving: float,
+    effort: int = 7,
+) -> List[str]:
+    """Content-aware transcode of JPEG/PNG pages to JXL (B&W) / AVIF (color).
+
+    Opt-in via --modernize. ``policy``: "auto" (JXL for gray, AVIF for color) |
+    "jxl" | "avif" | "jxl+avif" (encode both, keep the smaller). ``gray_quality``
+    is the JXL distance (1.0 ~ visually lossless; 0.0 selects JXL lossless
+    mode); ``color_quality`` is the AVIF quality (90 default; 85 aggressive).
+    ``min_saving`` is the keep-threshold: the new file replaces the original
+    only if its size < orig_size * min_saving, else the original is kept
+    byte-for-byte (so already-dense pages are auto-skipped and nothing bloats).
+
+    Returns the per-slot path list (new .jxl/.avif where it helped, otherwise
+    the unchanged original path), matching recompress_chapter_images_to_webp's
+    contract — the caller reassigns raw_image_paths to it. See the section
+    header above for the routing/guard rationale and the fast-path coupling.
+    """
+    if not raw_paths:
+        return list(raw_paths)
+
+    # JXL is an optional plugin (pillow-jxl-plugin); importing it registers the
+    # encoder in PIL.Image.SAVE. AVIF is native in Pillow >= 12. --modernize is
+    # validated at parse time (grep '--modernize compatibility checks') so both
+    # are present in the normal flow; the try/except keeps the function callable
+    # from tests when JXL isn't installed (a missing-encoder save then fails
+    # per-page and the original is kept).
+    if policy != "avif":
+        try:
+            import pillow_jxl  # noqa: F401
+        except ImportError:
+            pass
+    if policy != "jxl":
+        # AVIF is native in Pillow >= 12; the pillow-avif-plugin fallback for
+        # older Pillow only registers on import (Image.init() won't trigger it).
+        # Best-effort so an avif/auto/jxl+avif policy works on pre-12 Pillow too,
+        # mirroring the pillow_jxl import and the parse-time gate (grep
+        # 'import pillow_avif'). Missing -> the AVIF save fails per-page and the
+        # original is kept (broad catch in _convert_one).
+        try:
+            import pillow_avif  # noqa: F401
+        except ImportError:
+            pass
+    # Register plugins once, single-threaded, before the worker pool starts.
+    # The native AVIF plugin registers lazily on first save; letting parallel
+    # workers trigger that registration concurrently is a data race. Idempotent.
+    Image.init()
+
+    def _pick_target(im, w: int, h: int) -> str:
+        if max(w, h) > _MODERNIZE_MAX_DIM:
+            return "jxl" if policy != "avif" else "skip"
+        if policy == "jxl":
+            return "jxl"
+        if policy == "avif":
+            return "avif"
+        if policy == "jxl+avif":
+            return "both"
+        return "jxl" if _page_is_grayscale(im) else "avif"  # auto
+
+    def _convert_one(entry: Tuple[int, str]) -> Tuple[int, str]:
+        idx, src = entry
+        base, _ = os.path.splitext(src)
+        try:
+            orig_size = os.path.getsize(src)
+            with Image.open(src) as im:
+                src_fmt = (im.format or "").upper()
+                if src_fmt in _MODERN_SKIP_FORMATS:
+                    return idx, src
+                w, h = im.size
+                target = _pick_target(im, w, h)
+                if target == "skip":
+                    return idx, src
+                candidates: List[Tuple[int, str]] = []
+                if target in ("jxl", "both"):
+                    jxl_path = base + ".jxl"
+                    # Encode as-is (no convert("L") — see header). Keep alpha-
+                    # capable modes (JXL carries alpha); map paletted
+                    # transparency to RGBA so palette alpha isn't flattened; only
+                    # widen truly exotic modes pillow_jxl can't take (opaque P /
+                    # CMYK / I / ...) to RGB. Mirrors the AVIF branch's no-flatten
+                    # rule (grep 'AVIF carries alpha').
+                    if im.mode in ("L", "LA", "RGB", "RGBA"):
+                        jxl_src = im
+                    elif im.mode == "PA" or (
+                        im.mode == "P" and "transparency" in im.info
+                    ):
+                        jxl_src = im.convert("RGBA")
+                    else:
+                        jxl_src = im.convert("RGB")
+                    # JPEG quirk (measured on file-based sources, which is all
+                    # we get): pillow_jxl's default lossless_jpeg=True does
+                    # bit-exact JPEG *reconstruction* and SILENTLY IGNORES
+                    # distance (~78%, diff=0, and warns). So:
+                    #   * lossy/visually-lossless default -> force
+                    #     lossless_jpeg=False so --modernize-distance actually
+                    #     applies (58%, diff>0, no warning).
+                    #   * gray_quality == 0.0 (strict lossless) -> KEEP the
+                    #     default: lossless=True then gives bit-exact JPEG->JXL
+                    #     reconstruction (~78%) for JPEG and pixel-lossless for
+                    #     PNG automatically — exactly the two lossless tiers, no
+                    #     external cjxl needed. (PNG/other sources ignore
+                    #     lossless_jpeg either way.)
+                    jxl_src.save(
+                        jxl_path,
+                        format="JXL",
+                        effort=effort,
+                        **({"lossless": True} if gray_quality == 0.0
+                           else {"distance": gray_quality, "lossless_jpeg": False}),
+                    )
+                    candidates.append((os.path.getsize(jxl_path), jxl_path))
+                if target in ("avif", "both"):
+                    avif_path = base + ".avif"
+                    # AVIF carries alpha — never flatten it. The CBZ byte-
+                    # passthrough fast path this rides preserved the original PNG,
+                    # so a transparent page (RGBA / LA / paletted-transparency)
+                    # must stay transparent; converting it to RGB here would make
+                    # the background opaque. Map every alpha-bearing source to
+                    # RGBA and widen the rest (L / opaque-P / CMYK / ...) to RGB.
+                    # Grayscale color-routed pages are rare (auto sends B&W to
+                    # JXL), so the L->RGB widening only bites forced
+                    # --modernize-format avif / jxl+avif.
+                    if im.mode == "RGB":
+                        avif_src = im
+                    elif im.mode in ("RGBA", "LA", "PA") or (
+                        im.mode == "P" and "transparency" in im.info
+                    ):
+                        avif_src = im.convert("RGBA")
+                    else:
+                        avif_src = im.convert("RGB")
+                    avif_src.save(
+                        avif_path, format="AVIF", quality=color_quality, speed=6
+                    )
+                    candidates.append((os.path.getsize(avif_path), avif_path))
+        except Exception as e:
+            # Corrupt page, missing encoder, DecompressionBomb, etc. Keep the
+            # original; clean up any partial temp. One bad page never aborts the
+            # chapter (mirrors the webp fn's broad catch at ~line 2894).
+            log_verbose(
+                f"  Warning: modernize transcode failed for "
+                f"{os.path.basename(src)}: {e}. Keeping original."
+            )
+            for _ext in (".jxl", ".avif"):
+                try:
+                    os.remove(base + _ext)
+                except OSError:
+                    pass
+            return idx, src
+
+        # Pick the smallest candidate; discard the rest (jxl+avif loser).
+        candidates.sort(key=lambda c: c[0])
+        best_size, best_path = candidates[0]
+        for _sz, loser in candidates[1:]:
+            try:
+                os.remove(loser)
+            except OSError:
+                pass
+        # Guard: adopt the new file only if it clears the savings threshold.
+        if best_size < orig_size * min_saving:
+            try:
+                os.remove(src)
+            except OSError as e:
+                # New file is fine; couldn't delete the original (AV / OneDrive
+                # lock). Leftover gets wiped on the next chapter-dir reset.
+                log_debug(
+                    f"    Modernize: kept original alongside "
+                    f"{os.path.splitext(best_path)[1]} ({e}): "
+                    f"{os.path.basename(src)}"
+                )
+            return idx, best_path
+        # Not enough headroom — drop the new file, keep the original bytes.
+        try:
+            os.remove(best_path)
+        except OSError:
+            pass
+        return idx, src
+
+    cpu = os.cpu_count() or 4
+    half_cores = max(1, cpu // 2)
+    workers = max(1, min(half_cores, len(raw_paths)))
+
+    out: List[Optional[str]] = [None] * len(raw_paths)
+    with _cpu_guard("recompress_modern"):
+        if workers == 1 or len(raw_paths) == 1:
+            for entry in enumerate(raw_paths):
+                idx, dst = _convert_one(entry)
+                out[idx] = dst
+                if idx % 8 == 0:
+                    _hb("cpu", f"modernize {idx+1}/{len(raw_paths)}")
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="modern-recompress"
+            ) as pool:
+                # JXL/AVIF native encoders generally release the GIL during the
+                # heavy encode (like libwebp/libjpeg), so workers translate to
+                # speedup; if a given pillow_jxl build holds the GIL the pool
+                # just serializes (correct, only slower). Part B uses processes.
+                for idx, dst in pool.map(
+                    _convert_one, list(enumerate(raw_paths))
+                ):
+                    out[idx] = dst
+                    if idx % 8 == 0:
+                        _hb("cpu", f"modernize {idx+1}/{len(raw_paths)}")
+
+    return [p for p in out if p is not None]
+
+
+# -----------------------------------------------------------
 # Builders (PDF, EPUB, CBZ)
 # -----------------------------------------------------------
 def _media(path: str):
@@ -4040,6 +4332,16 @@ _RESUME_GATING_DESTS = frozenset({
     # don't end up half-Komikku. See the cbz-cache creation block (grep
     # 'cached_cbz_path = os.path.join') for where this matters.
     "komikku",
+    # Content-aware JXL/AVIF transcode (--modernize, CBZ-only). Changing any of
+    # these re-routes or re-encodes pages, and the transcode DELETES the
+    # original JPEG/PNG bytes in place — so a resume with different settings
+    # must re-download + re-transcode (the on-disk .jxl/.avif no longer match
+    # the requested encoding). See recompress_chapter_images_modern().
+    "modernize",
+    "modernize_format",
+    "modernize_quality",
+    "modernize_distance",
+    "modernize_min_saving",
 })
 
 # Dests that must NEVER be persisted to run_params.json. Every other
@@ -4147,6 +4449,26 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
         "metadata_source": str(getattr(args, "metadata_source", "none") or "none"),
         "metadata_tag_min_rank": int(getattr(args, "metadata_tag_min_rank", 50) or 50),
         "metadata_refresh": bool(getattr(args, "metadata_refresh", False)),
+        # Content-aware JXL/AVIF transcode (--modernize family). Persisted so
+        # --update-all child runs keep transcoding newly downloaded chapters;
+        # without this a series first grabbed with --save-params --modernize
+        # would get plain JPEG/PNG pages on every update, leaving the library
+        # half-modernized. Replay branch: _append_saved_update_options. NOTE: no
+        # `or` defaults on distance/min_saving — 0.0 distance (JXL lossless) is a
+        # valid value that `or` would silently clobber to the default.
+        "modernize": bool(getattr(args, "modernize", False)),
+        "modernize_format": str(getattr(args, "modernize_format", "auto") or "auto"),
+        "modernize_quality": int(getattr(args, "modernize_quality", 90) or 90),
+        "modernize_distance": float(
+            getattr(args, "modernize_distance", 1.0)
+            if getattr(args, "modernize_distance", 1.0) is not None
+            else 1.0
+        ),
+        "modernize_min_saving": float(
+            getattr(args, "modernize_min_saving", 0.92)
+            if getattr(args, "modernize_min_saving", 0.92) is not None
+            else 0.92
+        ),
     }
     if getattr(args, "format", None) == "epub":
         data["epub_layout"] = getattr(args, "epub_layout", "vertical")
@@ -4205,12 +4527,22 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
         child_cmd.extend(["--site", str(params["site"])])
     if params.get("epub_layout"):
         child_cmd.extend(["--epub-layout", str(params["epub_layout"])])
-    if params.get("width"):
+    # --modernize rides the CBZ byte-passthrough fast-path and HARD-errors at
+    # parse time on an explicit --width / --aspect-ratio / --quality (grep
+    # '--modernize compatibility checks'). When replaying a modernize series we
+    # must NOT re-emit those — the saved values are just the cbz defaults the
+    # original run never set explicitly (e.g. width=1500), and emitting them
+    # would flip the child's _user_set_* sentinels and make it self-reject. The
+    # original run required scaling==100, so the saved scaling is 100 and
+    # emitting it stays compatible.
+    _replay_modernize = bool(params.get("modernize"))
+    if params.get("width") and not _replay_modernize:
         child_cmd.extend(["--width", str(params["width"])])
-    if params.get("aspect_ratio"):
+    if params.get("aspect_ratio") and not _replay_modernize:
         child_cmd.extend(["--aspect-ratio", str(params["aspect_ratio"])])
     if not params.get("no_processing"):
-        child_cmd.extend(["--quality", str(params.get("quality", 85))])
+        if not _replay_modernize:
+            child_cmd.extend(["--quality", str(params.get("quality", 85))])
         child_cmd.extend(["--scaling", str(params.get("scaling", 100))])
     if params.get("cookies"):
         child_cmd.extend(["--cookies", str(params["cookies"])])
@@ -4256,6 +4588,29 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
         saved_rank = params.get("metadata_tag_min_rank")
         if isinstance(saved_rank, int) and saved_rank != 50:
             child_cmd.extend(["--metadata-tag-min-rank", str(saved_rank)])
+
+    # Content-aware JXL/AVIF transcode (--modernize family). Mirrors the
+    # metadata_source replay above: saved by _save_download_params, absent in
+    # older download_params.json (get → None → skipped, forward-compatible).
+    # Emit the master flag + only NON-default knobs (argparse defaults:
+    # format=auto, quality=90, distance=1.0, min-saving=0.92) to keep the spawn
+    # line clean. The child re-runs the parse-time compat checks; because the
+    # width/aspect/quality emissions above are suppressed under _replay_modernize
+    # and --format cbz / --scaling 100 are replayed, it satisfies the fast-path.
+    if _replay_modernize:
+        child_cmd.append("--modernize")
+        mfmt = params.get("modernize_format")
+        if mfmt and mfmt != "auto":
+            child_cmd.extend(["--modernize-format", str(mfmt)])
+        mq = params.get("modernize_quality")
+        if isinstance(mq, (int, float)) and int(mq) != 90:
+            child_cmd.extend(["--modernize-quality", str(int(mq))])
+        md = params.get("modernize_distance")
+        if isinstance(md, (int, float)) and float(md) != 1.0:
+            child_cmd.extend(["--modernize-distance", str(md)])
+        mms = params.get("modernize_min_saving")
+        if isinstance(mms, (int, float)) and float(mms) != 0.92:
+            child_cmd.extend(["--modernize-min-saving", str(mms)])
     if params.get("metadata_refresh"):
         child_cmd.append("--metadata-refresh")
 
@@ -6377,6 +6732,69 @@ def main():
              "method=6 trades ~2-3x encode time for ~5%% smaller files — "
              "sensible for overnight bulk runs on a desktop, not phone CPUs.",
     )
+    # ── Content-aware JXL/AVIF transcode (opt-in via --modernize) ──
+    # CBZ-only storage optimizer: re-encode JPEG/PNG pages to JXL (B&W line
+    # art) or AVIF (color) before the byte-passthrough fast-path packages them.
+    # Hard-gated below (grep '--modernize compatibility checks') to the CBZ
+    # fast-path: every flag that would force the slow save_final_images path
+    # (which re-encodes .jxl/.avif to PNG) is rejected with p.error(). Pairs
+    # with recompress_chapter_images_modern(); the --modernize* dests are in
+    # _RESUME_GATING_DESTS so changing them re-transcodes on resume.
+    p.add_argument(
+        "--modernize",
+        action="store_true",
+        help="CBZ ONLY: transcode downloaded JPEG/PNG pages to JXL (grayscale "
+             "line art) or AVIF (color) before packaging, for visually-lossless "
+             "storage savings on a reader that decodes them. Per-page format "
+             "choice; WebP/AVIF/GIF/already-JXL sources are left untouched (no "
+             "headroom). A page is replaced only if the new file is smaller by "
+             "the --modernize-min-saving margin, else the original bytes are "
+             "kept. Rides the CBZ byte-passthrough fast-path and is therefore "
+             "rejected at startup with --format other than cbz, --no-processing, "
+             "--no-cbz-preserve-originals, --quality, --width, --aspect-ratio, "
+             "or --scaling != 100; use --keep-images to retain the original "
+             "downloads. Needs pillow-jxl-plugin for JXL (AVIF is built into "
+             "Pillow >= 12).",
+    )
+    p.add_argument(
+        "--modernize-format",
+        choices=["auto", "jxl", "avif", "jxl+avif"],
+        default="auto",
+        help="Codec routing for --modernize (default: auto). auto = JXL for "
+             "grayscale pages, AVIF for color. jxl / avif = force one codec. "
+             "jxl+avif = encode both per page and keep the smaller (slower). "
+             "Oversized pages (> 8192 px) route to JXL regardless (AVIF "
+             "large-dimension decode is less portable), except under 'avif' "
+             "where they are left untouched.",
+    )
+    p.add_argument(
+        "--modernize-quality",
+        type=int,
+        default=90,
+        choices=range(1, 101),
+        metavar="[1-100]",
+        help="AVIF quality for color pages under --modernize (default: 90 ~ "
+             "visually lossless; 85 = aggressive, smaller, artifacts only under "
+             "pixel-peeping). Ignored for grayscale (JXL) pages.",
+    )
+    p.add_argument(
+        "--modernize-distance",
+        type=float,
+        default=1.0,
+        help="JXL Butteraugli distance for grayscale pages under --modernize "
+             "(default: 1.0 ~ visually lossless; lower = higher quality/larger; "
+             "0.0 selects JXL mathematically-lossless mode). Ignored for color "
+             "(AVIF) pages.",
+    )
+    p.add_argument(
+        "--modernize-min-saving",
+        type=float,
+        default=0.92,
+        help="Keep a transcoded page only if its size is below this fraction "
+             "of the original (default: 0.92 = must save at least 8%%). Guards "
+             "against bloating already-dense pages and auto-skips low-headroom "
+             "sources; the original bytes are kept otherwise.",
+    )
     # ── Komikku-compatible per-chapter CBZ output (Komikku LocalSource format) ──
     # Writes per-chapter CBZs with per-chapter ComicInfo.xml, plus
     # cover.jpg and details.json at the series-folder root, matching the
@@ -6679,6 +7097,92 @@ def main():
                 "CBZ. Disable --keep-images to maximize disk savings.",
                 file=sys.stderr,
             )
+
+    # --modernize compatibility checks. Like --webtoon-recompress these run
+    # early (before a multi-hour download), but ALL fast-path-disabling
+    # combinations are HARD errors, not warnings: --modernize emits .jxl/.avif,
+    # and unlike .webp those are NOT understood by the slow save_final_images
+    # auto-format path (it would re-encode them to PNG, and epub/none force
+    # JPEG). So --modernize is only correct on the CBZ byte-passthrough
+    # fast-path; we reject anything that would disable it. The seven checks
+    # mirror the seven cbz_fast_path conditions (grep 'cbz_fast_path =') using
+    # the same _user_set_* sentinels so they track that gate if it ever changes.
+    if getattr(args, "modernize", False):
+        if args.format != "cbz":
+            p.error(
+                "--modernize requires --format cbz: it transcodes pages into "
+                "the CBZ byte-passthrough fast-path. Other formats re-encode the "
+                "pages (epub/none -> JPEG, pdf -> /DCTDecode) and would discard "
+                "the JXL/AVIF."
+            )
+        if getattr(args, "no_cbz_preserve_originals", False):
+            p.error(
+                "--modernize is incompatible with --no-cbz-preserve-originals: "
+                "it disables the fast-path, so the .jxl/.avif pages would be "
+                "decoded and re-encoded to PNG by save_final_images."
+            )
+        if args.no_processing:
+            p.error(
+                "--modernize is incompatible with --no-processing, which "
+                "bypasses the transcode stage entirely."
+            )
+        if args.scaling != 100:
+            p.error(
+                f"--modernize is incompatible with --scaling={args.scaling}: "
+                "resizing forces the slow decode-resize-encode path, which "
+                "re-encodes the .jxl/.avif pages to PNG. Use --scaling 100."
+            )
+        if getattr(args, "_user_set_width", False):
+            p.error(
+                "--modernize is incompatible with --width: it forces the slow "
+                "decode-resize-encode path (which re-encodes pages to PNG)."
+            )
+        if getattr(args, "_user_set_aspect_ratio", False):
+            p.error(
+                "--modernize is incompatible with --aspect-ratio: it forces the "
+                "slow decode-resize-encode path (which re-encodes pages to PNG)."
+            )
+        if getattr(args, "_user_set_quality", False):
+            p.error(
+                "--modernize is incompatible with an explicit --quality: it "
+                "forces the slow re-encode path. Set modernize quality via "
+                "--modernize-quality (AVIF) and --modernize-distance (JXL)."
+            )
+        # Fail fast on missing encoders rather than mid-download. JXL needs the
+        # optional pillow-jxl-plugin; AVIF is native in Pillow >= 12. An
+        # avif-only policy never emits JXL (oversized pages are skipped), so it
+        # doesn't require the JXL plugin.
+        _mpolicy = args.modernize_format
+        if _mpolicy != "avif":
+            try:
+                import pillow_jxl  # noqa: F401  (registers JXL in PIL.Image.SAVE)
+            except ImportError:
+                p.error(
+                    f"--modernize-format {_mpolicy} needs the JXL encoder. "
+                    "Install it: pip install pillow-jxl-plugin "
+                    "(or use --modernize-format avif for AVIF-only)."
+                )
+        if _mpolicy in ("auto", "avif", "jxl+avif"):
+            # AVIF is native in Pillow >= 12 (Image.init() registers it). On
+            # OLDER Pillow the pillow-avif-plugin fallback advertised in the
+            # error below registers AVIF only when its module is IMPORTED —
+            # Image.init() does not load it — so try that import first or we'd
+            # reject a working install. Best-effort, mirrors the pillow_jxl
+            # import above. The same import is repeated in
+            # recompress_chapter_images_modern so the encoder is present at
+            # encode time too (grep 'import pillow_avif').
+            try:
+                import pillow_avif  # noqa: F401  (registers AVIF in PIL.Image.SAVE)
+            except ImportError:
+                pass
+            Image.init()  # native AVIF plugin registers lazily
+            if "AVIF" not in Image.SAVE:
+                p.error(
+                    f"--modernize-format {_mpolicy} needs AVIF write support. "
+                    "Pillow >= 12 has it natively; otherwise: "
+                    "pip install pillow-avif-plugin."
+                )
+
     # --search is checked before --list-chapters / build-final-file because it
     # resolves the URL, and the downstream modes' "URL required" check would
     # otherwise fire before search runs.
@@ -8762,6 +9266,8 @@ def main():
                 # per-file extensions on the arcname, so .webp downloads stay
                 # .webp, .png stay .png, etc. Phase A made raw_image_paths
                 # land with correct extensions which is what makes this work.
+                # Computed BEFORE the --modernize block so modernize gates on the
+                # exact same condition (see below).
                 cbz_fast_path = (
                     args.format == "cbz"
                     and not args.no_processing
@@ -8771,6 +9277,51 @@ def main():
                     and not getattr(args, "_user_set_aspect_ratio", False)
                     and not getattr(args, "_user_set_quality", False)
                 )
+                # --modernize (opt-in, CBZ-only): content-aware JXL/AVIF
+                # transcode of the downloaded pages, in place, BEFORE the CBZ
+                # fast-path consumes raw_image_paths — so the new .jxl/.avif
+                # bytes flow straight into build_cbz with correct extensions and
+                # never reach the slow save_final_images path (which would
+                # re-encode them to PNG). Gated on cbz_fast_path itself, NOT just
+                # format==cbz: the parse-time hard errors (grep '--modernize
+                # compatibility checks') are SKIPPED on a --restore-parameters
+                # resume (the bare resume CLI omits --modernize, so that block
+                # never runs, then run_params.json restores modernize=True). A
+                # resume that re-adds a fast-path-breaking override
+                # (--no-processing / --width / --scaling) would otherwise smuggle
+                # .jxl/.avif into the slow path; riding cbz_fast_path closes that
+                # hole. Runs after the webtoon-recompress block above (so .webp
+                # pages are skipped) and after the prefetch kickoff (CPU encode
+                # overlaps the next downloads). See
+                # recompress_chapter_images_modern().
+                if getattr(args, "modernize", False) and cbz_fast_path:
+                    _t0_modernize = time.monotonic()
+                    log_verbose(
+                        f"  [modernize] Transcoding {len(raw_image_paths)} pages "
+                        f"({args.modernize_format})..."
+                    )
+                    raw_image_paths = recompress_chapter_images_modern(
+                        raw_image_paths,
+                        policy=args.modernize_format,
+                        gray_quality=args.modernize_distance,
+                        color_quality=args.modernize_quality,
+                        min_saving=args.modernize_min_saving,
+                    )
+                    log_verbose(
+                        f"  [modernize] Done in "
+                        f"{time.monotonic() - _t0_modernize:.1f}s."
+                    )
+                elif getattr(args, "modernize", False):
+                    # Requested but the fast-path is disabled — almost always a
+                    # resume with a fast-path-breaking override. Skip (don't feed
+                    # .jxl/.avif into the re-encode path) and say so, rather than
+                    # hard-erroring and aborting the whole resume.
+                    log_verbose(
+                        "  [modernize] skipped: effective settings disable the "
+                        "CBZ byte-passthrough fast-path (e.g. a "
+                        "--restore-parameters resume adding --no-processing, "
+                        "--width, or --scaling). Pages left as-is."
+                    )
                 if cbz_fast_path:
                     processed_page_images = list(raw_image_paths)
                     log_verbose(

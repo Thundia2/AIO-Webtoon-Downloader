@@ -62,6 +62,31 @@ ANILIST_GRAPHQL_URL = "https://graphql.anilist.co"
 # fix their site's title field, not lower this floor.
 ANILIST_TITLE_MATCH_THRESHOLD = 75.0
 
+# rapidfuzz token_set_ratio (0..100) floor for treating a candidate's AniList
+# staff as the same creator the *site* credited. token_set_ratio (not WRatio) so
+# name order and extra tokens don't matter: "Hata Kenjirou" vs "Kenjirou Hata" =
+# 100, "MASHIMA Hiro" vs "Hiro Mashima" = 100. Author is a TIEBREAK/booster
+# layered on top of the 75 title gate, never a hard filter — series whose site
+# romanizes the author differently from AniList (Eleceed's "Jeho Son / ZHENA",
+# Tekyuu's "Roots") still match on title alone, they just don't get the boost.
+# 85 is high enough that an unrelated creator won't trip it. Used by
+# _author_match_score / _pick_best_candidate / the cached-ID self-heal in
+# enrich_from_anilist.
+ANILIST_AUTHOR_MATCH_THRESHOLD = 85.0
+
+# Title-score band (points) for the composite match ranker. Candidates whose
+# title score is within this many points of the BEST title score among the gated
+# candidates form the "top band"; the author/popularity tiebreaks apply only
+# WITHIN that band. This stops a spurious author hit on a LESS-similar entry from
+# beating the obvious title match: site "Solo Leveling" scores 100 on the main
+# series (id 105398) but only 90 on the sequel "Solo Leveling: Ragnarok" (id
+# 179445), and the site's studio credit "Redice Studio" happens to match the
+# sequel's staff exactly (100) while the main series credits individuals (81). An
+# 8-point band keeps near-exact title matches together while separating subtitle-
+# extended titles (must stay < 10 to split the Solo/Ragnarok 100-vs-90 gap). grep
+# caller: _pick_best_candidate.
+_TITLE_BAND_DELTA = 8.0
+
 # Spacing between retries when AniList didn't tell us how long to wait.
 # Budget at 90 req/min = 1 every 0.67s; 0.7s leaves ~5% margin so we
 # never get caught by the burst limiter. Only applies inside the retry
@@ -145,6 +170,9 @@ fragment MediaFields on Media {
   siteUrl
   genres
   tags { name category rank isAdult isMediaSpoiler isGeneralSpoiler }
+  staff(perPage: 8) {
+    edges { role node { name { full native } } }
+  }
 }
 """
 
@@ -387,29 +415,122 @@ def _shortened_prefix(title: str, words: int = 4) -> str:
     return " ".join(toks[:words])
 
 
-def _candidate_titles(media: Dict[str, Any]) -> List[str]:
-    """All title variants a candidate exposes — used for fuzzy matching."""
+def _candidate_titles_split(
+    media: Dict[str, Any],
+) -> Tuple[List[str], List[str]]:
+    """(primary_titles, synonyms) for a candidate.
+
+    Primary = the four official title slots (romaji/english/native/
+    userPreferred). Synonyms = AniList's free-form `synonyms` list, which is
+    where fan/alt spellings AND parody/doujin cross-references live. Keeping the
+    buckets apart lets _score_candidate_detail flag a "synonym-only" match — e.g.
+    a Hentai doujin (id 128087) that merely lists "Fairy Tail" as a synonym must
+    not tie the real FAIRY TAIL (id 30598) whose PRIMARY title matches. grep
+    callers: _candidate_titles, _score_candidate_detail.
+    """
     title_block = media.get("title") or {}
-    out: List[str] = []
-    for key in ("romaji", "english", "native", "userPreferred"):
-        val = title_block.get(key)
-        if val:
-            out.append(str(val))
-    for syn in media.get("synonyms") or []:
-        if syn:
-            out.append(str(syn))
-    return out
+    primary = [
+        str(title_block[k])
+        for k in ("romaji", "english", "native", "userPreferred")
+        if title_block.get(k)
+    ]
+    synonyms = [str(s) for s in (media.get("synonyms") or []) if s]
+    return primary, synonyms
 
 
-def _score_candidate(
+def _candidate_titles(media: Dict[str, Any]) -> List[str]:
+    """All title variants (primary + synonyms) a candidate exposes."""
+    primary, synonyms = _candidate_titles_split(media)
+    return primary + synonyms
+
+
+def _candidate_author_names(media: Dict[str, Any]) -> List[str]:
+    """Creator names from a candidate's `staff` connection — STORY/ART roles
+    only.
+
+    AniList staff edges carry a `role` string: authorship roles ("Story", "Art",
+    "Story & Art", "Original Story") plus production/localization ones
+    ("Translator", "Lettering (English)", "Character Design"). We keep roles
+    mentioning story/art and drop the rest, then return BOTH name.full (romaji)
+    and name.native (kanji/hangul) so a site storing either form can match. grep
+    caller: _author_match_score. Requires the `staff{}` selection in
+    _MEDIA_FRAGMENT.
+    """
+    edges = ((media.get("staff") or {}).get("edges")) or []
+    names: List[str] = []
+    for edge in edges:
+        role = str(edge.get("role") or "").lower()
+        if not any(k in role for k in ("story", "art")):
+            continue
+        if any(bad in role for bad in ("translator", "lettering", "design", "assistant", "editor")):
+            continue
+        name_block = (edge.get("node") or {}).get("name") or {}
+        for val in (name_block.get("full"), name_block.get("native")):
+            if val:
+                names.append(str(val))
+    return names
+
+
+# Site author strings that carry no identifying signal — never let these
+# manufacture an author "match". Compared after default_process lowercasing.
+_AUTHOR_PLACEHOLDERS = frozenset(
+    {"unknown", "n/a", "na", "none", "null", "-", "updating", "author", "artist"}
+)
+
+
+def _author_match_score(
+    source_authors: Optional[List[str]], candidate: Dict[str, Any]
+) -> Optional[float]:
+    """Best rapidfuzz token_set_ratio between the site's author(s) and the
+    candidate's AniList staff. None when either side has no usable name — lets
+    the caller tell "authors disagree" (a number below threshold) apart from
+    "can't tell" (None).
+
+    token_set_ratio is order- and extra-token-insensitive: "Hata Kenjirou" vs
+    "Kenjirou Hata" = 100, "MASHIMA Hiro" vs "Hiro Mashima" = 100. Placeholder/
+    empty/<3-char site strings are dropped so a bare "Unknown" can't match an
+    AniList "Unknown". grep callers: _pick_best_candidate, enrich_from_anilist.
+    """
+    try:
+        from rapidfuzz import fuzz
+        from rapidfuzz.utils import default_process
+    except ImportError as exc:
+        raise ImportError(
+            "rapidfuzz is required for --metadata-source enrichment. "
+            "Install with: pip install rapidfuzz"
+        ) from exc
+    srcs: List[str] = []
+    for author in source_authors or []:
+        author = str(author or "").strip()
+        if len(author) >= 3 and author.lower() not in _AUTHOR_PLACEHOLDERS:
+            srcs.append(author)
+    cand_names = _candidate_author_names(candidate)
+    if not srcs or not cand_names:
+        return None
+    best = 0.0
+    for s in srcs:
+        for c in cand_names:
+            score = float(fuzz.token_set_ratio(s, c, processor=default_process))
+            if score > best:
+                best = score
+    return best
+
+
+def _score_candidate_detail(
     source_titles: List[str], candidate: Dict[str, Any]
-) -> float:
-    """Best (max) rapidfuzz WRatio across all (source x candidate) pairs,
-    compared case/punctuation-insensitively via default_process.
+) -> Tuple[float, bool]:
+    """(best_title_score, primary_hit).
 
-    rapidfuzz is project-wide required for cross-site search; this lazy
-    import keeps the failure mode consistent (clear ImportError naming
-    the install command) instead of failing at module-load time.
+    best_title_score = max rapidfuzz WRatio over ALL candidate titles (primary +
+    synonyms), processor=default_process — the value the 75 admission gate uses
+    (unchanged from the old _score_candidate). primary_hit = True when the
+    candidate's PRIMARY titles alone clear the gate, i.e. the match isn't
+    synonym-only. _pick_best_candidate ranks primary hits above synonym-only
+    hits so a doujin can't hijack a series via a parody synonym. See
+    _candidate_titles_split.
+
+    rapidfuzz lazy-imported here (module-wide pattern) so a packager who strips
+    it breaks only enrichment, with a clear ImportError.
     """
     try:
         from rapidfuzz import fuzz
@@ -420,47 +541,137 @@ def _score_candidate(
             "Install with: pip install rapidfuzz"
         ) from exc
     if not source_titles:
-        return 0.0
-    cand_titles = _candidate_titles(candidate)
-    if not cand_titles:
-        return 0.0
-    # processor=default_process lowercases, trims, and strips non-alphanumerics
-    # on both sides before scoring. Without it WRatio is brutally case-sensitive:
-    # "FULL METAL ALCHEMIST" vs the synonym "Full Metal Alchemist" scores 25 raw
-    # but 100 processed (verified against id 30025), while the unrelated romaji
-    # "Hagane no Renkinjutsushi" sits at 26 processed. So the 75 threshold still
-    # separates cleanly — processing rescues case/punctuation drift without
-    # inventing matches.
-    best = 0.0
-    for s in source_titles:
-        for c in cand_titles:
-            score = float(fuzz.WRatio(s, c, processor=default_process))
-            if score > best:
-                best = score
-    return best
+        return 0.0, False
+    primary, synonyms = _candidate_titles_split(candidate)
+    if not primary and not synonyms:
+        return 0.0, False
+
+    def _best_over(cands: List[str]) -> float:
+        best = 0.0
+        for s in source_titles:
+            for c in cands:
+                # processor=default_process lowercases, trims, strips non-
+                # alphanumerics on both sides. Without it WRatio is brutally
+                # case-sensitive: "FULL METAL ALCHEMIST" vs synonym "Full Metal
+                # Alchemist" = 25 raw / 100 processed (id 30025); unrelated
+                # "Hagane no Renkinjutsushi" stays 26. The 75 floor still
+                # separates cleanly.
+                score = float(fuzz.WRatio(s, c, processor=default_process))
+                if score > best:
+                    best = score
+        return best
+
+    primary_score = _best_over(primary)
+    synonym_score = _best_over(synonyms)
+    best_score = max(primary_score, synonym_score)
+    primary_hit = primary_score >= ANILIST_TITLE_MATCH_THRESHOLD
+    return best_score, primary_hit
+
+
+def _score_candidate(
+    source_titles: List[str], candidate: Dict[str, Any]
+) -> float:
+    """Back-compat shim: best title score only. New code wants the
+    (score, primary_hit) pair from _score_candidate_detail.
+    """
+    return _score_candidate_detail(source_titles, candidate)[0]
 
 
 def _pick_best_candidate(
     source_titles: List[str],
     candidates: List[Dict[str, Any]],
+    *,
+    source_authors: Optional[List[str]] = None,
+    year: Optional[int] = None,
 ) -> Tuple[Optional[Dict[str, Any]], float]:
-    """Return (best_candidate, best_score) — best_candidate is None when
-    no candidate cleared ANILIST_TITLE_MATCH_THRESHOLD.
+    """Return (best_candidate, best_score) — best_candidate is None when no
+    candidate cleared ANILIST_TITLE_MATCH_THRESHOLD.
 
-    The score is returned in both branches so the caller can log the
-    best-seen-score when a match was rejected ("no confident match
-    for X — best score 42 < 75").
+    Selection is a COMPOSITE rank over every candidate that passes the 75 title
+    gate, in this priority order (each a tiebreak for the previous):
+      0. title band   — candidates within _TITLE_BAND_DELTA points of the best
+         title score. Only same-band (≈equally-similar) candidates compete on the
+         keys below, so a less-similar sequel/spinoff can't steal the match on a
+         fluke author/popularity hit (site "Solo Leveling" = 100 on the main
+         series but 90 on "Solo Leveling: Ragnarok", whose staff the site's
+         "Redice Studio" credit happens to match).
+      1. primary_hit    — title matched on a PRIMARY title, not synonym-only
+         (kills the doujin-synonym hijack: the Hentai "Fairy Tail" carries the
+         title only as a SYNONYM, so it loses to the real series here even when
+         author data is absent).
+      2. year_matched   — startDate.year == site year hint (when provided).
+      3. popularity     — AniList popularity; canonical entries dwarf parody/
+         duplicate/obscure same-title ones (Fly Me: 40474 vs 1669). This is the
+         main same-title disambiguator on a FRESH search (no cached id).
+      4. author_matched — site author == candidate AniList staff (>= 85
+         token_set_ratio). A TIEBREAK/booster that sits BELOW popularity, NOT a
+         lever that overrides it: identically-titled series ("Fly Me to the Moon"
+         returns 6 entries all scoring 100; "Fairy Tail" the real series + a
+         same-titled doujin) are separated by popularity first, and a fuzzy
+         author-string hit on an obscure franchise/studio entry must never
+         outrank a far more popular in-band candidate whose author the site
+         merely romanizes differently. Mirrors the self-heal popularity guard
+         (grep 'best_pop >= cached_pop'); author's decisive role lives in the
+         cached self-heal detection + tail override (enrich_from_anilist), not
+         here.
+      5. title_score    — raw WRatio, last resort.
+
+    The 75 title floor stays a HARD gate, so the band/author/popularity tiebreaks
+    can never admit an unrelated series — they only reorder title-plausible ones.
+    best_score (the chosen candidate's title score, or the best seen when
+    nothing passed) is returned for the caller's "no confident match (best NN)"
+    log. The old behavior (pure max title score, first-wins on ties) was the
+    Fly-Me-to-the-Moon / Fairy-Tail mismatch bug. grep caller:
+    enrich_from_anilist.
     """
-    best_cand: Optional[Dict[str, Any]] = None
-    best_score = 0.0
+    best_seen = 0.0
+    gated: List[Tuple[bool, bool, bool, int, float, Dict[str, Any]]] = []
     for cand in candidates:
-        score = _score_candidate(source_titles, cand)
-        if score > best_score:
-            best_cand = cand
-            best_score = score
-    if best_cand is None or best_score < ANILIST_TITLE_MATCH_THRESHOLD:
-        return None, best_score
-    return best_cand, best_score
+        title_score, primary_hit = _score_candidate_detail(source_titles, cand)
+        if title_score > best_seen:
+            best_seen = title_score
+        if title_score < ANILIST_TITLE_MATCH_THRESHOLD:
+            continue
+        author = _author_match_score(source_authors, cand)
+        author_matched = author is not None and author >= ANILIST_AUTHOR_MATCH_THRESHOLD
+        year_matched = False
+        if year:
+            cand_year = (cand.get("startDate") or {}).get("year")
+            try:
+                year_matched = cand_year is not None and int(cand_year) == int(year)
+            except (TypeError, ValueError):
+                year_matched = False
+        popularity = int(cand.get("popularity") or 0)
+        gated.append(
+            (author_matched, primary_hit, year_matched, popularity, title_score, cand)
+        )
+    if not gated:
+        return None, best_seen
+    # Primary key is the TITLE BAND: only candidates whose title score is within
+    # _TITLE_BAND_DELTA of the best title score compete on the keys below, so a
+    # less-similar entry can't win on a spurious author/popularity hit (the
+    # Solo-Leveling-vs-Ragnarok fix). Within the band: primary-title hit > year >
+    # popularity > author match > title score. Python's stable sort preserves
+    # AniList return order for exact all-key ties.
+    best_title = max(r[4] for r in gated)
+
+    def _rank_key(r: Tuple[bool, bool, bool, int, float, Dict[str, Any]]):
+        author_matched, primary_hit, year_matched, popularity, title_score, _cand = r
+        in_band = title_score >= best_title - _TITLE_BAND_DELTA
+        # popularity OUTRANKS author_matched: on a fresh search (no cached id to
+        # apply the self-heal popularity guard) a coincidental author-string hit
+        # on an obscure franchise/studio entry would otherwise beat a far more
+        # popular same-title candidate whose author the site romanizes
+        # differently. Canonical entries dominate popularity, so the same-title
+        # fixes (Fly Me, Fairy Tail) hold on popularity (+ primary_hit) without
+        # leaning on author here; author stays a final tiebreak/booster. This is
+        # the fresh-path analogue of enrich_from_anilist's 'best_pop >=
+        # cached_pop' guard — author must never DOWNGRADE popularity.
+        return (in_band, primary_hit, year_matched, popularity, author_matched, title_score)
+
+    gated.sort(key=_rank_key, reverse=True)
+    chosen = gated[0]
+    return chosen[5], chosen[4]
 
 
 # --- Internal: derived fields ----------------------------------------------
@@ -575,9 +786,10 @@ def _apply_anilist_match(
         the 50+-tag taxonomy dumps. Spoilers are excluded from this
         visible field. Falls back to the site genres only when AniList
         contributed nothing (changed from UNION 2026-06-06 per user req).
-      - authors / artists: FILL-MISSING (v1 doesn't fetch AniList
-        staff{} connection so this is effectively a no-op today; the
-        semantic is documented for future expansion)
+      - authors / artists: NOT written here. AniList `staff{}` IS now
+        fetched, but only to DISAMBIGUATE matches (_author_match_score /
+        _pick_best_candidate); the site's own author/artist strings are
+        kept as-is. Filling them from staff is left for future expansion.
       - status: REPLACE with AniList enum spelling. The existing
         aio-dl.py:_komikku_status_to_digit helper already handles
         AniList's enum spellings via its lowercase mapping
@@ -685,17 +897,24 @@ def enrich_from_anilist(
 
     Flow:
       1. If `cached_anilist_id` is set AND NOT `force_refresh`: fetch
-         that Media by ID (1 GraphQL hit). On success, apply fields and
-         return immediately. On 404 / network failure / API errors,
-         fall through to the search path so a stale cached ID can
+         that Media by ID (1 GraphQL hit). Apply and return UNLESS the
+         site author disagrees with the fetched entry's staff — then the
+         cached id is suspect (a pre-fix wrong-series cache), so we stash
+         it and fall through to re-search (self-heal). On 404 / network
+         failure / API errors, fall through too so a stale cached ID can
          self-heal.
-      2. Search AniList for the site title + alt_names. Score every
-         candidate via rapidfuzz WRatio across every source-title ×
-         candidate-title pair; pick the highest.
-      3. If best score >= ANILIST_TITLE_MATCH_THRESHOLD (75), apply
-         fields. The match's anilist_id then gets persisted by
-         aio-dl.py's .aio_series.json writer so subsequent runs
-         take the cached fast path.
+      2. Search AniList for the site title + alt_names, then rank every
+         candidate that clears the 75 title gate by the composite key in
+         _pick_best_candidate (author match > primary-title hit > year >
+         popularity > title score). Author is what separates same-titled
+         series that title scoring alone can't.
+      3. On a confident match, apply fields. The match's anilist_id then
+         gets persisted by aio-dl.py's .aio_series.json writer so
+         subsequent runs take the cached fast path. When self-healing, the
+         search result overrides the suspect cache only if it is itself
+         author-matched AND at least as popular as the cached entry (so a
+         franchise-owner author coincidence can't downgrade a good cache to
+         an obscure same-series entry); otherwise the cached entry is restored.
       4. Otherwise leave comic_data untouched (no anilist_id key set)
          so the caller knows to log "no confident match" and the run
          continues with site-only metadata. The best-observed score
@@ -704,19 +923,43 @@ def enrich_from_anilist(
          non-persistable transient data and downstream writers ignore
          unknown keys.
 
-    `year`, `cover_url`, `hid`, `handler_name` are currently accepted-
-    but-unused — forwarded for future scoring refinements (year
-    tiebreak, cover-image perceptual match) without breaking the API.
+    `year` feeds the _pick_best_candidate year tiebreak when the site
+    supplied it (live path only; the refresh path passes year=None).
+    `cover_url`, `hid`, `handler_name` are accepted-but-unused — forwarded
+    for future scoring refinements (cover-image perceptual match) without
+    breaking the API.
     """
-    # Cached-ID fast path.
+    # Author(s) the SITE credited — the disambiguator the matcher leans on.
+    # Present at both call sites: a live download sets comic_data["authors"] from
+    # the handler; --refresh-library-metadata seeds it from .aio_series.json
+    # (aio-dl.py, grep '"authors": list(meta'). May be [] for sites that omit
+    # authorship, in which case author scoring is skipped end to end.
+    src_authors = [a for a in (comic_data.get("authors") or []) if a]
+
+    # Cached-ID fast path (+ self-heal). A cached anilist_id normally means one
+    # GraphQL hit and we're done. BUT pre-fix caches can point at the WRONG
+    # same-titled series (the Fly-Me-to-the-Moon / Fairy-Tail bug), and a pure
+    # by-id fetch would re-apply that wrong series forever. So when the site gave
+    # us an author AND it disagrees with the cached entry's staff, we stop
+    # trusting the cache: stash the fetched media and fall through to the
+    # author-aware search. The search only OVERRIDES the cache if it turns up an
+    # author-MATCHED alternative (a genuine fix); otherwise the tail restores the
+    # cached entry — so a series whose site merely romanizes the author
+    # differently from AniList keeps its id, at the cost of one extra search.
+    selfheal_cached_media: Optional[Dict[str, Any]] = None
     if cached_anilist_id and not force_refresh:
         media = _fetch_by_id(int(cached_anilist_id))
         if media:
-            _apply_anilist_match(comic_data, media, tag_min_rank)
-            return comic_data
-        # Stale ID or transient network failure: fall through. If the
-        # search step also fails, comic_data ends up unchanged and the
-        # caller logs accordingly.
+            cached_author = _author_match_score(src_authors, media)
+            if cached_author is None or cached_author >= ANILIST_AUTHOR_MATCH_THRESHOLD:
+                _apply_anilist_match(comic_data, media, tag_min_rank)
+                return comic_data
+            # Author disagrees with the cached entry — suspect. Remember it and
+            # fall through; the tail decides the cache-vs-search winner.
+            selfheal_cached_media = media
+        # Stale ID / transient failure / author-suspect: fall through. If the
+        # search also yields nothing the tail restores selfheal_cached_media (if
+        # any) or leaves comic_data unchanged, and the caller logs accordingly.
 
     # Search path. Two deliberately decoupled lists:
     #   scoring_titles — the identity set: each source title + its bracket/
@@ -768,6 +1011,10 @@ def enrich_from_anilist(
         _add_query(_subtitle_segment(cleaned or raw))
         _add_query(_shortened_prefix(cleaned or raw))
     if not scoring_titles:
+        # No title to search on. If we bypassed a cached entry for self-heal,
+        # restore it rather than dropping enrichment entirely.
+        if selfheal_cached_media is not None:
+            _apply_anilist_match(comic_data, selfheal_cached_media, tag_min_rank)
         return comic_data
 
     # Query AniList with each search query in priority order, accumulating
@@ -789,12 +1036,56 @@ def enrich_from_anilist(
                 seen_ids.add(cid)
             pool.append(cand)
         if pool:
-            best, score = _pick_best_candidate(scoring_titles, pool)
+            best, score = _pick_best_candidate(
+                scoring_titles, pool, source_authors=src_authors, year=year
+            )
             if best is not None:
                 break
 
     comic_data["_anilist_best_score"] = score
-    if best is None:
+
+    # Decide what to apply, accounting for the self-heal fallthrough:
+    #   - search winner AUTHOR-matches            -> use it (real fix, even when
+    #     it overrides a suspect cached id).
+    #   - search winner does NOT author-match but
+    #     we were self-healing a cached entry     -> keep the CACHED entry (the
+    #     site author just doesn't line up with AniList's romanization; re-
+    #     picking by title alone could swap a correct cache for a wrong same-
+    #     title hit).
+    #   - search winner and no cached entry        -> use the winner.
+    #   - no search winner                         -> restore the cached entry if
+    #     we have one, else leave comic_data untouched.
+    chosen: Optional[Dict[str, Any]] = None
+    if best is not None:
+        if selfheal_cached_media is None:
+            chosen = best
+        else:
+            # Override the suspect cache ONLY when the search winner both
+            # author-matches AND is at least as popular as the cached entry. The
+            # popularity guard stops a self-heal from downgrading a good, popular
+            # cache to an obscure same-franchise entry whose staff coincidentally
+            # matches a studio/owner credit: site "Clannad" + author "Key
+            # (Company)" author-matches a minor "CLANNAD" (id 149957, pop 364,
+            # staff "Key") but the cached "CLANNAD: Official Comic" (id 32598,
+            # pop 2290) is the better match — keep it. Real poison always
+            # replaces UP in popularity (Fly Me 157566 pop 1669 -> 101177 pop
+            # 40474; Fairy Tail doujin -> the real series), so the genuine fixes
+            # still apply.
+            best_author = _author_match_score(src_authors, best)
+            cached_pop = int(selfheal_cached_media.get("popularity") or 0)
+            best_pop = int(best.get("popularity") or 0)
+            if (
+                best_author is not None
+                and best_author >= ANILIST_AUTHOR_MATCH_THRESHOLD
+                and best_pop >= cached_pop
+            ):
+                chosen = best
+            else:
+                chosen = selfheal_cached_media
+    elif selfheal_cached_media is not None:
+        chosen = selfheal_cached_media
+
+    if chosen is None:
         return comic_data
-    _apply_anilist_match(comic_data, best, tag_min_rank)
+    _apply_anilist_match(comic_data, chosen, tag_min_rank)
     return comic_data
