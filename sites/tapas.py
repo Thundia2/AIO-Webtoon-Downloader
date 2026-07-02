@@ -518,8 +518,20 @@ class TapasSiteHandler(BaseSiteHandler):
                     source_url=bgm_url,
                     filename=name,
                     mime="audio/mpeg",
+                    # has_bgm mirrors the webtoons BGM specs (grep
+                    # _resolve_bgm_specs meta in linewebtoon.py): the aux writer
+                    # (_materialize_chapter_aux, audio_download branch) reads it
+                    # to set the chapter record's has_bgm flag. Without it a
+                    # tapas chapter with successfully DOWNLOADED bgm recorded
+                    # has_bgm=false while webtoons recorded true — same fact,
+                    # divergent flag. CBZs written before 2026-07-03 keep the
+                    # old shape, so readers must treat non-empty `audio` as
+                    # authoritative regardless (the flag is a hint, not the
+                    # presence signal). kind/title are spec documentation only —
+                    # nothing consumes them (writer reads has_bgm exclusively).
                     meta={
                         "kind": "bgm",
+                        "has_bgm": True,
                         "title": chapter.get("_bgm_title") or "",
                     },
                 )
