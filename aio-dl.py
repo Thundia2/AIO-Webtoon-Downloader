@@ -2987,8 +2987,10 @@ def recompress_chapter_images_to_webp(
 
 # Pages larger than this in either dimension route to JXL regardless of color:
 # AVIF encodes them fine but its on-device (Android) decode at extreme heights
-# (long-strip webtoons up to ~15000px) is unverified, and JXL ties AVIF on size
-# for tall strips while decoding large dimensions more robustly. Under an
+# (long-strip webtoons up to ~15000px) is unverified, and JXL measured strictly
+# better on tall strips anyway — 12 MP strip: JXL d1 968,501 B / butteraugli
+# 1.23 / 27.6 MP/s decode vs AVIF-444 1,072,135 B / bt 2.28 / 13.0 MP/s
+# (libavif 1.4.2, 2026-07-02 bench). Under an
 # avif-only policy the user opted out of JXL, so oversized pages are skipped
 # (original kept) instead of emitting an unasked-for format.
 _MODERNIZE_MAX_DIM = 8192
@@ -3187,7 +3189,14 @@ def recompress_chapter_images_modern(
                 target = _pick_target(im, w, h)
                 if target == "skip":
                     return idx, src
-                candidates: List[Tuple[int, str]] = []
+                # (size, path, is_recon). is_recon marks the JXL save that ran
+                # pillow_jxl's bit-exact JPEG->JXL *reconstruction* (JPEG file
+                # source + strict-lossless tier + no mode conversion): zero
+                # quality cost AND byte-recoverable (djxl reconstructs the
+                # original .jpg), so the adopt guard below exempts it from
+                # min_saving — any saving is pure win. Mirrored in
+                # tools/modernize_library.py (grep is_recon).
+                candidates: List[Tuple[int, str, bool]] = []
                 if target in ("jxl", "both"):
                     jxl_path = base + ".jxl"
                     # Encode as-is (no convert("L") — see header). Keep alpha-
@@ -3216,7 +3225,10 @@ def recompress_chapter_images_modern(
                     #     reconstruction (~78%) for JPEG and pixel-lossless for
                     #     PNG automatically — exactly the two lossless tiers, no
                     #     external cjxl needed. (PNG/other sources ignore
-                    #     lossless_jpeg either way.)
+                    #     lossless_jpeg either way.) Bench 2026-07-02:
+                    #     reconstruction = 12.7-92.6% of the source JPEG,
+                    #     sha256-verified reversible; see
+                    #     ~/.claude/plans/compression-modernize-handoff.md.
                     jxl_src.save(
                         jxl_path,
                         format="JXL",
@@ -3224,7 +3236,18 @@ def recompress_chapter_images_modern(
                         **({"lossless": True} if gray_quality == 0.0
                            else {"distance": gray_quality, "lossless_jpeg": False}),
                     )
-                    candidates.append((os.path.getsize(jxl_path), jxl_path))
+                    # A CMYK JPEG went through convert("RGB") above, severing
+                    # pillow_jxl's access to the original bitstream — that save
+                    # is a pixel-lossless encode of converted pixels, NOT a
+                    # byte-recoverable reconstruction, hence the `is im` term.
+                    is_recon = (
+                        src_fmt == "JPEG"
+                        and gray_quality == 0.0
+                        and jxl_src is im
+                    )
+                    candidates.append(
+                        (os.path.getsize(jxl_path), jxl_path, is_recon)
+                    )
                 if target in ("avif", "both"):
                     avif_path = base + ".avif"
                     # AVIF carries alpha — never flatten it. The CBZ byte-
@@ -3244,10 +3267,23 @@ def recompress_chapter_images_modern(
                         avif_src = im.convert("RGBA")
                     else:
                         avif_src = im.convert("RGB")
+                    # 4:4:4 chroma, NOT Pillow's 4:2:0 default: q90 at 4:2:0
+                    # measured butteraugli ~7.1 / SSIMULACRA2 ~78 on saturated
+                    # color (chroma bleed on fine colored detail), reproduced on
+                    # libavif 1.4.2 — subsampling-inherent, not encoder vintage.
+                    # 4:4:4 measured bt ~1.3 at ~+12% bytes (2026-07-02 bench).
+                    # Hardcoded, not a flag: no new argparse dest, so no
+                    # resume-gating impact (grep _RESUME_GATING_DESTS).
                     avif_src.save(
-                        avif_path, format="AVIF", quality=color_quality, speed=speed
+                        avif_path,
+                        format="AVIF",
+                        quality=color_quality,
+                        speed=speed,
+                        subsampling="4:4:4",
                     )
-                    candidates.append((os.path.getsize(avif_path), avif_path))
+                    candidates.append(
+                        (os.path.getsize(avif_path), avif_path, False)
+                    )
         except Exception as e:
             # Corrupt page, missing encoder, DecompressionBomb, etc. Keep the
             # original; clean up any partial temp. One bad page never aborts the
@@ -3265,14 +3301,18 @@ def recompress_chapter_images_modern(
 
         # Pick the smallest candidate; discard the rest (jxl+avif loser).
         candidates.sort(key=lambda c: c[0])
-        best_size, best_path = candidates[0]
-        for _sz, loser in candidates[1:]:
+        best_size, best_path, best_is_recon = candidates[0]
+        for _sz, loser, _recon in candidates[1:]:
             try:
                 os.remove(loser)
             except OSError:
                 pass
         # Guard: adopt the new file only if it clears the savings threshold.
-        if best_size < orig_size * min_saving:
+        # JPEG reconstructions are exempt (adopt iff strictly smaller): the
+        # candidate is byte-recoverable, so unlike a lossy candidate there is
+        # no quality cost to weigh a marginal saving against — 92-93%-ratio
+        # line-art JPEGs would otherwise keep their originals for no benefit.
+        if best_size < orig_size * (1.0 if best_is_recon else min_saving):
             try:
                 os.remove(src)
             except OSError as e:
@@ -7307,7 +7347,10 @@ def main():
         help="JXL Butteraugli distance for grayscale pages under --modernize "
              "(default: 1.0 ~ visually lossless; lower = higher quality/larger; "
              "0.0 selects JXL mathematically-lossless mode). Ignored for color "
-             "(AVIF) pages.",
+             "(AVIF) pages. Sub-1.0 lossy distances are a trap on JPEG "
+             "sources: 0.5 measured 101-129%% of the already-lossy source "
+             "(bigger than the original) — for archival fidelity use 0.0 "
+             "(bit-exact JPEG reconstruction), not a lower lossy distance.",
     )
     p.add_argument(
         "--modernize-min-saving",
@@ -7346,8 +7389,9 @@ def main():
         help="AVIF encode speed for color pages under --modernize (default: 6 "
              "= sweet spot). INVERSE of JXL effort: higher = faster encode, "
              "LARGER files, same pixels; lower = slower, smaller. 4 is ~5x "
-             "slower than 6 for ~2%% smaller; 10 encodes fast but bloats ~13%%. "
-             "Ignored for grayscale (JXL) pages.",
+             "slower than 6 for ~2%% smaller; speeds <=3 measured <=0.5%% "
+             "smaller than 4 for 2.3-3.9x the time; 10 encodes fast but "
+             "bloats ~13%%. Ignored for grayscale (JXL) pages.",
     )
     # ── Auxiliary chapter assets (audio / motion-toon archival) ──
     # tapas.io + webtoons.com carry .mp3/.m4a audio (motion sounds + episode

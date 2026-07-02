@@ -471,6 +471,13 @@ export default function SettingsTab({ settings, onSave }) {
       // they're ever violated. DownloadTab's DEFAULT_FORM spread + App.jsx's
       // search/library defaults spread propagate these to every download path.
       modernize: false,
+      // Fully-reversible archival preset. UI-level only — no dedicated CLI
+      // flag: downloader.js:buildCliArgs forces the PAIR --modernize-format
+      // jxl + --modernize-distance 0 while this is on and ignores the stored
+      // routing/distance/AVIF values (kept, so switching the preset off
+      // restores them). A PAIR because auto + distance 0 is NOT reversible —
+      // auto still routes color pages to the always-lossy AVIF branch.
+      modernizeReversible: false,
       modernizeFormat: "auto",      // auto | jxl | avif | jxl+avif
       modernizeQuality: 90,         // AVIF color quality (1-100)
       modernizeDistance: 1.0,       // JXL grayscale distance (0.0 = lossless)
@@ -697,6 +704,7 @@ export default function SettingsTab({ settings, onSave }) {
         webtoonRecompressMethod: 4,
         // Modernize transcode defaults — mirror the initial-state block above.
         modernize: false,
+        modernizeReversible: false,
         modernizeFormat: "auto",
         modernizeQuality: 90,
         modernizeDistance: 1.0,
@@ -1042,7 +1050,10 @@ export default function SettingsTab({ settings, onSave }) {
             / scaling 100 / preserve-originals on / no-processing off) so the
             saved config can't hard-error at spawn — mirrors the format=none →
             keepImages auto-enable precedent above. The valued knobs map 1:1 to
-            the CLI: codec routing, JXL distance, AVIF quality, min-saving.
+            the CLI: codec routing, JXL distance, AVIF quality, min-saving —
+            plus a UI-level fully-reversible preset (modernizeReversible, no
+            dedicated CLI flag) that buildCliArgs resolves to the forced pair
+            jxl + distance 0 and that hides the knobs it overrides.
             DownloadTab's DEFAULT_FORM spread + App.jsx's defaults spread carry
             these to every download; downloader.js:buildCliArgs maps modernize*
             → --modernize* and strips them if the fast-path is disabled. Needs
@@ -1132,6 +1143,41 @@ export default function SettingsTab({ settings, onSave }) {
                   No&nbsp;processing off).
                 </p>
               )}
+              {/* Fully-reversible archival preset. buildCliArgs (downloader.js)
+                  forces the PAIR --modernize-format jxl + --modernize-distance
+                  0 while this is on — a PAIR because auto + distance 0 is NOT
+                  reversible (auto still routes color pages to the always-lossy
+                  AVIF branch). The routing/distance/AVIF controls below are
+                  hidden meanwhile; their stored values are untouched so
+                  switching the preset off restores them. Python side: distance
+                  0 = bit-exact JPEG->JXL reconstruction + pixel-lossless PNG,
+                  reconstructions exempt from min-saving (aio-dl.py, grep
+                  is_recon). */}
+              <div className="flex items-start gap-3">
+                <Switch
+                  checked={!!local.defaults.modernizeReversible}
+                  onCheckedChange={(v) => setDefault("modernizeReversible", !!v)}
+                  className="mt-0.5"
+                />
+                <div className="flex-1">
+                  <Label className="text-xs cursor-pointer">
+                    Fully reversible (archival)
+                  </Label>
+                  <p className="text-[10px] text-muted-foreground mt-0.5 leading-snug">
+                    Every page becomes lossless JXL: JPEGs are stored as
+                    bit-exact reversible reconstructions (the original .jpg is
+                    recoverable byte-for-byte; measured 7–87% smaller than the
+                    source), PNGs become pixel-lossless, WebP/GIF stay
+                    untouched. Locks routing to JXL-only — under Auto, color
+                    pages would still take the lossy AVIF path. Larger than the
+                    visually-lossless tiers, but the archive stays a faithful
+                    master copy.
+                  </p>
+                </div>
+              </div>
+              {/* Routing / distance / AVIF-quality are moot while the
+                  reversible preset forces jxl + d0 — hidden, values kept. */}
+              {!local.defaults.modernizeReversible && (<>
               <div>
                 <Label className="text-xs">Codec routing</Label>
                 <Select
@@ -1173,7 +1219,10 @@ export default function SettingsTab({ settings, onSave }) {
                     <span className="font-mono">1.0</span> = visually lossless
                     (default); lower = larger/closer to source;{" "}
                     <span className="font-mono">0.0</span> = mathematically
-                    lossless (much larger; only wins on PNG sources).
+                    lossless — JPEGs become byte-exact reversible
+                    reconstructions (measured 7–87% smaller than the source),
+                    PNGs pixel-lossless. For a fully reversible archive use the
+                    toggle above; routing must be JXL-only too.
                   </p>
                 </div>
                 <div>
@@ -1197,6 +1246,7 @@ export default function SettingsTab({ settings, onSave }) {
                   </p>
                 </div>
               </div>
+              </>)}
               {/* Encoder effort ─ pure CPU↔size knobs (--modernize-effort /
                   --modernize-avif-speed). Split from the quality grid above
                   because these change encode TIME and file SIZE only, never the
@@ -1223,7 +1273,9 @@ export default function SettingsTab({ settings, onSave }) {
                 <div className="grid grid-cols-2 gap-x-6 gap-y-3">
                   <div>
                     <div className="flex items-center justify-between mb-1">
-                      <Label className="text-xs">JXL effort (B&amp;W)</Label>
+                      <Label className="text-xs">
+                        JXL effort {local.defaults.modernizeReversible ? "(all pages)" : "(B&W)"}
+                      </Label>
                       <Badge variant="secondary" className="font-mono tabular-nums">
                         {local.defaults.modernizeEffort ?? 7}
                       </Badge>
@@ -1252,6 +1304,9 @@ export default function SettingsTab({ settings, onSave }) {
                       </p>
                     )}
                   </div>
+                  {/* Hidden under the reversible preset — jxl-only routing
+                      means the AVIF branch never runs. */}
+                  {!local.defaults.modernizeReversible && (
                   <div>
                     <div className="flex items-center justify-between mb-1">
                       <Label className="text-xs">AVIF speed (color)</Label>
@@ -1284,6 +1339,7 @@ export default function SettingsTab({ settings, onSave }) {
                       </p>
                     )}
                   </div>
+                  )}
                 </div>
               </div>
               <div>
@@ -1305,7 +1361,10 @@ export default function SettingsTab({ settings, onSave }) {
                   smaller than the original — otherwise the original bytes stay.
                   Default <span className="font-mono">≥8%</span>{" "}
                   (<span className="font-mono">min-saving 0.92</span>) skips
-                  already-dense pages so the archive never grows.
+                  already-dense pages so the archive never grows. At distance{" "}
+                  <span className="font-mono">0</span>, JPEG→JXL reconstructions
+                  are exempt — being byte-recoverable, they're adopted whenever
+                  they're smaller at all.
                 </p>
               </div>
             </div>

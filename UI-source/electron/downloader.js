@@ -336,26 +336,46 @@ function buildCliArgs(args) {
   // flag is absent). Defaults: format=auto, distance=1.0, quality=90,
   // min-saving=0.92 (grep the '--modernize-*' add_argument calls in aio-dl.py).
   if (args.modernize === true && !modernizeBlocked) {
-    if (args.modernizeFormat != null && args.modernizeFormat !== "auto") {
-      cliArgs.push("--modernize-format", String(args.modernizeFormat));
+    if (args.modernizeReversible === true) {
+      // Fully-reversible archival preset (SettingsTab's modernizeReversible —
+      // UI-level, NO dedicated Python flag): force the PAIR format=jxl +
+      // distance=0 and ignore the stored routing/distance/AVIF knobs. A PAIR
+      // because `auto` + distance 0 is NOT reversible — auto still routes
+      // color pages to the AVIF branch, which is lossy at any setting. At
+      // distance 0 the Python JXL save runs bit-exact JPEG->JXL
+      // reconstruction (djxl recovers the original .jpg byte-for-byte) and
+      // pixel-lossless PNG (aio-dl.py: grep is_recon / lossless_jpeg).
+      // Resolved here — the single spawn chokepoint — so search/library/
+      // UpdatesCenter paths that spread settings.defaults get the same
+      // guarantee as the New tab.
+      cliArgs.push("--modernize-format", "jxl");
+      cliArgs.push("--modernize-distance", "0");
+    } else {
+      if (args.modernizeFormat != null && args.modernizeFormat !== "auto") {
+        cliArgs.push("--modernize-format", String(args.modernizeFormat));
+      }
+      if (args.modernizeDistance != null && Number(args.modernizeDistance) !== 1.0) {
+        cliArgs.push("--modernize-distance", String(args.modernizeDistance));
+      }
+      if (args.modernizeQuality != null && Number(args.modernizeQuality) !== 90) {
+        cliArgs.push("--modernize-quality", String(args.modernizeQuality));
+      }
+      // AVIF speed only matters when the AVIF branch can run — i.e. not under
+      // the reversible preset's forced jxl-only routing. Note speed=0 is a
+      // valid non-default (slowest/smallest), so the !== 6 test emits it.
+      if (args.modernizeAvifSpeed != null && Number(args.modernizeAvifSpeed) !== 6) {
+        cliArgs.push("--modernize-avif-speed", String(args.modernizeAvifSpeed));
+      }
     }
-    if (args.modernizeDistance != null && Number(args.modernizeDistance) !== 1.0) {
-      cliArgs.push("--modernize-distance", String(args.modernizeDistance));
-    }
-    if (args.modernizeQuality != null && Number(args.modernizeQuality) !== 90) {
-      cliArgs.push("--modernize-quality", String(args.modernizeQuality));
-    }
+    // min-saving + JXL effort apply on both paths: effort is a pure CPU<->size
+    // knob (applies to lossless encodes too), and min-saving still guards the
+    // PNG-pixel-lossless tier — JPEG reconstructions are guard-EXEMPT on the
+    // Python side (adopted whenever smaller at all; grep is_recon).
     if (args.modernizeMinSaving != null && Number(args.modernizeMinSaving) !== 0.92) {
       cliArgs.push("--modernize-min-saving", String(args.modernizeMinSaving));
     }
-    // CPU<->size encoder knobs. Same value-differs gating; Python defaults are
-    // effort=7 (JXL, 1-9) and avif-speed=6 (AVIF, 0-10). Note speed=0 is a
-    // valid non-default (slowest/smallest), so the !== 6 test emits it.
     if (args.modernizeEffort != null && Number(args.modernizeEffort) !== 7) {
       cliArgs.push("--modernize-effort", String(args.modernizeEffort));
-    }
-    if (args.modernizeAvifSpeed != null && Number(args.modernizeAvifSpeed) !== 6) {
-      cliArgs.push("--modernize-avif-speed", String(args.modernizeAvifSpeed));
     }
   }
 

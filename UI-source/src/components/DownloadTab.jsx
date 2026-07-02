@@ -97,6 +97,13 @@ const DEFAULT_FORM = {
   // :buildCliArgs maps modernize* → --modernize* and strips the family if the
   // CBZ fast-path is disabled. aio-dl.py: grep '--modernize compatibility checks'.
   modernize: false,
+  // Fully-reversible archival preset — resolved at downloader.js:buildCliArgs
+  // into the forced PAIR --modernize-format jxl + --modernize-distance 0
+  // (auto + distance 0 is NOT reversible: color pages would still take the
+  // always-lossy AVIF branch). No per-job UI here; hydrates from
+  // settings.defaults like the other modernize knobs (SettingsTab owns the
+  // toggle).
+  modernizeReversible: false,
   modernizeFormat: "auto",
   modernizeQuality: 90,
   modernizeDistance: 1.0,
@@ -268,6 +275,7 @@ export default function DownloadTab({
     // format like webtoon so a stale saved default never reaches a pdf/none/epub job.
     if (form.modernize && modernizeAllowed) {
       args.modernize = true;
+      args.modernizeReversible = form.modernizeReversible === true;
       args.modernizeFormat = form.modernizeFormat;
       args.modernizeDistance = form.modernizeDistance;
       args.modernizeQuality = form.modernizeQuality;
