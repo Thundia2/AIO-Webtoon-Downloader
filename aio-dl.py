@@ -3853,14 +3853,21 @@ def _fetch_binary_asset_bytes(
 
     Deliberately NOT dl_image: dl_image sniffs image magic bytes and would
     mislabel an .mp3/.m4a. Routes through make_request (the project's canonical
-    GET with backoff + rate-limit coordination) and honors the per-chapter
-    watchdog + host-poison guard so a dead audio CDN can't hang the run.
+    GET with backoff + rate-limit coordination).
+
+    Deliberately IGNORES the per-chapter watchdog (2026-07-03; it used to
+    fast-fail on _chapter_cancelled): aux materialization only runs AFTER the
+    completeness gate accepted the chapter (grep _materialize_chapter_aux's
+    call site — inside `if process_this_chapter:` post-gate), so the pages are
+    already secured and the deadline has nothing left to protect. Honoring it
+    meant a chapter whose page phase ran long SILENTLY dropped its BGM (the
+    record kept has_bgm=True but no _aio/ audio member). Wall-clock stays
+    bounded by retries x make_request's own timeout/backoff budget, and the
+    host-poison guard still stops a dead audio CDN from grinding.
     """
     host = urlparse(url).netloc
     poison = int(globals().get("_CHAPTER_HOST_POISON", 5))
     for attempt in range(1, max(1, retries) + 1):
-        if _chapter_cancelled():
-            return None
         if poison > 0 and _host_fail_count(host) >= poison:
             return None
         try:
@@ -3875,7 +3882,7 @@ def _fetch_binary_asset_bytes(
                 f"    [assets] fetch attempt {attempt}/{retries} failed "
                 f"for {url}: {type(exc).__name__}: {exc}"
             )
-        if attempt < retries and not _chapter_cancelled():
+        if attempt < retries:
             time.sleep(0.5 * attempt)
     return None
 
@@ -3982,6 +3989,45 @@ def _materialize_chapter_aux(
         # Unknown spec.type — ignored (forward-compatible).
 
     return record, members
+
+
+def _chapter_carries_aux(ch: Dict[str, Any]) -> bool:
+    """True when this chapter is known to carry faithful-archival aux content
+    on the PRIMARY source (BGM audio, motion-toon manifest/sounds, or an
+    audio-reference marker). Consulted by _process_chapter_strict to VETO the
+    multi-source alt rescue: alternative sites only mirror flattened pages, so
+    a rescue would silently trade real content (audio/motion) for availability
+    (user directive 2026-07-03 — "BGM or animation chapters shouldn't be
+    rescuable by --multi-source").
+
+    Signals, most specific first:
+      - ch["_aux_assets"]: AssetSpec list stashed by get_chapter_images
+        (linewebtoon._stash_normal_audio / _stash_motion_aux,
+        tapas._stash_aux_assets). Present whenever the failed attempt got as
+        far as the episode page — the overwhelmingly common failure point is
+        Phase 2 page downloads, which is after the stash.
+      - list-time BGM flags, covering attempts that died before/inside
+        get_chapter_images: linewebtoon.get_chapters stamps has_bgm from the
+        episode API's hasBgm; tapas.get_chapters stamps _has_bgm/_bgm_url.
+        Motion-toons have no list-time flag — an attempt that fails that
+        early stays rescue-eligible (nothing was fetched to lose, and we
+        can't know it's motion without the page).
+      - merged collapse-split parts (_merged_parts): any part carrying
+        either signal vetoes the whole synthesized chapter.
+    """
+    def _one(d: Dict[str, Any]) -> bool:
+        return bool(
+            d.get("_aux_assets")
+            or d.get("has_bgm")
+            or d.get("_has_bgm")
+            or d.get("_bgm_url")
+        )
+
+    if _one(ch):
+        return True
+    return any(
+        _one(p) for p in ch.get("_merged_parts") or [] if isinstance(p, dict)
+    )
 
 
 def _scan_chapter_cbz_aux(out_dir: str) -> Dict[str, Dict[str, Any]]:
@@ -9267,6 +9313,10 @@ def main():
             # have already downloaded everything into tdir + written
             # `.download_prefetched`. Without the join we'd race the wipe
             # against the prefetch worker writing files.
+            # 2026-07-03: the REAL (blocking) join now happens in
+            # _process_chapter BEFORE the watchdog timer is armed, so queue
+            # wait no longer burns the chapter's deadline; this call is a
+            # no-op backstop for any future direct-impl caller.
             _consume_image_prefetch(n)
             prefetch_marker_path = os.path.join(tdir, ".download_prefetched")
             if force_redownload:
@@ -9660,7 +9710,38 @@ def main():
                     poisoned_hosts = [h for h, c in _HOST_FAIL_COUNT.items() if c >= poison_threshold]
             deadline_hit = _chapter_cancelled()
             incomplete = (pages_total > 0 and pages_ok < pages_total)
-            if incomplete or deadline_hit or poisoned_hosts:
+            # A COMPLETE chapter is never discarded (2026-07-03). The watchdog
+            # deadline and the host-poison counter exist to stop WAITING on
+            # failing downloads; once every page has landed there is nothing
+            # left to protect, and wiping finished work turns a slow-but-
+            # successful chapter into a spurious multi-source rescue that can
+            # REPLACE it with an inferior alt copy. Real case
+            # (bench/unordinaryLogs.md): chs 130/135/143 finished 141/141,
+            # 121/121, 124/124 via the background prefetch, but the deadline
+            # had expired while the main thread was blocked in
+            # _consume_image_prefetch, so the old `or deadline_hit` gate wiped
+            # them and the atsumaru rescues delivered 119/107/122 pages —
+            # strictly worse archives. Deadline/poison still fail the chapter
+            # when pages ARE missing (the elif below is the pre-existing gate).
+            if pages_total > 0 and not incomplete:
+                if deadline_hit or poisoned_hosts:
+                    why = (
+                        "time budget elapsed"
+                        if deadline_hit
+                        else f"host failures on {poisoned_hosts[0]}"
+                    )
+                    print(
+                        f"  [i] Chapter {n} complete ({pages_ok}/{pages_total} "
+                        f"pages) — accepting despite {why}."
+                    )
+                if deadline_hit and _CHAPTER_CANCEL is not None:
+                    # Stand the watchdog down for the rest of this chapter's
+                    # pipeline (recompress/modernize/aux/CBZ). The one-shot
+                    # timer has already fired; leaving the Event set would
+                    # make _respect_rate_limit skip politeness sleeps and any
+                    # remaining cancel-aware helper fast-fail for no reason.
+                    _CHAPTER_CANCEL.clear()
+            elif incomplete or deadline_hit or poisoned_hosts:
                 # host_blame fallback chain. download_tasks is empty for
                 # handlers that return all binary_image entries (e.g.
                 # MangaDex's resilient pipeline that pre-fetches blobs at
@@ -9867,58 +9948,6 @@ def main():
                     f"{time.monotonic() - _t0_recompress:.1f}s."
                 )
 
-            # Sidecar auxiliary assets (audio / motion-toon manifest / layer
-            # map) — faithful-archival feature. Materialize the handler's
-            # _aux_assets into in-memory CBZ members (audio bytes + motion
-            # manifest) + a ComicInfo record; the members are EMBEDDED into the
-            # chapter CBZ at build time under _aio/ (grep 'cached_cbz_path'),
-            # never a loose _assets/ file. CBZ-only: EPUB/PDF can't hold
-            # per-chapter sidecars, so aux is skipped there (logged once). Inside
-            # `if process_this_chapter:` so a resume-collect skips it — the prior
-            # run's CBZ already carries the aux. Handler-scoped: an alt source
-            # that set no _aux_assets is inert. Opt-out: --no-sidecar-assets. See
-            # _materialize_chapter_aux + sites.base.AssetSpec; the record feeds
-            # the per-chapter ComicInfo (_aux_records) + the series has_audio/
-            # has_motion flags (aux_seen, patched into details.json at run end).
-            if (
-                ch.get("_aux_assets")
-                and not getattr(args, "no_sidecar_assets", False)
-            ):
-                if args.format == "cbz":
-                    try:
-                        _aux_rec, _aux_members = _materialize_chapter_aux(
-                            ch["_aux_assets"], scraper, make_request
-                        )
-                    except Exception as _aux_exc:
-                        # Never let an aux-asset failure abort the chapter — the
-                        # images are the deliverable; sidecars are a bonus.
-                        log_verbose(
-                            f"  [assets] aux materialize failed for Ch {n}: "
-                            f"{type(_aux_exc).__name__}: {_aux_exc}"
-                        )
-                        _aux_rec, _aux_members = None, []
-                    if _aux_rec:
-                        ch["_aux_records"] = _aux_rec
-                        ch["_aux_members"] = _aux_members
-                        if (
-                            _aux_rec.get("audio")
-                            or _aux_rec.get("audio_refs")
-                            or _aux_rec.get("has_bgm")
-                        ):
-                            aux_seen["audio"] = True
-                        if _aux_rec.get("motion_manifest") or _aux_rec.get("layers"):
-                            aux_seen["motion"] = True
-                        log_verbose(
-                            f"  [assets] Ch {n}: {len(_aux_rec.get('audio') or [])} "
-                            f"audio, motion={bool(_aux_rec.get('motion_manifest'))}, "
-                            f"{len(_aux_rec.get('audio_refs') or [])} ref(s)"
-                        )
-                else:
-                    _warn_aux_needs_cbz_once(args.format)
-
-            _t0_proc = time.monotonic()
-            os.makedirs(processed_tdir, exist_ok=True)
-
             # Phase G7 (2026-05-08; Phase B chain 2026-05-13): kick off
             # image prefetch chain for upcoming chapters NOW — after this
             # chapter's downloads + validation succeeded, before the CPU-
@@ -9928,6 +9957,13 @@ def main():
             # images in parallel (up to `image_prefetch_parallel` workers).
             # _process_chapter_impl's next iteration consumes the prefetch
             # via the .download_prefetched marker.
+            #
+            # 2026-07-03: deliberately fires BEFORE the sidecar-aux block
+            # below — a slow BGM/motion fetch (network) then overlaps with
+            # the next chapters' background image downloads instead of
+            # stalling them (the aux insertion for PR #56 had landed above
+            # this block and pushed the chain later by the aux fetch
+            # duration).
             #
             # Worker count knobs:
             #   --prefetch-image-workers: parallelism WITHIN one chapter
@@ -9984,6 +10020,58 @@ def main():
                         depth=depth,
                         no_processing=bool(args.no_processing),
                     )
+
+            # Sidecar auxiliary assets (audio / motion-toon manifest / layer
+            # map) — faithful-archival feature. Materialize the handler's
+            # _aux_assets into in-memory CBZ members (audio bytes + motion
+            # manifest) + a ComicInfo record; the members are EMBEDDED into the
+            # chapter CBZ at build time under _aio/ (grep 'cached_cbz_path'),
+            # never a loose _assets/ file. CBZ-only: EPUB/PDF can't hold
+            # per-chapter sidecars, so aux is skipped there (logged once). Inside
+            # `if process_this_chapter:` so a resume-collect skips it — the prior
+            # run's CBZ already carries the aux. Handler-scoped: an alt source
+            # that set no _aux_assets is inert. Opt-out: --no-sidecar-assets. See
+            # _materialize_chapter_aux + sites.base.AssetSpec; the record feeds
+            # the per-chapter ComicInfo (_aux_records) + the series has_audio/
+            # has_motion flags (aux_seen, patched into details.json at run end).
+            if (
+                ch.get("_aux_assets")
+                and not getattr(args, "no_sidecar_assets", False)
+            ):
+                if args.format == "cbz":
+                    try:
+                        _aux_rec, _aux_members = _materialize_chapter_aux(
+                            ch["_aux_assets"], scraper, make_request
+                        )
+                    except Exception as _aux_exc:
+                        # Never let an aux-asset failure abort the chapter — the
+                        # images are the deliverable; sidecars are a bonus.
+                        log_verbose(
+                            f"  [assets] aux materialize failed for Ch {n}: "
+                            f"{type(_aux_exc).__name__}: {_aux_exc}"
+                        )
+                        _aux_rec, _aux_members = None, []
+                    if _aux_rec:
+                        ch["_aux_records"] = _aux_rec
+                        ch["_aux_members"] = _aux_members
+                        if (
+                            _aux_rec.get("audio")
+                            or _aux_rec.get("audio_refs")
+                            or _aux_rec.get("has_bgm")
+                        ):
+                            aux_seen["audio"] = True
+                        if _aux_rec.get("motion_manifest") or _aux_rec.get("layers"):
+                            aux_seen["motion"] = True
+                        log_verbose(
+                            f"  [assets] Ch {n}: {len(_aux_rec.get('audio') or [])} "
+                            f"audio, motion={bool(_aux_rec.get('motion_manifest'))}, "
+                            f"{len(_aux_rec.get('audio_refs') or [])} ref(s)"
+                        )
+                else:
+                    _warn_aux_needs_cbz_once(args.format)
+
+            _t0_proc = time.monotonic()
+            os.makedirs(processed_tdir, exist_ok=True)
 
             chapter_content = []
 
@@ -10585,6 +10673,18 @@ def main():
         next_chapter is still in the primary's chapter list).
         """
         global _CHAPTER_CANCEL
+        # Join any in-flight background prefetch for this chapter BEFORE
+        # arming the watchdog (2026-07-03). The join can block up to 300s on
+        # a backlogged prefetch queue (grep _consume_image_prefetch) — time
+        # spent on the pool's other jobs, not on this chapter's own work.
+        # When the join ran inside the deadline window (the impl's old call
+        # site), a slow prefetch consumed the whole budget before the chapter
+        # even started: unordinaryLogs.md ch 141 opened with "0/114
+        # (reason=time_budget)" in the same second, and ch 143's fully
+        # prefetched 124/124 pages were wiped at the completeness gate. The
+        # impl's own _consume_image_prefetch call stays as a no-op backstop
+        # (this join pops the done-event).
+        _consume_image_prefetch(ch.get("chap"))
         # Reset per-chapter host-failure tally so the poison threshold is
         # scoped per chapter, not per run.
         _reset_host_failures_for_chapter()
@@ -10625,7 +10725,11 @@ def main():
 
         Behavior the user explicitly asked for after seeing partial PDFs:
           1. Never accept a partial chapter (any missing page → fallback or retry).
-          2. Try alternative sources first (cheap — no sleep).
+          2. Try alternative sources first (cheap — no sleep) — EXCEPT
+             aux-bearing chapters (webtoons BGM/motion, tapas BGM): those are
+             never alt-rescued because alt sites lack the audio/motion content
+             (2026-07-03 directive; grep _chapter_carries_aux). They go
+             straight to the inline retry on the primary.
           3. If all sources fail: long inline retry on primary (CDN recovery).
           4. If inline retries don't recover: stop the run with a clear error.
 
@@ -10652,6 +10756,32 @@ def main():
         except ChapterSkippedError as cse_primary:
             primary_err: ChapterSkippedError = cse_primary
 
+        # Faithful-archival veto (2026-07-03): a chapter that carries sidecar
+        # aux content on the primary (webtoons BGM / motion-toon, tapas BGM —
+        # grep _chapter_carries_aux) is NEVER rescued from an alternative
+        # source. Alt sites only mirror the flattened pages, so a rescue
+        # silently drops the audio/motion. Recovery for these chapters is
+        # inline-retry on the primary only (below). The veto also skips the
+        # lazy-discovery trigger: no point paying the one-time cross-site
+        # search for a chapter that won't consult the result —
+        # _ms_lazy_pending stays armed for the next aux-free failure.
+        # Scoped to runs where the sidecar would actually be embedded: aux is
+        # CBZ-only and --no-sidecar-assets opts out entirely (mirrors the
+        # gating at _materialize_chapter_aux's call site) — when aux wouldn't
+        # land in the archive anyway, a rescue loses nothing and stays allowed.
+        aux_veto = (
+            args.format == "cbz"
+            and not getattr(args, "no_sidecar_assets", False)
+            and _chapter_carries_aux(ch)
+        )
+        if aux_veto and (_ms_lazy_pending or _multi_source_alternatives):
+            print(
+                f"  [Multi-source] Chapter {n_for_log} carries sidecar assets "
+                f"(BGM/motion) that alt sources can't provide; skipping "
+                f"alt-source rescue, will inline-retry on "
+                f"{primary_state[0].name}."
+            )
+
         # --multi-source-lazy: the upfront cross-site discovery was deferred
         # at startup; the first failed chapter pays for it here, once, so the
         # alts lookup below (and every later chapter, including the missed-
@@ -10660,7 +10790,7 @@ def main():
         # isn't re-attempted on every subsequent failure. Runs outside the
         # per-attempt watchdog (_process_chapter cancelled its timer before
         # this except arm), so the chapter deadline can't kill the discovery.
-        if _ms_lazy_pending:
+        if _ms_lazy_pending and not aux_veto:
             _ms_lazy_pending = False
             print(
                 f"  [Multi-source] Chapter {n_for_log} failed on "
@@ -10673,14 +10803,15 @@ def main():
         # Look up alternatives by chapter number (float). Numeric extraction
         # mirrors chapter_merger._extract_chapter_num.
         alts: List[Dict[str, Any]] = []
-        try:
-            chap_str = str(ch.get("chap") or "").strip()
-            m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
-            if m:
-                chap_float = float(m.group(1))
-                alts = list(_multi_source_alternatives.get(chap_float, []))
-        except (TypeError, ValueError):
-            alts = []
+        if not aux_veto:
+            try:
+                chap_str = str(ch.get("chap") or "").strip()
+                m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
+                if m:
+                    chap_float = float(m.group(1))
+                    alts = list(_multi_source_alternatives.get(chap_float, []))
+            except (TypeError, ValueError):
+                alts = []
 
         if alts:
             print(
