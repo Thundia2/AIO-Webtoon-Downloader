@@ -806,12 +806,29 @@ _CHAPTER_FAIL_SIG_LOCK = threading.Lock()
 # Phase D (2026-05-13): per-host concurrency cap that dials DOWN on
 # confirmed CDN failures during a run. Distinct from _HOST_FAIL_COUNT
 # (per-chapter, drives the chapter-skip threshold) — this lives across
-# the whole run so a CDN that 520s on chapter 5 stays capped through
-# chapter 50. Reset only by _reset_host_concurrency_caps at run start.
+# the whole run. Reset by _reset_host_concurrency_caps at run start.
 # Floor is 1; we never reduce below "one request at a time" because
 # concurrency reduction is a coarse control and the polite-delay
 # machinery handles fine-grained request pacing separately.
+#
+# AIMD recovery (2026-07-03; reverses the original "capped for the rest of
+# the run" decision): once the prefetch fast path started feeding this cap
+# (grep record_host_failure in _run_image_prefetch_job), descent got fast
+# enough that one bad patch could pin a 400-chapter run at cap 1-3 for hours
+# after the CDN recovered. So: _HOST_CLEAN_STREAK counts gate-accepted
+# chapters since the host's last recorded failure (any failure resets it);
+# every _HOST_CAP_RECOVERY_STREAK consecutive clean chapters buy +1 cap
+# (grep _record_host_clean_chapter). _HOST_CAP_BASELINE remembers the
+# pre-reduction cap from the host's FIRST reduction; on climbing back to it
+# the cap entry is DELETED rather than set to a number — deletion is the
+# true fully-recovered state because _effective_concurrency clamps to
+# min(base, cap) and a pool whose base exceeds the default 8 (e.g.
+# --image-workers 10) must return to its own base, not to 8.
+# All three structures share _HOST_CAP_LOCK.
 _HOST_CONCURRENCY_CAP: Dict[str, int] = {}
+_HOST_CAP_BASELINE: Dict[str, int] = {}
+_HOST_CLEAN_STREAK: Dict[str, int] = {}
+_HOST_CAP_RECOVERY_STREAK = 3
 _HOST_CAP_LOCK = threading.Lock()
 
 # Set by the per-chapter watchdog Timer in _process_chapter when the chapter's
@@ -1192,7 +1209,11 @@ def _reset_host_failures_for_chapter() -> None:
 def _record_host_failure_for_backoff(host: str, cls: str) -> None:
     """Reduce _HOST_CONCURRENCY_CAP[host] in response to a confirmed failure.
 
-    Called from _record_failure right after the URL bookkeeping. Floor is 1.
+    Called from _record_failure right after the URL bookkeeping, and directly
+    from the prefetch fast path's _prefetch_backoff_feedback callback
+    (backoff-ONLY feedback — grep _run_image_prefetch_job; it deliberately
+    bypasses _record_failure so background failures can't leak into the
+    FOREGROUND chapter's poison tally or ghost signatures). Floor is 1.
     Class behavior:
       - rate_limit:   cap //= 2  (aggressive — server is mad at request rate)
       - retryable:    cap -= 1   (we got unlucky; light decrement)
@@ -1201,6 +1222,11 @@ def _record_host_failure_for_backoff(host: str, cls: str) -> None:
                                   when origin comes back)
       - permanent:    no-op      (4xx — already filtered by _record_failure)
 
+    Every non-permanent call also resets the host's AIMD clean-chapter streak
+    (even when the cap doesn't move, e.g. already at floor or origin_error) —
+    a fresh failure means recovery must re-earn its next +1 step. Grep
+    _record_host_clean_chapter for the increase side.
+
     Cross-process backoff (sibling worker processes via _COORD) is NOT
     triggered from here — that path goes through _record_rate_limit which
     is hit by the in-band retry logic. The concurrency cap is purely
@@ -1208,11 +1234,16 @@ def _record_host_failure_for_backoff(host: str, cls: str) -> None:
 
     No-op for empty host (defensive — _record_failure already guards but
     we re-check for cheap insurance)."""
-    if cls in ("permanent", "origin_error"):
+    if cls == "permanent":
         return
     if not host:
         return
     with _HOST_CAP_LOCK:
+        # Any qualifying failure restarts the recovery clock first, so the
+        # streak resets even on classes that don't move the cap.
+        _HOST_CLEAN_STREAK.pop(host, None)
+        if cls == "origin_error":
+            return
         # Default base is 8 (matches --image-concurrency default). First
         # failure for this host: start from 8, then reduce per the class.
         # If user passed --image-concurrency 4 and we've already capped to
@@ -1225,6 +1256,9 @@ def _record_host_failure_for_backoff(host: str, cls: str) -> None:
         else:
             return
         if new_cap < current:
+            # First reduction remembers where the host started so recovery
+            # knows when it is fully healed (grep _HOST_CAP_BASELINE).
+            _HOST_CAP_BASELINE.setdefault(host, current)
             _HOST_CONCURRENCY_CAP[host] = new_cap
             log_verbose(
                 f"  [Backoff] Reducing {host} concurrency: {current} -> "
@@ -1247,14 +1281,78 @@ def _effective_concurrency(host: str, base: int) -> int:
     return min(base, cap) if cap is not None else base
 
 
+def _host_concurrency_capped(host: str) -> bool:
+    """True while `host` is under a reduced concurrency cap (it has recorded
+    failures this run and hasn't fully recovered — full recovery DELETES the
+    cap entry). Used by the prefetch chain-push to shrink queue pressure
+    against a struggling CDN (grep 'chain depth' in _process_chapter_impl)."""
+    if not host:
+        return False
+    with _HOST_CAP_LOCK:
+        return host in _HOST_CONCURRENCY_CAP
+
+
+def _record_host_clean_chapter(host: str) -> None:
+    """AIMD additive-increase: credit one gate-accepted chapter to `host`;
+    after _HOST_CAP_RECOVERY_STREAK consecutive clean chapters, step the
+    concurrency cap back up by 1. Climbing back to the host's pre-reduction
+    baseline DELETES the cap entry (every pool returns to its own base) —
+    see the _HOST_CAP_BASELINE comment at the declarations.
+
+    Called once per chapter from _process_chapter_impl right after the
+    completeness gate accepts. Prefetch-adopted chapters count: the host
+    served those bytes cleanly too, just on a background worker, and the
+    gate fires exactly once per chapter regardless of who downloaded.
+    Chapters served by an alt source credit the ALT host (host is the
+    chapter's blame host, not the primary's) — correct, since it's the host
+    that demonstrated health. The decrease side (_record_host_failure_for_
+    backoff) resets the streak on any non-permanent failure, including
+    failures recorded concurrently by prefetch workers — so a see-saw under
+    sustained sickness settles near the capacity point instead of ratcheting
+    to zero or climbing on luck."""
+    if not host:
+        return
+    with _HOST_CAP_LOCK:
+        cap = _HOST_CONCURRENCY_CAP.get(host)
+        if cap is None:
+            # Healthy host: drop any stale streak so the dict can't grow
+            # unbounded over a long multi-host run.
+            _HOST_CLEAN_STREAK.pop(host, None)
+            return
+        streak = _HOST_CLEAN_STREAK.get(host, 0) + 1
+        if streak < _HOST_CAP_RECOVERY_STREAK:
+            _HOST_CLEAN_STREAK[host] = streak
+            return
+        # Streak complete — spend it on one +1 step.
+        _HOST_CLEAN_STREAK.pop(host, None)
+        baseline = _HOST_CAP_BASELINE.get(host, 8)
+        new_cap = cap + 1
+        if new_cap >= baseline:
+            _HOST_CONCURRENCY_CAP.pop(host, None)
+            _HOST_CAP_BASELINE.pop(host, None)
+            log_verbose(
+                f"  [Backoff] {host} concurrency fully recovered "
+                f"({cap} -> uncapped)"
+            )
+        else:
+            _HOST_CONCURRENCY_CAP[host] = new_cap
+            log_verbose(
+                f"  [Backoff] Recovering {host} concurrency: {cap} -> "
+                f"{new_cap} (after {_HOST_CAP_RECOVERY_STREAK} clean chapters)"
+            )
+
+
 def _reset_host_concurrency_caps() -> None:
-    """Clear per-run concurrency caps. Called by _apply_runtime_tunables at
-    run start so each run begins with fresh CDN trust. The polite-delay
-    decay (_cool_polite_delay) handles fine-grained request-pacing recovery
-    within a run; concurrency stays capped for the rest of the run once
-    reduced, intentionally — a CDN that 520s once is likely to 520 again."""
+    """Clear per-run concurrency-cap state (cap + AIMD baseline/streak).
+    Called by _apply_runtime_tunables at run start so each run begins with
+    fresh CDN trust. Within a run, recovery is handled by the AIMD increase
+    (_record_host_clean_chapter) — the old "capped for the rest of the run"
+    rule was retired 2026-07-03 when the prefetch path started feeding the
+    cap and descent became fast enough to need an exit ramp."""
     with _HOST_CAP_LOCK:
         _HOST_CONCURRENCY_CAP.clear()
+        _HOST_CAP_BASELINE.clear()
+        _HOST_CLEAN_STREAK.clear()
 
 
 def _chapter_cancelled() -> bool:
@@ -5820,13 +5918,38 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                 fast_conc,
             )
             fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
-            # No host-poison feedback here: prefetch is best-effort. If
-            # it fails, the partial-failure branch below wipes tdir and
-            # main's foreground download retries with full instrumentation.
+            # Backoff feedback (2026-07-03): prefetch hard-failures dial down
+            # the shared per-host concurrency cap. Before this, the prefetch
+            # path — which does nearly ALL the downloading in steady state —
+            # fed the backoff NOTHING, so a saturated CDN kept getting hit at
+            # full concurrency while only the rare foreground failure stepped
+            # the cap down (bench/unordinaryLogs.md: 8->3 took 50 minutes,
+            # five single steps, each from a foreground chapter failure).
+            # Deliberately backoff-ONLY (_record_host_failure_for_backoff,
+            # NOT _record_failure): per-chapter poison counts and ghost
+            # signatures must stay scoped to the FOREGROUND chapter — this
+            # worker runs concurrently with some other chapter's window.
+            # 4xx-status failures are skipped (stricter than the foreground's
+            # blanket "retryable"): prefetch has no ghost detector downstream,
+            # and a prefetched placeholder chapter of uniform 403s must not
+            # throttle the whole run's CDN trust. Timeouts/5xx (status None
+            # or >= 500) are the congestion signal we want.
+            #
+            # Still NO poison feedback: if prefetch fails, the partial-failure
+            # branch below wipes tdir and main's foreground download retries
+            # with full instrumentation.
+            def _prefetch_backoff_feedback(
+                h: str, u: str, *, status=None, body_size=None
+            ) -> None:
+                if status is not None and 400 <= int(status) < 500:
+                    return
+                _record_host_failure_for_backoff(h, "retryable")
+
             fast_results = handler.fast_download_images(
                 download_tasks,
                 concurrency=fast_conc,
                 timeout=fast_timeout,
+                record_host_failure=_prefetch_backoff_feedback,
                 # Forward cookies (e.g. age-gate cookies for LineWebtoon)
                 # so prefetch can fetch the same content the foreground
                 # path would. Base impl filters to host-relevant cookies.
@@ -9710,6 +9833,42 @@ def main():
                     poisoned_hosts = [h for h, c in _HOST_FAIL_COUNT.items() if c >= poison_threshold]
             deadline_hit = _chapter_cancelled()
             incomplete = (pages_total > 0 and pages_ok < pages_total)
+            # Host attribution, shared by three consumers: the AIMD clean-
+            # chapter credit (accept branch below), the failure diagnostic +
+            # skip reason (elif branch), and the cap-aware prefetch chain
+            # clamp (grep 'chain depth'). download_tasks is empty for
+            # handlers that return all binary_image entries (e.g. MangaDex's
+            # resilient pipeline) AND for prefetch-adopted chapters (every
+            # page arrives as immediate_images) — fall back to the first
+            # media_entries URL, then the chapter's source URL, so every
+            # consumer sees a concrete host instead of ''.
+            def _resolve_host_blame() -> str:
+                if download_tasks:
+                    try:
+                        return urlparse(download_tasks[0][1]).netloc
+                    except Exception:
+                        pass
+                if media_entries:
+                    first = media_entries[0]
+                    if isinstance(first, dict):
+                        url = first.get("url")
+                        if url:
+                            try:
+                                return urlparse(url).netloc
+                            except Exception:
+                                pass
+                    elif isinstance(first, str):
+                        try:
+                            return urlparse(first).netloc
+                        except Exception:
+                            pass
+                chap_url = ch.get("url")
+                if chap_url:
+                    try:
+                        return urlparse(str(chap_url)).netloc
+                    except Exception:
+                        pass
+                return ""
             # A COMPLETE chapter is never discarded (2026-07-03). The watchdog
             # deadline and the host-poison counter exist to stop WAITING on
             # failing downloads; once every page has landed there is nothing
@@ -9741,40 +9900,14 @@ def main():
                     # make _respect_rate_limit skip politeness sleeps and any
                     # remaining cancel-aware helper fast-fail for no reason.
                     _CHAPTER_CANCEL.clear()
+                # AIMD additive-increase: a gate-accepted chapter is the
+                # "clean" signal that earns a capped host its concurrency
+                # back (grep _record_host_clean_chapter). Credited even on
+                # accept-despite-deadline/poison — those failure events
+                # already reset the streak themselves; the credit just marks
+                # "a full chapter's bytes landed from this host".
+                _record_host_clean_chapter(_resolve_host_blame())
             elif incomplete or deadline_hit or poisoned_hosts:
-                # host_blame fallback chain. download_tasks is empty for
-                # handlers that return all binary_image entries (e.g.
-                # MangaDex's resilient pipeline that pre-fetches blobs at
-                # the handler level). Fall back to the first media_entries
-                # URL, then the chapter's source URL, so the diagnostic
-                # log line always shows a concrete host instead of '-'.
-                def _resolve_host_blame() -> str:
-                    if download_tasks:
-                        try:
-                            return urlparse(download_tasks[0][1]).netloc
-                        except Exception:
-                            pass
-                    if media_entries:
-                        first = media_entries[0]
-                        if isinstance(first, dict):
-                            url = first.get("url")
-                            if url:
-                                try:
-                                    return urlparse(url).netloc
-                                except Exception:
-                                    pass
-                        elif isinstance(first, str):
-                            try:
-                                return urlparse(first).netloc
-                            except Exception:
-                                pass
-                    chap_url = ch.get("url")
-                    if chap_url:
-                        try:
-                            return urlparse(str(chap_url)).netloc
-                        except Exception:
-                            pass
-                    return ""
                 # Ghost-chapter check FIRST. The detector uses pages_ok=0 +
                 # uniform signatures across all recorded failures, which is
                 # disjoint from "any pages succeeded" — so a chapter that
@@ -9995,6 +10128,21 @@ def main():
             else:
                 effective_prefetch_workers = int(prefetch_workers_raw)
             depth = max(0, int(getattr(args, "image_prefetch_depth", 2) or 0))
+            # Cap-aware prefetch pressure (2026-07-03): while this chapter's
+            # image host is under a reduced concurrency cap, push at most ONE
+            # chapter ahead. Depth-N pushes against a struggling CDN grow the
+            # prefetch queue backlog (slow jobs, busy workers) — exactly what
+            # produced the 90-300s consume waits behind the unordinaryLogs.md
+            # time-budget failures. Depth 1 keeps the pipeline overlap alive
+            # without stacking pressure; the AIMD recovery (grep
+            # _record_host_clean_chapter) lifts the cap — and with it this
+            # clamp — once the host runs clean again.
+            if depth > 1 and _host_concurrency_capped(_resolve_host_blame()):
+                log_verbose(
+                    f"  [Img Prefetch] host under backoff cap — "
+                    f"chain depth {depth} -> 1"
+                )
+                depth = 1
             if (
                 effective_prefetch_workers > 0
                 and depth > 0
