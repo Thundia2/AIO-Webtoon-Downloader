@@ -88,3 +88,7 @@ test_downloads.py
 # — not shipped, same policy as /bench/.
 /tools/
 .claude/
+
+# Local compression test corpus (raw + modernized page samples for codec
+# benchmarking). Copyrighted manga pages + series-named files — never track.
+/_testpages/
