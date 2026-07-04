@@ -160,10 +160,30 @@ class ArtlapsaSiteHandler(BaseSiteHandler):
         start = data.find("[", idx)
         if start == -1:
             return None
+        # String-aware bracket scan (parity with linewebtoon CL-5): a bare [/]
+        # depth count miscounts when a string VALUE inside the array contains a
+        # bracket (e.g. a page URL ".../img].jpg") — the slice then ends at the
+        # wrong ] and the caller's json.loads (see get_chapter_images) fails.
+        # Skip brackets inside quoted strings, honoring backslash escapes. The
+        # x-data is JS, so track BOTH ' and " openers and close only on the
+        # matching quote: the "pages" array is JSON (double-quoted values), but
+        # sibling fields like baseLink are single-quoted (see _extract_string_value).
         depth = 0
+        quote = None  # the opening quote char while inside a string, else None
+        esc = False
         for pos in range(start, len(data)):
             char = data[pos]
-            if char == "[":
+            if quote is not None:
+                if esc:
+                    esc = False
+                elif char == "\\":
+                    esc = True
+                elif char == quote:
+                    quote = None
+                continue
+            if char == "'" or char == '"':
+                quote = char
+            elif char == "[":
                 depth += 1
             elif char == "]":
                 depth -= 1

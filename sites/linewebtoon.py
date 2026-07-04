@@ -800,8 +800,9 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
         # a JSON string VALUE contains a bracket (e.g. bgmTitle "Track [Mix]"):
         # the slice then ends at the wrong ] and json.loads fails, silently
         # degrading real BGM to a presence marker. Skip brackets inside quoted
-        # strings (honoring backslash escapes). artlapsa._extract_json_array
-        # does the same string-aware slice — grep it.
+        # strings (honoring backslash escapes). NOTE: artlapsa._extract_json_array
+        # is the SAME shape but is NOT yet string-aware — it still carries the
+        # latent version of this exact bug; don't cite it as a correct reference.
         depth = 0
         in_str = False
         esc = False

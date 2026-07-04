@@ -368,6 +368,19 @@ class SimpleMangaFireVRFGenerator:
         self._op_lock = threading.Lock()
         atexit.register(self.close)
 
+    def evict_cached_path(self, path: str) -> None:
+        """Drop the cached VRF token + meta for `path` so the next ensure_vrf
+        re-derives a FRESH token. Called from the chapter-fetch retry loop
+        (sites/mangafire.py, finding MF-1) when an attempt fails carrying a
+        possibly-stale/poisoned token. MUST run on the VRF worker thread that
+        owns these dicts — callers reach it via _VRFBridge.evict_vrf → _vrf_call,
+        never a raw pop from their own thread (that hits the _VRFBridge facade,
+        which has no _vrf_cache attribute → AttributeError swallowed → no-op).
+        `path` is the request path (e.g. "/ajax/read/chapter/123"), identical to
+        the ensure_vrf lookup key and the handle_request storage key."""
+        self._vrf_cache.pop(path, None)
+        self._vrf_meta.pop(path, None)
+
     # ----------------------------- logging -----------------------------
 
     def _log(self, msg: str) -> None:
@@ -2104,6 +2117,18 @@ class _VRFBridge:
 
     def generate_vrf(self, url_path: str, init_url: str | None = None) -> str:
         return _vrf_call("generate_vrf", url_path, init_url=init_url)
+
+    def evict_vrf(self, path: str) -> None:
+        """Drop the cached VRF token (+meta) for `path` on the worker thread
+        that OWNS the cache dict, so the next ensure_vrf re-derives a fresh
+        token. MF-1: a raw `get_vrf_generator()._vrf_cache.pop(...)` from the
+        caller's thread hits THIS bridge object (no _vrf_cache attribute) →
+        AttributeError; the dict lives on the _VRF_GEN singleton confined to
+        the VRF worker thread, reachable only through _vrf_call."""
+        try:
+            _vrf_call("evict_cached_path", path)
+        except Exception:
+            pass
 
     def capture_search(self, query: str, *, timeout_ms: int | None = None) -> dict:
         """Run the typeahead-driven search via the persistent browser. Returns

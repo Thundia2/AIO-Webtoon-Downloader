@@ -233,8 +233,10 @@ class ManganatoSiteHandler(BaseSiteHandler):
             )
         # Tolerant sort key: a non-numeric chapter title (e.g. "Oneshot",
         # "Extra") makes a bare float() raise ValueError and abort get_chapters
-        # for the whole series. Bucket non-numeric labels together (sorted last)
-        # instead of crashing. Review finding HB-1/PYP-1.
+        # for the whole series. Bucket non-numeric labels together instead of
+        # crashing — their exact position is irrelevant (the aio-dl.py download
+        # loop re-buckets by float and re-sorts; under reverse=True here they
+        # actually LEAD the numeric run, not trail it). Review finding HB-1/PYP-1.
         def _chap_key(c):
             try:
                 return (0, float(c.get("chap")))
