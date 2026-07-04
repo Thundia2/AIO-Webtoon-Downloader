@@ -292,7 +292,12 @@ export default function SettingsTab({ settings, onSave }) {
     //     :group_chapters_for_download for the full 6-rule cluster table.
     // Persisted as settings.collapseSplits; useDownloader.queueDownload and
     // .runSearch inject this into args/opts before IPC.
-    collapseSplits: true,
+    // Default OFF (opt-in, documented 2026-05-27) to MATCH the spawn sites,
+    // which all read `settings.collapseSplits === true` (absent → OFF): with a
+    // `true` default here the toggle showed ON while downloads ran OFF until the
+    // first save, and saving then silently flipped collapse ON against the
+    // documented default. Residual follow-up.
+    collapseSplits: false,
     // Inter-chapter image prefetch worker count (Phase G7, 2026-05-08).
     // While chapter N is encoding (CPU-bound), a background thread
     // downloads chapter N+1's images. -1 = match Image Workers (default).
@@ -657,7 +662,7 @@ export default function SettingsTab({ settings, onSave }) {
       workingDir: "",
       isPackaged: prev.isPackaged,
       verboseAlways: true,
-      collapseSplits: true,
+      collapseSplits: false,
       prefetchImageWorkers: -1,
       imageConcurrency: 8,
       imagePrefetchDepth: 2,
@@ -1613,7 +1618,7 @@ export default function SettingsTab({ settings, onSave }) {
               </p>
             </div>
             <Switch
-              checked={local.collapseSplits !== false}
+              checked={local.collapseSplits === true}
               onCheckedChange={(v) => set("collapseSplits", v)}
             />
           </div>

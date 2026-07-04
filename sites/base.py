@@ -300,6 +300,7 @@ class BaseSiteHandler:
         is_cancelled: Optional[Callable[[], bool]] = None,
         record_host_failure: Optional[Callable[..., None]] = None,
         scraper: Any = None,
+        pending_suffix: str = "",
     ) -> List[Tuple[int, Optional[str]]]:
         """Bulk-download chapter images via curl_cffi async + HTTP/2.
 
@@ -342,6 +343,13 @@ class BaseSiteHandler:
                           like LineWebtoon ride along their .webtoons.com
                           age-gate cookies even though the curl_cffi session
                           is a separate TLS session from cloudscraper's.
+          pending_suffix: Appended to the ".pending_<base>" tempfile name (NOT
+                          the final page name — finalize_pending_image renames by
+                          the explicit `base`). aio-dl.py's image-prefetch worker
+                          passes ".bgprefetch" so a background page download can't
+                          collide with the FOREGROUND writing the same page into
+                          the same tdir after it adopts the chapter (S5-2 write
+                          race); both finalize to the same page atomically.
 
         Returns: list of (page_index, path_or_None), ordered by page_index.
         path_or_None matches dl_image's contract — None signals failure.
@@ -394,7 +402,7 @@ class BaseSiteHandler:
             base, _ = os.path.splitext(filename)
             if not base:
                 base = filename
-            pending_path = os.path.join(folder, f".pending_{base}")
+            pending_path = os.path.join(folder, f".pending_{base}{pending_suffix}")
             host = urlparse(url).netloc
 
             # Two attempts: original + one retry on transient failure. No
