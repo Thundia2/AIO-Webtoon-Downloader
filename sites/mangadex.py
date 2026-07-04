@@ -907,10 +907,14 @@ class MangaDexSiteHandler(BaseSiteHandler):
                 "type": "binary_image",
                 "data": blob,
                 "extension": ext,
-                # Page indices are 1-based in MangaDex display. Filename
-                # placeholder mirrors what dl_image would have produced
-                # (n_<page>_<width>.ext is the chapter loop's pattern; we
-                # only set the *base* name and let aio-dl.py re-prefix).
+                # Extension hint ONLY — the leading digits are ignored. The
+                # chapter loop (aio-dl.py) names every page by its own
+                # continuous page_counter (f"{n}_{page:04d}{ext}"), NOT this
+                # string: a bare per-chapter name like "0001.png" collides when
+                # --collapse-splits concatenates multiple parts into one tdir
+                # (part 2 overwrites part 1). `extension` above is the primary
+                # ext source; this is only a fallback. Grep
+                # bench/collapseSplitsModernize.md for the failure it caused.
                 "name": f"{idx + 1:04d}{ext}",
             })
         return entries

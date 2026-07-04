@@ -5857,12 +5857,15 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                     if not blob:
                         continue
                     explicit_ext = entry.get("extension")
+                    custom_name = entry.get("name")
                     if explicit_ext:
                         ext = (
                             explicit_ext
                             if explicit_ext.startswith(".")
                             else "." + explicit_ext
                         )
+                    elif custom_name and os.path.splitext(custom_name)[1]:
+                        ext = os.path.splitext(custom_name)[1]
                     else:
                         ext = _sniff_image_extension(
                             blob[:32]
@@ -5870,12 +5873,12 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                             else b"",
                             entry.get("content_type"),
                         )
-                    custom_name = entry.get("name")
-                    filename = (
-                        custom_name
-                        if custom_name
-                        else f"{chap_label}_{page_counter:04d}{ext}"
-                    )
+                    # Unique per-page name (continuous page_counter), never the
+                    # handler's bare `name` — a per-chapter name like MangaDex's
+                    # "0001.png" collides when --collapse-splits merges parts
+                    # into one tdir. Full rationale at the foreground twin (grep
+                    # collapseSplitsModernize.md / _merged_parts).
+                    filename = f"{chap_label}_{page_counter:04d}{ext}"
                     pth = os.path.join(target_tdir, filename)
                     try:
                         with open(pth, "wb") as fh:
@@ -9619,25 +9622,36 @@ def main():
                         if not blob:
                             continue
                         # Phase A (2026-05-07): if the handler provided an
-                        # explicit extension, trust it. Otherwise sniff from
-                        # blob magic + the optional content-type hint, falling
-                        # back to .jpg only when nothing matches. Same logic
-                        # as dl_image so binary_image entries don't bypass the
-                        # CBZ byte-preservation guarantee.
+                        # explicit extension, trust it; else honor a suffix on
+                        # the handler's `name` hint; else sniff blob magic + the
+                        # optional content-type hint (falling back to .jpg).
+                        # Same logic as dl_image so binary_image entries don't
+                        # bypass the CBZ byte-preservation guarantee.
                         explicit_ext = entry.get("extension")
+                        custom_name = entry.get("name")
                         if explicit_ext:
                             ext = explicit_ext if explicit_ext.startswith(".") else "." + explicit_ext
+                        elif custom_name and os.path.splitext(custom_name)[1]:
+                            ext = os.path.splitext(custom_name)[1]
                         else:
                             ext = _sniff_image_extension(
                                 blob[:32] if isinstance(blob, (bytes, bytearray)) else b"",
                                 entry.get("content_type"),
                             )
-                        custom_name = entry.get("name")
-                        filename = (
-                            custom_name
-                            if custom_name
-                            else f"{n}_{page_counter:04d}{ext}"
-                        )
+                        # On-disk page name is ALWAYS the continuous
+                        # page_counter, never the handler's bare `name`: a
+                        # per-chapter name (MangaDex "0001.png", no chapter
+                        # prefix) collides when --collapse-splits concatenates
+                        # parts into one tdir — part 2's "0001.png" overwrites
+                        # part 1's, so immediate_images collects duplicate paths.
+                        # That drops part-1 pages, and under --modernize races the
+                        # transcode pool on the shared path (winner deletes the
+                        # source, the dup slot's except-cleanup deletes the
+                        # winner's .jxl) → CBZ FileNotFoundError, chapter missed.
+                        # The archive never shows this name (build_cbz renumbers
+                        # by arcname). Mirrored in _run_image_prefetch_job; see
+                        # bench/collapseSplitsModernize.md.
+                        filename = f"{n}_{page_counter:04d}{ext}"
                         pth = os.path.join(tdir, filename)
                         with open(pth, "wb") as fh:
                             fh.write(blob)
