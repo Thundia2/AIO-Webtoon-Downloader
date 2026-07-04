@@ -3267,12 +3267,29 @@ def _compute_t2_score(
                 with _T2_NIQE_INFER_LOCK:
                     try:
                         import torch
-                        with torch.no_grad(), _warnings.catch_warnings():
-                            _warnings.simplefilter("error", UserWarning)
+                        # SRCH-1: RECORD warnings instead of promoting them to
+                        # exceptions. The old `simplefilter("error", UserWarning)`
+                        # mutates the PROCESS-GLOBAL warnings.filters for the
+                        # duration of this block; catch_warnings() only restores
+                        # that global state on exit, it grants no thread
+                        # isolation. So while NIQE ran, a concurrently-running
+                        # ARNIQA/CLIP-IQA thread (different inference locks) that
+                        # emitted any UserWarning had it raised as an exception,
+                        # silently nulling its score. record=True + "always"
+                        # keeps the degenerate-content signal (a NIQE warning →
+                        # niqe_score=None, preserved below) without ever setting
+                        # a global "error" filter that leaks across threads.
+                        with torch.no_grad(), _warnings.catch_warnings(record=True) as _niqe_warns:
+                            _warnings.simplefilter("always")
                             raw = niqe_model(tensor_rgb)
-                        niqe_score = float(raw.item()) if hasattr(raw, "item") else float(raw)
-                        niqe_norm = _niqe_to_norm(niqe_score)
-                    except (Exception, UserWarning):
+                        if _niqe_warns:
+                            # Degenerate content warned → treat as unreliable.
+                            niqe_score = None
+                            niqe_norm = None
+                        else:
+                            niqe_score = float(raw.item()) if hasattr(raw, "item") else float(raw)
+                            niqe_norm = _niqe_to_norm(niqe_score)
+                    except Exception:
                         niqe_score = None
                         niqe_norm = None
 
