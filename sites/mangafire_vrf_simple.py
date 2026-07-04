@@ -669,6 +669,14 @@ class SimpleMangaFireVRFGenerator:
                     pass
             self._page = self._context.new_page()
 
+            # MF-4: reset the Layer-4 in-page-fetch circuit breaker. A new page
+            # means a new obfuscated network hook, so the in-page fast path is
+            # worth retrying once — the docstring at _capture_via_inpage_fetch
+            # ("The flag clears on _recreate_page") relied on this reset, but it
+            # was never actually performed, permanently disabling the fast path
+            # after the first failure for the rest of the run.
+            self._inpage_fetch_failed = False
+
             # Re-register the route handler on the context (unroute_all removed it)
             try:
                 self._context.route("**/*", self._route_handler)
