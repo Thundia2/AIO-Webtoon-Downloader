@@ -55,7 +55,7 @@ from aio_config import (
     write_hid_marker,
 )
 from sites import get_handler_by_name, get_handler_for_url
-from sites.chapter_merger import group_chapters_for_download
+from sites.chapter_merger import group_chapters_for_download, _extract_chapter_num
 from sites.base import SiteComicContext, IncompleteChapterError
 from sites._image_io import (
     sniff_image_extension as _sniff_image_extension,
@@ -6097,6 +6097,34 @@ def _image_prefetch_worker_loop() -> None:
             _image_prefetch_queue.task_done()
 
 
+def _binary_image_page_name(entry: Dict[str, Any], blob, chap_label, page_counter: int) -> str:
+    """On-disk filename for a binary_image page: '<chap_label>_<counter:04d><ext>'.
+
+    ext = explicit entry['extension'] -> a suffix on entry['name'] -> magic-sniff
+    (blob[:32] + content_type). The chap_label prefix + CONTINUOUS page_counter
+    (never the handler's per-chapter 'name') is REQUIRED: a per-chapter name like
+    MangaDex's "0001.png" collides when --collapse-splits concatenates parts into
+    one tdir — part 2 overwrites part 1, dropping pages, and under --modernize the
+    transcode pool races the shared path (winner deletes the source, the dup
+    slot's cleanup deletes the winner's .jxl) -> CBZ FileNotFoundError. Shared by
+    _process_chapter_impl (foreground) and _run_image_prefetch_job (prefetch) so
+    the naming can't drift between the two — the exact bug that forced editing
+    both twins (grep bench/collapseSplitsModernize.md). CL-4.
+    """
+    explicit_ext = entry.get("extension")
+    custom_name = entry.get("name")
+    if explicit_ext:
+        ext = explicit_ext if explicit_ext.startswith(".") else "." + explicit_ext
+    elif custom_name and os.path.splitext(custom_name)[1]:
+        ext = os.path.splitext(custom_name)[1]
+    else:
+        ext = _sniff_image_extension(
+            blob[:32] if isinstance(blob, (bytes, bytearray)) else b"",
+            entry.get("content_type"),
+        )
+    return f"{chap_label}_{page_counter:04d}{ext}"
+
+
 def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
     """The body of one prefetch job. Lifted verbatim from the old
     inline _worker closure in _start_image_prefetch (pre-2026-05-13)
@@ -6158,29 +6186,11 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                     blob = entry.get("data")
                     if not blob:
                         continue
-                    explicit_ext = entry.get("extension")
-                    custom_name = entry.get("name")
-                    if explicit_ext:
-                        ext = (
-                            explicit_ext
-                            if explicit_ext.startswith(".")
-                            else "." + explicit_ext
-                        )
-                    elif custom_name and os.path.splitext(custom_name)[1]:
-                        ext = os.path.splitext(custom_name)[1]
-                    else:
-                        ext = _sniff_image_extension(
-                            blob[:32]
-                            if isinstance(blob, (bytes, bytearray))
-                            else b"",
-                            entry.get("content_type"),
-                        )
-                    # Unique per-page name (continuous page_counter), never the
-                    # handler's bare `name` — a per-chapter name like MangaDex's
-                    # "0001.png" collides when --collapse-splits merges parts
-                    # into one tdir. Full rationale at the foreground twin (grep
-                    # collapseSplitsModernize.md / _merged_parts).
-                    filename = f"{chap_label}_{page_counter:04d}{ext}"
+                    # CL-4: shared with the foreground twin so the collapse-safe
+                    # naming can't drift (grep _binary_image_page_name).
+                    filename = _binary_image_page_name(
+                        entry, blob, chap_label, page_counter
+                    )
                     pth = os.path.join(target_tdir, filename)
                     try:
                         with open(pth, "wb") as fh:
@@ -9995,37 +10005,14 @@ def main():
                         blob = entry.get("data")
                         if not blob:
                             continue
-                        # Phase A (2026-05-07): if the handler provided an
-                        # explicit extension, trust it; else honor a suffix on
-                        # the handler's `name` hint; else sniff blob magic + the
-                        # optional content-type hint (falling back to .jpg).
-                        # Same logic as dl_image so binary_image entries don't
-                        # bypass the CBZ byte-preservation guarantee.
-                        explicit_ext = entry.get("extension")
-                        custom_name = entry.get("name")
-                        if explicit_ext:
-                            ext = explicit_ext if explicit_ext.startswith(".") else "." + explicit_ext
-                        elif custom_name and os.path.splitext(custom_name)[1]:
-                            ext = os.path.splitext(custom_name)[1]
-                        else:
-                            ext = _sniff_image_extension(
-                                blob[:32] if isinstance(blob, (bytes, bytearray)) else b"",
-                                entry.get("content_type"),
-                            )
-                        # On-disk page name is ALWAYS the continuous
-                        # page_counter, never the handler's bare `name`: a
-                        # per-chapter name (MangaDex "0001.png", no chapter
-                        # prefix) collides when --collapse-splits concatenates
-                        # parts into one tdir — part 2's "0001.png" overwrites
-                        # part 1's, so immediate_images collects duplicate paths.
-                        # That drops part-1 pages, and under --modernize races the
-                        # transcode pool on the shared path (winner deletes the
-                        # source, the dup slot's except-cleanup deletes the
-                        # winner's .jxl) → CBZ FileNotFoundError, chapter missed.
-                        # The archive never shows this name (build_cbz renumbers
-                        # by arcname). Mirrored in _run_image_prefetch_job; see
-                        # bench/collapseSplitsModernize.md.
-                        filename = f"{n}_{page_counter:04d}{ext}"
+                        # CL-4: ext-determination + collapse-safe naming now live
+                        # in the shared _binary_image_page_name so this and the
+                        # prefetch twin (_run_image_prefetch_job) can't drift —
+                        # the per-chapter-name collision they both guard against
+                        # (MangaDex "0001.png" overwriting across merged parts,
+                        # racing the modernize pool → CBZ FileNotFoundError) is
+                        # documented in the helper. bench/collapseSplitsModernize.md.
+                        filename = _binary_image_page_name(entry, blob, n, page_counter)
                         pth = os.path.join(tdir, filename)
                         with open(pth, "wb") as fh:
                             fh.write(blob)
@@ -10314,16 +10301,14 @@ def main():
                 # ChapterGhostError it raises.
                 primary_only_for_ghost: Optional[bool] = None
                 if _multi_source_alternatives:
-                    try:
-                        chap_str = str(ch.get("chap") or "").strip()
-                        m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
-                        if m:
-                            chap_float = float(m.group(1))
-                            primary_only_for_ghost = (
-                                not _multi_source_alternatives.get(chap_float)
-                            )
-                    except (TypeError, ValueError):
-                        primary_only_for_ghost = None
+                    # CL-1: use the canonical extractor the aligner keyed the
+                    # alternatives_by_chap_num dict with (grep _extract_chapter_num)
+                    # so the float lookup can't drift from an inline regex reimpl.
+                    _cf = _extract_chapter_num(ch.get("chap"))
+                    if _cf is not None:
+                        primary_only_for_ghost = (
+                            not _multi_source_alternatives.get(_cf)
+                        )
                 if _is_ghost_chapter_signature(
                     pages_ok=pages_ok,
                     pages_total=pages_total,
@@ -11340,14 +11325,11 @@ def main():
         # mirrors chapter_merger._extract_chapter_num.
         alts: List[Dict[str, Any]] = []
         if not aux_veto:
-            try:
-                chap_str = str(ch.get("chap") or "").strip()
-                m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
-                if m:
-                    chap_float = float(m.group(1))
-                    alts = list(_multi_source_alternatives.get(chap_float, []))
-            except (TypeError, ValueError):
-                alts = []
+            # CL-1: canonical extractor (matches the aligner's dict keys) — grep
+            # _extract_chapter_num.
+            _cf = _extract_chapter_num(ch.get("chap"))
+            if _cf is not None:
+                alts = list(_multi_source_alternatives.get(_cf, []))
 
         if alts:
             print(
@@ -11437,16 +11419,13 @@ def main():
         if primary_err.reason == "ghost_chapter":
             primary_only_for_ghost: Optional[bool] = None
             if _multi_source_alternatives:
-                try:
-                    chap_str = str(ch.get("chap") or "").strip()
-                    m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
-                    if m:
-                        chap_float = float(m.group(1))
-                        primary_only_for_ghost = (
-                            not _multi_source_alternatives.get(chap_float)
-                        )
-                except (TypeError, ValueError):
-                    primary_only_for_ghost = None
+                # CL-1: canonical extractor (matches the aligner's dict keys) —
+                # grep _extract_chapter_num.
+                _cf = _extract_chapter_num(ch.get("chap"))
+                if _cf is not None:
+                    primary_only_for_ghost = (
+                        not _multi_source_alternatives.get(_cf)
+                    )
             raise ChapterGhostError(
                 chap=n_for_log,
                 host=primary_err.host,
