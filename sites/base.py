@@ -514,9 +514,17 @@ class BaseSiteHandler:
                     content_type = r.headers.get("Content-Type", "") or ""
                 except Exception:
                     content_type = ""
-                final = finalize_pending_image(
-                    pending_path, folder, base, content_type
-                )
+                try:
+                    final = finalize_pending_image(
+                        pending_path, folder, base, content_type
+                    )
+                except Exception:
+                    # INFRA-1: an AV/indexer briefly locking the .pending_ file
+                    # can make the atomic rename raise (Windows PermissionError).
+                    # Drop just THIS page (the caller retries it) instead of
+                    # letting the exception bubble out of gather and fail the
+                    # whole chapter, discarding every sibling page that succeeded.
+                    return page_idx, None
                 return page_idx, final
             return page_idx, None
 
@@ -535,7 +543,18 @@ class BaseSiteHandler:
                     _fetch_one(s, sema, p_idx, url, folder, name)
                     for p_idx, url, folder, name in download_tasks
                 ]
-                return await asyncio.gather(*tasks)
+                # return_exceptions=True (INFRA-1): a single page coroutine that
+                # raises unexpectedly must NOT abort gather and fail the WHOLE
+                # chapter. Map any raised exception back to that page's
+                # (idx, None) miss so the caller retries just that page; gather
+                # preserves task order, so zip with download_tasks recovers the
+                # page_idx the dead coroutine couldn't return.
+                gathered = await asyncio.gather(*tasks, return_exceptions=True)
+                out: List[Tuple[int, Optional[str]]] = []
+                for (p_idx, _u, _f, _n), res in zip(download_tasks, gathered):
+                    out.append(res if not isinstance(res, BaseException)
+                               else (p_idx, None))
+                return out
 
         # Run in this thread's own event loop. asyncio.run constructs a fresh
         # loop, so works whether called from main thread or from a daemon

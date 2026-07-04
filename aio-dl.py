@@ -230,12 +230,28 @@ _PERMANENT_SKIP_REASONS = frozenset({"mature_login_required"})
 # Cross-process folder allocation (avoid mixing same-title series)
 # -----------------------------------------------------------
 class _AIOFileLock:
-    """A tiny cross-platform exclusive file lock."""
+    """A tiny cross-platform exclusive file lock.
+
+    RACE-1: a single instance (the _COORD._net_lock / _cpu_lock / _state_lock
+    singletons) is entered by MULTIPLE THREADS. With only one self._fd, two
+    concurrent __enter__s clobbered it — the first thread's __exit__ then closed
+    the SECOND thread's fd (EBADF, swallowed → it ran UNLOCKED) while the first
+    thread's real OS lock leaked for the process lifetime (+10s msvcrt spins per
+    later acquire on Windows; POSIX siblings block forever). Serialize entry/exit
+    with a threading.Lock so exactly one thread owns self._fd at a time. This is
+    correct: it's an EXCLUSIVE lock, so same-process threads must be mutually
+    exclusive too, not just cross-process — the file lock still provides the
+    cross-process half. Non-reentrant: no coordinator method nests the same lock
+    (verified — net_phase/cpu_phase/state ops each take one lock, sequentially).
+    Only exercised under --jobs>1 (grep AIO_COORD_ENABLED / _COORD).
+    """
     def __init__(self, path: str):
         self.path = path
         self._fd = -1
+        self._tlock = threading.Lock()
 
     def __enter__(self):
+        self._tlock.acquire()
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         try:
             self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT)
@@ -250,7 +266,8 @@ class _AIOFileLock:
                 import fcntl
                 fcntl.flock(self._fd, fcntl.LOCK_EX)
         except Exception:
-            # Best effort — close fd and proceed without lock.
+            # Best effort — close fd and proceed without the OS lock (the
+            # threading.Lock is still held, so intra-process exclusion holds).
             if self._fd >= 0:
                 try:
                     os.close(self._fd)
@@ -260,23 +277,27 @@ class _AIOFileLock:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self._fd < 0:
-            return
+        # ALWAYS release the threading.Lock, even on the best-effort no-fd path,
+        # or a failed os.open would leak the mutex and hang every later acquire.
         try:
-            if os.name == "nt":
-                import msvcrt
-                os.lseek(self._fd, 0, os.SEEK_SET)
-                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-        except Exception:
-            pass
-        try:
-            os.close(self._fd)
-        except Exception:
-            pass
-        self._fd = -1
+            if self._fd >= 0:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        os.lseek(self._fd, 0, os.SEEK_SET)
+                        msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(self._fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    os.close(self._fd)
+                except Exception:
+                    pass
+                self._fd = -1
+        finally:
+            self._tlock.release()
 
 
 
@@ -911,6 +932,27 @@ _HOST_CAP_LOCK = threading.Lock()
 _CHAPTER_CANCEL: Optional[threading.Event] = None
 
 
+# RACE-2: the LEGACY (non-fast-download) image-prefetch path downloads the NEXT
+# chapters' pages via dl_image on a background ThreadPool. dl_image /
+# _try_download_url poll the FOREGROUND chapter's watchdog (_chapter_cancelled)
+# and per-host poison tally (_host_fail_count) — so a foreground chapter's
+# deadline/poison would abort the unrelated background prefetch of chapter N+k,
+# which then wipes its tdir and the foreground re-downloads it (the exact waste
+# the prefetch exists to avoid). And the prefetch's own failures fed the
+# foreground poison/ghost accumulators via _record_failure. This thread-local
+# marks a thread as a background-prefetch worker; _chapter_cancelled returns
+# False, _host_fail_count returns 0, and _record_failure routes to backoff-ONLY
+# for such threads — matching the fast path's already-decoupled behavior (grep
+# _prefetch_backoff_feedback). dl_image propagates the flag into its parallel
+# variant sub-threads (grep _bg_prefetch). The fast path never set this (it
+# doesn't call these foreground helpers at all).
+_PREFETCH_TLS = threading.local()
+
+
+def _in_background_prefetch() -> bool:
+    return getattr(_PREFETCH_TLS, "active", False)
+
+
 def _record_rate_limit(host: str, delay: float) -> None:
     if not host or delay <= 0:
         return
@@ -1123,6 +1165,20 @@ def _record_failure(
     4xx failures contribute to ghost detection if they came with a
     body (the host-fail count guard stays gated on non-permanent only).
     """
+    # RACE-2: a background image-prefetch worker (grep _in_background_prefetch)
+    # runs concurrently with some OTHER foreground chapter's window. Its failures
+    # must NOT pollute that chapter's poison tally or ghost-signature accumulator
+    # — feed ONLY the per-host backoff cap, exactly like the fast path's
+    # _prefetch_backoff_feedback (4xx skipped: prefetch has no ghost detector
+    # downstream, so a placeholder chapter of uniform 403s must not throttle the
+    # run's CDN trust).
+    if _in_background_prefetch():
+        if status is not None and 400 <= int(status) < 500:
+            return
+        if host and cls != "permanent":
+            _record_host_failure_for_backoff(host, cls)
+        return
+
     # Signature recording happens BEFORE the cls=="permanent" gate so that
     # uniform 4xx ghost responses (e.g. true 403 placeholder pages whose
     # body lacks rate-limit keywords) still feed the detector. Without
@@ -1257,6 +1313,10 @@ def _is_ghost_chapter_signature(
 
 def _host_fail_count(host: str) -> int:
     """Distinct URLs that have fully failed against this host this chapter."""
+    # RACE-2: a background prefetch worker must not fast-fail on the FOREGROUND
+    # chapter's poison tally — 0 keeps it downloading the next chapters.
+    if _in_background_prefetch():
+        return 0
     if not host:
         return 0
     with _HOST_FAIL_LOCK:
@@ -1431,7 +1491,15 @@ def _reset_host_concurrency_caps() -> None:
 def _chapter_cancelled() -> bool:
     """True if the current chapter's watchdog has fired or _CHAPTER_CANCEL was
     set explicitly. Returns False outside a chapter (cover download etc.)."""
-    return _CHAPTER_CANCEL is not None and _CHAPTER_CANCEL.is_set()
+    # RACE-2: background prefetch workers download the NEXT chapters and must not
+    # honor the FOREGROUND chapter's watchdog/cancel.
+    if _in_background_prefetch():
+        return False
+    # Capture the global once: the main loop flips _CHAPTER_CANCEL to None between
+    # chapters, so reading it twice ("is not None" then ".is_set()") could hit a
+    # None on the second read and AttributeError in a worker thread. S5-6.
+    evt = _CHAPTER_CANCEL
+    return evt is not None and evt.is_set()
 
 
 # Image format sniffing + atomic-rename helpers live in sites/_image_io.py
@@ -1626,6 +1694,11 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
     timeout = 30  # seconds
 
     os.makedirs(folder, exist_ok=True)
+
+    # RACE-2: capture prefetch mode once so the parallel variant sub-threads
+    # spawned below inherit it (thread-locals don't cross threads); grep
+    # _in_background_prefetch / _bg_prefetch.
+    _bg = _in_background_prefetch()
 
     # Phase A (2026-05-07): callers pass `name` like "5_0001.jpg" by historic
     # convention, but the actual bytes may be webp/png/avif. Strip the
@@ -1825,6 +1898,10 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
 
     def try_variant(attempt_url, thread_id):
         """Helper function for parallel execution - each thread uses its own temp file"""
+        # RACE-2: this runs in a fresh variant sub-thread; carry the prefetch
+        # flag over so _chapter_cancelled()/_host_fail_count() below (and inside
+        # _try_download_url) stay decoupled from the foreground chapter.
+        _PREFETCH_TLS.active = _bg
         # Fast-fail: skip this variant if the chapter is already being aborted
         # or the target host is poisoned. _try_download_url itself also checks
         # this, but bailing out before tempfile creation saves needless I/O.
@@ -5985,6 +6062,12 @@ _image_prefetch_queue: "_stdlib_queue.Queue[Optional[_ImgPrefetchJob]]" = (
 _image_prefetch_workers: List[threading.Thread] = []
 _image_prefetch_seen: set = set()                       # dedupe: chap_label
 _image_prefetch_done: Dict[str, threading.Event] = {}   # chap_label -> Event
+# S5-2: chap_labels whose consume-wait TIMED OUT while the worker was still
+# running. The foreground then downloads into the same ch_{chap} tdir, so the
+# still-running worker must NOT wipe it (partial-fail rm_tree) or write its late
+# success marker. Set under _image_prefetch_lock by _consume_image_prefetch on
+# timeout; the worker checks + discards it right before its finalize.
+_image_prefetch_abandoned: set = set()                  # chap_label
 _image_prefetch_lock = threading.Lock()                 # guards _seen/_done/_workers
 # Set by _apply_runtime_tunables from --image-prefetch-parallel (default 2).
 _image_prefetch_parallel: int = 2
@@ -6185,11 +6268,23 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                 urlparse(download_tasks[0][1]).netloc if download_tasks else "",
                 workers,
             ))
+            # RACE-2: mark each pool thread as a background prefetch worker so
+            # dl_image / _try_download_url don't honor the FOREGROUND chapter's
+            # watchdog + poison tally (which would abort this prefetch of a LATER
+            # chapter and wipe its tdir). The flag rides a thread-local (grep
+            # _in_background_prefetch); dl_image propagates it into its variant
+            # sub-threads. Reset per task; the pool's threads die with the block.
+            def _bg_prefetch(url, folder, name):
+                _PREFETCH_TLS.active = True
+                try:
+                    return dl_image(url, folder, name, scraper, True)
+                finally:
+                    _PREFETCH_TLS.active = False
             with ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix=f"img-prefetch-{chap_label}"
             ) as pool:
                 futures = [
-                    pool.submit(dl_image, url, folder, name, scraper, True)
+                    pool.submit(_bg_prefetch, url, folder, name)
                     for _, url, folder, name in download_tasks
                 ]
                 for fut in as_completed(futures):
@@ -6199,7 +6294,20 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                     except Exception:
                         failed += 1
 
-        if failed == 0:
+        # S5-2: if the foreground gave up waiting (consume timed out) it has
+        # ADOPTED this tdir and is downloading into it now. Neither write our
+        # marker nor wipe the dir — a late rm_tree here deletes the foreground's
+        # in-progress pages mid-build (the unordinaryLogs.md 90-300s consume
+        # waits made this reachable). Leave ch_{chap} entirely to the foreground.
+        with _image_prefetch_lock:
+            _abandoned = chap_label in _image_prefetch_abandoned
+            _image_prefetch_abandoned.discard(chap_label)
+        if _abandoned:
+            log_verbose(
+                f"  [Img Prefetch] Ch {chap_label} abandoned (foreground took "
+                f"over its tdir after consume timeout) — leaving it untouched"
+            )
+        elif failed == 0:
             _write_prefetched_marker(target_tdir)
             log_verbose(
                 f"  [Img Prefetch] Ch {chap_label} ready ({len(download_tasks)} imgs)"
@@ -6381,7 +6489,19 @@ def _consume_image_prefetch(chap_label: str) -> None:
         # pushes us beyond this, foreground download falls through and
         # main re-does the work — same recovery semantics as a single-
         # thread prefetch hanging.
-        evt.wait(timeout=300.0)
+        finished = evt.wait(timeout=300.0)
+        if not finished:
+            # S5-2: we're giving up the wait but the worker is STILL running.
+            # The foreground is about to download into the SAME ch_{chap} tdir,
+            # so flag the chapter abandoned — the worker's late finalize then
+            # skips both its rm_tree (which would delete our in-progress pages)
+            # and its success marker. Grep _image_prefetch_abandoned.
+            with _image_prefetch_lock:
+                _image_prefetch_abandoned.add(chap_label)
+            log_verbose(
+                f"  Image prefetch of Ch {chap_label} exceeded 300s; foreground "
+                f"taking over its tdir."
+            )
     with _image_prefetch_lock:
         # Clean up per-chap state. Keep _image_prefetch_seen entry so a
         # second enqueue for the same chapter (e.g. inline retry) is
