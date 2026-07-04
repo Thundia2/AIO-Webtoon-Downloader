@@ -883,12 +883,19 @@ class MadaraSiteHandler(BaseSiteHandler):
         image_urls: List[str] = []
         for selector in self.reader_selectors:
             for img in soup.select(selector):
-                src = (
-                    img.get("data-src")
-                    or img.get("data-srcset")
-                    or img.get("data-cfsrc")
-                    or img.get("src")
-                )
+                src = img.get("data-src")
+                if not src:
+                    # HA-2: data-srcset is a comma-separated candidate list
+                    # ("url1 720w, url2 1080w"), NOT a single URL. Using it raw
+                    # yields a garbage URL on srcset-only Madara sites. Take the
+                    # first candidate, then its URL token (before any whitespace
+                    # descriptor). The normal src/data-src path is untouched.
+                    srcset = img.get("data-srcset")
+                    if srcset:
+                        first_candidate = srcset.split(",", 1)[0].strip()
+                        src = first_candidate.split()[0] if first_candidate else None
+                if not src:
+                    src = img.get("data-cfsrc") or img.get("src")
                 if not src:
                     continue
                 src = src.strip()
