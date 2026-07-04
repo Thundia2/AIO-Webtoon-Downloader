@@ -3269,7 +3269,18 @@ def recompress_chapter_images_modern(
             return "both"
         return "jxl" if _page_is_grayscale(im) else "avif"  # auto
 
-    def _convert_one(entry: Tuple[int, str]) -> Tuple[int, str]:
+    def _convert_one(
+        entry: Tuple[int, str], nthreads: int
+    ) -> Tuple[int, str, Optional[Exception]]:
+        """Transcode one page; return (idx, result_path, error).
+
+        error is None on success OR a legitimate keep (skip format, animated
+        source, no min_saving headroom). It carries the exception ONLY when the
+        encode itself raised — those slots keep the original for now and are
+        handed to the serial mop-up pass in the driver below. ``nthreads`` bounds
+        each encoder's internal thread pool (grep enc_threads — the fix for the
+        intermittent libjxl JXL_ENC_ERROR under pool oversubscription).
+        """
         idx, src = entry
         base, _ = os.path.splitext(src)
         try:
@@ -3282,11 +3293,11 @@ def recompress_chapter_images_modern(
                 # frame would drop the animation. Flatten guard: grep
                 # _is_animated_image.
                 if src_fmt in _MODERN_SKIP_FORMATS or getattr(im, "is_animated", False):
-                    return idx, src
+                    return idx, src, None
                 w, h = im.size
                 target = _pick_target(im, w, h)
                 if target == "skip":
-                    return idx, src
+                    return idx, src, None
                 # (size, path, is_recon). is_recon marks the JXL save that ran
                 # pillow_jxl's bit-exact JPEG->JXL *reconstruction* (JPEG file
                 # source + strict-lossless tier + no mode conversion): zero
@@ -3327,10 +3338,16 @@ def recompress_chapter_images_modern(
                     #     reconstruction = 12.7-92.6% of the source JPEG,
                     #     sha256-verified reversible; see
                     #     ~/.claude/plans/compression-modernize-handoff.md.
+                    # num_threads caps pillow_jxl's internal Encoder pool
+                    # (default -1 = ALL cores) so `workers` concurrent encodes
+                    # don't oversubscribe — the fix for the intermittent
+                    # JXL_ENC_ERROR on large pages (grep enc_threads in the
+                    # driver). Bit-identical output, verified across 1/2/4/-1.
                     jxl_src.save(
                         jxl_path,
                         format="JXL",
                         effort=effort,
+                        num_threads=nthreads,
                         **({"lossless": True} if gray_quality == 0.0
                            else {"distance": gray_quality, "lossless_jpeg": False}),
                     )
@@ -3372,30 +3389,33 @@ def recompress_chapter_images_modern(
                     # 4:4:4 measured bt ~1.3 at ~+12% bytes (2026-07-02 bench).
                     # Hardcoded, not a flag: no new argparse dest, so no
                     # resume-gating impact (grep _RESUME_GATING_DESTS).
+                    # max_threads caps libavif's pool (default = all cores) for
+                    # the same anti-oversubscription reason as JXL's num_threads.
                     avif_src.save(
                         avif_path,
                         format="AVIF",
                         quality=color_quality,
                         speed=speed,
                         subsampling="4:4:4",
+                        max_threads=nthreads,
                     )
                     candidates.append(
                         (os.path.getsize(avif_path), avif_path, False)
                     )
         except Exception as e:
-            # Corrupt page, missing encoder, DecompressionBomb, etc. Keep the
-            # original; clean up any partial temp. One bad page never aborts the
+            # Corrupt page, missing encoder, DecompressionBomb, OR a transient
+            # encoder failure under load (libjxl JXL_ENC_ERROR — grep
+            # enc_threads). Clean the partial temp and report the error UP: the
+            # driver's serial mop-up retries this page single-file (no pool
+            # contention) before conceding, so we do NOT warn here — the mop-up
+            # warns only if the retry also fails. One bad page never aborts the
             # chapter (mirrors the webp fn's broad catch at ~line 2894).
-            log_verbose(
-                f"  Warning: modernize transcode failed for "
-                f"{os.path.basename(src)}: {e}. Keeping original."
-            )
             for _ext in (".jxl", ".avif"):
                 try:
                     os.remove(base + _ext)
                 except OSError:
                     pass
-            return idx, src
+            return idx, src, e
 
         # Pick the smallest candidate; discard the rest (jxl+avif loser).
         candidates.sort(key=lambda c: c[0])
@@ -3421,24 +3441,40 @@ def recompress_chapter_images_modern(
                     f"{os.path.splitext(best_path)[1]} ({e}): "
                     f"{os.path.basename(src)}"
                 )
-            return idx, best_path
+            return idx, best_path, None
         # Not enough headroom — drop the new file, keep the original bytes.
         try:
             os.remove(best_path)
         except OSError:
             pass
-        return idx, src
+        return idx, src, None
 
+    # Encoder-thread budget — the fix for the intermittent modernize failure
+    # "... Generic Error. Please build `libjxl` from source ...". pillow_jxl's
+    # Encoder AND Pillow's native AVIF encoder each default to an ALL-CORES
+    # internal thread pool (num_threads=-1 / max_threads=cpu). Nested under this
+    # `workers`-thread page pool that compounds to workers*cpu threads (e.g.
+    # 6*12=72 on a 12-core box), and the oversubscription intermittently trips
+    # libjxl's parallel runner into a bare JXL_ENC_ERROR on very large pages
+    # under real-world load — reproduced on ~62 MP progressive JPEGs while the
+    # background image-prefetch chain ran (bench: 3/42 byte-identical pages
+    # failed intermittently; all pass single-threaded). Sizing each encode at
+    # cpu//workers keeps every core busy with NO oversubscription. Thread count
+    # NEVER changes the output bytes (sha-identical + reconstruction bit-exact
+    # across 1/2/4/-1), so it is invisible to the CBZ and to resume gating.
     cpu = os.cpu_count() or 4
-    half_cores = max(1, cpu // 2)
-    workers = max(1, min(half_cores, len(raw_paths)))
+    workers = max(1, min(cpu // 2, len(raw_paths)))
+    enc_threads = max(1, cpu // workers)
 
     out: List[Optional[str]] = [None] * len(raw_paths)
+    failed: List[Tuple[int, str]] = []  # (idx, src) whose encode raised
     with _cpu_guard("recompress_modern"):
         if workers == 1 or len(raw_paths) == 1:
             for entry in enumerate(raw_paths):
-                idx, dst = _convert_one(entry)
+                idx, dst, err = _convert_one(entry, enc_threads)
                 out[idx] = dst
+                if err is not None:
+                    failed.append((idx, raw_paths[idx]))
                 if idx % 8 == 0:
                     _hb("cpu", f"modernize {idx+1}/{len(raw_paths)}")
         else:
@@ -3449,12 +3485,43 @@ def recompress_chapter_images_modern(
                 # heavy encode (like libwebp/libjpeg), so workers translate to
                 # speedup; if a given pillow_jxl build holds the GIL the pool
                 # just serializes (correct, only slower). Part B uses processes.
-                for idx, dst in pool.map(
-                    _convert_one, list(enumerate(raw_paths))
+                for idx, dst, err in pool.map(
+                    lambda e: _convert_one(e, enc_threads),
+                    list(enumerate(raw_paths)),
                 ):
                     out[idx] = dst
+                    if err is not None:
+                        failed.append((idx, raw_paths[idx]))
                     if idx % 8 == 0:
                         _hb("cpu", f"modernize {idx+1}/{len(raw_paths)}")
+
+        # Serial mop-up: a page whose encode raised almost always succeeds when
+        # retried single-file — no sibling encoders competing for cores/memory
+        # is exactly the low-contention condition that never failed in testing.
+        # Give the lone encode the full core count (nothing else runs now) and
+        # retry twice with a short backoff before conceding. This turns the
+        # transient libjxl failure from "page silently left un-modernized" into
+        # "page transcoded a beat later".
+        if failed:
+            log_verbose(
+                f"  [modernize] Retrying {len(failed)} page(s) that failed "
+                f"under load (serial)..."
+            )
+            for idx, src in failed:
+                dst = src
+                err: Optional[Exception] = None
+                for _attempt in range(2):
+                    _hb("cpu", f"modernize retry {os.path.basename(src)}")
+                    _, dst, err = _convert_one((idx, src), cpu)
+                    if err is None:
+                        break
+                    time.sleep(0.3 * (_attempt + 1))
+                out[idx] = dst
+                if err is not None:
+                    log_verbose(
+                        f"  Warning: modernize transcode failed for "
+                        f"{os.path.basename(src)}: {err}. Keeping original."
+                    )
 
     return [p for p in out if p is not None]
 
