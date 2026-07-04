@@ -508,6 +508,21 @@ function scanLibrary(mangasDir, thumbCacheDir) {
       lastModified = seriesMeta.last_downloaded_at;
     }
 
+    // UIE-1: The Python downloader writes a real cover.jpg at the series-folder
+    // root (Komikku layout; grep _refresh_cover_jpg / cover_dst in aio-dl.py).
+    // Archive series (cbz/epub — webtoons/manhwa) have no PDF and no
+    // coverImagePath, so without this probe they show no cover unless a web
+    // cover happened to be cached. Feed the on-disk cover into coverImagePath
+    // (the field LibraryTab already renders); prefer it over the image-only
+    // page-1 fallback since a real cover.jpg is a better thumbnail.
+    for (const coverName of ["cover.jpg", "cover.png", "cover.webp", "cover.jpeg"]) {
+      const candidate = path.join(folderPath, coverName);
+      if (fs.existsSync(candidate)) {
+        coverImagePath = candidate;
+        break;
+      }
+    }
+
     // ── Check for cached thumbnail ──
     // Priority: web cover (from seriesMeta.cover) > PDF page-1 render
     let thumbPath = null;
@@ -727,9 +742,25 @@ function downloadCoverImage(imageUrl, thumbCacheDir, redirectsLeft = COVER_MAX_R
     // Pick http or https based on the URL
     const client = imageUrl.startsWith("https") ? https : http;
 
+    // UIE-2: pstatic/webtoons cover CDNs reject a Referer-less request with
+    // 403, so the cover never caches. Send a Referer: use the webtoons
+    // homepage for its own CDN hosts (pstatic/webtoon), otherwise the cover
+    // URL's own origin. Merged per-request so the shared COVER_REQUEST_HEADERS
+    // constant stays intact across the redirect recursion.
+    let referer;
+    try {
+      const origin = new URL(imageUrl).origin;
+      referer = /(?:pstatic\.net|webtoon)/i.test(imageUrl)
+        ? "https://www.webtoons.com/"
+        : origin + "/";
+    } catch {
+      referer = "https://www.webtoons.com/";
+    }
+    const requestHeaders = { ...COVER_REQUEST_HEADERS, Referer: referer };
+
     const request = client.get(
       imageUrl,
-      { timeout: 15000, headers: COVER_REQUEST_HEADERS },
+      { timeout: 15000, headers: requestHeaders },
       (response) => {
         // Follow redirects up to COVER_MAX_REDIRECTS deep. A 3xx without a
         // Location header is malformed; reject with a clear error rather

@@ -225,6 +225,13 @@ function runMetadataCli(args, stdinData = null) {
         reject(new Error(`Invalid metadata JSON: ${err.message}`));
       }
     });
+    // UIE-3: if the child exits early, writing to its stdin raises EPIPE.
+    // Without a listener that surfaces as an unhandled 'error' that crashes
+    // the Electron main process — swallow it (the 'close' handler above
+    // already rejects with the child's exit code/stderr).
+    proc.stdin.on("error", (e) => {
+      console.warn("metadata_cli stdin write error:", e.message || e);
+    });
     if (stdinData) proc.stdin.write(stdinData);
     proc.stdin.end();
   });

@@ -184,6 +184,16 @@ export default function DownloadTab({
   // Helper to update one form field
   const set = (key, value) => updateForm((prev) => ({ ...prev, [key]: value }));
 
+  // UIR-3: clamp numeric inputs whose raw Number() read is forwarded straight
+  // to the CLI (Network Tuning). Empty/NaN (e.g. the user cleared the field)
+  // falls back to the field's DEFAULT_FORM value instead of emitting 0/null;
+  // `min` enforces a sane floor so e.g. --http-timeout can't go to 0.
+  const setNum = (key, raw, min) => {
+    const n = Number(raw);
+    const value = raw === "" || Number.isNaN(n) ? DEFAULT_FORM[key] : Math.max(min, n);
+    updateForm((prev) => ({ ...prev, [key]: value }));
+  };
+
   // --webtoon-recompress needs an archive to write the converted pages into,
   // so aio-dl.py rejects it for --format pdf/none (hard error at startup,
   // see the --webtoon-recompress validation block ~aio-dl.py:6028). --komikku
@@ -758,23 +768,23 @@ export default function DownloadTab({
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <Label className="text-xs">HTTP Timeout (sec)</Label>
-                <Input type="number" value={form.httpTimeout} onChange={(e) => set("httpTimeout", Number(e.target.value))} className="mt-1" />
+                <Input type="number" min={1} value={form.httpTimeout} onChange={(e) => setNum("httpTimeout", e.target.value, 1)} className="mt-1" />
               </div>
               <div>
                 <Label className="text-xs">Max Retries</Label>
-                <Input type="number" value={form.httpMaxRetries} onChange={(e) => set("httpMaxRetries", Number(e.target.value))} className="mt-1" />
+                <Input type="number" min={0} value={form.httpMaxRetries} onChange={(e) => setNum("httpMaxRetries", e.target.value, 0)} className="mt-1" />
               </div>
               <div>
                 <Label className="text-xs">Backoff Base (sec)</Label>
-                <Input type="number" step="0.1" value={form.httpBackoffBase} onChange={(e) => set("httpBackoffBase", Number(e.target.value))} className="mt-1" />
+                <Input type="number" step="0.1" min={0.1} value={form.httpBackoffBase} onChange={(e) => setNum("httpBackoffBase", e.target.value, 0.1)} className="mt-1" />
               </div>
               <div>
                 <Label className="text-xs">Backoff Cap (sec)</Label>
-                <Input type="number" value={form.httpBackoffCap} onChange={(e) => set("httpBackoffCap", Number(e.target.value))} className="mt-1" />
+                <Input type="number" min={1} value={form.httpBackoffCap} onChange={(e) => setNum("httpBackoffCap", e.target.value, 1)} className="mt-1" />
               </div>
               <div>
                 <Label className="text-xs">Net Min Gap (sec)</Label>
-                <Input type="number" step="0.05" value={form.netMinGap} onChange={(e) => set("netMinGap", Number(e.target.value))} className="mt-1" />
+                <Input type="number" step="0.05" min={0} value={form.netMinGap} onChange={(e) => setNum("netMinGap", e.target.value, 0)} className="mt-1" />
               </div>
             </div>
           </Collapsible>
