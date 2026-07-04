@@ -177,7 +177,15 @@ class MangaHubSiteHandler(BaseSiteHandler):
                     "_number": number,
                 }
             )
-        results.sort(key=lambda c: float(c.get("chap") or 0))
+        # Tolerant sort key: a non-numeric "chap" (defensive — number is coerced
+        # via str() above, but a future schema drift shouldn't crash the whole
+        # get_chapters). Non-numeric labels bucket last. Review finding PYP-3.
+        def _chap_key(c):
+            try:
+                return (0, float(c.get("chap")))
+            except (TypeError, ValueError):
+                return (1, 0.0)
+        results.sort(key=_chap_key)
         return results
 
     def get_chapter_images(

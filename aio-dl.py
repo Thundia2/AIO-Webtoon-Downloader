@@ -186,6 +186,46 @@ class ChapterGhostError(Exception):
         )
 
 
+class ChapterPermanentSkipError(Exception):
+    """Raised by _process_chapter_strict for a chapter that failed with a
+    DETERMINISTIC per-chapter gate no retry or alternate source can clear —
+    currently a mature/age/login interstitial (reason 'mature_login_required',
+    grep _PERMANENT_SKIP_REASONS). The main loop treats this as skip-and-
+    continue: record missed + move on, WITHOUT the ghost path's consecutive-
+    host-block escalation (a mature series legitimately has many consecutive
+    gated episodes, so counting them toward a host-level abort would be wrong).
+
+    Why distinct from ChapterGhostError: ghost means "this chapter looks
+    structurally absent / the host is misbehaving" and escalates to a run abort
+    after GHOST_ABORT_THRESHOLD in a row; a login gate is a per-episode content
+    restriction, not a host fault. Why distinct from ChapterAbortedError: the
+    OLD flow inline-retried 'mature_login_required' to exhaustion and then
+    ABORTED the whole run on a single login-gated tapas BGM episode (the aux
+    veto — grep _chapter_carries_aux — also blocked alt-rescue), losing every
+    later good chapter over one age-gated one. Cross-file: sites/tapas.py raises
+    IncompleteChapterError(reason='mature_login_required') from
+    get_chapter_images when a logged-out mature interstitial replaces the
+    panels; the conversion to this class happens in _process_chapter_strict.
+    """
+    def __init__(self, chap, reason: str = "", host: str = "", pages_total: int = 0):
+        self.chap = chap
+        self.reason = reason
+        self.host = host
+        self.pages_total = pages_total
+        super().__init__(
+            f"chapter {chap} permanent-skip: reason={reason} "
+            f"host={host or '-'} pages={pages_total}"
+        )
+
+
+# Deterministic per-chapter failure reasons that no inline retry or alternate
+# source can clear — routed to ChapterPermanentSkipError (skip + continue) by
+# _process_chapter_strict instead of the inline-retry→abort path. A set so
+# future handlers can add their own login/paywall gate reasons; grep
+# mature_login_required (sites/tapas.py) for the sole producer today.
+_PERMANENT_SKIP_REASONS = frozenset({"mature_login_required"})
+
+
 # -----------------------------------------------------------
 # Cross-process folder allocation (avoid mixing same-title series)
 # -----------------------------------------------------------
@@ -733,6 +773,39 @@ def _parse_chapter_spec_number(value: str) -> Optional[float]:
         return float(match.group(1))
     except ValueError:
         return None
+
+
+def _chap_as_float(chap) -> Optional[float]:
+    """Tolerant chapter-number parse for the post-bucketing filter/sort sites.
+
+    Returns the label as a float, or None for a non-numeric label. The chapter-
+    bucketing step (grep chapters_by_num) already normalizes float/"Oneshot"
+    labels to a numeric STRING and drops raw non-numeric ones, so in the normal
+    flow every downstream ch["chap"] parses — but the collapse-splits relabel
+    (sites/chapter_merger.py group.label, which can be "?" or "" for an
+    empty/None chap) can reintroduce a non-numeric label. The --no-partials /
+    --chapters filters and the .aio_series.json sort used a bare
+    float(c["chap"]) that crashed the whole run on that edge; this keeps them
+    defensive. C1 review finding.
+    """
+    try:
+        return float(chap)
+    except (TypeError, ValueError):
+        return None
+
+
+def _chap_label_str(chap) -> str:
+    """Canonical chapter-label string matching --list-chapters' normalization.
+
+    --list-chapters emits f"{num:g}" for numeric labels (grep deduped_pool), so
+    the .aio_series.json chapters_downloaded set MUST use the same form or the
+    UI's update-check diff (main.js Set difference of raw strings) never matches
+    a float-emitting handler's chapters (mangathemesia family: 4.0 vs 4) and the
+    series sticks at "+N new" forever, re-downloading everything on each update.
+    Non-numeric labels fall back to str(). XF-1 review finding.
+    """
+    f = _chap_as_float(chap)
+    return str(chap) if f is None else f"{f:g}"
 
 
 def is_chapter_wanted(chapter_num_float: float, range_spec: str) -> bool:
@@ -5157,7 +5230,15 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
         # harness building a Namespace by hand). Argparse default-paths
         # always populate the string/int form.
         "metadata_source": str(getattr(args, "metadata_source", "none") or "none"),
-        "metadata_tag_min_rank": int(getattr(args, "metadata_tag_min_rank", 50) or 50),
+        # `is not None` (not `or 50`) — 0 is a documented-legal min-rank (keep
+        # all tags) that `or` would silently clobber to 50, so --update-all
+        # children would then filter every rank-0 tag. Mirrors the
+        # modernize_distance guard below. S2-3 review finding.
+        "metadata_tag_min_rank": int(
+            getattr(args, "metadata_tag_min_rank", 50)
+            if getattr(args, "metadata_tag_min_rank", 50) is not None
+            else 50
+        ),
         "metadata_refresh": bool(getattr(args, "metadata_refresh", False)),
         # Content-aware JXL/AVIF transcode (--modernize family). Persisted so
         # --update-all child runs keep transcoding newly downloaded chapters;
@@ -5193,6 +5274,40 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
             if getattr(args, "modernize_avif_speed", 6) is not None
             else 6
         ),
+        # Chapter-SET / output-LAYOUT flags that were silently dropped from the
+        # replay before (grep _append_saved_update_options for the matching
+        # branches). Without these, --update-all children diverged from the
+        # original download:
+        #   collapse_splits — re-downloads previously-collapsed .1/.2 fragments
+        #     as perpetual "new" chapters (changes the chapter set). S4-2.
+        #   komikku — loses per-chapter ComicInfo + cover.jpg/details.json layout
+        #     (the child re-coerces format/keep/no-final itself). S2-2/S4-3.
+        #   webtoon_recompress[_quality/_method] — new LINE Webtoon chapters ship
+        #     as full-size PNG instead of the chosen WebP. S2-2.
+        #   no_sidecar_assets — the user's opt-out wasn't honored on updates.
+        # method default 4 uses `is not None` (0 is a valid libwebp method);
+        # quality min is 1 so plain `or` would be safe but is kept symmetric.
+        "collapse_splits": bool(getattr(args, "collapse_splits", False)),
+        "komikku": bool(getattr(args, "komikku", False)),
+        "webtoon_recompress": bool(getattr(args, "webtoon_recompress", False)),
+        "webtoon_recompress_quality": int(
+            getattr(args, "webtoon_recompress_quality", 85)
+            if getattr(args, "webtoon_recompress_quality", 85) is not None
+            else 85
+        ),
+        "webtoon_recompress_method": int(
+            getattr(args, "webtoon_recompress_method", 4)
+            if getattr(args, "webtoon_recompress_method", 4) is not None
+            else 4
+        ),
+        "no_sidecar_assets": bool(getattr(args, "no_sidecar_assets", False)),
+        # Persist the "user explicitly typed --quality <100" sentinel so replay
+        # only re-emits --quality when the ORIGINAL run set it. Emitting the
+        # default --quality 85 on replay flips the child's _user_set_quality True
+        # → disables the CBZ byte-passthrough fast-path → silent lossy q85
+        # re-encode of update chapters. S4-1. (The child recomputes this from its
+        # own argv at args._user_set_quality; grep that name.)
+        "_user_set_quality": bool(getattr(args, "_user_set_quality", False)),
     }
     if getattr(args, "format", None) == "epub":
         data["epub_layout"] = getattr(args, "epub_layout", "vertical")
@@ -5265,7 +5380,14 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
     if params.get("aspect_ratio") and not _replay_modernize:
         child_cmd.extend(["--aspect-ratio", str(params["aspect_ratio"])])
     if not params.get("no_processing"):
-        if not _replay_modernize:
+        # Only replay --quality when the ORIGINAL run had the user explicitly set
+        # it (_user_set_quality). Emitting the default --quality 85 flips the
+        # child's _user_set_quality sentinel True → disables the CBZ byte-
+        # passthrough fast-path → silent lossy q85 re-encode of update chapters
+        # while the rest of the byte-preserved library stays lossless. Old
+        # download_params.json lacking the key → get() falsy → skipped (byte-
+        # preserve), the safe default. S4-1 review finding.
+        if params.get("_user_set_quality") and not _replay_modernize:
             child_cmd.extend(["--quality", str(params.get("quality", 85))])
         child_cmd.extend(["--scaling", str(params.get("scaling", 100))])
     if params.get("cookies"):
@@ -5288,9 +5410,30 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
         ("no_cleanup", "--no-cleanup"),
         ("verbose", "--verbose"),
         ("debug", "--debug"),
+        # Chapter-set / layout flags now persisted by _save_download_params.
+        # collapse_splits changes the chapter SET (drops fragments) — replaying
+        # it stops --update-all re-downloading collapsed .1/.2 as "new" (S4-2);
+        # komikku re-coerces format/keep/no-final in the child so the flag alone
+        # restores the per-chapter layout (S2-2/S4-3); no_sidecar_assets honors
+        # the user's opt-out on updates.
+        ("collapse_splits", "--collapse-splits"),
+        ("komikku", "--komikku"),
+        ("no_sidecar_assets", "--no-sidecar-assets"),
     ):
         if params.get(key):
             child_cmd.append(flag)
+    # LINE Webtoon WebP recompression + its quality/method knobs (store_true +
+    # two ints). Emit non-default sub-values only, mirroring the modernize block
+    # below. Without this, newly downloaded webtoon chapters ship as full-size
+    # PNG instead of the chosen WebP. S2-2 review finding.
+    if params.get("webtoon_recompress"):
+        child_cmd.append("--webtoon-recompress")
+        wq = params.get("webtoon_recompress_quality")
+        if isinstance(wq, int) and wq != 85:
+            child_cmd.extend(["--webtoon-recompress-quality", str(wq)])
+        wm = params.get("webtoon_recompress_method")
+        if isinstance(wm, int) and wm != 4:
+            child_cmd.extend(["--webtoon-recompress-method", str(wm)])
     # External metadata enrichment (--metadata-source family). Saved by
     # _save_download_params; absence in older download_params.json files
     # silently degrades to the default-off behavior (the get returns None
@@ -8954,7 +9097,14 @@ def main():
             float(num_str)
             if num_str not in chapters_by_num:
                 chapters_by_num[num_str] = []
-            chapters_by_num[num_str].append(ch)
+            # Propagate the normalized label back onto the dict (was: append the
+            # raw `ch`). Bucketing keys on num_str — "Oneshot"→"1", float 4.0→"4"
+            # (:g above), numeric 0→"0" — but ch["chap"] kept the RAW value, so
+            # the downstream float(c["chap"]) filters (--no-partials / --chapters)
+            # crashed on "Oneshot" and the .aio_series.json writer recorded "4.0"
+            # where --list-chapters emits "4" (perpetual "+N new"). Rewriting the
+            # dict here fixes all three at the single chokepoint. C1 review finding.
+            chapters_by_num[num_str].append({**ch, "chap": num_str})
         except (ValueError, TypeError):
             log_verbose(f"  Skipping chapter with invalid number: {num_str}")
             continue
@@ -9042,11 +9192,13 @@ def main():
 
     if args.no_partials:
         original_count = len(chapters)
-        chapters = [
-            c
-            for c in chapters
-            if float(c["chap"]) == int(float(c["chap"]))
-        ]
+        # Guard float(c["chap"]) against a non-numeric group.label (collapse-
+        # splits can relabel to "?"/"" — grep _chap_as_float). A non-numeric
+        # label isn't a numeric ".5" partial, so keep it rather than crash.
+        def _is_numeric_partial(c) -> bool:
+            cf = _chap_as_float(c.get("chap"))
+            return cf is not None and cf != int(cf)
+        chapters = [c for c in chapters if not _is_numeric_partial(c)]
         log_verbose(
             f"  --no-partials: Filtered out {original_count - len(chapters)} partial chapters."
         )
@@ -9070,11 +9222,13 @@ def main():
             pass
 
         if not is_negative_index:
-            chapters = [
-                c
-                for c in chapters
-                if is_chapter_wanted(float(c["chap"]), args.chapters)
-            ]
+            # Guard float(c["chap"]) against a non-numeric group.label (grep
+            # _chap_as_float): a numbered range can't match a non-numeric label,
+            # so drop it rather than crash the run.
+            def _wanted(c) -> bool:
+                cf = _chap_as_float(c.get("chap"))
+                return cf is not None and is_chapter_wanted(cf, args.chapters)
+            chapters = [c for c in chapters if _wanted(c)]
             log_verbose(
                 f"  --chapters '{args.chapters}': Filtered list down to {len(chapters)} chapters."
             )
@@ -9308,14 +9462,33 @@ def main():
         try:
             os.makedirs(os.path.dirname(missed_log_path) or '.', exist_ok=True)
             with open(missed_log_path, 'w', encoding='utf-8') as f:
-                json.dump(entries, f, ensure_ascii=False, indent=2)
+                # default=str is a belt-and-suspenders: _record_missed already
+                # strips the non-serializable _aux* keys (grep _strip_aux_for_log),
+                # but any future non-JSON value must NOT silently blow away the
+                # whole missed log via the except:pass below. S5-1 review finding.
+                json.dump(entries, f, ensure_ascii=False, indent=2, default=str)
         except Exception:
             pass
+
+    def _strip_aux_for_log(d: Dict[str, Any]) -> Dict[str, Any]:
+        # AssetSpec instances (_aux_assets) and raw audio bytes (_aux_members)
+        # aren't JSON-serializable, and _aux_members can be MB of audio — storing
+        # them in the missed log made json.dump raise TypeError, swallowed by
+        # _save_missed's except:pass, so the WHOLE run's missed_chapters.json went
+        # missing/stale (the end-of-run copy then shipped nothing). Drop every
+        # _aux* key; recurse into _merged_parts which carry their own. S5-1.
+        out = {k: v for k, v in d.items() if not k.startswith('_aux')}
+        parts = out.get('_merged_parts')
+        if isinstance(parts, list):
+            out['_merged_parts'] = [
+                _strip_aux_for_log(p) if isinstance(p, dict) else p for p in parts
+            ]
+        return out
 
     def _record_missed(ch: Dict[str, Any], grp_name: str, reason: str, err: str, *, insert_list_index: int, insert_chapter_index: int, insert_marker_index: int, insert_page_index: int, host: str = "", pages_ok: int = 0, pages_total: int = 0) -> None:
         entry = {
             'key': _chapter_key(ch),
-            'ch': ch,
+            'ch': _strip_aux_for_log(ch),
             'chap': ch.get('chap'),
             'url': ch.get('url'),
             'group': grp_name,
@@ -11147,6 +11320,22 @@ def main():
                 primary_only=primary_only_for_ghost,
             ) from primary_err
 
+        # Deterministic per-chapter gate (mature/age/login interstitial): no
+        # inline retry or alt source clears it, and for an aux chapter the veto
+        # above already skipped alt-rescue — so the OLD path exhausted retries
+        # and then ABORTED the whole run on a single login-gated tapas BGM
+        # episode. Skip + continue instead (the main loop records it missed),
+        # WITHOUT the ghost path's consecutive-host-block escalation (a mature
+        # series legitimately has many consecutive gated episodes). Grep
+        # _PERMANENT_SKIP_REASONS / ChapterPermanentSkipError.
+        if primary_err.reason in _PERMANENT_SKIP_REASONS:
+            raise ChapterPermanentSkipError(
+                chap=n_for_log,
+                reason=primary_err.reason,
+                host=primary_err.host,
+                pages_total=primary_err.pages_total,
+            ) from primary_err
+
         # Other reasons (incomplete / time_budget / host_poison): fall back
         # to inline-retry on the primary source — these CAN be transient.
         last_err: ChapterSkippedError = primary_err
@@ -11366,6 +11555,29 @@ def main():
                 host=cge.host,
                 pages_ok=0,
                 pages_total=cge.pages_total,
+            )
+            continue
+        except ChapterPermanentSkipError as cpse:
+            # Deterministic per-chapter gate (mature/age/login) — record missed
+            # and continue, with NO consecutive-host-block escalation (unlike the
+            # ghost soft-skip above). See ChapterPermanentSkipError +
+            # _PERMANENT_SKIP_REASONS; the sole producer today is sites/tapas.py's
+            # mature_login_required. Fixes the old abort-on-one-gated-episode.
+            print(
+                f"\n[!] Chapter {cpse.chap}: {cpse.reason} on "
+                f"{cpse.host or '?'} — content is gated (needs a site login we "
+                f"don't have). Recorded as missed; the run continues."
+            )
+            _record_missed(
+                ch, grp_name, cpse.reason,
+                "deterministic per-chapter gate; no retry/alt source can clear it",
+                insert_list_index=insert_list_index,
+                insert_chapter_index=insert_chapter_index,
+                insert_marker_index=insert_marker_index,
+                insert_page_index=insert_page_index,
+                host=cpse.host,
+                pages_ok=0,
+                pages_total=cpse.pages_total,
             )
             continue
         except ChapterAbortedError as cae:
@@ -11670,9 +11882,21 @@ def main():
         # Figure out which chapters were actually downloaded successfully.
         # Start with all chapters we attempted, then subtract any that are
         # still in the missed list after retries.
-        downloaded_nums = set(str(ch["chap"]) for ch in chapters)
-        still_missed_nums = set(str(e["chap"]) for e in missed_entries) if missed_entries else set()
-        actually_downloaded = sorted(downloaded_nums - still_missed_nums, key=lambda x: float(x))
+        # Normalize labels to --list-chapters' f"{num:g}" form (grep
+        # _chap_label_str) so the UI's update-check diff matches — a float-
+        # emitting handler otherwise records "4.0" here vs "4" from
+        # --list-chapters and the series sticks at "+N new". Safe sort key so a
+        # stray non-numeric label can't crash the whole .aio_series.json write
+        # (it lives in a log-only except → silent metadata loss). XF-1/PYP-2.
+        downloaded_nums = set(_chap_label_str(ch["chap"]) for ch in chapters)
+        still_missed_nums = (
+            set(_chap_label_str(e["chap"]) for e in missed_entries)
+            if missed_entries else set()
+        )
+        actually_downloaded = sorted(
+            downloaded_nums - still_missed_nums,
+            key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
+        )
 
         # If a previous .aio_series.json exists (from an earlier download),
         # merge the chapter lists so partial/split downloads accumulate.
@@ -11684,10 +11908,15 @@ def main():
             except Exception:
                 pass
 
-        prev_downloaded = set(existing_meta.get("chapters_downloaded", []))
+        # Re-normalize any legacy "4.0"-style entries from an older writer so a
+        # once-polluted file self-heals to "4" on this write (else the union
+        # keeps BOTH "4.0" and "4"). Safe sort key (grep _chap_as_float).
+        prev_downloaded = set(
+            _chap_label_str(x) for x in existing_meta.get("chapters_downloaded", [])
+        )
         merged_downloaded = sorted(
             prev_downloaded | set(actually_downloaded),
-            key=lambda x: float(x),
+            key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
         )
 
         # Serialize AniList tags as dicts (the AnilistTag dataclass

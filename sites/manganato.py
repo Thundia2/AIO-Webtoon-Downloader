@@ -231,7 +231,16 @@ class ManganatoSiteHandler(BaseSiteHandler):
                     "uploaded": row.get("uploaded"),
                 }
             )
-        chapters.sort(key=lambda c: float(c.get("chap") or 0), reverse=True)
+        # Tolerant sort key: a non-numeric chapter title (e.g. "Oneshot",
+        # "Extra") makes a bare float() raise ValueError and abort get_chapters
+        # for the whole series. Bucket non-numeric labels together (sorted last)
+        # instead of crashing. Review finding HB-1/PYP-1.
+        def _chap_key(c):
+            try:
+                return (0, float(c.get("chap")))
+            except (TypeError, ValueError):
+                return (1, 0.0)
+        chapters.sort(key=_chap_key, reverse=True)
         return chapters
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
