@@ -819,9 +819,13 @@ def _chap_as_float(chap) -> Optional[float]:
     defensive. C1 review finding.
     """
     try:
-        return float(chap)
+        f = float(chap)
     except (TypeError, ValueError):
         return None
+    # Reject non-finite: float("inf") / "nan" / "1e400" all parse but aren't
+    # valid chapter numbers — inf/nan would crash int(cf) in _is_numeric_partial
+    # and poison the (is-None, value) sort keys. Residual follow-up.
+    return f if math.isfinite(f) else None
 
 
 def _chap_label_str(chap) -> str:
@@ -1718,7 +1722,17 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
     base, _orig_ext = os.path.splitext(name)
     if not base:
         base = name
-    pending_pth = os.path.join(folder, f".pending_{base}")
+    # S5-2 (write race): a background-prefetch download uses a DISTINCT pending
+    # name so it can't collide with the foreground writing the SAME page into
+    # the same tdir after it adopts this chapter (grep _image_prefetch_is_abandoned
+    # / _bg above). finalize_pending_image renames by the explicit `base`, NOT
+    # the pending basename, so the final page name is identical either way; the
+    # two writers' atomic os.replace to that shared final name is last-writer-
+    # wins (both fetched the same URL -> same bytes). Leftover .pending_* dotfiles
+    # are excluded from the CBZ build (grep "not fn.startswith").
+    pending_pth = os.path.join(
+        folder, f".pending_{base}" + (".bgprefetch" if _bg else "")
+    )
 
     if url.startswith("data:"):
         try:
@@ -6313,6 +6327,11 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                 # but we DO honor being adopted. fast_download_images re-checks
                 # is_cancelled before each attempt and after the semaphore.
                 is_cancelled=lambda: _image_prefetch_is_abandoned(chap_label),
+                # S5-2 (write race): distinct pending-file name so an in-flight
+                # prefetch page write (one that started before is_cancelled
+                # fired) can't collide with the foreground's write of the same
+                # page into the adopted tdir (grep .bgprefetch / pending_suffix).
+                pending_suffix=".bgprefetch",
                 # Forward cookies (e.g. age-gate cookies for LineWebtoon)
                 # so prefetch can fetch the same content the foreground
                 # path would. Base impl filters to host-relevant cookies.
@@ -9147,6 +9166,15 @@ def main():
             # buckets them). XF-1 follow-up.
             if num.lower() in ("oneshot", "one-shot"):
                 num = "1"
+            # Mirror the download path's numeric gate: bucketing (grep
+            # chapters_by_num) does float(num_str) and DROPS non-numeric labels,
+            # so best_chapters — everything the download actually fetches — is
+            # numeric-only. --list-chapters must drop them too, else the UI
+            # update-check surfaces a "Special"/"Extra"/"Omake" that never
+            # downloads as a perpetual "+N new". Extends the Oneshot fix above to
+            # ALL non-numeric labels. Residual follow-up.
+            if _chap_as_float(num) is None:
+                continue
             if num in seen_nums:
                 continue
             seen_nums.add(num)
