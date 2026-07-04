@@ -2518,12 +2518,17 @@ def _wrap_text_line(
             lines.append(current)
             current = ""
 
-        for segment in _split_long_word(word, font, max_width):
-            if _measure_text(font, segment) <= max_width and not current:
-                current = segment
-            else:
-                lines.append(segment)
-                current = ""
+        # Emit every full segment as its own line; carry only the LAST segment
+        # as `current` so the next word can join the trailing partial. The old
+        # `and not current` gate held the first segment then flushed ALTERNATING
+        # segments, dropping every other one — halving CJK / long-word text that
+        # has no spaces to break on (a 6-segment word became 3 lines). Review
+        # finding S1-1.
+        segments = _split_long_word(word, font, max_width)
+        for segment in segments[:-1]:
+            lines.append(segment)
+        if segments:
+            current = segments[-1]
 
     if current:
         lines.append(current)
@@ -4553,7 +4558,11 @@ def build_epub(
     os.makedirs(os.path.join(temp_dir, "META-INF"), exist_ok=True)
 
     # --- 1. mimetype file ---
-    with open(os.path.join(temp_dir, "mimetype"), "w") as f:
+    # encoding="utf-8" on every EPUB text write below: the default open() uses
+    # the platform locale codepage (cp1254 on this Turkish-locale machine), so a
+    # non-ASCII chapter title / description / body raised UnicodeEncodeError (or
+    # silently mojibake'd) against the UTF-8 the XHTML/OPF declare. S2-5 finding.
+    with open(os.path.join(temp_dir, "mimetype"), "w", encoding="utf-8") as f:
         f.write("application/epub+zip")
 
     # --- 2. container.xml ---
@@ -4563,7 +4572,7 @@ def build_epub(
         <rootfile full-path="EPUB/content.opf" media-type="application/oebps-package+xml"/>
     </rootfiles>
 </container>'''
-    with open(os.path.join(temp_dir, "META-INF", "container.xml"), "w") as f:
+    with open(os.path.join(temp_dir, "META-INF", "container.xml"), "w", encoding="utf-8") as f:
         f.write(container_xml)
 
     # --- 3. content.opf (Package Document) ---
@@ -4590,7 +4599,7 @@ def build_epub(
 body, html { padding: 0; margin: 0; height: 100%; width: 100%; text-align: center; }
 svg, img { max-width: 100vw; max-height: 100vh; object-fit: contain; display: block; margin: auto; }'''
     style_path = os.path.join(epub_dir, "style.css")
-    with open(style_path, "w") as f:
+    with open(style_path, "w", encoding="utf-8") as f:
         f.write(style_content)
     manifest_items.append('<item id="css" href="style.css" media-type="text/css"/>')
 
@@ -4610,7 +4619,7 @@ p {
 }
 '''
     text_style_path = os.path.join(epub_dir, "text.css")
-    with open(text_style_path, "w") as f:
+    with open(text_style_path, "w", encoding="utf-8") as f:
         f.write(text_style_content)
     manifest_items.append('<item id="text_css" href="text.css" media-type="text/css"/>')
 
@@ -4650,7 +4659,7 @@ a { text-decoration: none; color: #005a9c; }
 a:hover, a:active { text-decoration: underline; }
 '''
     nav_style_path = os.path.join(epub_dir, "nav_style.css")
-    with open(nav_style_path, "w") as f:
+    with open(nav_style_path, "w", encoding="utf-8") as f:
         f.write(nav_style_content)
     manifest_items.append(
         '<item id="nav_css" href="nav_style.css" media-type="text/css"/>'
@@ -4679,7 +4688,7 @@ a:hover, a:active { text-decoration: underline; }
     <img src="images/cover.jpg" alt="Cover"/>
 </body>
 </html>'''
-            with open(os.path.join(epub_dir, "cover.xhtml"), "w") as f:
+            with open(os.path.join(epub_dir, "cover.xhtml"), "w", encoding="utf-8") as f:
                 f.write(cover_html_content)
             manifest_items.append(
                 '<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>'
@@ -4717,7 +4726,7 @@ a:hover, a:active { text-decoration: underline; }
     <img src="images/{img_filename}" alt="Page {page_index + 1}"/>
 </body>
 </html>'''
-            with open(os.path.join(epub_dir, page_filename), "w") as f:
+            with open(os.path.join(epub_dir, page_filename), "w", encoding="utf-8") as f:
                 f.write(page_html_content)
             manifest_items.append(
                 f'<item id="page_{page_index}" href="{page_filename}" media-type="application/xhtml+xml"/>'
@@ -4766,7 +4775,7 @@ a:hover, a:active { text-decoration: underline; }
     </nav>
 </body>
 </html>'''
-        with open(os.path.join(epub_dir, "nav.xhtml"), "w") as f:
+        with open(os.path.join(epub_dir, "nav.xhtml"), "w", encoding="utf-8") as f:
             f.write(nav_content)
         manifest_items.append(
             '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>'
@@ -4855,7 +4864,7 @@ a:hover, a:active { text-decoration: underline; }
         {spine_xml}
     </spine>
 </package>'''
-    with open(os.path.join(epub_dir, "content.opf"), "w") as f:
+    with open(os.path.join(epub_dir, "content.opf"), "w", encoding="utf-8") as f:
         f.write(package_document)
 
     # --- Create the EPUB file (zip archive) ---
@@ -6817,7 +6826,12 @@ def _refresh_library_metadata(args) -> int:
         # Rewrite Komikku details.json (preserve extra keys + existing artist).
         new_details = dict(existing_details)
         new_details["title"] = title
-        new_details["author"] = ", ".join(comic_data.get("authors") or [])
+        # Preserve a previously-recorded author when the refresh source has none
+        # (AniList enrichment doesn't populate `authors`, and a legacy
+        # .aio_series.json may lack it) — the old unconditional assign BLANKED a
+        # good author to "". Mirrors the artist setdefault below. Finding S3-1.
+        new_authors = ", ".join(comic_data.get("authors") or [])
+        new_details["author"] = new_authors or existing_details.get("author", "")
         new_details.setdefault("artist", existing_details.get("artist", ""))
         new_details["description"] = (
             comic_data.get("desc") or existing_details.get("description", "")
