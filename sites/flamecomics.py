@@ -250,6 +250,11 @@ class FlameComicsSiteHandler(BaseSiteHandler):
             # name = "Chapter {chapter} - {title}"
             # token = chapter.token
             
+            # HB-3: a missing "chapter" value would make str(None) == "None",
+            # producing a chapter numbered literally "None" that can't be
+            # downloaded. Skip the entry entirely rather than emit a junk chapter.
+            if chap.get("chapter") is None:
+                continue
             chap_num = str(chap.get("chapter"))
             title = chap.get("title") or ""
             token = chap.get("token")

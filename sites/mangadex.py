@@ -759,9 +759,18 @@ class MangaDexSiteHandler(BaseSiteHandler):
                 else:
                     path_seg = "data-saver"
                     names = saver_filenames
+                # HA-1: `pending` indices come from the INITIAL n_pages, but a
+                # node-swap / data-saver rebind (see the `names`/`file_hash`
+                # reassignments below) can return a SHORTER filename list. A bare
+                # `names[idx]` would then raise IndexError and escape the
+                # IncompleteChapterError contract as an unclassified crash. Only
+                # build URLs for indices the current `names` list can actually
+                # address; out-of-range pages simply stay in `pending` and are
+                # surfaced by the post-loop `if pending: raise IncompleteChapterError`.
                 url_by_idx: Dict[int, str] = {
                     idx: f"{base_url}/{path_seg}/{file_hash}/{names[idx]}"
                     for idx in pending
+                    if idx < len(names)
                 }
 
                 # Submit + wait on this batch. Pool worker cap caps in-flight
