@@ -372,8 +372,6 @@ export function useDownloader() {
     if (q.length === 0 || currentIdRef.current || startingRef.current) return;
 
     const next = q[0];
-    // Remove it from the queue
-    setQueue((prev) => prev.slice(1));
 
     // Spawn the Python process. Reserve the slot synchronously before the
     // await so a concurrent queueDownload (e.g. user clicks Download again
@@ -385,6 +383,11 @@ export function useDownloader() {
         url: next.url,
         args: next.args,
       });
+
+      // UIR-1: only dequeue AFTER a successful spawn, so a throw leaves the
+      // item in place to be retried (the startingRef guard above prevents a
+      // concurrent call from double-spawning q[0] during the await).
+      setQueue((prev) => prev.slice(1));
 
       setActiveDownloads((prev) => ({
         ...prev,
@@ -422,7 +425,10 @@ export function useDownloader() {
       const s = settingsRef.current;
       const finalArgs = {
         verbose: s?.verboseAlways !== false,
-        collapseSplits: s?.collapseSplits !== false,
+        // XF-4: opt-in default OFF (absent → OFF). Matches main.js/searcher.js's
+        // `=== true`; the old `!== false` collapsed on download but not on the
+        // update-check, so fragments stuck as "+N new" forever.
+        collapseSplits: s?.collapseSplits === true,
         // Curated-sites toggle. Persisted under settings.searchOpts.seededOnly
         // because SettingsTab + SearchTab both write that namespace; we mirror
         // it here so download paths see the same flag. Only takes effect when

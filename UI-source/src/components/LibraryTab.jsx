@@ -271,7 +271,10 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings }) {
     const d = settings?.defaults || {};
     const args = {
       format: meta.format || d.format || "pdf",
-      quality: d.quality ?? 85,
+      // XF-2: default 100 (not 85) so an unset quality preserves bytes —
+      // any --quality < 100 flips the child's _user_set_quality True and
+      // disables the CBZ byte-passthrough fast-path (silent lossy re-encode).
+      quality: d.quality ?? 100,
       chapters: rangeStr,
       language: meta.language || "en",
       site: meta.site || undefined,
@@ -1132,7 +1135,10 @@ export default function LibraryTab({
     const d = settings?.defaults || {};
     const args = {
       format: meta.format || d.format || "pdf",
-      quality: d.quality ?? 85,
+      // XF-2: default 100 (not 85) so an unset quality preserves bytes —
+      // any --quality < 100 flips the child's _user_set_quality True and
+      // disables the CBZ byte-passthrough fast-path (silent lossy re-encode).
+      quality: d.quality ?? 100,
       chapters: rangeStr,
       language: meta.language || "en",
       site: meta.site || undefined,
