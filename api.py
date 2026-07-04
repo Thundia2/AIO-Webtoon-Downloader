@@ -80,6 +80,15 @@ def _allowed_image_url(url: str) -> bool:
         return False
     if host.startswith("10.") or host.startswith("192.168.") or host.startswith("169.254."):
         return False
+    # MISC-4: block the 172.16.0.0/12 private range (172.16.x – 172.31.x), which
+    # the prefix checks above missed. Matches the manual-prefix style used here.
+    if host.startswith("172."):
+        try:
+            second_octet = int(host.split(".")[1])
+        except (IndexError, ValueError):
+            second_octet = -1
+        if 16 <= second_octet <= 31:
+            return False
     for handler in getattr(sites, "_REGISTERED_HANDLERS", []):
         for domain in getattr(handler, "domains", ()) or ():
             if host == domain or host.endswith("." + domain):

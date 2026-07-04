@@ -227,23 +227,32 @@ def configure_throttling(
         _TLS.inside_hardening = True
         try:
             for attempt in range(max_retries):
+                # INFRA-3: is another attempt coming after this one? On the final
+                # attempt we must NOT sleep the backoff cooldown — the loop won't
+                # retry, so it would be pure wasted wall-clock (up to ~96s+jitter)
+                # before returning the failed response / raising anyway.
+                has_next_attempt = attempt < max_retries - 1
                 try:
                     resp = orig_request(method, url, *args, **kwargs)
                     last_resp = resp
-                    
+
                     if looks_like_cloudflare_rate_limit(resp):
-                        cooldown = backoff_base * (2 ** attempt) + random.uniform(0.0, 4.0)
-                        print(f"[!] {domains[0]} rate-limit/challenge (HTTP {getattr(resp, 'status_code', '???')}). Cooling down {cooldown:.1f}s...")
-                        time.sleep(cooldown)
-                        continue
-                    
+                        if has_next_attempt:
+                            cooldown = backoff_base * (2 ** attempt) + random.uniform(0.0, 4.0)
+                            print(f"[!] {domains[0]} rate-limit/challenge (HTTP {getattr(resp, 'status_code', '???')}). Cooling down {cooldown:.1f}s...")
+                            time.sleep(cooldown)
+                            continue
+                        # Last attempt: return the rate-limited response without cooling down.
+                        return resp
+
                     return resp
                 except Exception as e:
                     # Network errors often mean "connection reset" by firewall
                     last_err = e
-                    cooldown = backoff_base * (2 ** attempt) + random.uniform(0.0, 4.0)
-                    print(f"[!] {domains[0]} request error: {e}. Cooling down {cooldown:.1f}s...")
-                    time.sleep(cooldown)
+                    if has_next_attempt:
+                        cooldown = backoff_base * (2 ** attempt) + random.uniform(0.0, 4.0)
+                        print(f"[!] {domains[0]} request error: {e}. Cooling down {cooldown:.1f}s...")
+                        time.sleep(cooldown)
 
             if last_resp is not None:
                  return last_resp
