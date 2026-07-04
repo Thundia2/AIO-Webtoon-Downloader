@@ -611,12 +611,22 @@ class MangaFireSiteHandler(BaseSiteHandler):
                 # which crashed the legacy path when curl_cffi was
                 # unavailable. Rewriting at the URL-generation site fixes
                 # that and keeps fast_download_images on the base class.
-                #   nw8.mfcdn{N}.xyz → k99.mfcdn{N}.xyz (live CDN cluster)
+                #   <sub>.mfcdn{N?}.xyz → k99.mfcdn{N?}.xyz (live CDN cluster)
                 #   {nw8|fmcdn|static}.mfcdn.{nl|net} → k99.mfcdn3.xyz (dead-domain remap)
+                # MF-2: broadened from the old single-digit nw8-only regex so
+                # it also catches multi-digit (mfcdn10/12), no-digit (mfcdn.xyz)
+                # and non-nw8 .xyz subdomains of the same CDN family. Any
+                # subdomain of an mfcdn{N?}.xyz host is repointed to k99 with the
+                # same number preserved (digitless → k99.mfcdn.xyz), matching how
+                # the prior single-digit case mapped nw8.mfcdn1.xyz → k99.mfcdn1.xyz.
                 rewritten_images = []
                 for img_url in images:
                     if "mfcdn" in img_url:
-                        img_url = re.sub(r'https://nw8\.mfcdn([0-9])\.xyz/', r'https://k99.mfcdn\1.xyz/', img_url)
+                        img_url = re.sub(
+                            r'https://[^./]+\.mfcdn([0-9]*)\.xyz/',
+                            r'https://k99.mfcdn\1.xyz/',
+                            img_url,
+                        )
                         img_url = img_url.replace("https://nw8.mfcdn.nl/", "https://k99.mfcdn3.xyz/")
                         img_url = img_url.replace("https://nw8.mfcdn.net/", "https://k99.mfcdn3.xyz/")
                         img_url = img_url.replace("https://fmcdn.mfcdn.net/", "https://k99.mfcdn3.xyz/")
@@ -628,6 +638,18 @@ class MangaFireSiteHandler(BaseSiteHandler):
             except Exception as e:
                 last_err = e
                 print(f"[!] Chapter {chapter_id} attempt {attempt}/{self._JSON_RETRIES} failed at stage={stage}: {e}")
+                # MF-1: evict the cached VRF for this chapter path so the next
+                # attempt re-navigates and re-derives a FRESH token. ensure_vrf
+                # returns the cached value verbatim on subsequent calls, so a
+                # poisoned/stale token would otherwise be reused across every
+                # retry — failing the chapter for the whole process lifetime
+                # with no recovery. Only the cache entry is dropped; token
+                # derivation is untouched.
+                try:
+                    vrf_gen._vrf_cache.pop(ajax_path, None)
+                    vrf_gen._vrf_meta.pop(ajax_path, None)
+                except Exception:
+                    pass
                 if attempt < self._JSON_RETRIES:
                     time.sleep(self._JSON_RETRY_DELAY)
                     continue
