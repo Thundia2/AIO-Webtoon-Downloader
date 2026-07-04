@@ -796,10 +796,28 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
         start = html.find("[", i)
         if start < 0:
             return []
+        # CL-5: string-aware bracket scan. A bare [/] depth count miscounts when
+        # a JSON string VALUE contains a bracket (e.g. bgmTitle "Track [Mix]"):
+        # the slice then ends at the wrong ] and json.loads fails, silently
+        # degrading real BGM to a presence marker. Skip brackets inside quoted
+        # strings (honoring backslash escapes). artlapsa._extract_json_array
+        # does the same string-aware slice — grep it.
         depth = 0
+        in_str = False
+        esc = False
         for j in range(start, len(html)):
             c = html[j]
-            if c == "[":
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "[":
                 depth += 1
             elif c == "]":
                 depth -= 1
@@ -1203,9 +1221,17 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                 # safe-degrade outcome (source ranked by title_match alone).
                 pass
 
-        with _cf.ThreadPoolExecutor(
+        # AUX-2: do NOT use `with ... as pool:` — its implicit shutdown(wait=True)
+        # JOINS every straggler (~1.6s each) at block exit, blowing total_budget_s
+        # into minutes on a large hit set (the budget check below only stops the
+        # as_completed LOOP, not the join). Manage the pool manually and
+        # shutdown(wait=False) so the call returns at the deadline; unfinished
+        # probes just leave actual_chapter_count=None (the documented safe-degrade)
+        # and finish harmlessly in the background.
+        pool = _cf.ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="webtoons-count"
-        ) as pool:
+        )
+        try:
             futures = [pool.submit(_count_one, h) for h in hits]
             for fut in _cf.as_completed(futures):
                 remaining = deadline - _t.monotonic()
@@ -1215,6 +1241,13 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                     fut.result(timeout=max(0.1, remaining))
                 except Exception:
                     pass
+        finally:
+            # cancel_futures (Py3.9+) drops queued-but-unstarted probes; running
+            # ones aren't waited on (wait=False).
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
 
 
 __all__ = ["LineWebtoonSiteHandler"]

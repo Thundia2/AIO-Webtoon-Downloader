@@ -61,41 +61,9 @@ class IncompleteChapterError(Exception):
             f"chapter incomplete: {self.pages_ok}/{self.pages_total} from "
             f"{self.host or '?'} ({self.reason})"
         )
-
-
-class IncompleteChapterError(Exception):
-    """Raised by handlers when a chapter cannot be fully fetched after the
-    handler's own retry logic (e.g. MangaDex's MD@H node-swap loop has
-    exhausted re-fetches but pages are still missing).
-
-    The chapter download loop in aio-dl.py:_process_chapter_impl catches
-    this around the get_chapter_images call and converts it to
-    ChapterSkippedError, so the strict-wrapper retry / multi-source
-    fallback / inline-retry machinery treats it the same as a Phase-2
-    download failure. Without this signaling path, a handler that returns
-    a truncated binary_image list would look "complete" to the validation
-    block (since pages_total is computed AFTER the entries are classified).
-
-    Cross-file: see aio-dl.py's existing ChapterSkippedError for the full
-    retry contract; this exception only carries the diagnostic fields the
-    wrapper needs to re-raise as ChapterSkippedError.
-    """
-
-    def __init__(
-        self,
-        pages_ok: int,
-        pages_total: int,
-        host: str = "",
-        reason: str = "",
-    ) -> None:
-        self.pages_ok = int(pages_ok)
-        self.pages_total = int(pages_total)
-        self.host = host or ""
-        self.reason = reason or "handler_incomplete"
-        super().__init__(
-            f"chapter incomplete: {self.pages_ok}/{self.pages_total} from "
-            f"{self.host or '?'} ({self.reason})"
-        )
+        # INFRA-6: an identical second `class IncompleteChapterError` definition
+        # followed here (a merge artifact that shadowed this one, byte-for-byte).
+        # Removed — a single definition is authoritative.
 
 
 @dataclass
