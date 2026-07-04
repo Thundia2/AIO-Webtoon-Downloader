@@ -386,8 +386,12 @@ export function useDownloader() {
 
       // UIR-1: only dequeue AFTER a successful spawn, so a throw leaves the
       // item in place to be retried (the startingRef guard above prevents a
-      // concurrent call from double-spawning q[0] during the await).
-      setQueue((prev) => prev.slice(1));
+      // concurrent call from double-spawning q[0] during the await). Dequeue by
+      // IDENTITY, not slice(1): if the user removed a DIFFERENT row during the
+      // spawn await, q[0] may no longer be `next`, and slice(1) would drop that
+      // other item instead. Each queued entry is a distinct object, so `!==`
+      // removes exactly the spawned one.
+      setQueue((prev) => prev.filter((item) => item !== next));
 
       setActiveDownloads((prev) => ({
         ...prev,

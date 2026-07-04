@@ -798,7 +798,7 @@ export default function DownloadTab({
               </div>
               <div>
                 <Label className="text-xs">Image Workers</Label>
-                <Input type="number" min={1} max={10} value={form.imageWorkers} onChange={(e) => set("imageWorkers", Number(e.target.value))} className="mt-1" />
+                <Input type="number" min={1} max={10} value={form.imageWorkers} onChange={(e) => setNum("imageWorkers", e.target.value, 1)} className="mt-1" />
                 <p className="text-[10px] text-muted-foreground mt-1">Threads per chapter for image downloads</p>
               </div>
             </div>
@@ -812,7 +812,7 @@ export default function DownloadTab({
               </div>
               <div>
                 <Label className="text-xs">Retry Attempts</Label>
-                <Input type="number" min={0} max={10} value={form.missedRetries} onChange={(e) => set("missedRetries", Number(e.target.value))} disabled={form.noRetryMissedChapters} className="mt-1 w-24" />
+                <Input type="number" min={0} max={10} value={form.missedRetries} onChange={(e) => setNum("missedRetries", e.target.value, 0)} disabled={form.noRetryMissedChapters} className="mt-1 w-24" />
               </div>
             </div>
           </Collapsible>

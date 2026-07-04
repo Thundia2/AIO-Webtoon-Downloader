@@ -252,8 +252,17 @@ class _AIOFileLock:
 
     def __enter__(self):
         self._tlock.acquire()
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         try:
+            # makedirs is INSIDE the try (RACE-1 follow-up): if it raised after
+            # the _tlock.acquire() above, __enter__ would propagate WITHOUT
+            # Python ever calling __exit__ (it doesn't, when __enter__ raises) →
+            # the mutex leaks and every later acquire on this singleton
+            # deadlocks. Folding it into the best-effort block degrades a
+            # transient FS error (unmount / ACL flip / path-is-now-a-file under
+            # --jobs>1) to "proceed without the OS lock" — the threading.Lock is
+            # still held for intra-process exclusion — exactly like an os.open
+            # failure below.
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT)
             if os.name == "nt":
                 import msvcrt
@@ -6073,6 +6082,21 @@ _image_prefetch_lock = threading.Lock()                 # guards _seen/_done/_wo
 _image_prefetch_parallel: int = 2
 
 
+def _image_prefetch_is_abandoned(chap_label: str) -> bool:
+    """True once _consume_image_prefetch handed this chapter's tdir to the
+    foreground (300s consume timeout). The prefetch worker polls this DURING
+    Phase 2 so it stops writing into the tdir the foreground now downloads
+    into — otherwise both write the same per-page .pending_<base> tempfile
+    (base.py's fast path AND dl_image's legacy path share that name, keyed on
+    (folder, base), NOT per-thread), tearing the tempfile and racing the
+    atomic rename. Distinct from _chapter_cancelled: that's the FOREGROUND
+    chapter's watchdog, which RACE-2 keeps prefetch decoupled from; THIS is a
+    per-chapter hand-off signal prefetch DOES honor. Peek only — the finalize
+    block still does the discard under the lock. S5-2 write-race follow-up."""
+    with _image_prefetch_lock:
+        return chap_label in _image_prefetch_abandoned
+
+
 def _image_prefetch_worker_loop() -> None:
     """Dequeue prefetch jobs forever. Daemon thread; exits with the
     process. Each iteration runs the same body the old _worker closure
@@ -6172,6 +6196,22 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
 
         os.makedirs(target_tdir, exist_ok=True)
 
+        # S5-2 (write race): if get_chapter_images (Phase 1, network-bound) ran
+        # long enough that the foreground's consume timed out and ADOPTED this
+        # tdir, write NOTHING into it — the foreground owns it now and is
+        # downloading the same pages. Discard the flag and bail before any
+        # classification / binary-blob write. (Phase-2 downloads are gated
+        # per-page below too: is_cancelled on the fast path, _bg_prefetch on the
+        # legacy path — this covers a slow Phase-1 that finished after adoption.)
+        if _image_prefetch_is_abandoned(chap_label):
+            with _image_prefetch_lock:
+                _image_prefetch_abandoned.discard(chap_label)
+            log_verbose(
+                f"  [Img Prefetch] Ch {chap_label} abandoned during fetch — "
+                f"foreground owns the tdir; not writing"
+            )
+            return
+
         # ── Classify entries (mirrors main's Phase 1 logic) ──
         download_tasks: List[Tuple[int, str, str, str]] = []
         page_counter = 1
@@ -6265,6 +6305,14 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                 concurrency=fast_conc,
                 timeout=fast_timeout,
                 record_host_failure=_prefetch_backoff_feedback,
+                # S5-2 (write race): bail per-page once the foreground adopts
+                # this tdir (consume timeout) so we stop writing the shared
+                # .pending_<base> tempfiles it is now writing too. This is the
+                # PREFETCH's own hand-off signal, NOT the foreground chapter's
+                # watchdog — RACE-2 keeps us decoupled from _chapter_cancelled,
+                # but we DO honor being adopted. fast_download_images re-checks
+                # is_cancelled before each attempt and after the semaphore.
+                is_cancelled=lambda: _image_prefetch_is_abandoned(chap_label),
                 # Forward cookies (e.g. age-gate cookies for LineWebtoon)
                 # so prefetch can fetch the same content the foreground
                 # path would. Base impl filters to host-relevant cookies.
@@ -6285,6 +6333,17 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
             # _in_background_prefetch); dl_image propagates it into its variant
             # sub-threads. Reset per task; the pool's threads die with the block.
             def _bg_prefetch(url, folder, name):
+                # S5-2 (write race): once the foreground adopts this tdir
+                # (consume timeout), stop scheduling new page writes into it —
+                # it downloads the same pages now and shares dl_image's
+                # per-(folder,base) .pending_ tempfile, so concurrent writes
+                # tear the tempfile / race the rename. Not-yet-started tasks
+                # short-circuit here; the ≤workers already inside dl_image
+                # finish their current page (bounded). Counts as failed, but the
+                # finalize block checks _abandoned FIRST and leaves the dir to
+                # the foreground (no rm_tree, no marker).
+                if _image_prefetch_is_abandoned(chap_label):
+                    return False
                 _PREFETCH_TLS.active = True
                 try:
                     return dl_image(url, folder, name, scraper, True)
@@ -9077,6 +9136,17 @@ def main():
                 num = f"{num:g}"
             else:
                 num = str(num)
+            # Mirror the download path's "Oneshot"→"1" remap (grep
+            # chapters_by_num, ~line 9237) so --list-chapters and the
+            # .aio_series.json writer agree on the label. manganato's
+            # _chapter_number returns the raw title as its no-numeric-token
+            # fallback, so a chapter literally titled "Oneshot" would otherwise
+            # LIST as "Oneshot" but RECORD as "1" → the UI update-check shows it
+            # as a perpetual "+1 new". Must run BEFORE the seen_nums dedup so a
+            # real Ch.1 + a "Oneshot" collapse to one "1" (as the download path
+            # buckets them). XF-1 follow-up.
+            if num.lower() in ("oneshot", "one-shot"):
+                num = "1"
             if num in seen_nums:
                 continue
             seen_nums.add(num)
