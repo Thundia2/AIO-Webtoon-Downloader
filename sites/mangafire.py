@@ -644,12 +644,12 @@ class MangaFireSiteHandler(BaseSiteHandler):
                 # poisoned/stale token would otherwise be reused across every
                 # retry — failing the chapter for the whole process lifetime
                 # with no recovery. Only the cache entry is dropped; token
-                # derivation is untouched.
-                try:
-                    vrf_gen._vrf_cache.pop(ajax_path, None)
-                    vrf_gen._vrf_meta.pop(ajax_path, None)
-                except Exception:
-                    pass
+                # derivation is untouched. MUST go through the bridge's
+                # evict_vrf() — the cache dict lives on the _VRF_GEN singleton
+                # confined to the VRF worker thread, so a raw
+                # vrf_gen._vrf_cache.pop() hits the _VRFBridge facade (which has
+                # no such attribute) and AttributeErrors into a silent no-op.
+                vrf_gen.evict_vrf(ajax_path)
                 if attempt < self._JSON_RETRIES:
                     time.sleep(self._JSON_RETRY_DELAY)
                     continue
