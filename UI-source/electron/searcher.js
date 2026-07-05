@@ -16,37 +16,17 @@
 // ============================================================
 
 const { spawn } = require("child_process");
+// Shared line hygiene — same ANSI strip + Playwright-teardown noise drop the
+// download subprocess uses (both crash via the same PipeTransport bridge on
+// close). NOISY_LINE_RE + stripAnsi were byte-identical copies here before
+// the dedup sweep; classifyLogLevel's success branch is search-specific,
+// injected below via SEARCH_SUCCESS_RE.
+const { NOISY_LINE_RE, stripAnsi, classifyLogLevel } = require("./log-filter");
 
-// Stderr noise drop-list (mirrors downloader.js NOISY_LINE_RE — same
-// Playwright teardown produces these on search subprocess close). Match
-// before the line reaches the LogPanel so the user never sees them.
-//
-// Extended 2026-05-08 to cover the full Node.js crash dump (15-20 lines
-// of JS stack trace + errno object + "Node.js vX.Y.Z" footer) that the
-// original EPIPE-substring match missed entirely. See downloader.js for
-// the per-pattern rationale; we keep these in sync because both processes
-// crash via the same PipeTransport bridge.
-const NOISY_LINE_RE = new RegExp(
-  [
-    String.raw`\b(EPIPE|BrokenPipeError|ConnectionResetError)\b`,
-    String.raw`node:events:\d`,
-    String.raw`node:internal\/(net|streams|process|timers|destroy)`,
-    String.raw`playwright[\\/]driver`,
-    String.raw`\bPipeTransport\b`,
-    String.raw`\bDispatcherConnection\b`,
-    String.raw`\bBrowserContextDispatcher\b`,
-    String.raw`\bCRBrowserContext\b`,
-    String.raw`^\s*throw\s+er\b`,
-    String.raw`(Unhandled|Emitted) '\w+' event`,
-    String.raw`^\s*errno:\s*-?\d+`,
-    String.raw`^\s*syscall:\s*['"]`,
-    String.raw`^Node\.js v\d`,
-    String.raw`^\s*\^\s*$`,
-    String.raw`^\s*[{}],?\s*$`,
-  ].join("|"),
-);
-
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
+// Search-stream "this line is a success" markers (green in the LogPanel):
+// the auto-pick winner + the chapter-alignment summary. downloader.js
+// supplies its own (Done./saved/etc.) set.
+const SEARCH_SUCCESS_RE = /--auto-pick selected|alignment/i;
 
 /**
  * Build CLI args from the UI's options object.
@@ -86,26 +66,6 @@ function buildSearchArgs(query, opts = {}) {
   if (opts.enableMlRating) args.push("--enable-ml-rating");
 
   return args;
-}
-
-/**
- * Classify a stderr line for log-level coloring (same convention as
- * downloader.js — keeps the LogPanel rendering consistent). Patterns
- * stay STRICT (anchored, word-bound) so retry-style messages like
- * "First variant failed, trying 9 more" or "[Fallback] X failed" don't
- * paint red. Same fix as downloader.js (2026-05-07 log-noise bug).
- */
-function classifyLogLevel(line) {
-  const trimmed = line.trim();
-  if (/^\[!\]/.test(trimmed)) return "error";
-  if (/^Traceback /.test(trimmed)) return "error";
-  if (/^\w*?Error:/.test(trimmed)) return "error";
-  if (/\bFAILED\b/.test(line)) return "error";
-
-  if (/Warning:|warning:|⚠/i.test(line)) return "warning";
-  if (/--auto-pick selected|alignment/i.test(line)) return "success";
-  if (/^\s{2,}/.test(line)) return "verbose";
-  return "info";
 }
 
 class Searcher {
@@ -201,11 +161,10 @@ class Searcher {
           // Strip ANSI escapes once — Node-side Playwright driver wraps
           // values in SGR codes (\x1b[33m...\x1b[39m) and the regex
           // anchors (^\s*errno:, ^\s*syscall:) need the bare text.
-          // Fast-path lines without escape bytes (the majority) so we
-          // skip the regex scan and string allocation on plain text.
-          const line = rawLine.includes("\x1b") ? rawLine.replace(ANSI_RE, "") : rawLine;
+          // stripAnsi fast-paths lines without escape bytes (the majority).
+          const line = stripAnsi(rawLine);
           if (NOISY_LINE_RE.test(line)) continue;
-          this._onLog?.(searchId, line, classifyLogLevel(line));
+          this._onLog?.(searchId, line, classifyLogLevel(line, SEARCH_SUCCESS_RE));
         }
       });
 
@@ -220,10 +179,11 @@ class Searcher {
         // Drain any final stderr line (no trailing newline edge case).
         // ANSI-strip + NOISY_LINE_RE applied here too so a Playwright
         // teardown line arriving without a terminating newline doesn't
-        // slip past.
-        const tail = stderrBuffer.includes("\x1b") ? stderrBuffer.replace(ANSI_RE, "") : stderrBuffer;
+        // slip past. Kept inline (not the stream loop's shape) — the tail
+        // gate is `tail` truthiness, not a per-line skip.
+        const tail = stripAnsi(stderrBuffer);
         if (tail && !NOISY_LINE_RE.test(tail)) {
-          this._onLog?.(searchId, tail, classifyLogLevel(tail));
+          this._onLog?.(searchId, tail, classifyLogLevel(tail, SEARCH_SUCCESS_RE));
         }
 
         if (signal === "SIGTERM" || signal === "SIGKILL") {

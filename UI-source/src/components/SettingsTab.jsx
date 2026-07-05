@@ -7,24 +7,7 @@ import {
   Check, AlertTriangle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-
-// Same language list as DownloadTab/SearchTab. Duplicated rather than
-// importing to avoid pulling unrelated module deps; one row to add when
-// a new language ships, lives in three places.
-const LANGUAGES = [
-  { value: "en", label: "English" },
-  { value: "ja", label: "Japanese" },
-  { value: "ko", label: "Korean" },
-  { value: "zh", label: "Chinese" },
-  { value: "es", label: "Spanish" },
-  { value: "fr", label: "French" },
-  { value: "pt-br", label: "Portuguese (BR)" },
-  { value: "de", label: "German" },
-  { value: "it", label: "Italian" },
-  { value: "ru", label: "Russian" },
-  { value: "ar", label: "Arabic" },
-  { value: "tr", label: "Turkish" },
-];
+import { LANGUAGES } from "@/lib/constants";
 
 // Default values for settings.searchOpts. Mirrors DEFAULT_OPTS in
 // SearchTab.jsx. Both surfaces (Settings + Search) read/write this
@@ -48,6 +31,52 @@ const DEFAULT_SEARCH_OPTS = {
   // both surfaces. See SearchTab.jsx for the WMI-hang rationale.
   enableMlRating: false,
 };
+
+// ── IntInput ──
+// Controlled integer <Input> that folds the identical parse+truncate+clamp
+// dance the Image-Prefetch/Concurrency number fields used to hand-roll inline.
+// Calls `onChange(intValue)` with a coerced integer — never a raw string, so
+// the Python argparse `type=int` flags can't crash on a decimal.
+//
+// Coercion contract (must stay byte-identical to the four migrated fields —
+// prefetchImageWorkers, imageConcurrency, imagePrefetchDepth,
+// imagePrefetchParallel):
+//   - empty string or non-finite (e.g. the user cleared it, or typed "-") →
+//     `fallback`.
+//   - else truncate toward zero.
+//   - below `min`: `clampLow` true → clamp UP to `min` (prefetchImageWorkers /
+//     imageConcurrency); false → `fallback` (imagePrefetchDepth /
+//     imagePrefetchParallel, which reset to their default when the user types
+//     a below-range value).
+//   - above `max` → clamp DOWN to `max` (all four).
+// This deliberately does NOT cover the Default-Network trio or the search
+// fields — those have different empty/rounding semantics (see their inline
+// handlers) and would change behavior if forced through here.
+function IntInput({ value, onChange, min, max, fallback, clampLow = true, ...props }) {
+  const coerce = (raw) => {
+    const n = Number(raw);
+    if (raw === "" || !Number.isFinite(n)) return fallback;
+    let v = Math.trunc(n);
+    // Below-min test uses the PRE-truncation `n`: the migrated fields guarded
+    // the parsed value (e.g. `v < 0`) BEFORE truncating, so a typed "-0.5" must
+    // reset — trunc(-0.5) === 0 would otherwise slip past a `v < min` check on
+    // the min=0 field (imagePrefetchDepth) and read as "disable" instead.
+    if (min != null && n < min) return clampLow ? min : fallback;
+    if (max != null && v > max) return max;
+    return v;
+  };
+  return (
+    <Input
+      type="number"
+      min={min}
+      max={max}
+      step={1}
+      value={value}
+      onChange={(e) => onChange(coerce(e.target.value))}
+      {...props}
+    />
+  );
+}
 
 // ── DEFAULT VALUES ──
 // Empty placeholders shown only during the brief window before main.js's
@@ -79,6 +108,243 @@ const DEV_DEFAULTS = {
   pythonCmd: "",
   scriptPath: "",
   workingDir: "",
+};
+
+// ── DEFAULT_SETTINGS ──
+// Single source of truth for the initial `local` settings draft AND the Reset
+// button's target. Previously the same ~90 fields were spelled out twice (the
+// useState initializer + handleReset), which drifted easily. Both consume this
+// via structuredClone(DEFAULT_SETTINGS) so neither mutates the shared const's
+// nested objects. Reset overrides only `isPackaged` (kept from prev, since
+// main.js owns it) — see handleReset.
+//
+// This IS the UI architectural triad's owner of the download defaults
+// (electron/main.js and useDownloader.js carry NO defaults dict). Keep it here.
+//
+// The comments below are the field-level rationale that used to live inline in
+// the useState initializer — preserved because they're load-bearing for the
+// next reader (quality=100 fast-path, collapseSplits opt-in, etc.).
+const DEFAULT_SETTINGS = {
+  pythonCmd: DEV_DEFAULTS.pythonCmd,
+  scriptPath: DEV_DEFAULTS.scriptPath,
+  workingDir: DEV_DEFAULTS.workingDir,
+  verboseAlways: true,
+  // Global chapter-collapse toggle. Affects:
+  //   - Search-display "X main / Y entries" diagnostic counts.
+  //   - Actual download behavior — split clusters (e.g. 1.1/1.2/1.3/1.4)
+  //     merge into one combined chapter file; redundant duplicate uploads
+  //     of the same chapter are pruned. See sites/chapter_merger.py
+  //     :group_chapters_for_download for the full 6-rule cluster table.
+  // Persisted as settings.collapseSplits; useDownloader.queueDownload and
+  // .runSearch inject this into args/opts before IPC.
+  // Default OFF (opt-in, documented 2026-05-27) to MATCH the spawn sites,
+  // which all read `settings.collapseSplits === true` (absent → OFF): with a
+  // `true` default here the toggle showed ON while downloads ran OFF until the
+  // first save, and saving then silently flipped collapse ON against the
+  // documented default. Residual follow-up.
+  collapseSplits: false,
+  // Inter-chapter image prefetch worker count (Phase G7, 2026-05-08).
+  // While chapter N is encoding (CPU-bound), a background thread
+  // downloads chapter N+1's images. -1 = match Image Workers (default).
+  // 0 = disable prefetch entirely. Positive N = use exactly N workers.
+  // Drop to 4 (or 0) when the upstream CDN is throttling and the extra
+  // concurrent burst from N+1's downloads compounds throttling.
+  prefetchImageWorkers: -1,
+  // ── Image prefetch & concurrency (generalized 2026-05-13) ──
+  // Apply to any handler with SUPPORTS_FAST_DOWNLOAD=True (currently
+  // mangafire and linewebtoon; see sites/base.py:fast_download_images
+  // for the implementation).
+  //   - imageConcurrency: asyncio.Semaphore bound for image fetches via
+  //     curl_cffi async + HTTP/2 multiplex. 8 hits ~5 MB/s (near network
+  //     ceiling on home links). Auto-dials down per-host on CDN errors.
+  //   - imagePrefetchDepth: how many chapters ahead to keep queued for
+  //     image prefetch. Higher helps when main-loop processing is fast
+  //     relative to network download (CBZ fast-path, LINE Webtoon).
+  //   - imagePrefetchParallel: concurrent prefetch worker threads. =2
+  //     means up to 2 chapters in flight while main processes a third.
+  //   - noFastDownload: escape hatch — force-disable curl_cffi path.
+  // queueDownload (useDownloader.js) injects each into args only when
+  // not at default. Pre-2026-05-13 setting `mangafireImageConcurrency`
+  // is migrated to `imageConcurrency` at settings-load time below.
+  imageConcurrency: 8,
+  imagePrefetchDepth: 2,
+  imagePrefetchParallel: 2,
+  noFastDownload: false,
+  // ── MangaFire VRF capture knobs intentionally NOT surfaced in UI ──
+  // VRF is MangaFire-specific browser-automation tuning that users
+  // shouldn't need to touch. The CLI flags
+  // --mangafire-vrf-prefetch-depth (default 4) and
+  // --mangafire-vrf-parallel (default 1) still exist for advanced
+  // tuning; the UI just inherits the argparse defaults.
+  // How often the UI refreshes logs & progress (in milliseconds).
+  // Lower = more responsive. Default: 100ms (10 updates/sec).
+  logUpdateInterval: 100,
+  // When true, update checks scan actual files on disk instead of
+  // trusting .aio_series.json. Saved as a top-level setting.
+  useFileBasedChapterCheck: false,
+  // ── Library Check All filter ──
+  // When true (default), "Check All" includes series marked Completed /
+  // Finished, not just Ongoing / Releasing. Many aggregators — mangafire
+  // most notoriously — slap "Completed" on actively-updating series, so
+  // skipping them by default would silently leave the user months behind
+  // on a chunk of their library. The cost of an extra check on a truly
+  // completed series is ~one Python proc (handled by the parallel pool
+  // in <1 ms of wall-time per slot saturation), vs. the cost of missing
+  // weeks of releases by trusting the bad metadata. Cross-file: the
+  // filter lives in UI-source/electron/main.js:check-all-updates handler;
+  // LibraryTab.jsx mirrors the filter for the toolbar's ongoingCount.
+  checkAllIncludeCompleted: true,
+  // Parallel "Check All" worker count. Clamped to [1, 8] by main.js. 4 is
+  // the safe sweet spot — finishes 30 series in 30-60s while keeping any
+  // single site from getting hit with 4+ concurrent --list-chapters calls
+  // (the provider-aware scheduler in main.js further fans across distinct
+  // sites when possible).
+  checkAllConcurrency: 4,
+  // When ON (default), downloads queued from the UpdatesCenter panel get
+  // --seeded-rating-only injected so the multi-source rating skips its
+  // image-quality probe phase and ranks alternatives from
+  // sites/quality_seed.json's per-site priors instead. Saves 30-60+ s
+  // per series on MangaFire-class handlers (the probe runs Playwright
+  // VRF per sample chapter plus image-quality scoring). For a 1-5
+  // chapter update delta, the probe cost dwarfs the actual download.
+  // Off restores full probe accuracy at the per-download cost — pick
+  // off only if you've tuned multi-source ranking carefully and want
+  // every download to use measured scores. Read in LibraryTab.jsx's
+  // buildDownloadArgsForRow; flag plumbed via downloader.js's
+  // seededRatingOnly boolMap entry; honored in aio_search_cli.
+  // find_alternatives_for_direct_url.
+  updateChecksUseSeededRating: true,
+  // ── External metadata enrichment (--metadata-source family) ──
+  // Top-level "global setting" semantic: applies to EVERY download
+  // regardless of which tab spawned it (New / Search / Library / queue).
+  // useDownloader.queueDownload injects these into args for every
+  // electronAPI.startDownload, so it's a true app-wide preference rather
+  // than a per-download form value. Defaults match the Python argparse
+  // defaults so a Save with the section untouched is a no-op for the
+  // spawn line. Python side: aio-dl.py near --enable-ml-rating (flag
+  // registration) + sites/external_metadata.py (the AniList GraphQL
+  // client). Grep cross-file: metadataSource, metadata-source.
+  metadataSource: "none",
+  metadataTagMinRank: 50,
+  metadataRefresh: false,
+  // Whether the app is running from an installed .exe (bundled mode)
+  // or from source (dev mode). Set by main.js, read-only here. Reset
+  // preserves prev.isPackaged rather than this false (see handleReset).
+  isPackaged: false,
+  defaults: {
+    format: "pdf",
+    // Global download language. DownloadTab.jsx:32 had its own per-form
+    // default of "en"; surfacing it here lets the user pick a different
+    // global default (e.g. "ja" for a Japanese-only library) without
+    // changing the dropdown on every download. DownloadTab's useEffect
+    // at line ~95-99 already spreads settings.defaults onto its form,
+    // so this propagates through automatically. Library-tab downloads
+    // override with the per-series saved language; Search-tab downloads
+    // inherit via App.jsx's defaults-spread.
+    language: "en",
+    // 100 (not aio-dl.py's argparse default of 85): Phase G4 in aio-dl.py
+    // (~line 4272) sets _user_set_quality = (--quality on argv) AND
+    // (args.quality < 100). When True, the CBZ byte-preserving fast-path
+    // (cbzPreserveOriginals) is bypassed in favor of decode/re-encode.
+    // The UI always emits --quality from form state, so a default of 85
+    // would force every default CBZ download into the slow legacy path
+    // — defeating the cbzPreserveOriginals toggle for everyone except
+    // users who manually slide the quality up to 100. The Python
+    // argparse default of 85 still applies to direct CLI users; the
+    // UI's separate default is intentional. Keep this at 100 unless
+    // you also revisit the Phase G4 guard.
+    quality: 100,
+    scaling: 100,
+    keepChapters: false,
+    noFinalFile: false,
+    keepImages: false,
+    noProcessing: false,
+    noCleanup: false,
+    imageWorkers: 3,
+    httpTimeout: 30,
+    httpMaxRetries: 6,
+    jobs: 1,
+    // Multi-source fallback default (added 2026-05-07). DownloadTab's
+    // useEffect spreads settings.defaults into its form on mount, so
+    // setting these here makes them survive both tab switches and
+    // session restarts. Per-job overrides in DownloadTab don't save back.
+    multiSource: false,
+    multiSourceQualityMin: 0.65,
+    // Lazy-discovery modifier for multi-source (2026-07-02): defer the
+    // ~30-80 s cross-site alternatives discovery until a chapter actually
+    // fails, instead of running it before the first chapter. Opt-OUT
+    // nested inside the multi-source opt-in: the multiSource toggle's
+    // handler force-resets this to true on every enable, and every
+    // consumer treats ABSENT as on (`!== false`) so settings dicts saved
+    // before this field existed stay lazy. Only an explicit false (user
+    // unticked the nested toggle) reverts to eager discovery.
+    // downloader.js emits --multi-source-lazy from a dedicated
+    // chokepoint (grep multiSourceLazy there — NOT in boolMap, because
+    // boolMap's `=== true` test would break absent-means-on); Python
+    // side: aio-dl.py --multi-source-lazy + _ms_lazy_pending.
+    multiSourceLazy: true,
+    // CBZ byte-preservation default (added 2026-05-07). When ON (default),
+    // CBZ output uses the original wire bytes from the CDN (lossless,
+    // fastest, smallest archives). Setting this to false emits
+    // --no-cbz-preserve-originals which forces decode/re-encode even at
+    // --scaling 100. The downloader.js boolMap handles the negative-form
+    // flag emission. Only meaningful for --format cbz.
+    cbzPreserveOriginals: true,
+    // Komikku-compatible per-chapter CBZ output (2026-05-12, Komikku LocalSource format).
+    // When ON, Python auto-coerces --format cbz --keep-chapters
+    // --no-final-file and writes per-chapter ComicInfo.xml + cover.jpg
+    // + details.json at <out>/manga/<Series>/. The format selector
+    // above is effectively ignored when this is on (Python prints a
+    // [Komikku] coercion notice in the log). DownloadTab's DEFAULT_FORM
+    // spread picks this up via the useEffect at line ~120-124; App.jsx's
+    // search/library wrappers spread it into queueDownload args.
+    komikku: false,
+    // LINE Webtoon WebP recompression defaults (Phase 1, 2026-05-11).
+    // When enabled here, BOTH the New tab AND search/library-initiated
+    // downloads inherit these knobs: the New tab's DEFAULT_FORM spread
+    // (DownloadTab.jsx:~110) and App.jsx's settings.defaults spread for
+    // the search/library onStartDownload wrappers (App.jsx:~155 and
+    // :~192) both pick this up. Master toggle is off by default so
+    // existing user flows are unchanged; toggling on in Settings makes
+    // every new webtoons.com download recompress without per-job UI.
+    // Silently no-ops for non-webtoons.com handlers (Python checks
+    // handler.name === "linewebtoon" before the encode pass).
+    webtoonRecompress: false,
+    webtoonRecompressQuality: 85,
+    webtoonRecompressMethod: 4,
+    // Content-aware JXL/AVIF transcode (opt-in, CBZ-only). Mirrors the
+    // --modernize* CLI flags (aio-dl.py, grep '--modernize compatibility
+    // checks'). Rides the CBZ byte-passthrough fast-path, so it's only valid
+    // with the fast-path conditions (format cbz/komikku, quality 100,
+    // scaling 100, preserve-originals on, no-processing off); the toggle in
+    // the Modernize section below auto-corrects those on enable, and
+    // downloader.js:buildCliArgs (modernizeBlocked) strips the flag if
+    // they're ever violated. DownloadTab's DEFAULT_FORM spread + App.jsx's
+    // search/library defaults spread propagate these to every download path.
+    modernize: false,
+    // Fully-reversible archival preset. UI-level only — no dedicated CLI
+    // flag: downloader.js:buildCliArgs forces the PAIR --modernize-format
+    // jxl + --modernize-distance 0 while this is on and ignores the stored
+    // routing/distance/AVIF values (kept, so switching the preset off
+    // restores them). A PAIR because auto + distance 0 is NOT reversible —
+    // auto still routes color pages to the always-lossy AVIF branch.
+    modernizeReversible: false,
+    modernizeFormat: "auto",      // auto | jxl | avif | jxl+avif
+    modernizeQuality: 90,         // AVIF color quality (1-100)
+    modernizeDistance: 1.0,       // JXL grayscale distance (0.0 = lossless)
+    modernizeMinSaving: 0.92,     // keep transcode only if < orig * this
+    // CPU<->size knobs (no pixel change; NON-gating on the Python side).
+    // INVERSE axes — higher JXL effort = slower/smaller, higher AVIF speed =
+    // faster/larger. Defaults are the measured sweet spot (see the effort-9
+    // CPU-trap benchmark). downloader.js emits --modernize-effort /
+    // --modernize-avif-speed only when they differ from these.
+    modernizeEffort: 7,           // JXL effort 1-9
+    modernizeAvifSpeed: 6,        // AVIF speed 0-10
+  },
+  // Per-search defaults — read by SearchTab on mount via the same
+  // settings.searchOpts namespace. Surfaced here so the user has one
+  // central place to configure both download and search defaults.
+  searchOpts: { ...DEFAULT_SEARCH_OPTS },
 };
 
 // ── Dirty diff for the Save Settings button ──
@@ -279,227 +545,12 @@ function SaveSettingsButton({ dirty, onSave }) {
 
 export default function SettingsTab({ settings, onSave }) {
   // Local copy of settings so changes don't apply until you click Save
-  const [local, setLocal] = useState({
-    pythonCmd: DEV_DEFAULTS.pythonCmd,
-    scriptPath: DEV_DEFAULTS.scriptPath,
-    workingDir: DEV_DEFAULTS.workingDir,
-    verboseAlways: true,
-    // Global chapter-collapse toggle. Affects:
-    //   - Search-display "X main / Y entries" diagnostic counts.
-    //   - Actual download behavior — split clusters (e.g. 1.1/1.2/1.3/1.4)
-    //     merge into one combined chapter file; redundant duplicate uploads
-    //     of the same chapter are pruned. See sites/chapter_merger.py
-    //     :group_chapters_for_download for the full 6-rule cluster table.
-    // Persisted as settings.collapseSplits; useDownloader.queueDownload and
-    // .runSearch inject this into args/opts before IPC.
-    // Default OFF (opt-in, documented 2026-05-27) to MATCH the spawn sites,
-    // which all read `settings.collapseSplits === true` (absent → OFF): with a
-    // `true` default here the toggle showed ON while downloads ran OFF until the
-    // first save, and saving then silently flipped collapse ON against the
-    // documented default. Residual follow-up.
-    collapseSplits: false,
-    // Inter-chapter image prefetch worker count (Phase G7, 2026-05-08).
-    // While chapter N is encoding (CPU-bound), a background thread
-    // downloads chapter N+1's images. -1 = match Image Workers (default).
-    // 0 = disable prefetch entirely. Positive N = use exactly N workers.
-    // Drop to 4 (or 0) when the upstream CDN is throttling and the extra
-    // concurrent burst from N+1's downloads compounds throttling.
-    prefetchImageWorkers: -1,
-    // ── Image prefetch & concurrency (generalized 2026-05-13) ──
-    // Apply to any handler with SUPPORTS_FAST_DOWNLOAD=True (currently
-    // mangafire and linewebtoon; see sites/base.py:fast_download_images
-    // for the implementation).
-    //   - imageConcurrency: asyncio.Semaphore bound for image fetches via
-    //     curl_cffi async + HTTP/2 multiplex. 8 hits ~5 MB/s (near network
-    //     ceiling on home links). Auto-dials down per-host on CDN errors.
-    //   - imagePrefetchDepth: how many chapters ahead to keep queued for
-    //     image prefetch. Higher helps when main-loop processing is fast
-    //     relative to network download (CBZ fast-path, LINE Webtoon).
-    //   - imagePrefetchParallel: concurrent prefetch worker threads. =2
-    //     means up to 2 chapters in flight while main processes a third.
-    //   - noFastDownload: escape hatch — force-disable curl_cffi path.
-    // queueDownload (useDownloader.js) injects each into args only when
-    // not at default. Pre-2026-05-13 setting `mangafireImageConcurrency`
-    // is migrated to `imageConcurrency` at settings-load time below.
-    imageConcurrency: 8,
-    imagePrefetchDepth: 2,
-    imagePrefetchParallel: 2,
-    noFastDownload: false,
-    // ── MangaFire VRF capture knobs intentionally NOT surfaced in UI ──
-    // VRF is MangaFire-specific browser-automation tuning that users
-    // shouldn't need to touch. The CLI flags
-    // --mangafire-vrf-prefetch-depth (default 4) and
-    // --mangafire-vrf-parallel (default 1) still exist for advanced
-    // tuning; the UI just inherits the argparse defaults.
-    // How often the UI refreshes logs & progress (in milliseconds).
-    // Lower = more responsive. Default: 100ms (10 updates/sec).
-    logUpdateInterval: 100,
-    // When true, update checks scan actual files on disk instead of
-    // trusting .aio_series.json. Saved as a top-level setting.
-    useFileBasedChapterCheck: false,
-    // ── Library Check All filter ──
-    // When true (default), "Check All" includes series marked Completed /
-    // Finished, not just Ongoing / Releasing. Many aggregators — mangafire
-    // most notoriously — slap "Completed" on actively-updating series, so
-    // skipping them by default would silently leave the user months behind
-    // on a chunk of their library. The cost of an extra check on a truly
-    // completed series is ~one Python proc (handled by the parallel pool
-    // in <1 ms of wall-time per slot saturation), vs. the cost of missing
-    // weeks of releases by trusting the bad metadata. Cross-file: the
-    // filter lives in UI-source/electron/main.js:check-all-updates handler;
-    // LibraryTab.jsx mirrors the filter for the toolbar's ongoingCount.
-    checkAllIncludeCompleted: true,
-    // Parallel "Check All" worker count. Clamped to [1, 8] by main.js. 4 is
-    // the safe sweet spot — finishes 30 series in 30-60s while keeping any
-    // single site from getting hit with 4+ concurrent --list-chapters calls
-    // (the provider-aware scheduler in main.js further fans across distinct
-    // sites when possible).
-    checkAllConcurrency: 4,
-    // When ON (default), downloads queued from the UpdatesCenter panel get
-    // --seeded-rating-only injected so the multi-source rating skips its
-    // image-quality probe phase and ranks alternatives from
-    // sites/quality_seed.json's per-site priors instead. Saves 30-60+ s
-    // per series on MangaFire-class handlers (the probe runs Playwright
-    // VRF per sample chapter plus image-quality scoring). For a 1-5
-    // chapter update delta, the probe cost dwarfs the actual download.
-    // Off restores full probe accuracy at the per-download cost — pick
-    // off only if you've tuned multi-source ranking carefully and want
-    // every download to use measured scores. Read in LibraryTab.jsx's
-    // buildDownloadArgsForRow; flag plumbed via downloader.js's
-    // seededRatingOnly boolMap entry; honored in aio_search_cli.
-    // find_alternatives_for_direct_url.
-    updateChecksUseSeededRating: true,
-    // ── External metadata enrichment (--metadata-source family) ──
-    // Top-level "global setting" semantic: applies to EVERY download
-    // regardless of which tab spawned it (New / Search / Library / queue).
-    // useDownloader.queueDownload injects these into args for every
-    // electronAPI.startDownload, so it's a true app-wide preference rather
-    // than a per-download form value. Defaults match the Python argparse
-    // defaults so a Save with the section untouched is a no-op for the
-    // spawn line. Python side: aio-dl.py near --enable-ml-rating (flag
-    // registration) + sites/external_metadata.py (the AniList GraphQL
-    // client). Grep cross-file: metadataSource, metadata-source.
-    metadataSource: "none",
-    metadataTagMinRank: 50,
-    metadataRefresh: false,
-    // Whether the app is running from an installed .exe (bundled mode)
-    // or from source (dev mode). Set by main.js, read-only here.
-    isPackaged: false,
-    defaults: {
-      format: "pdf",
-      // Global download language. DownloadTab.jsx:32 had its own per-form
-      // default of "en"; surfacing it here lets the user pick a different
-      // global default (e.g. "ja" for a Japanese-only library) without
-      // changing the dropdown on every download. DownloadTab's useEffect
-      // at line ~95-99 already spreads settings.defaults onto its form,
-      // so this propagates through automatically. Library-tab downloads
-      // override with the per-series saved language; Search-tab downloads
-      // inherit via App.jsx's defaults-spread.
-      language: "en",
-      // 100 (not aio-dl.py's argparse default of 85): Phase G4 in aio-dl.py
-      // (~line 4272) sets _user_set_quality = (--quality on argv) AND
-      // (args.quality < 100). When True, the CBZ byte-preserving fast-path
-      // (cbzPreserveOriginals) is bypassed in favor of decode/re-encode.
-      // The UI always emits --quality from form state, so a default of 85
-      // would force every default CBZ download into the slow legacy path
-      // — defeating the cbzPreserveOriginals toggle for everyone except
-      // users who manually slide the quality up to 100. The Python
-      // argparse default of 85 still applies to direct CLI users; the
-      // UI's separate default is intentional. Keep this at 100 unless
-      // you also revisit the Phase G4 guard.
-      quality: 100,
-      scaling: 100,
-      keepChapters: false,
-      noFinalFile: false,
-      keepImages: false,
-      noProcessing: false,
-      noCleanup: false,
-      imageWorkers: 3,
-      httpTimeout: 30,
-      httpMaxRetries: 6,
-      jobs: 1,
-      // Multi-source fallback default (added 2026-05-07). DownloadTab's
-      // useEffect spreads settings.defaults into its form on mount, so
-      // setting these here makes them survive both tab switches and
-      // session restarts. Per-job overrides in DownloadTab don't save back.
-      multiSource: false,
-      multiSourceQualityMin: 0.65,
-      // Lazy-discovery modifier for multi-source (2026-07-02): defer the
-      // ~30-80 s cross-site alternatives discovery until a chapter actually
-      // fails, instead of running it before the first chapter. Opt-OUT
-      // nested inside the multi-source opt-in: the multiSource toggle's
-      // handler force-resets this to true on every enable, and every
-      // consumer treats ABSENT as on (`!== false`) so settings dicts saved
-      // before this field existed stay lazy. Only an explicit false (user
-      // unticked the nested toggle) reverts to eager discovery.
-      // downloader.js emits --multi-source-lazy from a dedicated
-      // chokepoint (grep multiSourceLazy there — NOT in boolMap, because
-      // boolMap's `=== true` test would break absent-means-on); Python
-      // side: aio-dl.py --multi-source-lazy + _ms_lazy_pending.
-      multiSourceLazy: true,
-      // CBZ byte-preservation default (added 2026-05-07). When ON (default),
-      // CBZ output uses the original wire bytes from the CDN (lossless,
-      // fastest, smallest archives). Setting this to false emits
-      // --no-cbz-preserve-originals which forces decode/re-encode even at
-      // --scaling 100. The downloader.js boolMap handles the negative-form
-      // flag emission. Only meaningful for --format cbz.
-      cbzPreserveOriginals: true,
-      // Komikku-compatible per-chapter CBZ output (2026-05-12, Komikku LocalSource format).
-      // When ON, Python auto-coerces --format cbz --keep-chapters
-      // --no-final-file and writes per-chapter ComicInfo.xml + cover.jpg
-      // + details.json at <out>/manga/<Series>/. The format selector
-      // above is effectively ignored when this is on (Python prints a
-      // [Komikku] coercion notice in the log). DownloadTab's DEFAULT_FORM
-      // spread picks this up via the useEffect at line ~120-124; App.jsx's
-      // search/library wrappers spread it into queueDownload args.
-      komikku: false,
-      // LINE Webtoon WebP recompression defaults (Phase 1, 2026-05-11).
-      // When enabled here, BOTH the New tab AND search/library-initiated
-      // downloads inherit these knobs: the New tab's DEFAULT_FORM spread
-      // (DownloadTab.jsx:~110) and App.jsx's settings.defaults spread for
-      // the search/library onStartDownload wrappers (App.jsx:~155 and
-      // :~192) both pick this up. Master toggle is off by default so
-      // existing user flows are unchanged; toggling on in Settings makes
-      // every new webtoons.com download recompress without per-job UI.
-      // Silently no-ops for non-webtoons.com handlers (Python checks
-      // handler.name === "linewebtoon" before the encode pass).
-      webtoonRecompress: false,
-      webtoonRecompressQuality: 85,
-      webtoonRecompressMethod: 4,
-      // Content-aware JXL/AVIF transcode (opt-in, CBZ-only). Mirrors the
-      // --modernize* CLI flags (aio-dl.py, grep '--modernize compatibility
-      // checks'). Rides the CBZ byte-passthrough fast-path, so it's only valid
-      // with the fast-path conditions (format cbz/komikku, quality 100,
-      // scaling 100, preserve-originals on, no-processing off); the toggle in
-      // the Modernize section below auto-corrects those on enable, and
-      // downloader.js:buildCliArgs (modernizeBlocked) strips the flag if
-      // they're ever violated. DownloadTab's DEFAULT_FORM spread + App.jsx's
-      // search/library defaults spread propagate these to every download path.
-      modernize: false,
-      // Fully-reversible archival preset. UI-level only — no dedicated CLI
-      // flag: downloader.js:buildCliArgs forces the PAIR --modernize-format
-      // jxl + --modernize-distance 0 while this is on and ignores the stored
-      // routing/distance/AVIF values (kept, so switching the preset off
-      // restores them). A PAIR because auto + distance 0 is NOT reversible —
-      // auto still routes color pages to the always-lossy AVIF branch.
-      modernizeReversible: false,
-      modernizeFormat: "auto",      // auto | jxl | avif | jxl+avif
-      modernizeQuality: 90,         // AVIF color quality (1-100)
-      modernizeDistance: 1.0,       // JXL grayscale distance (0.0 = lossless)
-      modernizeMinSaving: 0.92,     // keep transcode only if < orig * this
-      // CPU<->size knobs (no pixel change; NON-gating on the Python side).
-      // INVERSE axes — higher JXL effort = slower/smaller, higher AVIF speed =
-      // faster/larger. Defaults are the measured sweet spot (see the effort-9
-      // CPU-trap benchmark). downloader.js emits --modernize-effort /
-      // --modernize-avif-speed only when they differ from these.
-      modernizeEffort: 7,           // JXL effort 1-9
-      modernizeAvifSpeed: 6,        // AVIF speed 0-10
-    },
-    // Per-search defaults — read by SearchTab on mount via the same
-    // settings.searchOpts namespace. Surfaced here so the user has one
-    // central place to configure both download and search defaults.
-    searchOpts: { ...DEFAULT_SEARCH_OPTS },
-  });
+  // Local copy of settings so changes don't apply until you click Save.
+  // Sourced from the module-level DEFAULT_SETTINGS (single source of truth,
+  // also consumed by handleReset). Lazy initializer + structuredClone so the
+  // draft owns its own nested `defaults`/`searchOpts` objects and never
+  // mutates the shared const. Field-level rationale lives on DEFAULT_SETTINGS.
+  const [local, setLocal] = useState(() => structuredClone(DEFAULT_SETTINGS));
 
   // Display-only resolved paths (what main.js would use as defaults when
   // local.pythonCmd / .scriptPath / .workingDir are empty). Shown as
@@ -650,77 +701,16 @@ export default function SettingsTab({ settings, onSave }) {
   };
 
   const handleReset = () => {
+    // Reset to DEFAULT_SETTINGS (the same single source the useState
+    // initializer clones). structuredClone so the reset draft owns fresh
+    // nested objects. Path fields reset to "" in BOTH packaged and dev modes
+    // (empty == "use the runtime-resolved default"; the placeholder from
+    // getResolvedPaths shows what will run) — DEFAULT_SETTINGS already carries
+    // "" for all three. Only isPackaged is overridden: it's owned by main.js,
+    // so keep the current value rather than DEFAULT_SETTINGS's placeholder.
     setLocal((prev) => ({
-      // Keep isPackaged from the current state (it's set by main.js).
-      // Path fields reset to empty in BOTH packaged and dev modes —
-      // empty == "use the runtime-resolved default" per the post-2026-05-13
-      // round-trip-prevention design. The placeholder shown in the UI
-      // (sourced from getResolvedPaths) tells the user what's actually
-      // going to run; the empty string is just the absence of an override.
-      pythonCmd: "",
-      scriptPath: "",
-      workingDir: "",
+      ...structuredClone(DEFAULT_SETTINGS),
       isPackaged: prev.isPackaged,
-      verboseAlways: true,
-      collapseSplits: false,
-      prefetchImageWorkers: -1,
-      imageConcurrency: 8,
-      imagePrefetchDepth: 2,
-      imagePrefetchParallel: 2,
-      noFastDownload: false,
-      logUpdateInterval: 100,
-      useFileBasedChapterCheck: false,
-      // Mirror initial state: Check All includes Completed by default, four
-      // parallel workers. See rationale in the initial useState above.
-      checkAllIncludeCompleted: true,
-      checkAllConcurrency: 4,
-      updateChecksUseSeededRating: true,
-      // Metadata enrichment defaults — mirror the initial-state block above.
-      // Off/default values match the Python argparse defaults so Reset
-      // produces a clean "no spawn-line metadata flags" state.
-      metadataSource: "none",
-      metadataTagMinRank: 50,
-      metadataRefresh: false,
-      defaults: {
-        format: "pdf",
-        language: "en",
-        // See the rationale on the corresponding line in the initial-state
-        // defaults block above — 100, not 85, to keep cbzPreserveOriginals's
-        // fast-path active by default. Reset must mirror initial state.
-        quality: 100,
-        scaling: 100,
-        keepChapters: false,
-        noFinalFile: false,
-        keepImages: false,
-        noProcessing: false,
-        noCleanup: false,
-        imageWorkers: 3,
-        httpTimeout: 30,
-        httpMaxRetries: 6,
-        jobs: 1,
-        cbzPreserveOriginals: true,
-        multiSource: false,
-        multiSourceQualityMin: 0.65,
-        multiSourceLazy: true,
-        // Mirror webtoonRecompress* initial-state defaults so Reset clears
-        // them too. See the rationale block in the initial useState above.
-        webtoonRecompress: false,
-        webtoonRecompressQuality: 85,
-        webtoonRecompressMethod: 4,
-        // Modernize transcode defaults — mirror the initial-state block above.
-        modernize: false,
-        modernizeReversible: false,
-        modernizeFormat: "auto",
-        modernizeQuality: 90,
-        modernizeDistance: 1.0,
-        modernizeMinSaving: 0.92,
-        modernizeEffort: 7,
-        modernizeAvifSpeed: 6,
-        // Komikku-mode default. Reset mirrors initial-state; see the
-        // rationale block in the initial useState above.
-        komikku: false,
-      },
-      searchOpts: { ...DEFAULT_SEARCH_OPTS },
     }));
   };
 
@@ -1636,32 +1626,16 @@ export default function SettingsTab({ settings, onSave }) {
                 saves 2-5s per chapter on MangaFire-style long-strip encodes when on.
               </p>
             </div>
-            <Input
-              type="number"
+            {/* The Python --prefetch-image-workers flag is argparse type=int;
+                IntInput truncates + clamps so a decimal never round-trips to
+                settings.json and crashes the next spawn. -1 = match Image
+                Workers; below -1 clamps up (clampLow default). */}
+            <IntInput
+              value={local.prefetchImageWorkers ?? -1}
+              onChange={(v) => set("prefetchImageWorkers", v)}
               min={-1}
               max={32}
-              step={1}
-              value={local.prefetchImageWorkers ?? -1}
-              onChange={(e) => {
-                // The Python --prefetch-image-workers flag is argparse
-                // type=int. A decimal value here (e.g. user typing 3.7 in
-                // the spinner) would round-trip to settings.json and crash
-                // the next spawn with "invalid int". Truncate to integer
-                // and clamp to the input range.
-                const raw = e.target.value;
-                if (raw === "" || raw === "-") {
-                  set("prefetchImageWorkers", -1);
-                  return;
-                }
-                const parsed = Number(raw);
-                if (!Number.isFinite(parsed)) {
-                  set("prefetchImageWorkers", -1);
-                  return;
-                }
-                const truncated = Math.trunc(parsed);
-                const clamped = Math.max(-1, Math.min(32, truncated));
-                set("prefetchImageWorkers", clamped);
-              }}
+              fallback={-1}
               className="w-20 shrink-0 font-mono tabular-nums"
             />
           </div>
@@ -1750,22 +1724,14 @@ export default function SettingsTab({ settings, onSave }) {
                 rate-limit / 5xx errors during a download.
               </p>
             </div>
-            <Input
-              type="number"
+            {/* Python's --image-concurrency is argparse type=int; IntInput
+                truncates + clamps [1,32] (empty/invalid → 8, the default). */}
+            <IntInput
+              value={local.imageConcurrency ?? 8}
+              onChange={(v) => set("imageConcurrency", v)}
               min={1}
               max={32}
-              step={1}
-              value={local.imageConcurrency ?? 8}
-              onChange={(e) => {
-                // Int-parse + clamp pattern matches imageWorkers above.
-                // Python's --image-concurrency is argparse type=int; a
-                // decimal here would crash the next spawn.
-                const raw = e.target.value;
-                if (raw === "") { set("imageConcurrency", 8); return; }
-                const v = Number(raw);
-                if (!Number.isFinite(v)) { set("imageConcurrency", 8); return; }
-                set("imageConcurrency", Math.max(1, Math.min(32, Math.trunc(v))));
-              }}
+              fallback={8}
               className="w-20 shrink-0 font-mono tabular-nums"
             />
           </div>
@@ -1783,19 +1749,15 @@ export default function SettingsTab({ settings, onSave }) {
                 {" "}<span className="font-mono">0</span> disables prefetch entirely.
               </p>
             </div>
-            <Input
-              type="number"
+            {/* clampLow=false: a below-0 entry resets to the default (2)
+                rather than clamping — matches the original v<0 guard. */}
+            <IntInput
+              value={local.imagePrefetchDepth ?? 2}
+              onChange={(v) => set("imagePrefetchDepth", v)}
               min={0}
               max={8}
-              step={1}
-              value={local.imagePrefetchDepth ?? 2}
-              onChange={(e) => {
-                const raw = e.target.value;
-                if (raw === "") { set("imagePrefetchDepth", 2); return; }
-                const v = Number(raw);
-                if (!Number.isFinite(v) || v < 0) { set("imagePrefetchDepth", 2); return; }
-                set("imagePrefetchDepth", Math.max(0, Math.min(8, Math.trunc(v))));
-              }}
+              fallback={2}
+              clampLow={false}
               className="w-20 shrink-0 font-mono tabular-nums"
             />
           </div>
@@ -1813,19 +1775,15 @@ export default function SettingsTab({ settings, onSave }) {
                 MangaFire's edge cache tolerate 2 well in practice.
               </p>
             </div>
-            <Input
-              type="number"
+            {/* clampLow=false: a below-1 entry resets to the default (2)
+                rather than clamping — matches the original v<1 guard. */}
+            <IntInput
+              value={local.imagePrefetchParallel ?? 2}
+              onChange={(v) => set("imagePrefetchParallel", v)}
               min={1}
               max={4}
-              step={1}
-              value={local.imagePrefetchParallel ?? 2}
-              onChange={(e) => {
-                const raw = e.target.value;
-                if (raw === "") { set("imagePrefetchParallel", 2); return; }
-                const v = Number(raw);
-                if (!Number.isFinite(v) || v < 1) { set("imagePrefetchParallel", 2); return; }
-                set("imagePrefetchParallel", Math.max(1, Math.min(4, Math.trunc(v))));
-              }}
+              fallback={2}
+              clampLow={false}
               className="w-20 shrink-0 font-mono tabular-nums"
             />
           </div>

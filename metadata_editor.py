@@ -3,7 +3,6 @@ import shutil
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
-import xml.sax.saxutils as saxutils
 
 # Make sure we use pypdf if available
 try:
@@ -18,8 +17,28 @@ try:
 except ImportError:
     HAS_PIL = False
 
-def escape(s):
-    return saxutils.escape(s) if s else ""
+# ---------------------------------------------------------
+# ComicInfo (CBZ) XML element helpers
+# ---------------------------------------------------------
+# Shared by read_cbz_metadata (get) and update_cbz_metadata (set) so the
+# find/read and find-or-create/remove logic lives in one place. Behavior is
+# identical to the former nested get_text/set_text closures; grep _xml_get /
+# _xml_set for call sites.
+
+def _xml_get(root, tag: str) -> str:
+    el = root.find(tag)
+    return el.text if el is not None and el.text else ""
+
+
+def _xml_set(root, tag: str, value):
+    el = root.find(tag)
+    if value is not None and value.strip():
+        if el is None:
+            el = ET.SubElement(root, tag)
+        el.text = value.strip()
+    elif el is not None:
+        root.remove(el)
+
 
 # ---------------------------------------------------------
 # CBZ Handle
@@ -32,18 +51,13 @@ def read_cbz_metadata(path: str) -> dict:
             if "ComicInfo.xml" in zf.namelist():
                 xml_data = zf.read("ComicInfo.xml")
                 root = ET.fromstring(xml_data)
-                
-                # Basic fields
-                def get_text(tag):
-                    el = root.find(tag)
-                    return el.text if el is not None and el.text else ""
-                    
-                meta["title"] = get_text("Title")
-                meta["synopsis"] = get_text("Summary")
-                meta["writers"] = get_text("Writer")
-                meta["pencillers"] = get_text("Penciller")
-                meta["genres"] = get_text("Genre")
-                meta["publisher"] = get_text("Publisher")
+
+                meta["title"] = _xml_get(root, "Title")
+                meta["synopsis"] = _xml_get(root, "Summary")
+                meta["writers"] = _xml_get(root, "Writer")
+                meta["pencillers"] = _xml_get(root, "Penciller")
+                meta["genres"] = _xml_get(root, "Genre")
+                meta["publisher"] = _xml_get(root, "Publisher")
     except Exception:
         pass
     return meta
@@ -75,23 +89,13 @@ def update_cbz_metadata(path: str, data: dict, cover_path: str = None):
                     "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance"
                 })
             
-            # Helper to update XML
-            def set_text(tag, value):
-                el = root.find(tag)
-                if value is not None and value.strip():
-                    if el is None:
-                        el = ET.SubElement(root, tag)
-                    el.text = value.strip()
-                elif el is not None:
-                    root.remove(el)
-
-            if "title" in data: set_text("Title", data["title"])
-            if "title" in data: set_text("Series", data["title"])
-            if "synopsis" in data: set_text("Summary", data["synopsis"])
-            if "writers" in data: set_text("Writer", data["writers"])
-            if "pencillers" in data: set_text("Penciller", data["pencillers"])
-            if "genres" in data: set_text("Genre", data["genres"])
-            if "publisher" in data: set_text("Publisher", data["publisher"])
+            if "title" in data: _xml_set(root, "Title", data["title"])
+            if "title" in data: _xml_set(root, "Series", data["title"])
+            if "synopsis" in data: _xml_set(root, "Summary", data["synopsis"])
+            if "writers" in data: _xml_set(root, "Writer", data["writers"])
+            if "pencillers" in data: _xml_set(root, "Penciller", data["pencillers"])
+            if "genres" in data: _xml_set(root, "Genre", data["genres"])
+            if "publisher" in data: _xml_set(root, "Publisher", data["publisher"])
 
             xml_str = ET.tostring(root, encoding="utf-8", xml_declaration=True).decode("utf-8")
             zout.writestr("ComicInfo.xml", xml_str)

@@ -197,8 +197,9 @@ function readHidMarker(folderPath) {
 function runMetadataCli(args, stdinData = null) {
   const metadataScript = path.join(path.dirname(defaultScriptPath), "metadata_cli.py");
   const settings = history?.getSettings?.() || {};
-  const pythonCmd = settings.pythonCmd || defaultPythonCmd;
-  const workingDir = settings.workingDir || defaultWorkingDir;
+  // metadata_cli always runs against the bundled defaultScriptPath dir (below),
+  // so we only need pythonCmd + workingDir from the resolver here.
+  const { pythonCmd, workingDir } = resolveSpawnPaths(settings);
   return new Promise((resolve, reject) => {
     const proc = spawn(pythonCmd, [metadataScript, ...args], {
       cwd: workingDir,
@@ -291,6 +292,64 @@ function ensurePythonSrcInPth() {
   } catch (err) {
     console.error("Failed to update ._pth file:", err.message);
   }
+}
+
+// ============================================================
+// HELPER: resolve the spawn paths (python / script / workingDir)
+// ============================================================
+//
+// Every IPC handler that spawns aio-dl.py resolves the same three paths
+// from saved settings, each falling back to the runtime-computed default
+// when the saved value is empty/missing. The empty-string fallback is
+// load-bearing: get-settings deliberately does NOT merge the resolved
+// paths, and the renderer saves "" for un-customized fields — so
+// `settings.X || defaultX` is the ONLY place the default gets applied on
+// the spawn side (see the get-settings handler's comment + history.js's
+// volatile-path filter for the AppImage/Gatekeeper stale-path story).
+// Kept as one helper so all spawn sites stay in lockstep; callers that
+// only need workingDir just destructure that field.
+function resolveSpawnPaths(settings) {
+  return {
+    pythonCmd: settings.pythonCmd || defaultPythonCmd,
+    scriptPath: settings.scriptPath || defaultScriptPath,
+    workingDir: settings.workingDir || defaultWorkingDir,
+  };
+}
+
+// ============================================================
+// HELPER: build the extra environment for a spawned Python process
+// ============================================================
+//
+// PLAYWRIGHT_BROWSERS_PATH (all platforms, packaged only): points
+// patchright at the bundled Chromium that setup.js downloaded, so the
+// VRF/Playwright handlers don't re-download into a system path. Gated on
+// fs.existsSync(playwrightDir) — if the browser dir isn't on disk yet
+// (setup incomplete), we DON'T pin a nonexistent path and let patchright
+// fall back to its own resolution. This existsSync guard is the "most
+// complete" form; _checkSeriesUpdates used to omit it (drift, unified
+// 2026-07 dedup sweep).
+//
+// PYTHONPATH (packaged Unix only): puts resources/python-src/ on sys.path
+// so aio-dl.py can `import sites` / `import aio_search_cli`. On Windows the
+// embed Python ignores PYTHONPATH and ensurePythonSrcInPth() writes the
+// path into ._pth instead.
+//
+// opts.unbuffered — when true, folds in PYTHONUNBUFFERED="1". Direct-spawn
+// callers (like _checkSeriesUpdates) that don't add it separately at spawn
+// time need it here; the Downloader/Searcher spawn path adds PYTHONUNBUFFERED
+// itself, so those callers omit it. NOTE: this is deliberately NOT the same
+// env as runMetadataCli, which sets an unconditional PYTHONPATH=<script dir>
+// and no Playwright var — that call site stays hand-rolled on purpose.
+function buildPythonEnv(opts = {}) {
+  const env = {};
+  if (opts.unbuffered) env.PYTHONUNBUFFERED = "1";
+  if (IS_PACKAGED && playwrightDir && fs.existsSync(playwrightDir)) {
+    env.PLAYWRIGHT_BROWSERS_PATH = playwrightDir;
+  }
+  if (IS_PACKAGED && process.platform !== "win32" && pythonSrcDir) {
+    env.PYTHONPATH = pythonSrcDir;
+  }
+  return env;
 }
 
 // ============================================================
@@ -455,23 +514,11 @@ function applyTheme() {
 // ============================================================
 
 function initDownloader() {
-  // Build the extra environment variables for the Python process.
-  //
-  // PLAYWRIGHT_BROWSERS_PATH (all platforms in packaged mode): points
-  // patchright at the bundled Chromium that setup.js downloaded, so
-  // VRF/Playwright handlers don't try to re-download into a system path.
-  //
-  // PYTHONPATH (packaged Unix only): puts resources/python-src/ on
-  // sys.path so aio-dl.py can `import sites` and `import aio_search_cli`.
-  // On Windows the embed Python ignores PYTHONPATH entirely and we use
-  // ensurePythonSrcInPth() to write the same path into ._pth instead.
-  const extraEnv = {};
-  if (IS_PACKAGED && playwrightDir && fs.existsSync(playwrightDir)) {
-    extraEnv.PLAYWRIGHT_BROWSERS_PATH = playwrightDir;
-  }
-  if (IS_PACKAGED && process.platform !== "win32" && pythonSrcDir) {
-    extraEnv.PYTHONPATH = pythonSrcDir;
-  }
+  // Build the extra environment variables for the Python process
+  // (PLAYWRIGHT_BROWSERS_PATH + Unix PYTHONPATH — see buildPythonEnv).
+  // No PYTHONUNBUFFERED here: the Downloader/Searcher _spawn path adds it
+  // at spawn time, so the constructors want just the Playwright/PYTHONPATH pair.
+  const extraEnv = buildPythonEnv();
 
   downloader = new Downloader({
     extraEnv,
@@ -573,9 +620,7 @@ function setupIPC() {
   // ── Start a download ──
   ipcMain.handle("start-download", async (_event, { url, args }) => {
     const settings = history.getSettings();
-    const pythonCmd = settings.pythonCmd || defaultPythonCmd;
-    const scriptPath = settings.scriptPath || defaultScriptPath;
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
 
     // Create the working directory on-demand (not at startup, so we don't
     // leave an empty "AIO Downloader" folder if the user never downloads)
@@ -604,9 +649,7 @@ function setupIPC() {
   // UI via 'search-log' events. UI shows results when this resolves.
   ipcMain.handle("search:run", async (_event, { query, opts }) => {
     const settings = history.getSettings();
-    const pythonCmd = settings.pythonCmd || defaultPythonCmd;
-    const scriptPath = settings.scriptPath || defaultScriptPath;
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
     try { fs.mkdirSync(workingDir, { recursive: true }); } catch {}
 
     try {
@@ -631,9 +674,7 @@ function setupIPC() {
   // ── Resume a download ──
   ipcMain.handle("resume-download", async (_event, { url, tmpDir, format, epubLayout }) => {
     const settings = history.getSettings();
-    const pythonCmd = settings.pythonCmd || defaultPythonCmd;
-    const scriptPath = settings.scriptPath || defaultScriptPath;
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
 
     const downloadId = downloader.resume({
       pythonCmd,
@@ -663,7 +704,7 @@ function setupIPC() {
   // ── Scan for resumable downloads ──
   ipcMain.handle("scan-resumable", async () => {
     const settings = history.getSettings();
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { workingDir } = resolveSpawnPaths(settings);
     const resumable = downloader.scanResumable(workingDir);
 
     const allHistory = history.getAll();
@@ -725,7 +766,7 @@ function setupIPC() {
   // sent to the renderer so it can update that card's cover image.
   ipcMain.handle("scan-library", async () => {
     const settings = history.getSettings();
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { workingDir } = resolveSpawnPaths(settings);
     const mangaDir = getConfiguredOutputRoot(workingDir);
     const thumbCacheDir = path.join(app.getPath("userData"), "thumb-cache");
 
@@ -868,9 +909,7 @@ function setupIPC() {
     }
 
     const settings = history.getSettings();
-    const pythonCmd = settings.pythonCmd || defaultPythonCmd;
-    const workingDir = settings.workingDir || defaultWorkingDir;
-    const scriptPath = settings.scriptPath || defaultScriptPath;
+    const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
 
     if (!fs.existsSync(scriptPath)) {
       return { error: "no_script", message: "aio-dl.py not found at " + scriptPath };
@@ -907,13 +946,9 @@ function setupIPC() {
         // on Unix (mirrors initDownloader; needed because the bundled
         // python-src lives under resources/ and won't be on sys.path
         // otherwise on standard CPython). Windows uses ._pth instead.
-        const extraEnv = { PYTHONUNBUFFERED: "1" };
-        if (IS_PACKAGED && playwrightDir) {
-          extraEnv.PLAYWRIGHT_BROWSERS_PATH = playwrightDir;
-        }
-        if (IS_PACKAGED && process.platform !== "win32" && pythonSrcDir) {
-          extraEnv.PYTHONPATH = pythonSrcDir;
-        }
+        // unbuffered:true folds in PYTHONUNBUFFERED since this spawn adds
+        // env inline (no separate PYTHONUNBUFFERED at the spawn call).
+        const extraEnv = buildPythonEnv({ unbuffered: true });
 
         const proc = spawn(pythonCmd, args, {
           cwd: workingDir,
@@ -1104,7 +1139,7 @@ function setupIPC() {
   // events are dispatched by `kind` in the renderer.
   ipcMain.handle("check-all-updates", async () => {
     const settings = history.getSettings();
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { workingDir } = resolveSpawnPaths(settings);
     const mangaDir = getConfiguredOutputRoot(workingDir);
     const thumbCacheDir = path.join(app.getPath("userData"), "thumb-cache");
 

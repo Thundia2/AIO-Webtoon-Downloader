@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/primitives";
 import { Download } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { LANGUAGES } from "@/lib/constants";
 
 // ── DEFAULT VALUES ──
 // Match aio-dl.py's defaults so you can start a basic download
@@ -133,20 +134,7 @@ const FORMATS = [
   { value: "none", label: "None", desc: "Images only" },
 ];
 
-const LANGUAGES = [
-  { value: "en", label: "English" },
-  { value: "ja", label: "Japanese" },
-  { value: "ko", label: "Korean" },
-  { value: "zh", label: "Chinese" },
-  { value: "es", label: "Spanish" },
-  { value: "fr", label: "French" },
-  { value: "pt-br", label: "Portuguese (BR)" },
-  { value: "de", label: "German" },
-  { value: "it", label: "Italian" },
-  { value: "ru", label: "Russian" },
-  { value: "ar", label: "Arabic" },
-  { value: "tr", label: "Turkish" },
-];
+// LANGUAGES moved to @/lib/constants (shared with SearchTab + SettingsTab).
 
 function formDefaults(settings) {
   return { ...DEFAULT_FORM, ...(settings?.defaults || {}) };

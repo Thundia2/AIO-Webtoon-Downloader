@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -112,9 +111,7 @@ class TCBScansSiteHandler(BaseSiteHandler):
             desc = desc_node.get_text(strip=True) if desc_node else ""
             
             # Parse chapter number
-            # Regex: \d+.?\d+$
-            match = re.search(r"(\d+(?:\.\d+)?)", raw_title)
-            chap_num = match.group(1) if match else "0"
+            chap_num = self._chapter_number_from_text(raw_title) or "0"
             
             # Construct full title
             full_title = raw_title
@@ -193,53 +190,44 @@ class TCBScansSiteHandler(BaseSiteHandler):
                 continue
             by_href.setdefault(href, []).append(a)
 
-        ql = clean.lower()
-        query_tokens = set(t for t in ql.split() if t)
-
-        scored: List = []
-        for href, anchor_list in by_href.items():
-            # Pick the title-text anchor (has non-empty text); fall back to
-            # the image's alt attribute on the image-only anchor.
-            text_anchor = next(
-                (a for a in anchor_list if a.get_text(strip=True)), None
-            )
-            img_anchor = next(
-                (a for a in anchor_list if a.find("img")), None
-            )
-            title = ""
-            cover = None
-            if text_anchor:
-                title = text_anchor.get_text(strip=True)
-            if img_anchor:
-                img = img_anchor.find("img")
-                if img:
-                    if not title:
-                        title = (img.get("alt") or "").strip()
-                    src = img.get("src")
-                    if src:
-                        cover = src if src.startswith("http") else urljoin(self._BASE_URL, src)
-            if not title:
-                continue
-            tl = title.lower()
-            if ql in tl:
-                relevance = 1.0
-            elif query_tokens and all(tok in tl for tok in query_tokens):
-                relevance = 0.7
-            else:
-                continue
-            scored.append((relevance, title, href, cover))
-
-        scored.sort(key=lambda x: -x[0])
+        # Extract (title, cover) per catalog anchor, then rank via the shared
+        # client-side filter (grep _rank_client_filter_hits). Empty-title
+        # entries are dropped before scoring, exactly as before.
+        def _candidates():
+            for href, anchor_list in by_href.items():
+                # Pick the title-text anchor (has non-empty text); fall back to
+                # the image's alt attribute on the image-only anchor.
+                text_anchor = next(
+                    (a for a in anchor_list if a.get_text(strip=True)), None
+                )
+                img_anchor = next(
+                    (a for a in anchor_list if a.find("img")), None
+                )
+                title = ""
+                cover = None
+                if text_anchor:
+                    title = text_anchor.get_text(strip=True)
+                if img_anchor:
+                    img = img_anchor.find("img")
+                    if img:
+                        if not title:
+                            title = (img.get("alt") or "").strip()
+                        src = img.get("src")
+                        if src:
+                            cover = src if src.startswith("http") else urljoin(self._BASE_URL, src)
+                if not title:
+                    continue
+                yield title, (title, href, cover)
 
         hits: List[SearchHit] = []
-        for idx, (relevance, title, href, cover) in enumerate(scored[:limit]):
-            url_full = urljoin(self._BASE_URL, href)
-            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
+        for raw_score, (title, href, cover) in self._rank_client_filter_hits(
+            clean, _candidates(), limit=limit
+        ):
             hits.append(
                 SearchHit(
                     site=self.name,
                     title=title,
-                    url=url_full,
+                    url=urljoin(self._BASE_URL, href),
                     cover=cover,
                     alt_titles=[],
                     year=None,

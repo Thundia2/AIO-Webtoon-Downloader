@@ -53,7 +53,7 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import quote_plus, urljoin, urlparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 
 from .base import (
     AssetSpec,
@@ -92,20 +92,7 @@ class TapasSiteHandler(BaseSiteHandler):
     name = "tapas"
     domains = ("tapas.io",)
 
-    def __init__(self) -> None:
-        super().__init__()
-        try:
-            import lxml  # type: ignore  # noqa: F401
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ----------------------------------------------------------------- helpers
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html or "", self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html or "", "html.parser")
 
     @staticmethod
     def _slug_from_url(url: str) -> Optional[str]:

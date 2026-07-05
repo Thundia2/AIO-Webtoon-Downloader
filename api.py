@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -76,19 +78,34 @@ def _allowed_image_url(url: str) -> bool:
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return False
     host = parsed.hostname.lower()
-    if host in {"localhost", "127.0.0.1", "::1"}:
-        return False
-    if host.startswith("10.") or host.startswith("192.168.") or host.startswith("169.254."):
-        return False
-    # MISC-4: block the 172.16.0.0/12 private range (172.16.x – 172.31.x), which
-    # the prefix checks above missed. Matches the manual-prefix style used here.
-    if host.startswith("172."):
+    # SSRF guard: resolve the host to an IP and reject internal targets via the
+    # stdlib ipaddress module (covers IPv4 AND IPv6 uniformly — loopback incl.
+    # ::1/0.0.0.0, RFC1918 10/172.16-31/192.168, link-local 169.254/fe80::/10,
+    # ULA fc00::/7, reserved, unspecified, multicast — far more than the old
+    # string-prefix octet checks, which missed all IPv6 and 0.0.0.0). A bare IP
+    # literal is parsed directly; a name is resolved via DNS. Resolution failure
+    # is treated as NOT allowed (safest: an unresolvable host can't be fetched
+    # anyway, and this preserves the function's existing "bad input -> False").
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
         try:
-            second_octet = int(host.split(".")[1])
-        except (IndexError, ValueError):
-            second_octet = -1
-        if 16 <= second_octet <= 31:
+            ip = ipaddress.ip_address(socket.gethostbyname(host))
+        except (OSError, ValueError):
             return False
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_unspecified
+        or ip.is_multicast
+    ):
+        return False
+    # Advisory only: the handler-domain allowlist below does not gate the result
+    # (both the match and the fall-through return True). Any non-internal public
+    # host is permitted, matching prior behavior; the SSRF rejection above is the
+    # real guard. Left intact intentionally.
     for handler in getattr(sites, "_REGISTERED_HANDLERS", []):
         for domain in getattr(handler, "domains", ()) or ():
             if host == domain or host.endswith("." + domain):

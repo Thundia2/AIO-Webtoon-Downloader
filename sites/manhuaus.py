@@ -31,11 +31,9 @@ class ManhuaUSSiteHandler(BaseSiteHandler):
         slug = url.rstrip("/").split("/")[-1]
         return SiteComicContext(comic={"hid": slug, "title": title, "desc": description, "cover": cover, "genres": genres, "url": url}, title=title, identifier=slug, soup=soup)
     def get_chapters(self, context: SiteComicContext, scraper, language: str, make_request) -> List[Dict]:
-        import re
         soup = context.soup or self._make_soup(make_request(context.comic.get("url"), scraper).text)
         def clean_num(t):
-            m = re.search(r"(\d+(?:\.\d+)?)", t)
-            return m.group(1) if m else t
+            return self._chapter_number_from_text(t) or t
         return [{"hid": link.get("href"), "chap": clean_num(link.get_text(strip=True)), "title": link.get_text(strip=True), "url": link.get("href"), "uploaded": None} for li in soup.select(".wp-manga-chapter") if (link := li.select_one("a"))]
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         url = chapter.get("url")

@@ -455,12 +455,7 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             selector = self.chapter_selector
         else:
             selector = "#chapterlist li, .eplister li, .chapter-list li"
-            
-        if self._chapter_filter:
-            # Apply filter to selector(s)
-            # This is a bit complex if selector is a list string, but assuming simple cases
-            pass 
-        
+
         for item in soup.select(selector):
             # Check if item is 'a' or 'li'
             if item.name == 'a':

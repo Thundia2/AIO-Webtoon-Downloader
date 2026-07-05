@@ -676,11 +676,11 @@ class MangaFireSiteHandler(BaseSiteHandler):
         ignores the size token (all variants return the same 280×400
         image) so removing it at least gets us the full cover.
 
-        Note: this is the cover-FALLBACK path. BaseSiteHandler.probe_sample_image
-        first calls _probe_chapter_image which uses our get_chapter_images
-        (VRF-protected) for an accurate chapter-image measurement — that's
-        the preferred signal. Cover only fires when chapter-fetch fails (CF
-        challenge on series page, VRF init failure, Playwright unavailable).
+        Note: this is the cover-FALLBACK path. The orchestrator first calls
+        BaseSiteHandler._probe_chapter_aggregate which uses our get_chapter_images
+        (VRF-protected) for an accurate breadth-sampled measurement — that's
+        the preferred signal. Cover only fires when the aggregate returns None
+        (CF challenge on series page, VRF init failure, Playwright unavailable).
         Even with the @<digits> strip, cover stays at 280×400 which
         underranks MangaFire vs MangaDex/MangaReader covers — so the chapter
         path winning is important. Cross-file: search() returns hit.cover

@@ -40,7 +40,15 @@ class MangaBuddySiteHandler(MadaraSiteHandler):
             "li.wp-manga-chapter",
             "div#chapterlist li",
         )
-        
+
+        # Override reader selectors
+        self.reader_selectors = (
+            "div#chapter-images div.chapter-image img",
+            "#chapter-images img",
+            "div#chapter-images img",
+            "div.reading-content img",
+        )
+
     def get_chapter_images(self, chapter: dict, scraper, make_request) -> list[str]:
         """
         Extract chapter images from MangaBuddy.
@@ -60,14 +68,6 @@ class MangaBuddySiteHandler(MadaraSiteHandler):
         
         # Fallback to default selector-based extraction
         return super().get_chapter_images(chapter, scraper, make_request)
-
-        # Override reader selectors
-        self.reader_selectors = (
-            "div#chapter-images div.chapter-image img",
-            "#chapter-images img",
-            "div#chapter-images img",
-            "div.reading-content img",
-        )
 
     def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
         response = make_request(url, scraper)

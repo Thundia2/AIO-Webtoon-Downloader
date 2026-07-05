@@ -46,7 +46,7 @@ import {
   StopCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui/primitives";
-import { cn } from "@/lib/utils";
+import { cn, chaptersToRangeString, getInitials } from "@/lib/utils";
 
 // ── Section state → presentational metadata ──
 // Single source for the per-section accent so the chip, the section header,
@@ -83,27 +83,10 @@ const SECTION_THEME = {
 };
 
 // ── Helpers ──
-
-// Turn ["51","52","53","55","60"] into "51-53, 55, 60"
-// Local copy of LibraryTab's helper so this component can stand alone.
-function chaptersToRangeString(chapters) {
-  if (!chapters || chapters.length === 0) return "";
-  const nums = chapters.map(Number).sort((a, b) => a - b);
-  const ranges = [];
-  let start = nums[0];
-  let end = nums[0];
-  for (let i = 1; i < nums.length; i++) {
-    if (nums[i] - end <= 1.001) {
-      end = nums[i];
-    } else {
-      ranges.push(start === end ? String(start) : `${start}-${end}`);
-      start = nums[i];
-      end = nums[i];
-    }
-  }
-  ranges.push(start === end ? String(start) : `${start}-${end}`);
-  return ranges.join(", ");
-}
+// chaptersToRangeString + getInitials are shared from @/lib/utils (imported
+// above). formatDuration below is LOCAL and intentionally distinct from the
+// utils one — it renders the scan duration as "Nms"/"N.Ns"/"MmSSs", which is
+// a different format than utils.formatDuration ("Ns"/"Mm Ss").
 
 function formatDuration(ms) {
   if (!ms || ms < 1000) return `${ms}ms`;
@@ -127,14 +110,10 @@ function siteLabel(site) {
 // back to a two-letter monogram block on missing/erroring image.
 function RowCover({ title, cover }) {
   const [errored, setErrored] = useState(false);
-  const initials = useMemo(() => {
-    return title
-      .split(/[\s\-_]+/)
-      .filter(Boolean)
-      .slice(0, 2)
-      .map((w) => (w[0] || "").toUpperCase())
-      .join("") || "??";
-  }, [title]);
+  const initials = useMemo(
+    () => getInitials(title, { splitUnderscore: true, filterEmpty: true, fallback: "??" }),
+    [title]
+  );
 
   if (cover && !errored) {
     return (

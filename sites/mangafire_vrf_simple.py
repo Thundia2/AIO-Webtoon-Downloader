@@ -2155,9 +2155,6 @@ class _VRFBridge:
         except Exception:
             pass
 
-    def debug_state(self) -> str:
-        return _vrf_call("debug_state")
-
     def close(self) -> None:
         try:
             _vrf_call("close")

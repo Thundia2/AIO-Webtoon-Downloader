@@ -5,7 +5,7 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SiteComicContext
 
@@ -16,21 +16,7 @@ class ArtlapsaSiteHandler(BaseSiteHandler):
 
     _BASE_URL = "https://artlapsa.com"
 
-    def __init__(self) -> None:
-        super().__init__()
-        try:
-            from lxml import etree  # noqa: F401
-
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ---------------------------------------------------------------- helpers
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html, self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html, "html.parser")
 
     def _normalize_url(self, url: str) -> str:
         if not url.lower().startswith("http"):
@@ -63,22 +49,6 @@ class ArtlapsaSiteHandler(BaseSiteHandler):
             return self._series_id_from_url(href)
         return None
 
-    def _meta_content(
-        self,
-        soup: BeautifulSoup,
-        name: Optional[str] = None,
-        property_name: Optional[str] = None,
-    ) -> Optional[str]:
-        if name:
-            tag = soup.find("meta", attrs={"name": name})
-            if tag and tag.get("content"):
-                return tag["content"].strip()
-        if property_name:
-            tag = soup.find("meta", attrs={"property": property_name})
-            if tag and tag.get("content"):
-                return tag["content"].strip()
-        return None
-
     def _extract_series_title(self, soup: BeautifulSoup) -> Optional[str]:
         hidden = soup.select_one("#serieTitle")
         if hidden and hidden.get("value"):
@@ -96,12 +66,7 @@ class ArtlapsaSiteHandler(BaseSiteHandler):
         return None
 
     def _extract_chapter_number(self, text: Optional[str]) -> Optional[str]:
-        if not text:
-            return None
-        match = re.search(r"(\d+(?:\.\d+)?)", text.replace(",", "."))
-        if match:
-            return match.group(1)
-        return None
+        return self._chapter_number_from_text(text, decimal_comma=True)
 
     def _chapter_sort_key(self, chapter: Dict) -> float:
         chap = chapter.get("chap")

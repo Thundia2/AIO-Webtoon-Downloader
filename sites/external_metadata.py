@@ -478,6 +478,22 @@ _AUTHOR_PLACEHOLDERS = frozenset(
 )
 
 
+def _load_rapidfuzz():
+    """Lazy-import (fuzz, default_process) from rapidfuzz. Module-wide pattern so
+    a packager who strips rapidfuzz breaks only --metadata-source enrichment,
+    with a clear ImportError. grep callers: _author_match_score,
+    _score_candidate_detail."""
+    try:
+        from rapidfuzz import fuzz
+        from rapidfuzz.utils import default_process
+    except ImportError as exc:
+        raise ImportError(
+            "rapidfuzz is required for --metadata-source enrichment. "
+            "Install with: pip install rapidfuzz"
+        ) from exc
+    return fuzz, default_process
+
+
 def _author_match_score(
     source_authors: Optional[List[str]], candidate: Dict[str, Any]
 ) -> Optional[float]:
@@ -491,14 +507,7 @@ def _author_match_score(
     empty/<3-char site strings are dropped so a bare "Unknown" can't match an
     AniList "Unknown". grep callers: _pick_best_candidate, enrich_from_anilist.
     """
-    try:
-        from rapidfuzz import fuzz
-        from rapidfuzz.utils import default_process
-    except ImportError as exc:
-        raise ImportError(
-            "rapidfuzz is required for --metadata-source enrichment. "
-            "Install with: pip install rapidfuzz"
-        ) from exc
+    fuzz, default_process = _load_rapidfuzz()
     srcs: List[str] = []
     for author in source_authors or []:
         author = str(author or "").strip()
@@ -532,14 +541,7 @@ def _score_candidate_detail(
     rapidfuzz lazy-imported here (module-wide pattern) so a packager who strips
     it breaks only enrichment, with a clear ImportError.
     """
-    try:
-        from rapidfuzz import fuzz
-        from rapidfuzz.utils import default_process
-    except ImportError as exc:
-        raise ImportError(
-            "rapidfuzz is required for --metadata-source enrichment. "
-            "Install with: pip install rapidfuzz"
-        ) from exc
+    fuzz, default_process = _load_rapidfuzz()
     if not source_titles:
         return 0.0, False
     primary, synonyms = _candidate_titles_split(candidate)

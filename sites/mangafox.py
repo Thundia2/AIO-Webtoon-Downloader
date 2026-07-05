@@ -4,7 +4,7 @@ import datetime as dt
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SiteComicContext
 
@@ -30,21 +30,7 @@ class MangaFoxSiteHandler(BaseSiteHandler):
     _BASE_URL = "https://fanfox.net"
     _MOBILE_URL = "https://m.fanfox.net"
 
-    def __init__(self) -> None:
-        super().__init__()
-        try:
-            import lxml  # type: ignore  # noqa: F401
-
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ----------------------------------------------------------------- helpers
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html, self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html, "html.parser")
 
     def configure_session(self, scraper, args) -> None:
         scraper.headers.setdefault("Referer", self._BASE_URL + "/")
