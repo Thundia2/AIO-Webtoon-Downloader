@@ -22,6 +22,15 @@ const fs = require("fs");
 const { spawn } = require("child_process");
 const { Downloader } = require("./downloader");
 const { Searcher } = require("./searcher");
+// Resource Limits (Settings → Max network / Max CPU usage). Resolved HERE, the
+// universal live-settings spawn chokepoint, so manual/search/library/resume all
+// honor the CURRENT limit. Hard-override semantics — see resource-limits.js.
+const {
+  applyNetworkLimit,
+  cpuPercentForLevel,
+  searchParallelismForLevel,
+  resumeThrottleFlags,
+} = require("./resource-limits");
 const { HistoryManager } = require("./history");
 const { PythonSetup, isSetupComplete, deleteEnv, PYTHON_VERSION } = require("./setup");
 const { scanLibrary, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, getChaptersOnDevice, getImageChaptersOnDevice } = require("./library");
@@ -626,12 +635,23 @@ function setupIPC() {
     // leave an empty "AIO Downloader" folder if the user never downloads)
     try { fs.mkdirSync(workingDir, { recursive: true }); } catch {}
 
+    // Resource Limits (hard override): a Max-network preset REPLACES the
+    // image-concurrency family; a Max-CPU preset sets --max-cpu-percent (only
+    // when < 100 so Unlimited spawns stay byte-identical to before). Applied
+    // here — the single main-side spawn chokepoint — so every download path
+    // (New tab, search result, library UpdatesCenter) honors the current level.
+    let throttledArgs = applyNetworkLimit(args, settings.networkLimit);
+    const cpuPct = cpuPercentForLevel(settings.cpuLimit);
+    if (cpuPct < 100) {
+      throttledArgs = { ...throttledArgs, maxCpuPercent: cpuPct };
+    }
+
     const downloadId = downloader.start({
       pythonCmd,
       scriptPath,
       workingDir,
       url,
-      args,
+      args: throttledArgs,
     });
 
     return { downloadId };
@@ -652,13 +672,24 @@ function setupIPC() {
     const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
     try { fs.mkdirSync(workingDir, { recursive: true }); } catch {}
 
+    // Resource Limits: a Max-network preset caps the search fan-out
+    // (--search-parallelism). Hard override — the preset wins when a level is
+    // active; Unlimited passes the caller's value through (null → Python default 6).
+    const throttledOpts = {
+      ...opts,
+      searchParallelism: searchParallelismForLevel(
+        opts ? opts.searchParallelism : undefined,
+        settings.networkLimit,
+      ),
+    };
+
     try {
       const result = await searcher.runSearch({
         pythonCmd,
         scriptPath,
         workingDir,
         query,
-        opts,
+        opts: throttledOpts,
       });
       return { ok: true, result };
     } catch (err) {
@@ -676,6 +707,15 @@ function setupIPC() {
     const settings = history.getSettings();
     const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
 
+    // Resource Limits on resume: honor the CURRENT limit, NOT the value saved in
+    // run_params.json — the resume may run in a different environment (slower
+    // link, busier machine). resumeThrottleFlags emits concrete current values
+    // (network 4 knobs + --max-cpu-percent); downloader.resume appends them to
+    // the --restore-parameters spawn line and aio-dl.py keeps explicit CLI dests
+    // over the restored ones (grep _user_set_dests). None are resume-gating, so
+    // this never re-downloads completed chapters.
+    const resourceFlags = resumeThrottleFlags(settings);
+
     const downloadId = downloader.resume({
       pythonCmd,
       scriptPath,
@@ -684,6 +724,7 @@ function setupIPC() {
       tmpDir,
       format,
       epubLayout,
+      resourceFlags,
     });
 
     return { downloadId };
