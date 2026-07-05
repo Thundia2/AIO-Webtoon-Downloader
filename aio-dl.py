@@ -7122,10 +7122,23 @@ def _refresh_library_metadata(args) -> int:
 
         if not comic_data.get("anilist_id"):
             best = comic_data.pop("_anilist_best_score", 0.0) or 0.0
-            print(
-                f"  [-] {title}: no confident AniList match "
-                f"(best {best:.0f}) — left unchanged"
-            )
+            if comic_data.pop("_anilist_gate_rejected", False):
+                # LINE Webtoon corroboration gate: author disagreed + synonym-only
+                # hit. NOTE this path does NOT rewrite the existing files, so a
+                # previously-poisoned series stays poisoned on disk — the gate only
+                # stops re-applying. Full repair = re-download the series (metadata
+                # is re-fetched from the site; the .aio_series.json writer nulls the
+                # anilist fields via _anilist_meta_fields).
+                print(
+                    f"  [-] {title}: AniList match rejected — site author "
+                    f"disagrees and title {best:.0f} was a synonym-only hit "
+                    f"— left unchanged"
+                )
+            else:
+                print(
+                    f"  [-] {title}: no confident AniList match "
+                    f"(best {best:.0f}) — left unchanged"
+                )
             skipped.append(title)
             continue
 
@@ -9405,12 +9418,24 @@ def main():
                 )
             else:
                 best_score = comic_data.pop("_anilist_best_score", 0.0) or 0.0
-                log_verbose(
-                    f"  AniList enrichment: no confident match for "
-                    f"'{comic_data.get('title', '?')}' "
-                    f"(best rapidfuzz score {best_score:.1f} < 75 "
-                    f"threshold) — continuing with site-only metadata"
-                )
+                if comic_data.pop("_anilist_gate_rejected", False):
+                    # LINE Webtoon corroboration gate rejected a title-plausible
+                    # candidate (author disagreed AND it was a synonym-only hit —
+                    # the unOrdinary poison class). best_score is ABOVE 75 here.
+                    log_verbose(
+                        f"  AniList enrichment: rejected best candidate for "
+                        f"'{comic_data.get('title', '?')}' (title score "
+                        f"{best_score:.1f} cleared 75 but the site author "
+                        f"disagreed and the match was synonym-only) — "
+                        f"continuing with site-only metadata"
+                    )
+                else:
+                    log_verbose(
+                        f"  AniList enrichment: no confident match for "
+                        f"'{comic_data.get('title', '?')}' "
+                        f"(best rapidfuzz score {best_score:.1f} < 75 "
+                        f"threshold) — continuing with site-only metadata"
+                    )
         except Exception as exc:
             log_verbose(
                 f"  AniList enrichment failed (continuing with "

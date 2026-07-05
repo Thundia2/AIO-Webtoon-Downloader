@@ -676,6 +676,68 @@ def _pick_best_candidate(
     return chosen[5], chosen[4]
 
 
+# --- Internal: per-site trust gate -----------------------------------------
+
+# Sites whose author metadata is reliable enough to use as a MATCH-REJECTION
+# signal, not merely the tiebreak/booster it is everywhere else. LINE Webtoon
+# exposes a clean author meta tag (sites/linewebtoon.py, grep
+# 'com-linewebtoon:webtoon:author') and most of its originals simply aren't on
+# AniList, so a title-only hit whose author disagrees is almost always a synonym
+# collision — e.g. "unOrdinary" (by uru-chan) hitting the Japanese manga "Kanojo
+# Iro no Kanojo" (id 40442) purely through its synonym "Unordinary Life" (WRatio
+# 90). A frozenset so extending the policy to tapas / other webtoon handlers
+# later is a one-line change. grep caller: _match_is_trustworthy_for_site.
+_AUTHOR_GATED_SITES = frozenset({"linewebtoon"})
+
+
+def _match_is_trustworthy_for_site(
+    handler_name: str,
+    media: Dict[str, Any],
+    site_scoring_titles: List[str],
+    source_authors: Optional[List[str]],
+) -> bool:
+    """Author/primary-title CORROBORATION gate for author-reliable sites.
+
+    Returns False ⇒ the caller MUST reject this AniList match and fall back to
+    the site's own metadata. Always True for handlers NOT in _AUTHOR_GATED_SITES,
+    so every other site keeps its "author is a booster, never a filter" behavior
+    (the Eleceed/Tekyuu romanization-difference protection documented on
+    ANILIST_AUTHOR_MATCH_THRESHOLD stays intact library-wide).
+
+    For a gated site a match is trusted iff EITHER corroborating signal holds:
+      - author matches   — site author vs candidate staff ≥ ANILIST_AUTHOR_MATCH_
+        THRESHOLD (the normal author-match test), OR
+      - primary-title hit — the candidate matched on a PRIMARY title, not a
+        synonym only (_score_candidate_detail's primary_hit).
+    It is rejected only when BOTH fail: the author is absent or disagrees AND the
+    sole title basis is a synonym. That is precisely the unOrdinary poison class
+    (author 36 < 85, primary_hit False). Eleceed survives it — the site author
+    "Jeho Son / ZHENA" scores 67 < 85 against AniList's "Jae-Ho Son / Hye-Jin
+    Kim" (ZHENA is Hye-Jin Kim's pen name; Jeho vs Jae-Ho differ), but the
+    PRIMARY title "Eleceed" is an exact 100 → primary_hit True → trusted.
+
+    CRITICAL: site_scoring_titles MUST be the SITE title(s) only (the handler's
+    live title, or the folder/meta title on refresh) — NEVER the cached
+    alt_names / anilist_synonyms. A poisoned .aio_series.json carries the wrong
+    entry's OWN synonyms (unOrdinary's are "Kanojoiro no Kanojo", "Unordinary
+    Life"), and --refresh-library-metadata feeds them back in as alt_names; if
+    those reached the primary-hit test they would score ~100 against the poison
+    entry's primary title and fake corroboration, defeating the gate on exactly
+    the refresh path meant to repair the poison. grep caller: enrich_from_anilist.
+    """
+    if handler_name not in _AUTHOR_GATED_SITES:
+        return True
+    if not site_scoring_titles:
+        # No site title to corroborate against (pathological). Don't block —
+        # the caller's normal title gate already vetted the candidate.
+        return True
+    author = _author_match_score(source_authors, media)
+    if author is not None and author >= ANILIST_AUTHOR_MATCH_THRESHOLD:
+        return True
+    _, primary_hit = _score_candidate_detail(site_scoring_titles, media)
+    return primary_hit
+
+
 # --- Internal: derived fields ----------------------------------------------
 
 def _derive_media_format(country_code: Optional[str]) -> Optional[str]:
@@ -938,6 +1000,20 @@ def enrich_from_anilist(
     # authorship, in which case author scoring is skipped end to end.
     src_authors = [a for a in (comic_data.get("authors") or []) if a]
 
+    # Corroboration-gate titles for author-reliable sites (_AUTHOR_GATED_SITES).
+    # The SITE title(s) ONLY — never comic_data["alt_names"], which on the
+    # refresh path is the poisoned entry's own anilist_synonyms and would fake a
+    # primary-title hit (see _match_is_trustworthy_for_site's CRITICAL note).
+    # Empty for non-gated sites / titleless input, in which case the gate is a
+    # no-op. Cross-file: consumed at every _apply_anilist_match site below.
+    gate_titles: List[str] = []
+    _seen_gate: set = set()
+    for _t in (comic_data.get("title"), _clean_search_title(str(comic_data.get("title") or ""))):
+        _t = str(_t or "").strip()
+        if _t and _t.lower() not in _seen_gate:
+            _seen_gate.add(_t.lower())
+            gate_titles.append(_t)
+
     # Cached-ID fast path (+ self-heal). A cached anilist_id normally means one
     # GraphQL hit and we're done. BUT pre-fix caches can point at the WRONG
     # same-titled series (the Fly-Me-to-the-Moon / Fairy-Tail bug), and a pure
@@ -954,11 +1030,21 @@ def enrich_from_anilist(
         if media:
             cached_author = _author_match_score(src_authors, media)
             if cached_author is None or cached_author >= ANILIST_AUTHOR_MATCH_THRESHOLD:
-                _apply_anilist_match(comic_data, media, tag_min_rank)
-                return comic_data
-            # Author disagrees with the cached entry — suspect. Remember it and
-            # fall through; the tail decides the cache-vs-search winner.
-            selfheal_cached_media = media
+                if _match_is_trustworthy_for_site(
+                    handler_name, media, gate_titles, src_authors
+                ):
+                    _apply_anilist_match(comic_data, media, tag_min_rank)
+                    return comic_data
+                # Author-gated site (linewebtoon) whose cached entry matched only
+                # on a synonym and whose author doesn't corroborate: distrust the
+                # cache. Fall through to search but DO NOT stash it — the tail must
+                # not resurrect this poison via the self-heal restore. (Reaches
+                # here only when cached_author is None, i.e. the poison entry has
+                # no staff; a real author match would have returned above.)
+            else:
+                # Author disagrees with the cached entry — suspect. Remember it and
+                # fall through; the tail decides the cache-vs-search winner.
+                selfheal_cached_media = media
         # Stale ID / transient failure / author-suspect: fall through. If the
         # search also yields nothing the tail restores selfheal_cached_media (if
         # any) or leaves comic_data unchanged, and the caller logs accordingly.
@@ -1014,8 +1100,12 @@ def enrich_from_anilist(
         _add_query(_shortened_prefix(cleaned or raw))
     if not scoring_titles:
         # No title to search on. If we bypassed a cached entry for self-heal,
-        # restore it rather than dropping enrichment entirely.
-        if selfheal_cached_media is not None:
+        # restore it rather than dropping enrichment entirely — but still honor
+        # the per-site trust gate (a no-op here: gate_titles is empty with no
+        # title, so it passes; kept for uniformity should this path gain a title).
+        if selfheal_cached_media is not None and _match_is_trustworthy_for_site(
+            handler_name, selfheal_cached_media, gate_titles, src_authors
+        ):
             _apply_anilist_match(comic_data, selfheal_cached_media, tag_min_rank)
         return comic_data
 
@@ -1086,6 +1176,21 @@ def enrich_from_anilist(
                 chosen = selfheal_cached_media
     elif selfheal_cached_media is not None:
         chosen = selfheal_cached_media
+
+    # Per-site trust gate (author-reliable sites only — currently linewebtoon).
+    # The composite ranker + self-heal above optimize for the RIGHT same-title
+    # entry, but they never REJECT a title-plausible match; on LINE Webtoon a
+    # synonym collision with a disagreeing author (unOrdinary → "Kanojo Iro no
+    # Kanojo" via its "Unordinary Life" synonym) is poison, not a match. Drop it
+    # here so the caller keeps the site's own metadata. Flag the rejection
+    # (transient, underscore-prefixed → writers ignore it) so the caller's log
+    # distinguishes "author-gate reject" from "nothing cleared the 75 floor".
+    # No-op for every non-gated site: _match_is_trustworthy_for_site returns True.
+    if chosen is not None and not _match_is_trustworthy_for_site(
+        handler_name, chosen, gate_titles, src_authors
+    ):
+        comic_data["_anilist_gate_rejected"] = True
+        chosen = None
 
     if chosen is None:
         return comic_data
