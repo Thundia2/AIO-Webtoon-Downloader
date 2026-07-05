@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import datetime as dt
 import os
 import re
 import statistics
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, FeatureNotFound
 
 from ._image_io import finalize_pending_image
+
+# Preferred BeautifulSoup parser, detected once at import. lxml is faster and
+# more lenient than the stdlib parser; handlers used to copy this probe into
+# every __init__ + a _make_soup override (grep _make_soup). BaseSiteHandler
+# ._make_soup centralizes both.
+try:
+    import lxml as _lxml  # noqa: F401
+    _DEFAULT_SOUP_PARSER = "lxml"
+except Exception:
+    _DEFAULT_SOUP_PARSER = "html.parser"
 
 # curl_cffi powers the fast image-download path used by handlers that opt into
 # SUPPORTS_FAST_DOWNLOAD. HTTP/2 multiplex over a single keep-alive
@@ -193,6 +204,13 @@ class BaseSiteHandler:
 
     name: str = "base"
     domains: tuple[str, ...] = ()
+    # Preferred BeautifulSoup parser for _make_soup. None -> module default
+    # (_DEFAULT_SOUP_PARSER, lxml if importable). Subclasses needing a specific
+    # parser set this; most handlers just inherit _make_soup.
+    _parser: Optional[str] = None
+    # Shared chapter-number extractor for _chapter_number_from_text (grep it).
+    # ~11 handlers inlined this exact `(\d+(?:\.\d+)?)` group; now one regex.
+    _CHAPTER_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
     # When True, the orchestrator's image-quality probe phase clamps to a
     # SINGLE sample for low-title-match results (below
     # EXPENSIVE_PROBE_QUICK_THRESHOLD in search_orchestrator.py). Default
@@ -271,6 +289,129 @@ class BaseSiteHandler:
     # request before Referer/User-Agent so those two attributes can override
     # entries here if both are set.
     FAST_DL_EXTRA_HEADERS: Dict[str, str] = {}
+
+    def _make_soup(self, html: str) -> BeautifulSoup:
+        """Parse HTML with the preferred parser (``self._parser`` or the module
+        default — lxml if importable, else html.parser), falling back to
+        html.parser if the chosen parser isn't installed. Handlers call this
+        instead of ``BeautifulSoup(...)`` directly; it replaces the per-handler
+        lxml-probe ``__init__`` + ``_make_soup`` copy ~11 handlers carried."""
+        parser = self._parser or _DEFAULT_SOUP_PARSER
+        try:
+            return BeautifulSoup(html or "", parser)
+        except FeatureNotFound:
+            return BeautifulSoup(html or "", "html.parser")
+
+    def _chapter_number_from_text(
+        self, text: Optional[str], *, decimal_comma: bool = False
+    ) -> Optional[str]:
+        """Extract the first ``N`` / ``N.M`` run from a chapter label as a string.
+
+        Centralizes the ``_CHAPTER_NUM_RE`` search that ~11 handlers inlined
+        (madara, mangakatana, weebcentral, mangareader, mangapill, artlapsa,
+        asmotoon, tcbscans, atsumaru, manhuaus, manhuaplus; grep
+        _chapter_number_from_text). ``decimal_comma=True`` first maps ``','`` ->
+        ``'.'`` for sites that write decimal chapters as ``"12,5"`` (asmotoon,
+        artlapsa). Returns ``None`` for empty/None/no-digit input; callers that
+        want the raw label on a miss do ``... or title``.
+        """
+        if not text:
+            return None
+        if decimal_comma:
+            text = text.replace(",", ".")
+        match = self._CHAPTER_NUM_RE.search(text)
+        return match.group(1) if match else None
+
+    def _meta_content(
+        self,
+        soup: BeautifulSoup,
+        name: Optional[str] = None,
+        property_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return a stripped ``<meta>`` content value by ``name`` or ``property``.
+
+        Tries ``name`` first, then ``property_name`` (either may be omitted).
+        Consolidates the byte-identical copies asmotoon (formerly ``_meta``),
+        artlapsa, and assortedscans each carried; grep _meta_content.
+        """
+        if name:
+            tag = soup.find("meta", attrs={"name": name})
+            if tag and tag.get("content"):
+                return tag["content"].strip()
+        if property_name:
+            tag = soup.find("meta", attrs={"property": property_name})
+            if tag and tag.get("content"):
+                return tag["content"].strip()
+        return None
+
+    @staticmethod
+    def _parse_iso_z_timestamp(value: Optional[str]) -> Optional[int]:
+        """Parse an ISO-8601 ``...Z`` timestamp (with or without fractional
+        seconds) to a Unix-epoch ``int``; ``None`` if falsy/unparseable.
+
+        Shared by weebcentral (``_extract_datetime``) and atsumaru
+        (``_parse_chapter_entry``), which both inlined this exact two-format
+        ladder. NOTE: strptime yields a NAIVE datetime, so ``.timestamp()``
+        interprets it in the HOST's local timezone — preserved verbatim from
+        both original call sites. sites/dynasty.py deliberately does NOT use
+        this: it parses a date-only ``%Y-%m-%d`` anchored to UTC with a broad
+        ``except`` (a genuinely different contract, left standalone).
+        """
+        if not value:
+            return None
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+            try:
+                return int(dt.datetime.strptime(value, fmt).timestamp())
+            except ValueError:
+                continue
+        return None
+
+    def _rank_client_filter_hits(
+        self,
+        query: str,
+        candidates: Iterable[Tuple[str, Any]],
+        *,
+        limit: int = 20,
+    ) -> List[Tuple[float, Any]]:
+        """Rank a locally-scraped catalog against ``query`` for sites with no
+        server-side search (asmotoon, assortedscans, flamecomics, zeroscans,
+        tcbscans all fetch their whole catalog page and filter in-process).
+
+        ``candidates`` yields ``(title, payload)`` where ``payload`` is whatever
+        the caller needs to emit a :class:`SearchHit` (an href, a source dict,
+        an ``(href, cover)`` tuple...). Scoring mirrors what those five handlers
+        each inlined: a full-query substring match scores 1.0, every query token
+        present scores 0.7, anything else is dropped. Matches sort best-first and
+        each surviving hit's ``raw_score`` decays with rank position as
+        ``max(0.05, relevance * (1 - idx/n))`` where ``n`` is the total matched
+        count BEFORE truncation to ``limit`` (so trimming the tail can't inflate
+        the kept scores). Returns ``[(raw_score, payload), ...]``; the caller
+        keeps ownership of SearchHit construction — including any post-rank skip
+        (e.g. a missing id) applied in its own emit loop, which leaves the
+        raw_score sequence identical to the pre-refactor inline code.
+        """
+        clean = (query or "").strip()
+        if not clean:
+            return []
+        ql = clean.lower()
+        query_tokens = {t for t in ql.split() if t}
+        scored: List[Tuple[float, Any]] = []
+        for title, payload in candidates:
+            tl = (title or "").lower()
+            if ql in tl:
+                relevance = 1.0
+            elif query_tokens and all(tok in tl for tok in query_tokens):
+                relevance = 0.7
+            else:
+                continue
+            scored.append((relevance, payload))
+        scored.sort(key=lambda item: -item[0])
+        total = len(scored)
+        ranked: List[Tuple[float, Any]] = []
+        for idx, (relevance, payload) in enumerate(scored[:limit]):
+            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, total))))
+            ranked.append((raw_score, payload))
+        return ranked
 
     def _fast_dl_build_headers(self, host: str) -> Dict[str, str]:
         """Build the headers dict sent with every fast-download request.
@@ -779,145 +920,6 @@ class BaseSiteHandler:
           - Cap at `limit` hits to keep the merge step bounded.
         """
         return []
-
-    def probe_sample_image(
-        self, hit: "SearchHit", scraper, make_request
-    ) -> Optional[bytes]:
-        """Return raw bytes of a representative image for image-quality scoring.
-
-        Used by sites/search_orchestrator.py to replace per-site quality_seed
-        priors with measured values. Tries the chapter-image path first
-        (accurate — reflects what the user actually downloads) and falls back
-        to the cover-image path on any failure (faster, broadly available, but
-        biased per-site since cover and chapter-image CDN policies often
-        differ; e.g., MangaFire ships 280×400 covers but full-res chapter
-        pages, while MangaDex ships 690×1000 covers regardless of whether a
-        series is DMCA-hollowed).
-
-        Override when you need:
-          - site-specific cover URL cleanup → override _probe_cover_image
-            (see MangaFire's @<digits> strip).
-          - a custom chapter-fetch path that doesn't go through the standard
-            fetch_comic_context + get_chapters + get_chapter_images interface
-            → override this method directly.
-
-        Returns None on total failure (both chapter and cover paths failed).
-        The orchestrator then falls back to the seed prior.
-        """
-        blob = self._probe_chapter_image(hit, scraper, make_request)
-        if blob:
-            return blob
-        return self._probe_cover_image(hit, scraper, make_request)
-
-    def _probe_chapter_image(
-        self, hit: "SearchHit", scraper, make_request
-    ) -> Optional[bytes]:
-        """Fetch the middle page of a representative chapter for accurate
-        image-quality scoring.
-
-        Default flow uses the standard handler interface:
-          fetch_comic_context → get_chapters → pick middle chapter →
-          get_chapter_images → pick middle page → fetch bytes.
-
-        Handles two get_chapter_images return shapes (interface is currently
-        heterogeneous — base.py's type hint says List[str] but MangaReader
-        returns List[Dict]):
-          - List[str]: URL strings (most handlers). Fetched via scraper.get.
-          - List[Dict] with {"type": "binary_image", "data": bytes, ...}:
-            pre-fetched bytes (currently MangaReader, which descrambles
-            in-handler). Returned as-is.
-
-        Cross-file: orchestrator (sites/search_orchestrator.py:_probe_one)
-        calls this through probe_sample_image inside a thread; failures
-        propagate as None and probe_sample_image falls back to cover.
-
-        Returns None on any failure to keep the cover-fallback path simple.
-        """
-        if not hit or not hit.url:
-            return None
-        try:
-            context = self.fetch_comic_context(hit.url, scraper, make_request)
-        except Exception:
-            return None
-        if context is None:
-            return None
-        try:
-            chapters = self.get_chapters(context, scraper, "en", make_request)
-        except Exception:
-            return None
-        if not chapters:
-            return None
-        chapter = self._pick_representative_chapter(chapters)
-        if chapter is None:
-            return None
-        try:
-            image_items = self.get_chapter_images(chapter, scraper, make_request)
-        except Exception:
-            return None
-        if not image_items:
-            return None
-        item = self._pick_middle_image_item(image_items)
-        if item is None:
-            return None
-        # Pre-fetched binary (MangaReader-style): use the blob directly.
-        if isinstance(item, dict):
-            if item.get("type") == "binary_image":
-                blob = item.get("data")
-                if isinstance(blob, (bytes, bytearray)) and len(blob) >= 256:
-                    return bytes(blob)
-            return None
-        # URL string: fetch it directly. We use scraper.get (not make_request)
-        # because search_mr's 5xx-as-exception translation isn't useful for
-        # image bytes — we just want the file or a clear failure.
-        if isinstance(item, str) and item:
-            try:
-                response = scraper.get(item, timeout=15)
-                if response.status_code >= 400:
-                    return None
-                data = response.content
-                if not data or len(data) < 256:
-                    return None
-                return data
-            except Exception:
-                return None
-        return None
-
-    @staticmethod
-    def _pick_representative_chapter(chapters: List[Dict]) -> Optional[Dict]:
-        """DEPRECATED (kept as back-compat shim for the legacy
-        _probe_chapter_image path at sites/base.py:557 and external
-        callers). New code should use _pick_representative_chapters
-        (plural) which returns N chapters for breadth sampling — the
-        v5 probe pipeline samples 1 page from each of 8 chapters
-        instead of 5 pages from 1 chapter.
-
-        Picks a chapter from the middle of the list, preferring whole
-        numbers (4.5, 60.1 → omake/extras tend to have atypical page
-        counts; whole-numbered are more representative).
-
-        Chapter lists arrive in different orders per handler (MangaDex
-        ASC, MangaFire DESC) but the middle is representative regardless.
-        """
-        if not chapters:
-            return None
-        whole: List[Dict] = []
-        for ch in chapters:
-            chap = ch.get("chap")
-            if chap is None:
-                continue
-            try:
-                f = float(chap)
-            except (TypeError, ValueError):
-                continue
-            # Whole number: 4.0, 47, "12" all qualify; 4.5, 60.1 don't.
-            if f == int(f):
-                whole.append(ch)
-        pool = whole if whole else list(chapters)
-        if not pool:
-            return None
-        if len(pool) <= 2:
-            return pool[0]
-        return pool[len(pool) // 2]
 
     @staticmethod
     def _pick_representative_chapters(
@@ -1565,22 +1567,6 @@ class BaseSiteHandler:
         aggregate_metadata.setdefault("paired_pairs_compared", 0)
 
         return aggregate_score, aggregate_metadata
-
-    @staticmethod
-    def _pick_middle_image_item(image_items: List):
-        """Pick the middle item from a chapter's image list.
-
-        Index 0 is often a colored splash (compresses well, biases the
-        score high); the last index can be a credits/ad/team-promo page
-        that isn't representative either. Items can be URL strings or
-        pre-fetched binary dicts; the caller (_probe_chapter_image)
-        dispatches on type.
-        """
-        if not image_items:
-            return None
-        if len(image_items) <= 2:
-            return image_items[0]
-        return image_items[len(image_items) // 2]
 
     def _probe_cover_image(
         self, hit: "SearchHit", scraper, make_request

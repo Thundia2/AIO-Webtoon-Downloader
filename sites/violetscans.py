@@ -7,8 +7,7 @@ class VioletScansSiteHandler(MangaThemesiaSiteHandler):
     base_url = "https://violetscans.org"
     domains = ("violetscans.org", "www.violetscans.org")
     
-    def __init__(self, *args, **kwargs):
-        # Initialize with specific settings for VioletScans
+    def __init__(self):
         super().__init__(
             name=self.name,
             display_name=self.display_name,
@@ -16,6 +15,5 @@ class VioletScansSiteHandler(MangaThemesiaSiteHandler):
             domains=self.domains,
             use_playwright=True,
             verify_ssl=True,
-            *args, **kwargs
         )
 

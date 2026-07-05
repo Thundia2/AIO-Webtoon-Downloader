@@ -6,7 +6,7 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SiteComicContext
 
@@ -19,21 +19,7 @@ class LikeMangaSiteHandler(BaseSiteHandler):
     _DATE_RE = re.compile(r"^\s*(\w+\s+\d{1,2},\s+\d{4})")
     _CHAPTER_PAGE_REGEX = re.compile(r"load_list_chapter\((\d+)\)")
 
-    def __init__(self) -> None:
-        super().__init__()
-        try:
-            import lxml  # noqa: F401
-
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ----------------------------------------------------------------- helpers
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html, self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html, "html.parser")
 
     def configure_session(self, scraper, args) -> None:
         scraper.headers.setdefault("Referer", self._BASE_URL + "/")
@@ -156,7 +142,7 @@ class LikeMangaSiteHandler(BaseSiteHandler):
         html = payload.get("list_chap")
         if not isinstance(html, str):
             return []
-        fragment = BeautifulSoup(html, self._parser)
+        fragment = self._make_soup(html)
         return self._collect_chapters_from_soup(fragment)
 
     def get_chapters(

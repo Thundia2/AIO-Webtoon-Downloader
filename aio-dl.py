@@ -43,7 +43,7 @@ import textwrap
 import xml.sax.saxutils
 import zipfile
 import zlib
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, unquote_to_bytes
 
 from aio_config import (
@@ -3077,6 +3077,84 @@ def save_final_images(
 
 
 # -----------------------------------------------------------
+# Shared page-recompress concurrency driver
+# -----------------------------------------------------------
+def _run_recompress_pool(
+    raw_paths: List[str],
+    convert_one: Callable[
+        [Tuple[int, str], int], Tuple[int, str, Optional[Exception]]
+    ],
+    *,
+    guard: str,
+    thread_prefix: str,
+    label: str,
+    mop_up: Optional[
+        Callable[[List[Tuple[int, str]], List[Optional[str]], int, int], None]
+    ] = None,
+) -> List[str]:
+    """Shared dispatch skeleton for the two in-place page-recompress passes
+    (recompress_chapter_images_to_webp + recompress_chapter_images_modern),
+    which carried a byte-identical worker-pool loop.
+
+    Owns everything both twins shared: the cpu//2 worker count, the per-encode
+    thread budget (``enc_threads = cpu//workers`` — the anti-oversubscription
+    cap; webp ignores it, modern hands it to libjxl/libavif), the
+    serial-vs-ThreadPoolExecutor branch, the every-8-pages ``_hb`` heartbeat, and
+    the ``[p for p in out if p is not None]`` return. ``convert_one`` takes
+    ``(enumerate-entry, enc_threads)`` and returns ``(idx, dst, err)``: ``err`` is
+    ``None`` for webp (no encode-failure path) and carries the exception for
+    modern's mop-up. When ``mop_up`` is provided it runs INSIDE ``_cpu_guard``
+    (modern's serial retry must stay CPU-guarded — a real cross-process guard
+    when _COORD is set) with ``(failed, out, enc_threads, cpu)``; it mutates
+    ``out`` in place. grep _run_recompress_pool for the two callers.
+
+    workers uses ``max(1, min(cpu//2, len))`` — proven identical to webp's older
+    ``max(1, min(max(1, cpu//2), len))`` for every cpu>=1, and raw_paths is
+    always non-empty here (both callers early-return on the empty list).
+    """
+    cpu = os.cpu_count() or 4
+    workers = max(1, min(cpu // 2, len(raw_paths)))
+    enc_threads = max(1, cpu // workers)
+
+    out: List[Optional[str]] = [None] * len(raw_paths)
+    failed: List[Tuple[int, str]] = []  # (idx, src) whose encode raised
+    with _cpu_guard(guard):
+        if workers == 1 or len(raw_paths) == 1:
+            for entry in enumerate(raw_paths):
+                idx, dst, err = convert_one(entry, enc_threads)
+                out[idx] = dst
+                if err is not None:
+                    failed.append((idx, raw_paths[idx]))
+                if idx % 8 == 0:
+                    _hb("cpu", f"{label} {idx+1}/{len(raw_paths)}")
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix=thread_prefix
+            ) as pool:
+                # pool.map preserves submission order; consumed iteratively so
+                # memory stays bounded. Native encoders (libwebp/libjxl/libavif)
+                # release the GIL during the heavy encode, so workers translate
+                # to speedup; a GIL-holding build just serializes (correct, only
+                # slower). _hb every 8 keeps the per-chapter watchdog satisfied.
+                for idx, dst, err in pool.map(
+                    lambda e: convert_one(e, enc_threads),
+                    list(enumerate(raw_paths)),
+                ):
+                    out[idx] = dst
+                    if err is not None:
+                        failed.append((idx, raw_paths[idx]))
+                    if idx % 8 == 0:
+                        _hb("cpu", f"{label} {idx+1}/{len(raw_paths)}")
+
+        if mop_up is not None and failed:
+            mop_up(failed, out, enc_threads, cpu)
+
+    # No None entries possible on the webp path (every convert returns a str);
+    # modern's mop-up also fills every slot. The filter/cast keeps mypy quiet.
+    return [p for p in out if p is not None]
+
+
+# -----------------------------------------------------------
 # WebP recompression (LINE Webtoon, opt-in via --webtoon-recompress)
 # -----------------------------------------------------------
 
@@ -3203,35 +3281,16 @@ def recompress_chapter_images_to_webp(
             )
         return idx, dst
 
-    cpu = os.cpu_count() or 4
-    half_cores = max(1, cpu // 2)
-    workers = max(1, min(half_cores, len(raw_paths)))
-
-    out: List[Optional[str]] = [None] * len(raw_paths)
-    with _cpu_guard("recompress_webp"):
-        if workers == 1 or len(raw_paths) == 1:
-            for entry in enumerate(raw_paths):
-                idx, dst = _convert_one(entry)
-                out[idx] = dst
-                if idx % 8 == 0:
-                    _hb("cpu", f"recompress {idx+1}/{len(raw_paths)}")
-        else:
-            with ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="webp-recompress"
-            ) as pool:
-                # pool.map preserves submission order; consumed iteratively
-                # so memory stays bounded. _hb every 8 keeps the per-chapter
-                # watchdog satisfied on long chapters (60+ pages).
-                for idx, dst in pool.map(
-                    _convert_one, list(enumerate(raw_paths))
-                ):
-                    out[idx] = dst
-                    if idx % 8 == 0:
-                        _hb("cpu", f"recompress {idx+1}/{len(raw_paths)}")
-
-    # No None entries possible by construction (every _convert_one returns
-    # idx, str); the cast keeps mypy quiet.
-    return [p for p in out if p is not None]
+    # Shared concurrency driver (grep _run_recompress_pool). webp has no
+    # encode-failure retry path, so the adapter tags every result err=None (the
+    # mop-up never fires) and ignores the enc_threads budget.
+    return _run_recompress_pool(
+        raw_paths,
+        lambda entry, _enc_threads: (*_convert_one(entry), None),
+        guard="recompress_webp",
+        thread_prefix="webp-recompress",
+        label="recompress",
+    )
 
 
 # -----------------------------------------------------------
@@ -3627,81 +3686,58 @@ def recompress_chapter_images_modern(
             pass
         return idx, src, None
 
-    # Encoder-thread budget — the fix for the intermittent modernize failure
-    # "... Generic Error. Please build `libjxl` from source ...". pillow_jxl's
-    # Encoder AND Pillow's native AVIF encoder each default to an ALL-CORES
-    # internal thread pool (num_threads=-1 / max_threads=cpu). Nested under this
-    # `workers`-thread page pool that compounds to workers*cpu threads (e.g.
-    # 6*12=72 on a 12-core box), and the oversubscription intermittently trips
-    # libjxl's parallel runner into a bare JXL_ENC_ERROR on very large pages
-    # under real-world load — reproduced on ~62 MP progressive JPEGs while the
-    # background image-prefetch chain ran (bench: 3/42 byte-identical pages
-    # failed intermittently; all pass single-threaded). Sizing each encode at
-    # cpu//workers keeps every core busy with NO oversubscription. Thread count
-    # NEVER changes the output bytes (sha-identical + reconstruction bit-exact
-    # across 1/2/4/-1), so it is invisible to the CBZ and to resume gating.
-    cpu = os.cpu_count() or 4
-    workers = max(1, min(cpu // 2, len(raw_paths)))
-    enc_threads = max(1, cpu // workers)
+    # Serial mop-up for pages whose parallel encode raised (almost always a
+    # transient libjxl JXL_ENC_ERROR under pool oversubscription — grep
+    # enc_threads): retry each single-file with the FULL core count (no sibling
+    # encoders competing — the low-contention condition that never failed in
+    # testing), twice with a short backoff before conceding, so a transient
+    # failure becomes "page transcoded a beat later" instead of "silently left
+    # un-modernized". One bad page never aborts the chapter. _run_recompress_pool
+    # invokes this INSIDE _cpu_guard (before releasing it); it mutates `out`.
+    def _mop_up(
+        failed: List[Tuple[int, str]],
+        out: List[Optional[str]],
+        _enc_threads: int,
+        cpu: int,
+    ) -> None:
+        log_verbose(
+            f"  [modernize] Retrying {len(failed)} page(s) that failed "
+            f"under load (serial)..."
+        )
+        for idx, src in failed:
+            dst = src
+            err: Optional[Exception] = None
+            for _attempt in range(2):
+                _hb("cpu", f"modernize retry {os.path.basename(src)}")
+                _, dst, err = _convert_one((idx, src), cpu)
+                if err is None:
+                    break
+                time.sleep(0.3 * (_attempt + 1))
+            out[idx] = dst
+            if err is not None:
+                log_verbose(
+                    f"  Warning: modernize transcode failed for "
+                    f"{os.path.basename(src)}: {err}. Keeping original."
+                )
 
-    out: List[Optional[str]] = [None] * len(raw_paths)
-    failed: List[Tuple[int, str]] = []  # (idx, src) whose encode raised
-    with _cpu_guard("recompress_modern"):
-        if workers == 1 or len(raw_paths) == 1:
-            for entry in enumerate(raw_paths):
-                idx, dst, err = _convert_one(entry, enc_threads)
-                out[idx] = dst
-                if err is not None:
-                    failed.append((idx, raw_paths[idx]))
-                if idx % 8 == 0:
-                    _hb("cpu", f"modernize {idx+1}/{len(raw_paths)}")
-        else:
-            with ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="modern-recompress"
-            ) as pool:
-                # JXL/AVIF native encoders generally release the GIL during the
-                # heavy encode (like libwebp/libjpeg), so workers translate to
-                # speedup; if a given pillow_jxl build holds the GIL the pool
-                # just serializes (correct, only slower). Part B uses processes.
-                for idx, dst, err in pool.map(
-                    lambda e: _convert_one(e, enc_threads),
-                    list(enumerate(raw_paths)),
-                ):
-                    out[idx] = dst
-                    if err is not None:
-                        failed.append((idx, raw_paths[idx]))
-                    if idx % 8 == 0:
-                        _hb("cpu", f"modernize {idx+1}/{len(raw_paths)}")
-
-        # Serial mop-up: a page whose encode raised almost always succeeds when
-        # retried single-file — no sibling encoders competing for cores/memory
-        # is exactly the low-contention condition that never failed in testing.
-        # Give the lone encode the full core count (nothing else runs now) and
-        # retry twice with a short backoff before conceding. This turns the
-        # transient libjxl failure from "page silently left un-modernized" into
-        # "page transcoded a beat later".
-        if failed:
-            log_verbose(
-                f"  [modernize] Retrying {len(failed)} page(s) that failed "
-                f"under load (serial)..."
-            )
-            for idx, src in failed:
-                dst = src
-                err: Optional[Exception] = None
-                for _attempt in range(2):
-                    _hb("cpu", f"modernize retry {os.path.basename(src)}")
-                    _, dst, err = _convert_one((idx, src), cpu)
-                    if err is None:
-                        break
-                    time.sleep(0.3 * (_attempt + 1))
-                out[idx] = dst
-                if err is not None:
-                    log_verbose(
-                        f"  Warning: modernize transcode failed for "
-                        f"{os.path.basename(src)}: {err}. Keeping original."
-                    )
-
-    return [p for p in out if p is not None]
+    # Shared concurrency driver (grep _run_recompress_pool) owns the cpu//2
+    # worker count + the enc_threads=cpu//workers anti-oversubscription cap — the
+    # fix for the intermittent libjxl "Generic Error" / JXL_ENC_ERROR: pillow_jxl
+    # AND native AVIF each default to an all-cores internal pool; nested under a
+    # `workers`-thread page pool they compound to workers*cpu threads (e.g.
+    # 6*12=72 on a 12-core box) and trip libjxl's runner on ~62 MP pages under
+    # load. Thread count NEVER changes output bytes (sha-identical + recon
+    # bit-exact across 1/2/4/-1), so it's invisible to the CBZ and resume gating.
+    # _convert_one already matches the driver's (entry, enc_threads) ->
+    # (idx, dst, err) contract.
+    return _run_recompress_pool(
+        raw_paths,
+        _convert_one,
+        guard="recompress_modern",
+        thread_prefix="modern-recompress",
+        label="modernize",
+        mop_up=_mop_up,
+    )
 
 
 # -----------------------------------------------------------
@@ -6268,6 +6304,11 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
             _write_prefetched_marker(target_tdir)
             return
 
+        # Blame-host for the Phase-D per-host concurrency cap. download_tasks is
+        # non-empty here (guarded above), so the first task's netloc stands in
+        # for the chapter's CDN in both the fast and ThreadPool paths below.
+        prefetch_host = urlparse(download_tasks[0][1]).netloc
+
         # ── Phase 2: parallel download ──
         # curl_cffi async path runs concurrently inside this daemon
         # thread (asyncio.run() spins up its own event loop here).
@@ -6282,10 +6323,7 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
             # Phase D: apply per-host concurrency cap on prefetch too —
             # if the foreground path dialed concurrency down for this
             # CDN, prefetch should respect the same limit.
-            fast_conc = _effective_concurrency(
-                urlparse(download_tasks[0][1]).netloc if download_tasks else "",
-                fast_conc,
-            )
+            fast_conc = _effective_concurrency(prefetch_host, fast_conc)
             fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
             # Backoff feedback (2026-07-03): prefetch hard-failures dial down
             # the shared per-host concurrency cap. Before this, the prefetch
@@ -6341,10 +6379,7 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
         else:
             workers = max(1, min(image_workers, len(download_tasks)))
             # Phase D: cap prefetch ThreadPool concurrency too.
-            workers = max(1, _effective_concurrency(
-                urlparse(download_tasks[0][1]).netloc if download_tasks else "",
-                workers,
-            ))
+            workers = max(1, _effective_concurrency(prefetch_host, workers))
             # RACE-2: mark each pool thread as a background prefetch worker so
             # dl_image / _try_download_url don't honor the FOREGROUND chapter's
             # watchdog + poison tally (which would abort this prefetch of a LATER
@@ -6624,6 +6659,37 @@ def _serialize_anilist_tag(t: Any) -> Dict[str, Any]:
     }
 
 
+def _anilist_meta_fields(comic_data: Dict[str, Any]) -> Dict[str, Any]:
+    """The seven AniList enrichment fields shared VERBATIM by the two
+    .aio_series.json writers (live-download near 'series_meta =' and
+    --refresh-library-metadata's 'meta[...]' block) AND — as its leading
+    block — the details.json reader extras (_build_aio_reader_extras).
+
+    Returns them in canonical order (id, mal_id, country_of_origin,
+    media_format, synonyms, tags, spoiler_tags) so every on-disk artifact
+    stays key-order-identical. Tags run through the module-level
+    _serialize_anilist_tag (AnilistTag dataclass -> plain dict; the dataclass
+    itself doesn't survive json.dump); every value reads comic_data.get(...) so
+    an unenriched series emits null/[] on a stable schema. Cross-file: three
+    consumers, grep _anilist_meta_fields.
+    """
+    return {
+        "anilist_id": comic_data.get("anilist_id"),
+        "mal_id": comic_data.get("mal_id"),
+        "country_of_origin": comic_data.get("country_of_origin"),
+        "media_format": comic_data.get("media_format"),
+        "anilist_synonyms": list(comic_data.get("anilist_synonyms") or []),
+        "anilist_tags": [
+            _serialize_anilist_tag(t)
+            for t in (comic_data.get("anilist_tags") or [])
+        ],
+        "anilist_spoiler_tags": [
+            _serialize_anilist_tag(t)
+            for t in (comic_data.get("anilist_spoiler_tags") or [])
+        ],
+    }
+
+
 def _build_aio_reader_extras(
     comic_data: Dict[str, Any],
     *,
@@ -6668,19 +6734,9 @@ def _build_aio_reader_extras(
     'new_details.update').
     """
     return {
-        "anilist_id": comic_data.get("anilist_id"),
-        "mal_id": comic_data.get("mal_id"),
-        "country_of_origin": comic_data.get("country_of_origin"),
-        "media_format": comic_data.get("media_format"),
-        "anilist_synonyms": list(comic_data.get("anilist_synonyms") or []),
-        "anilist_tags": [
-            _serialize_anilist_tag(t)
-            for t in (comic_data.get("anilist_tags") or [])
-        ],
-        "anilist_spoiler_tags": [
-            _serialize_anilist_tag(t)
-            for t in (comic_data.get("anilist_spoiler_tags") or [])
-        ],
+        # Seven AniList fields (canonical order) shared with both
+        # .aio_series.json writers; grep _anilist_meta_fields.
+        **_anilist_meta_fields(comic_data),
         "source_site": source_site or "",
         "source_url": source_url or "",
         "language": language or "",
@@ -7077,19 +7133,11 @@ def _refresh_library_metadata(args) -> int:
         # URL after enrich, or the unchanged site cover when AniList had none
         # — safe to assign unconditionally.
         meta["cover"] = comic_data.get("cover")
-        meta["anilist_id"] = comic_data.get("anilist_id")
-        meta["mal_id"] = comic_data.get("mal_id")
-        meta["country_of_origin"] = comic_data.get("country_of_origin")
-        meta["media_format"] = comic_data.get("media_format")
-        meta["anilist_synonyms"] = list(comic_data.get("anilist_synonyms") or [])
-        meta["anilist_tags"] = [
-            _serialize_anilist_tag(t)
-            for t in (comic_data.get("anilist_tags") or [])
-        ]
-        meta["anilist_spoiler_tags"] = [
-            _serialize_anilist_tag(t)
-            for t in (comic_data.get("anilist_spoiler_tags") or [])
-        ]
+        # Same seven AniList fields the live-download .aio_series.json writer
+        # emits; .update overwrites the loaded meta's existing keys in place
+        # (order preserved), matching the prior sequential assignments byte-for-
+        # byte. grep _anilist_meta_fields.
+        meta.update(_anilist_meta_fields(comic_data))
         try:
             with open(
                 os.path.join(folder, SERIES_META_FILE), "w", encoding="utf-8"
@@ -8114,6 +8162,22 @@ def main():
 
         failed = []
         up_to_date = []
+
+        def _classify_update_result(title: str, returncode: int, stdout: str, stderr: str) -> None:
+            # Mirror the child's stdout/stderr, then bucket the run: rc 0 -> updated
+            # (implicit), rc != 0 with a "nothing new" marker -> up-to-date, else
+            # failed. Shared by the parallel + serial loops so the up-to-date
+            # heuristic can't drift between them.
+            sys.stdout.write(stdout)
+            sys.stderr.write(stderr)
+            if returncode != 0:
+                combined = stdout + stderr
+                if "No chapters selected" in combined or "Filtered list down to 0 chapters" in combined:
+                    up_to_date.append(title)
+                    print("  Already up to date.")
+                else:
+                    failed.append(title)
+
         jobs = max(1, int(getattr(args, "jobs", 1) or 1))
         if jobs > 1:
             print(f"[*] Running updates with up to {jobs} worker(s)...")
@@ -8127,30 +8191,14 @@ def main():
                     print(f"\n{'=' * 60}")
                     print(f"Updating: {title}")
                     print(f"{'=' * 60}")
-                    sys.stdout.write(stdout)
-                    sys.stderr.write(stderr)
-                    combined = stdout + stderr
-                    if returncode != 0:
-                        if "No chapters selected" in combined or "Filtered list down to 0 chapters" in combined:
-                            up_to_date.append(title)
-                            print("  Already up to date.")
-                        else:
-                            failed.append(title)
+                    _classify_update_result(title, returncode, stdout, stderr)
         else:
             for title, cmd in child_procs:
                 print(f"\n{'=' * 60}")
                 print(f"Updating: {title}")
                 print(f"{'=' * 60}")
                 _, returncode, stdout, stderr = _run_saved_update(title, cmd)
-                sys.stdout.write(stdout)
-                sys.stderr.write(stderr)
-                combined = stdout + stderr
-                if returncode != 0:
-                    if "No chapters selected" in combined or "Filtered list down to 0 chapters" in combined:
-                        up_to_date.append(title)
-                        print("  Already up to date.")
-                    else:
-                        failed.append(title)
+                _classify_update_result(title, returncode, stdout, stderr)
         print(f"\n{'=' * 60}")
         updated = len(child_procs) - len(failed) - len(up_to_date)
         print(f"Update complete: {updated} updated, {len(up_to_date)} up-to-date, {len(failed)} failed")
@@ -12130,22 +12178,13 @@ def main():
             key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
         )
 
-        # Serialize AniList tags as dicts (the AnilistTag dataclass
-        # doesn't survive json.dump). Empty lists when enrichment was
-        # off or no confident match — keeps the schema uniform so the
-        # library UI / user's reader can rely on the field always
-        # existing. Cross-file: sites/external_metadata.py:AnilistTag
-        # is the source; aio-dl.py:_load_cached_anilist_id reads
-        # "anilist_id" back on subsequent runs.
-        def _tag_to_dict(t: Any) -> Dict[str, Any]:
-            return {
-                "name": getattr(t, "name", ""),
-                "category": getattr(t, "category", ""),
-                "rank": int(getattr(t, "rank", 0) or 0),
-                "is_media_spoiler": bool(getattr(t, "is_media_spoiler", False)),
-                "is_general_spoiler": bool(getattr(t, "is_general_spoiler", False)),
-            }
-
+        # Serialize AniList tags via the module-level _serialize_anilist_tag —
+        # the same serializer the refresh writer + _build_aio_reader_extras use,
+        # so the on-disk schema stays identical across all three writers (the
+        # AnilistTag dataclass itself doesn't survive json.dump). Empty lists
+        # when enrichment was off / no confident match keep the field always
+        # present. Cross-file: sites/external_metadata.py:AnilistTag is the
+        # source; aio-dl.py:_load_cached_anilist_id reads "anilist_id" back on resume.
         series_meta = {
             "url": args.comic_url,
             "hid": hid,
@@ -12166,17 +12205,10 @@ def main():
             # null/empty when no match or feature disabled. The cached
             # IDs let resume + --update-all runs short-circuit the
             # fuzzy title-match step. See sites/external_metadata.py.
-            "anilist_id": comic_data.get("anilist_id"),
-            "mal_id": comic_data.get("mal_id"),
-            "country_of_origin": comic_data.get("country_of_origin"),
-            "media_format": comic_data.get("media_format"),
-            "anilist_synonyms": list(comic_data.get("anilist_synonyms") or []),
-            "anilist_tags": [
-                _tag_to_dict(t) for t in (comic_data.get("anilist_tags") or [])
-            ],
-            "anilist_spoiler_tags": [
-                _tag_to_dict(t) for t in (comic_data.get("anilist_spoiler_tags") or [])
-            ],
+            # Same seven fields as the refresh writer + _build_aio_reader_extras
+            # (grep _anilist_meta_fields), appended in canonical order so the
+            # on-disk key sequence is unchanged.
+            **_anilist_meta_fields(comic_data),
         }
 
         with open(series_meta_path, "w", encoding="utf-8") as f:

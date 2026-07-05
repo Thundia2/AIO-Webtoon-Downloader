@@ -367,8 +367,7 @@ class MangaReaderSiteHandler(BaseSiteHandler):
 
     # ----------------------------------------------------------------- parsing
     def _parse_chapter_number(self, text: str) -> Optional[str]:
-        match = re.search(r"(\d+(?:\.\d+)?)", text or "")
-        return match.group(1) if match else None
+        return self._chapter_number_from_text(text)
 
     def _infer_extension(self, url: str, data: bytes) -> str:
         ext = os.path.splitext(urlparse(url).path)[1].lower()

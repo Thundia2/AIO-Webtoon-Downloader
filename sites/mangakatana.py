@@ -5,7 +5,7 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
@@ -20,21 +20,7 @@ class MangaKatanaSiteHandler(BaseSiteHandler):
     _BASE_URL = "https://mangakatana.com"
     _DATE_FORMAT = "%b-%d-%Y"
 
-    def __init__(self) -> None:
-        super().__init__()
-        try:
-            import lxml  # noqa: F401
-
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ----------------------------------------------------------------- helpers
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html, self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html, "html.parser")
 
     def _slug_from_url(self, url: str) -> str:
         parsed = urlparse(url)
@@ -50,8 +36,7 @@ class MangaKatanaSiteHandler(BaseSiteHandler):
             return 0
 
     def _extract_chapter_number(self, text: str) -> Optional[str]:
-        match = re.search(r"(\d+(?:\.\d+)?)", text)
-        return match.group(1) if match else None
+        return self._chapter_number_from_text(text)
 
     def _extract_thumbnail(self, soup: BeautifulSoup, page_url: str) -> Optional[str]:
         node = soup.select_one("div.media div.cover img, .cover img")

@@ -4,7 +4,7 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
@@ -43,20 +43,7 @@ class ManganatoSiteHandler(BaseSiteHandler):
 
     _BASE_URL = "https://www.manganato.gg"
 
-    def __init__(self) -> None:
-        try:
-            import lxml  # type: ignore  # noqa: F401
-
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ------------------------------------------------------------------ helpers
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html, self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html, "html.parser")
 
     def _slug_from_url(self, url: str) -> str:
         parsed = urlparse(url)

@@ -5228,13 +5228,13 @@ def search_all(
         root = _find(keys[0])
         groups.setdefault(root, []).append((score, hit))
 
+    from collections import Counter
     candidates: List[SeriesCandidate] = []
     for key, members in groups.items():
         # canonical_title: most-common title across the bucket; shortest as
         # tiebreaker. Length-as-primary biases toward edition variants like
         # "One Piece - Digital Colored Comics" over the canonical "One Piece"
         # when 3 of 4 sources agree on the short name.
-        from collections import Counter
         title_counts = Counter((h.title or "") for _, h in members if (h.title or ""))
         if title_counts:
             max_freq = max(title_counts.values())
@@ -5446,7 +5446,8 @@ def search_all(
         )
 
         # Index hit-by-url for quick lookup during probe (so we can pass the
-        # full SearchHit to handler.probe_sample_image, not just the source).
+        # full SearchHit to handler._probe_chapter_aggregate / _probe_cover_image,
+        # not just the source).
         hit_by_url: Dict[str, SearchHit] = {h.url: h for _, h in scored}
         # Collect unique (site, url) source entries needing probe.
         # Same-(site,url) appearing in multiple candidates can share the same

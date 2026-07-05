@@ -263,11 +263,3 @@ def configure_throttling(
     scraper.request = patched_request
     setattr(scraper, "_hardening_patched", True)
     setattr(scraper, "_hardening_limiter", limiter)
-
-
-def throttled_request(make_request, scraper, url: str, domains: Tuple[str, ...]):
-    """
-    Wrapper for manual requests inside handlers that might not go through scraper.request
-    or need explicit throttling logic (though the patch above usually covers it).
-    """
-    return make_request(url, scraper)
