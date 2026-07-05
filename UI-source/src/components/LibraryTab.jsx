@@ -322,7 +322,7 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings }) {
           <Input
             value={manualUrl}
             onChange={(e) => setManualUrl(e.target.value)}
-            placeholder="https://mangafire.to/manga/..."
+            placeholder="https://mangafire.to/title/..."
             className="h-8 text-xs flex-1"
           />
           <Button
@@ -1080,8 +1080,8 @@ export default function LibraryTab({
   //
   // One UpdatesCenter-specific override: seededRatingOnly is injected by
   // default. The probe phase in search_all (run when --multi-source is on)
-  // costs ~30-60 s per series on MangaFire-class handlers — Playwright VRF
-  // per sample chapter plus image-quality scoring. For an update download
+  // costs seconds per series on slow Playwright-driven handlers (browser
+  // navigation per sample chapter) plus image-quality scoring. For an update download
   // that's typically 1-5 new chapters, that probe cost dominates the
   // actual download. Skipping it falls back to sites/quality_seed.json's
   // curated per-site quality priors for ranking (which is what the

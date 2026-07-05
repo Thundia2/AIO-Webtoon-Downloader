@@ -218,12 +218,6 @@ const DEFAULT_SETTINGS = {
   // via the `?? "unlimited"` reads at the Selects, so old settings dicts are safe.
   networkLimit: "unlimited",
   cpuLimit: "unlimited",
-  // ── MangaFire VRF capture knobs intentionally NOT surfaced in UI ──
-  // VRF is MangaFire-specific browser-automation tuning that users
-  // shouldn't need to touch. The CLI flags
-  // --mangafire-vrf-prefetch-depth (default 4) and
-  // --mangafire-vrf-parallel (default 1) still exist for advanced
-  // tuning; the UI just inherits the argparse defaults.
   // How often the UI refreshes logs & progress (in milliseconds).
   // Lower = more responsive. Default: 100ms (10 updates/sec).
   logUpdateInterval: 100,
@@ -251,9 +245,9 @@ const DEFAULT_SETTINGS = {
   // When ON (default), downloads queued from the UpdatesCenter panel get
   // --seeded-rating-only injected so the multi-source rating skips its
   // image-quality probe phase and ranks alternatives from
-  // sites/quality_seed.json's per-site priors instead. Saves 30-60+ s
-  // per series on MangaFire-class handlers (the probe runs Playwright
-  // VRF per sample chapter plus image-quality scoring). For a 1-5
+  // sites/quality_seed.json's per-site priors instead. Saves seconds
+  // per series on slow Playwright-driven handlers (the probe runs a
+  // browser navigation per sample chapter plus image-quality scoring). For a 1-5
   // chapter update delta, the probe cost dwarfs the actual download.
   // Off restores full probe accuracy at the per-download cost — pick
   // off only if you've tuned multi-source ranking carefully and want
@@ -1924,12 +1918,9 @@ export default function SettingsTab({ settings, onSave }) {
         </div>
       </div>
 
-      {/* MangaFire VRF capture knobs (--mangafire-vrf-prefetch-depth,
-          --mangafire-vrf-parallel) were removed from the UI on
-          2026-05-13. They're advanced Patchright/Cloudflare tuning
-          most users shouldn't touch; the argparse defaults (depth=4,
-          parallel=1) are bench-good. Advanced users can still pass
-          the CLI flags directly. */}
+      {/* MangaFire's VRF capture flags (--mangafire-vrf-*) were deleted
+          entirely with the 2026 MangaFire REST-API rewrite — MangaFire is
+          a plain JSON API now, with no Patchright/VRF tuning to expose. */}
     </>
   );
 

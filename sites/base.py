@@ -216,8 +216,9 @@ class BaseSiteHandler:
     # EXPENSIVE_PROBE_QUICK_THRESHOLD in search_orchestrator.py). Default
     # False — pure-HTTP handlers don't pay much for 5 samples, and we want
     # the full aggregate signal for them. Override to True on handlers
-    # whose per-chapter fetch is expensive (Playwright VRF capture). Today
-    # only mangafire flips this; new VRF/expensive handlers should opt in.
+    # whose per-chapter fetch is expensive (e.g. browser-driven capture).
+    # No handler sets this today (MangaFire's 2026 REST-API rewrite dropped
+    # its VRF cost); browser-based handlers can opt in.
     EXPENSIVE_PROBE: bool = False
 
     # When True, the search orchestrator treats this handler as the canonical
@@ -1165,8 +1166,8 @@ class BaseSiteHandler:
         ``max_samples`` (v5 semantics, BREAKING from v4): when set, clamps
         the probe to that many CHAPTERS (was: that many pages within 1
         chapter). The orchestrator passes ``max_samples=2`` for low-title-
-        match results on EXPENSIVE_PROBE handlers (mangafire VRF) per the
-        Phase 5 quick-probe clamp. None (default) probes 8 chapters.
+        match results on EXPENSIVE_PROBE handlers (browser-driven ones) per
+        the Phase 5 quick-probe clamp. None (default) probes 8 chapters.
 
         Why breadth instead of depth: research (~/.claude/plans/how-robust-
         is-the-memoized-koala-agent-a42650755ce151e5a.md) showed that

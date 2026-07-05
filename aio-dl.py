@@ -144,8 +144,8 @@ class ChapterGhostError(Exception):
 
     Why a distinct exception (not just another ChapterSkippedError reason):
     a ghost signature on the primary means the chapter is structurally absent
-    there — VRF token rotated to a different URL space, soft-launched
-    placeholder, CDN URL signed for a chapter that was unpublished, etc. No
+    there — a soft-launched placeholder, a CDN URL signed for a chapter
+    that was unpublished, etc. No
     amount of inline retry will help, because the response template that
     every page returns won't change after a 30s/60s sleep (mangafire's
     5051-byte CF 'access denied' is the canonical case — see the 2026-05-27
@@ -5768,8 +5768,8 @@ def _apply_runtime_tunables(args):
         after JSON values have been setattr'd onto args)
 
     Globals here are read at runtime by make_request, dl_image,
-    _process_chapter (watchdog), _process_chapter_strict (inline retry),
-    and _vrf_prefetch_worker_loop (batch sizing). Without the second
+    _process_chapter (watchdog), and _process_chapter_strict (inline
+    retry). Without the second
     call after restore, these caches still hold the argparse defaults
     from the resume invocation's CLI (which only re-passes
     --restore-parameters --format … --verbose <url>) — so the user's
@@ -5790,9 +5790,6 @@ def _apply_runtime_tunables(args):
     globals()["_CHAPTER_HOST_POISON"] = int(getattr(args, "chapter_host_poison_threshold", 5))
     globals()["_INLINE_CHAPTER_RETRIES"] = int(getattr(args, "inline_chapter_retries", 2))
     globals()["_INLINE_CHAPTER_BACKOFF"] = float(getattr(args, "inline_chapter_backoff", 30.0))
-    _vrf_async_batch_state["parallel_count"] = max(
-        1, int(getattr(args, "mangafire_vrf_parallel", 1) or 1)
-    )
     # --no-fast-download: force-disable curl_cffi fast path globally. Read
     # by both the main-path SUPPORTS_FAST_DOWNLOAD gate AND the prefetch
     # worker's SUPPORTS_FAST_DOWNLOAD gate. Module-global so the prefetch
@@ -5813,7 +5810,7 @@ def _apply_runtime_tunables(args):
         1, min(100, int(_cpu_pct if _cpu_pct is not None else 100))
     )
     # --image-prefetch-parallel: how many concurrent image-prefetch worker
-    # threads. Same module-global pattern as _vrf_async_batch_state since
+    # threads. Same module-global pattern as _CPU_POOL_PERCENT above, since
     # the workers are spawned by _ensure_image_prefetch_workers without
     # args in scope. Re-applied on --restore-parameters via the second
     # call to _apply_runtime_tunables.
@@ -5925,184 +5922,11 @@ def _validate_build_final_cli(p: argparse.ArgumentParser, argv: List[str]) -> No
 
 
 
-# -----------------------------------------------------------
-# VRF prefetch – overlap next-N-chapter VRF capture with
-#                current-chapter image downloads.
-#
-# How it works:
-#   - After get_chapter_images(ch_N) returns the image URLs,
-#     _start_vrf_prefetch_chain() pushes the next `depth` upcoming
-#     chapters onto _vrf_prefetch_queue.
-#   - A single long-lived daemon worker drains the queue, calling
-#     vrf_gen.ensure_vrf() for each. Tokens land in the shared
-#     _vrf_cache; later foreground calls hit cache instantly.
-#   - With depth=4 (the new default), by the time the main loop
-#     reaches chapter N+1, VRFs for N+2..N+4 are already captured
-#     or in flight, fully hiding VRF cost behind image download.
-#
-# Pre-2026-05-09: depth was effectively 1 (single thread, single
-# chapter ahead). Bumped to 4 + queue worker so capture starts
-# earlier; this matters most for runs where image download time
-# is short relative to VRF capture time (i.e. small chapters).
-#
-# Why this is safe with --jobs:
-#   --jobs spawns separate subprocesses, each with their own
-#   Playwright browser and VRF generator. This prefetch only
-#   touches the current process's VRF generator.
-# -----------------------------------------------------------
+# Shared stdlib queue for the inter-chapter image-download prefetch pool
+# below. (The MangaFire VRF-prefetch machinery that used to live here was
+# removed with the 2026 MangaFire REST-API rewrite — chapter payloads are
+# plain JSON now, no token capture; see sites/mangafire.py.)
 import queue as _stdlib_queue
-
-_vrf_prefetch_queue: "_stdlib_queue.Queue[Optional[Tuple[str, str, str]]]" = _stdlib_queue.Queue()
-_vrf_prefetch_worker: Optional[threading.Thread] = None
-# Tracks paths already submitted (or completed) so we don't enqueue the
-# same chapter VRF capture twice when overlapping prefetch windows include
-# it. Cleared at process exit; growth is bounded by the chapter count.
-_vrf_prefetch_seen: set = set()
-_vrf_prefetch_lock = threading.Lock()
-# Opt-in async batch capture instance, lazily created on first parallel
-# prefetch with --mangafire-vrf-parallel > 1. None when sequential mode.
-_vrf_async_batch_state: Dict[str, Any] = {"capturer": None, "parallel_count": 1}
-
-
-def _vrf_prefetch_worker_loop() -> None:
-    """Drain _vrf_prefetch_queue serially. Sequential mode uses sync
-    ensure_vrf (proven, ~1.5-2s/chapter). Parallel mode (parallel_count>1)
-    batches up to N items and submits to AsyncBatchVRFCapture for
-    concurrent multi-page capture. Both flow tokens into the shared
-    _vrf_cache, so subsequent ensure_vrf calls hit cache instantly."""
-    try:
-        from sites.mangafire_vrf_simple import get_vrf_generator
-    except Exception:
-        return  # No VRF backend; idle worker.
-
-    parallel_count = max(1, int(_vrf_async_batch_state.get("parallel_count", 1) or 1))
-
-    while True:
-        item = _vrf_prefetch_queue.get()
-        if item is None:  # Shutdown sentinel
-            return
-
-        # Drain up to parallel_count-1 additional items so we batch when
-        # parallel mode is active. In sequential mode batch_items has 1.
-        batch_items = [item]
-        if parallel_count > 1:
-            try:
-                while len(batch_items) < parallel_count:
-                    batch_items.append(_vrf_prefetch_queue.get_nowait())
-            except _stdlib_queue.Empty:
-                pass
-
-        if parallel_count > 1 and len(batch_items) > 1:
-            # Async batch path. Lazy-import to avoid loading async machinery
-            # for users who never opt in.
-            capturer = _vrf_async_batch_state.get("capturer")
-            if capturer is None:
-                try:
-                    from sites.mangafire_vrf_async_batch import AsyncBatchVRFCapture
-                    capturer = AsyncBatchVRFCapture()
-                    _vrf_async_batch_state["capturer"] = capturer
-                except Exception as exc:
-                    log_verbose(
-                        f"  [VRF Prefetch] AsyncBatch init failed; falling back "
-                        f"to sequential for this batch: {exc}"
-                    )
-                    capturer = None
-            if capturer is not None:
-                try:
-                    capturer.submit_batch(
-                        [(cid, curl) for (cid, curl, _label) in batch_items],
-                        parallel=parallel_count,
-                    )
-                    log_verbose(
-                        f"  [VRF Prefetch] async-batch captured "
-                        f"{len(batch_items)} VRFs (parallel={parallel_count})"
-                    )
-                    for _, _, label in batch_items:
-                        log_verbose(f"  [VRF Prefetch] (async) chapter {label} ready")
-                    [_vrf_prefetch_queue.task_done() for _ in batch_items]
-                    continue
-                except Exception as exc:
-                    # Async batch failed — fall through to sequential.
-                    log_verbose(
-                        f"  [VRF Prefetch] async-batch failed ({exc}); "
-                        "retrying sequentially"
-                    )
-
-        # Sequential path (default, also fallback when async fails).
-        for chapter_id, chapter_url, chap_label in batch_items:
-            ajax_path = f"/ajax/read/chapter/{chapter_id}"
-            try:
-                vrf_gen = get_vrf_generator()
-                vrf_gen.ensure_vrf(ajax_path, page_url=chapter_url, init_url=chapter_url)
-                log_verbose(f"  [VRF Prefetch] Cached VRF for chapter {chap_label}")
-            except Exception as exc:
-                # Not a problem — the foreground path will capture it.
-                log_verbose(
-                    f"  [VRF Prefetch] Failed for chapter {chap_label} "
-                    f"(will retry normally): {exc}"
-                )
-            finally:
-                _vrf_prefetch_queue.task_done()
-
-
-def _ensure_vrf_prefetch_worker() -> None:
-    """Lazy-start the worker on first chain push. Daemon thread, exits
-    automatically on process shutdown."""
-    global _vrf_prefetch_worker
-    with _vrf_prefetch_lock:
-        if _vrf_prefetch_worker is not None and _vrf_prefetch_worker.is_alive():
-            return
-        _vrf_prefetch_worker = threading.Thread(
-            target=_vrf_prefetch_worker_loop,
-            daemon=True,
-            name="VRF-Prefetch-Queue",
-        )
-        _vrf_prefetch_worker.start()
-
-
-def _start_vrf_prefetch_chain(
-    upcoming: List[Dict[str, Any]], handler, depth: int
-) -> None:
-    """Push the next `depth` chapters' VRF capture jobs onto the prefetch
-    queue. No-op for non-MangaFire handlers, missing chapter URLs, or
-    already-queued chapters. depth=0 disables prefetch entirely.
-
-    Replaces the pre-2026-05-09 _start_vrf_prefetch (single chapter
-    ahead). The queue worker drains in order; parallel mode (controlled
-    via _vrf_async_batch_state['parallel_count']) batches into multi-
-    page async capture inside the worker.
-    """
-    if depth <= 0 or not upcoming:
-        return
-    if getattr(handler, "name", "") != "mangafire":
-        return
-
-    pushed = 0
-    with _vrf_prefetch_lock:
-        for ch in upcoming[:depth]:
-            chapter_id = ch.get("hid")
-            chapter_url = ch.get("url")
-            if not chapter_id or not chapter_url:
-                continue
-            ajax_path = f"/ajax/read/chapter/{chapter_id}"
-            if ajax_path in _vrf_prefetch_seen:
-                continue
-            _vrf_prefetch_seen.add(ajax_path)
-            chap_label = str(ch.get("chap", "?"))
-            _vrf_prefetch_queue.put((chapter_id, chapter_url, chap_label))
-            pushed += 1
-
-    if pushed:
-        _ensure_vrf_prefetch_worker()
-
-
-# Backward-compat shim: existing call sites elsewhere may still reference
-# _start_vrf_prefetch (single chapter). Kept as a thin wrapper. Remove
-# once all call sites migrate to _start_vrf_prefetch_chain.
-def _start_vrf_prefetch(next_chapter: Optional[Dict], handler) -> None:
-    if next_chapter is None:
-        return
-    _start_vrf_prefetch_chain([next_chapter], handler, depth=1)
 
 
 # -----------------------------------------------------------
@@ -6123,7 +5947,7 @@ def _start_vrf_prefetch(next_chapter: Optional[Dict], handler) -> None:
 #     prefetched file instead of re-fetching.
 #   - Phase 1 (handler.get_chapter_images) still runs in main on every
 #     chapter — needed for media_entries (text_blocks etc.). For mangafire
-#     this is ~0.5-1s with the cached VRF; cheap enough that we don't try
+#     this is a single cheap JSON GET now; cheap enough that we don't try
 #     to share metadata via sidecar JSON between threads.
 #
 # Gated by --prefetch-image-workers (default -1 → match --image-workers).
@@ -6132,7 +5956,7 @@ def _start_vrf_prefetch(next_chapter: Optional[Dict], handler) -> None:
 # positive number to keep prefetch on but with a lighter footprint.
 #
 # Phase B (2026-05-13): replaced single-in-flight thread with a
-# queue+worker-pool pattern mirroring _vrf_prefetch_*. Multiple chapters
+# queue+worker-pool pattern. Multiple chapters
 # can now download in parallel (controlled by --image-prefetch-parallel),
 # and the queue depth (--image-prefetch-depth) lets us push ahead
 # multiple chapters at the chain-fire site. Preserves the filesystem-
@@ -6494,7 +6318,7 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
 
 def _ensure_image_prefetch_workers() -> None:
     """Lazy-spawn up to _image_prefetch_parallel daemon worker threads.
-    Mirrors _ensure_vrf_prefetch_worker but with N workers instead of 1.
+    N daemon workers total.
     Called from _start_image_prefetch on first enqueue; idempotent on
     subsequent calls (re-checks alive count and tops up if any died)."""
     with _image_prefetch_lock:
@@ -6588,8 +6412,7 @@ def _start_image_prefetch_chain(
     no_processing: bool,
 ) -> None:
     """Push the next `depth` chapters' image-prefetch jobs onto the queue.
-    No-op when depth <= 0 (user opted out). Mirror of
-    _start_vrf_prefetch_chain for the image-download side.
+    No-op when depth <= 0 (user opted out).
 
     Skips chapters whose tdir already has a success marker (processed-
     complete or download-complete depending on --no-processing) — same
@@ -7414,32 +7237,6 @@ def main():
         help=argparse.SUPPRESS,
     )
 
-    # MangaFire-specific VRF capture knobs (2026-05-09). VRF is MangaFire's
-    # proprietary token-capture problem; no other handler has it. Kept under
-    # the --mangafire- namespace because the flags don't apply to anyone else.
-    p.add_argument(
-        "--mangafire-vrf-prefetch-depth",
-        type=int,
-        default=4,
-        help="How many chapters ahead to keep VRF prefetch queued for MangaFire "
-             "(default 4). Sequential capture (~1.5-2s/chapter) but starts "
-             "earlier so VRF capture overlaps fully with image download — by "
-             "the time chapter N+1 begins, VRFs for N+2..N+4 are already "
-             "cached or in flight. 0 disables prefetch entirely.",
-    )
-    p.add_argument(
-        "--mangafire-vrf-parallel",
-        type=int,
-        default=1,
-        help="Opt-in: capture N MangaFire chapter VRFs concurrently via "
-             "Patchright async (default 1 = sequential, current behavior). "
-             "4 is bench-confirmed working with single-IP storage_state and "
-             "5.2x speedup over sequential, but can trigger CF rate-limiting "
-             "on some sessions. Recommended only for large downloads (50+ "
-             "chapters) on a stable IP; falls back to sequential transparently "
-             "on detected throttle (homepage redirect).",
-    )
-
     p.add_argument(
         "--site",
         type=str,
@@ -7483,11 +7280,10 @@ def main():
         type=float,
         default=20.0,
         help="Per-site search timeout in seconds (default: 20.0). Sized for "
-             "MangaFire's Playwright bridge: ~3s browser warmup + ~3-4s page "
-             "navigation with networkidle + up to 12s capture_search retry "
-             "loop. Pure-HTTP handlers complete in <2s. Slow sites self-select "
-             "out and the probe-failure cache suppresses them for 1h after "
-             "2 timeouts.",
+             "the slower Playwright-driven handlers (e.g. comix) that need "
+             "browser warmup + page navigation. Pure-HTTP handlers (incl. "
+             "MangaFire) complete in <2s. Slow sites self-select out and the "
+             "probe-failure cache suppresses them for 1h after 2 timeouts.",
     )
     p.add_argument(
         "--search-min-match",
@@ -8966,7 +8762,7 @@ def main():
             # any flag the user didn't pass on the resume CLI; now that
             # the JSON values have been setattr'd onto args, re-snapshot
             # so runtime-cached tunables (_HTTP_TIMEOUT, _CHAPTER_DEADLINE,
-            # _vrf_async_batch_state, etc.) honor the user's original
+            # _CPU_POOL_PERCENT, etc.) honor the user's original
             # choices instead of the argparse defaults.
             _apply_runtime_tunables(args)
 
@@ -9246,7 +9042,7 @@ def main():
 
     # ── --list-chapters: print metadata + chapter list as JSON, then exit ──
     # Used by the UI to check for new chapters without downloading anything.
-    # Only needs the page HTML + chapter list API call — no image VRF, no downloads.
+    # Only needs series metadata + the chapter list — no image fetching, no downloads.
     # IMPORTANT: This runs BEFORE allocate_series_output_dir so it doesn't
     # create empty folders in manga/ just for checking.
     #
@@ -10078,7 +9874,7 @@ def main():
                     rm_tree(tdir)
 
             print(f"\nChapter {n} ({grp_name or 'No Group'})")
-            _t0_vrf = time.monotonic()
+            _t0_imageurls = time.monotonic()
             # Phase 8 (2026-05-08): split-cluster collapse — when this chapter
             # was synthesized by group_chapters_for_download from multiple
             # parts (rule 5: X.1/X.2/X.3/X.4 with no integer X), `_merged_parts`
@@ -10185,19 +9981,8 @@ def main():
                         pages_ok=0,
                         pages_total=0,
                     ) from exc
-            _timing["vrf"] += time.monotonic() - _t0_vrf
+            _timing["imageurls"] += time.monotonic() - _t0_imageurls
 
-            # --- VRF pipelining: enqueue the next `depth` chapters' VRF
-            #     captures while this chapter's images download. The queue
-            #     worker drains them serially (or batches into async multi-
-            #     page if --mangafire-vrf-parallel > 1). With depth=4 and a
-            #     ~6s image download, all 4 fit into the overlap window so
-            #     subsequent chapters' VRFs are cached before they're needed.
-            depth = max(0, int(getattr(args, "mangafire_vrf_prefetch_depth", 4) or 0))
-            if upcoming_chapters:
-                _start_vrf_prefetch_chain(upcoming_chapters, handler, depth=depth)
-            elif next_chapter is not None:
-                _start_vrf_prefetch_chain([next_chapter], handler, depth=depth)
             raw_image_paths: List[str] = []
             text_blocks: List[Dict[str, Any]] = []
             page_counter = 1
@@ -10753,8 +10538,8 @@ def main():
                 and not force_redownload
                 and not is_alt_source
             ):
-                # Prefer the windowed upcoming_chapters list (same shape
-                # passed to the VRF chain), falling back to [next_chapter]
+                # Prefer the windowed upcoming_chapters list, falling
+                # back to [next_chapter]
                 # when the chapter loop didn't propagate a window.
                 chain_upcoming: List[Dict[str, Any]] = (
                     list(upcoming_chapters)
@@ -11712,7 +11497,7 @@ def main():
 
 
     # --- Timing accumulators (monotonic clock – essentially zero overhead) ---
-    _timing = {"vrf": 0.0, "download": 0.0, "processing": 0.0}
+    _timing = {"imageurls": 0.0, "download": 0.0, "processing": 0.0}
     _timing_total_start = time.monotonic()
     # Running counter for EPUB page indices – avoids re-scanning
     # the ever-growing current_book_content list every chapter.
@@ -11776,10 +11561,10 @@ def main():
         insert_chapter_index = len(current_book_chapters)
         insert_marker_index = len(current_epub_markers)
         insert_page_index = _running_page_count if args.format == 'epub' else 0
-        # Look ahead so _process_chapter_impl can prefetch upcoming chapters'
-        # VRFs (chain depth from --mangafire-vrf-prefetch-depth, default 4)
-        # while downloading images for this one. next_ch retained for the
-        # inter-chapter image prefetch (Phase G7) which is single-chapter.
+        # Look ahead so _process_chapter_impl can image-prefetch upcoming
+        # chapters while downloading images for this one. next_ch retained
+        # for the inter-chapter image prefetch (Phase G7) which is
+        # single-chapter.
         next_ch = chapters[ch_idx + 1] if ch_idx + 1 < len(chapters) else None
         # Slice depth+a-bit so the chain push has enough lookahead even if
         # depth is bumped at runtime via env (we don't have a depth-aware
@@ -12318,9 +12103,9 @@ def main():
             return f"{int(m)}m {sec:.1f}s"
         return f"{s:.1f}s"
 
-    _timing_other = max(0.0, _timing_total - _timing["vrf"] - _timing["download"] - _timing["processing"])
+    _timing_other = max(0.0, _timing_total - _timing["imageurls"] - _timing["download"] - _timing["processing"])
     print(f"\n--- Timing Summary ---")
-    print(f"  VRF / image URLs : {_fmt_time(_timing['vrf'])}")
+    print(f"  Image URL fetch  : {_fmt_time(_timing['imageurls'])}")
     print(f"  Image download   : {_fmt_time(_timing['download'])}")
     print(f"  Processing       : {_fmt_time(_timing['processing'])}")
     print(f"  Other (overhead) : {_fmt_time(_timing_other)}")

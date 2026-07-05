@@ -190,8 +190,8 @@ IMG_QUALITY_TTL_S = 30 * 24 * 3600
 # accuracy/speed tradeoff — see search_system.md "chapter-image probe" section.
 CHAPTER_PROBE_MIN_SEED = 0.65
 
-# 2026-05-08: when an "expensive-probe" handler (one that requires Playwright
-# / VRF capture per chapter — currently only MangaFire) hits a result whose
+# 2026-05-08: when an "expensive-probe" handler (one whose per-chapter fetch
+# is costly, e.g. browser-driven capture) hits a result whose
 # title_match falls below this threshold, the orchestrator clamps the probe
 # to a SINGLE image instead of the usual 5 samples. Rationale: low-match
 # results are usually noise (spinoffs, doujinshi, unrelated series sharing a
@@ -228,7 +228,7 @@ IS_OFFICIAL_REQUIRES_TITLE_MATCH = 0.85
 # probes (their threads keep going but we don't wait — the cache only persists
 # completed probes, so unfinished ones get retried next search). Bounds worst-
 # case latency from a hung handler (e.g., a site whose cover-fetch internally
-# blocks past the per-request timeout, or a Playwright-VRF call stuck in a bad
+# blocks past the per-request timeout, or a Playwright call stuck in a bad
 # state).
 #
 # Bumped to 120s when the multi-page aggregate probe shipped (2026-05-07): each
@@ -241,9 +241,10 @@ IS_OFFICIAL_REQUIRES_TITLE_MATCH = 0.85
 # Bumped to 180s when v5 breadth sampling shipped (2026-05-17): each high-seed
 # probe now does 8 separate `get_chapter_images` calls (one per sampled chapter)
 # + 1 image fetch each + up to THROTTLE_TAIL_PAGES extra fetches. For HTML-
-# scraped handlers `get_chapter_images` is ~1-2s per call; for VRF handlers
-# (mangafire) it's 3-5s. Worst case per probe: 8 × 7s + 3 × 15s = ~100s for
-# VRF, 8 × 3s + 3 × 5s = ~40s for HTML. At parallelism=6 with 22 high-seed
+# scraped handlers `get_chapter_images` is ~1-2s per call; for browser-driven
+# handlers (e.g. comix) it can be several seconds. Worst case per probe:
+# 8 × 7s + 3 × 15s = ~100s for the slowest, 8 × 3s + 3 × 5s = ~40s for HTML.
+# At parallelism=6 with 22 high-seed
 # sites, ~22/6 × 60s = ~220s mean. Mangadex API-driven handlers complete in
 # ~10-20s total because their `get_chapter_images` is a single JSON call
 # returning all URLs.
@@ -5430,8 +5431,8 @@ def search_all(
         # Girls" / "Anthology" surface as separate candidates with weaker
         # title_match; users almost never want those over the main series,
         # so spending 7 extra chapter-probe HTTP calls per sub-series source
-        # is wasted bandwidth — especially painful on MangaFire (Playwright
-        # VRF per chapter, 3-5 s each). One-image probes still produce a
+        # is wasted bandwidth — especially painful on browser-driven handlers
+        # (seconds per chapter). One-image probes still produce a
         # usable img_quality_score for ranking within the sub-series.
         # Same final ranking applies (line 5403); this just lightens the
         # probe cost for non-top candidates. Identical to the existing
@@ -5548,7 +5549,7 @@ def search_all(
                     # etc.) rarely win user attention vs the main series,
                     # so the extra 7 chapter fetches × N sources per
                     # sub-candidate is wasted bandwidth — especially on
-                    # MangaFire (Playwright VRF per chapter ~3-5 s each).
+                    # browser-driven handlers (seconds per chapter).
                     # The existing EXPENSIVE_PROBE quick_probe clamp still
                     # fires on top of this for weak-title-match results
                     # within a candidate (mostly redundant now that
@@ -5613,7 +5614,7 @@ def search_all(
             # shutdown(wait=True), which waits for ALL submitted tasks —
             # including any hung probe (e.g., a cover URL on a slow CDN, a
             # site whose internals don't honor scraper.get's timeout, or a
-            # Playwright VRF call stuck in a bad state). The previous code
+            # Playwright call stuck in a bad state). The previous code
             # could hang the orchestrator for minutes on a single bad site.
             #
             # Fix: spawn daemon worker threads pulling from a queue; bound
