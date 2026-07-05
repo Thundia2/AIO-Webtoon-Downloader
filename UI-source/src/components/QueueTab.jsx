@@ -23,7 +23,6 @@ function ProgressBar({ value, max, indeterminate, className }) {
 function phaseLabel(phase) {
   const labels = {
     starting: "Starting…",
-    vrf: "Capturing VRF token…",
     downloading: "Downloading chapters…",
     resuming: "Resuming download…",
     retrying: "Retrying missed chapters…",

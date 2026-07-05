@@ -80,12 +80,6 @@ function buildCliArgs(args) {
     // injects one key from settings.defaults (it migrated to
     // imageConcurrency at the same time).
     mangafireImageConcurrency: "--mangafire-image-concurrency",
-    // MangaFire VRF capture flags (--mangafire-vrf-prefetch-depth and
-    // --mangafire-vrf-parallel) intentionally NOT in flagMap. They were
-    // removed from the Settings UI on 2026-05-13 — argparse defaults
-    // are good for most users; advanced users pass them on the CLI
-    // directly. Keeping them out of flagMap means useDownloader.js
-    // can't accidentally emit them when settings dicts are spread.
     missedRetries: "--missed-retries",
     missedLog: "--missed-log",
     jobStallTimeout: "--job-stall-timeout",
@@ -470,11 +464,6 @@ function parseProgressLine(line) {
   if (batchMatch) {
     progress.batchCurrent = parseInt(batchMatch[1], 10);
     progress.batchTotal = parseInt(batchMatch[2], 10);
-  }
-
-  // ── VRF phase ──
-  if (/(?:VRF|vrf).*(?:captur|generat|ensur|browser|playwright)/i.test(line)) {
-    progress.phase = "vrf";
   }
 
   // ── Errors ──

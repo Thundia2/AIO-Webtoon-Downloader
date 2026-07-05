@@ -469,64 +469,76 @@ def test_flamecomics_strip_html_plain_text_passthrough():
 
 
 # ---------------------------------------------------------------------------
-# F5 — MangaFire artists extraction
+# F5 — MangaFire authors/artists extraction (JSON REST API, 2026 relaunch)
 # ---------------------------------------------------------------------------
 
-# MangaFire series page markup. Note: the handler also reads `.info p` for
-# status, `.poster img[itemprop=image]` for cover, `#synopsis` for desc.
+# MangaFire's 2026 relaunch replaced the scraped series page with a JSON detail
+# endpoint (/api/titles/{hid}); fetch_comic_context now reads authors/artists/
+# genres/desc/cover/etc. straight from the payload. See sites/mangafire.py.
 
-_MANGAFIRE_FULL_HTML = """
-<html><body>
-<div class="manga-info">
-  <div class="poster"><img itemprop="image" src="https://cdn.example.com/c.jpg"/></div>
-  <h1 itemprop="name">Test Series</h1>
-  <div id="synopsis">Sung Jinwoo, also known as "the weakest hunter"...</div>
-  <div class="info"><p>Completed</p></div>
-  <div class="meta">
-    <div><span>Author:</span> <a itemprop="author" href="/author/x">Test Author</a></div>
-    <div><span>Artist:</span> <a itemprop="artist" href="/artist/x">Test Studio</a></div>
-    <div><span>Genres:</span>
-      <a href="/genre/action">Action</a>
-      <a href="/genre/fantasy">Fantasy</a>
-    </div>
-    <div><span>Published:</span> Mar 21, 2017 to Sep 21, 2018</div>
-  </div>
-</div>
-</body></html>
-"""
+_MANGAFIRE_DETAIL_JSON = {
+    "data": {
+        "id": 123,
+        "hid": "x",
+        "slug": "test-series",
+        "title": "Test Series",
+        "type": "manga",
+        "status": "releasing",
+        "poster": {
+            "small": "https://cdn.example.com/c@100.jpg",
+            "medium": "https://cdn.example.com/c@280.jpg",
+            "large": "https://cdn.example.com/c.jpg",
+        },
+        "synopsisHtml": "Sung Jinwoo, also known as &quot;the weakest hunter&quot;.<br>Second line.",
+        "altTitles": ["テスト"],
+        "year": 2017,
+        "genres": [{"id": 1, "title": "Action"}, {"id": 2, "title": "Fantasy"}],
+        "authors": [{"id": 10, "title": "Test Author"}],
+        "artists": [{"id": 11, "title": "Test Studio"}],
+        "languages": ["en", "ja"],
+        "url": "/title/x-test-series",
+    }
+}
 
 
-def test_mangafire_artists_itemprop_extracted():
-    """MangaFire's series page exposes a separate Artist field via
-    itemprop='artist'. The F5 fix added this extraction; comic dict must now
-    contain both authors and artists.
-    """
+def test_mangafire_authors_artists_from_json():
+    """fetch_comic_context extracts both authors and artists (plus genres,
+    year, cover, alt names, mapped status, flattened desc) from the JSON
+    detail payload."""
     from sites.mangafire import MangaFireSiteHandler
     handler = MangaFireSiteHandler()
     ctx = handler.fetch_comic_context(
-        "https://example.com/manga/test-series.x",
+        "https://mangafire.to/title/x-test-series",
         MagicMock(),
-        _mr_returning(_MANGAFIRE_FULL_HTML),
+        _mr_returning(json_payload=_MANGAFIRE_DETAIL_JSON),
     )
+    assert ctx.identifier == "x"
     assert ctx.comic["authors"] == ["Test Author"]
     assert ctx.comic["artists"] == ["Test Studio"]
+    assert ctx.comic["genres"] == ["Action", "Fantasy"]
+    assert ctx.comic["status"] == "Ongoing"                       # releasing -> Ongoing
+    assert ctx.comic["year"] == 2017
+    assert ctx.comic["cover"] == "https://cdn.example.com/c.jpg"  # poster.large
+    assert ctx.comic["alt_names"] == ["テスト"]
+    # synopsisHtml flattened: tags stripped, entities unescaped
+    assert '"the weakest hunter"' in ctx.comic["desc"]
+    assert "<br>" not in ctx.comic["desc"]
 
 
-def test_mangafire_artists_label_fallback():
-    """When MangaFire drops the itemprop='artist' attribute, the F5 label-row
-    fallback should still find the artist via the 'Artist:' span text."""
-    html = _MANGAFIRE_FULL_HTML.replace(
-        '<a itemprop="artist" href="/artist/x">Test Studio</a>',
-        '<a href="/artist/x">Test Studio</a>',
-    )
+def test_mangafire_artists_empty_when_absent():
+    """A payload with no artists yields an empty list (not a crash / stub)."""
+    import copy
+    payload = copy.deepcopy(_MANGAFIRE_DETAIL_JSON)
+    payload["data"]["artists"] = []
     from sites.mangafire import MangaFireSiteHandler
     handler = MangaFireSiteHandler()
     ctx = handler.fetch_comic_context(
-        "https://example.com/manga/test-series.x",
+        "https://mangafire.to/title/x-test-series",
         MagicMock(),
-        _mr_returning(html),
+        _mr_returning(json_payload=payload),
     )
-    assert ctx.comic["artists"] == ["Test Studio"]
+    assert ctx.comic["artists"] == []
+    assert ctx.comic["authors"] == ["Test Author"]
 
 
 # ---------------------------------------------------------------------------

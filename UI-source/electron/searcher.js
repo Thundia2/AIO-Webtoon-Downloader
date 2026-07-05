@@ -77,10 +77,10 @@ class Searcher {
     this._onLog = onLog;
 
     // Extra environment variables to pass to every search subprocess. In
-    // packaged mode this carries PLAYWRIGHT_BROWSERS_PATH so MangaFire's
-    // VRF bridge (and the other Playwright-using handlers — violetscans,
-    // rizzfables, mangathemesia w/ use_playwright=True) can find the
-    // bundled Chromium. Without this, those handlers throw at search()
+    // packaged mode this carries PLAYWRIGHT_BROWSERS_PATH so the
+    // Playwright-using handlers (comix, violetscans, rizzfables,
+    // mangathemesia w/ use_playwright=True) can find the bundled
+    // Chromium. Without this, those handlers throw at search()
     // and silently drop out of the candidate list. Same shape as
     // Downloader._extraEnv — see main.js:initDownloader.
     this._extraEnv = extraEnv || {};
@@ -126,7 +126,7 @@ class Searcher {
           // PYTHONUNBUFFERED so stderr progress lines appear live, not in
           // 4KB-buffered bursts (same fix as downloader.js). _extraEnv
           // carries PLAYWRIGHT_BROWSERS_PATH in packaged mode so handlers
-          // that use Playwright (mangafire, violetscans, rizzfables, etc.)
+          // that use Playwright (comix, violetscans, rizzfables, etc.)
           // can find the bundled Chromium. Same merge order as downloader.js.
           env: { ...process.env, ...this._extraEnv, PYTHONUNBUFFERED: "1" },
         });
@@ -150,7 +150,7 @@ class Searcher {
       // does — the search emits things like
       //   "[*] Searching 22 sites for 'Frieren'..."
       //   "[*] Probing image quality across 35 sources..."
-      // mixed with VRF init noise from MangaFire's Playwright bridge.
+      // mixed with browser-init noise from the Playwright-driven handlers.
       let stderrBuffer = "";
       proc.stderr.on("data", (chunk) => {
         stderrBuffer += chunk.toString("utf8");

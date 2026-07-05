@@ -456,10 +456,7 @@ export function useDownloader() {
         // the spawn so older saved settings dicts that don't have the field
         // still produce identical CLI invocations. Python defaults:
         //   imageConcurrency=8, imagePrefetchDepth=2, imagePrefetchParallel=2.
-        // MangaFire VRF capture knobs (--mangafire-vrf-prefetch-depth,
-        // --mangafire-vrf-parallel) were dropped from the UI on 2026-05-13
-        // — argparse defaults serve everyone now; advanced users pass the
-        // CLI flags directly. Migration note: settings dicts persisted
+        // Migration note: settings dicts persisted
         // before 2026-05-13 carry `mangafireImageConcurrency` instead of
         // `imageConcurrency`. The SettingsTab loader migrates them at read
         // time, so by the time we get here `s.imageConcurrency` is live.

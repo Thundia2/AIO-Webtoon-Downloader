@@ -331,7 +331,7 @@ function resolveSpawnPaths(settings) {
 //
 // PLAYWRIGHT_BROWSERS_PATH (all platforms, packaged only): points
 // patchright at the bundled Chromium that setup.js downloaded, so the
-// VRF/Playwright handlers don't re-download into a system path. Gated on
+// Playwright-driven handlers don't re-download into a system path. Gated on
 // fs.existsSync(playwrightDir) — if the browser dir isn't on disk yet
 // (setup incomplete), we DON'T pin a nonexistent path and let patchright
 // fall back to its own resolution. This existsSync guard is the "most
@@ -549,7 +549,7 @@ function initDownloader() {
   //
   // Searcher gets the SAME extraEnv as Downloader (PLAYWRIGHT_BROWSERS_PATH
   // in packaged mode). Without this, search would still run but Playwright-
-  // using handlers (mangafire, violetscans, rizzfables, mangathemesia with
+  // using handlers (comix, violetscans, rizzfables, mangathemesia with
   // use_playwright=True) would silently fail and drop out of the candidate
   // list — making search results in installed builds inferior to dev builds.
   searcher = new Searcher({

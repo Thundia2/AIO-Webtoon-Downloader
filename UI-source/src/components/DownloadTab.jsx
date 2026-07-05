@@ -335,7 +335,7 @@ export default function DownloadTab({
             id="urls"
             value={form.urls}
             onChange={(e) => set("urls", e.target.value)}
-            placeholder="https://mangafire.to/manga/title.id"
+            placeholder="https://mangafire.to/title/id-slug"
             className="font-mono text-sm min-h-[70px]"
           />
         </div>

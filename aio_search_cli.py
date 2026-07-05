@@ -101,37 +101,53 @@ def _try_extract_seed_hit(query: str) -> Optional[SearchHit]:
             "intermittency is what motivated this feature). For other sites, "
             "search by title."
         )
-    # MangaFire URL → scrape via Playwright bridge.
+    # MangaFire URL → resolve via the handler's REST API. Since the 2026
+    # MangaFire relaunch this is a plain JSON GET (no browser/VRF) — see
+    # sites/mangafire.py. fetch_comic_context extracts the hid from either the
+    # new /title/{hid}-{slug} or the old /manga/{slug}.{hid} URL shape.
+    handler = get_handler_by_name("mangafire")
+    if handler is None:
+        sys.exit("MangaFire handler unavailable")
+    session = requests.Session()
     try:
-        from sites.mangafire_vrf_simple import get_vrf_generator, PLAYWRIGHT_AVAILABLE
-    except Exception as exc:
-        sys.exit(f"MangaFire bridge unavailable: {exc}")
-    if not PLAYWRIGHT_AVAILABLE:
-        sys.exit(
-            "URL-mode --search requires Patchright. "
-            "Install with: pip install patchright && python -m patchright install chromium"
-        )
+        handler.configure_session(session, None)
+    except Exception:
+        pass
+
+    def _mk(url, scraper):
+        return scraper.get(url, timeout=30)
+
     try:
-        meta = get_vrf_generator().capture_series_meta(q)
+        ctx = handler.fetch_comic_context(q, session, _mk)
     except Exception as exc:
-        sys.exit(f"Failed to scrape MangaFire URL: {exc}")
-    title = (meta or {}).get("title")
-    if not title:
+        sys.exit(f"Failed to resolve MangaFire URL: {exc}")
+    comic = ctx.comic or {}
+    title = ctx.title or comic.get("title")
+    if not title or title == "Unknown Title":
         sys.exit(f"MangaFire URL didn't yield a title: {q}")
+    # Accurate chapter count — one (or few) cheap JSON GET(s). Feeds the
+    # orchestrator's DMCA/count heuristics; non-fatal if it fails.
+    count: Optional[int] = None
+    try:
+        chaps = handler.get_chapters(ctx, session, "en", _mk)
+        count = len(chaps) if chaps else None
+    except Exception:
+        count = None
     return SearchHit(
         site="mangafire",
         title=title,
-        url=meta.get("final_url") or q,
-        cover=meta.get("cover"),
-        alt_titles=[],
-        year=None,
+        url=comic.get("url") or q,
+        cover=comic.get("cover"),
+        alt_titles=comic.get("alt_names") or [],
+        year=comic.get("year"),
         language=None,
-        chapter_count_hint=meta.get("chapter_count"),
-        actual_chapter_count=None,
+        chapter_count_hint=count,
+        actual_chapter_count=count,
         dmca_likely=False,
         # 1.0 because the title came directly from the URL's series page —
         # the user's intent is unambiguous, so seed it as a perfect match.
         raw_score=1.0,
+        is_official=False,
     )
 
 
@@ -352,9 +368,9 @@ def run_search_mode(
     set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
 
     # URL-mode: if the user supplied a MangaFire URL instead of a title text,
-    # scrape the series page once via Playwright and turn it into a seed hit.
+    # resolve the series via MangaFire's REST API and turn it into a seed hit.
     # The orchestrator then runs the normal cross-site search using the
-    # scraped title, with MangaFire's data already guaranteed to be present.
+    # resolved title, with MangaFire's data already guaranteed to be present.
     seed_hits: list = []
     seed = _try_extract_seed_hit(query)
     if seed is not None:
@@ -746,8 +762,8 @@ def find_alternatives_for_direct_url(
 
     Flow:
       1. Determine the series title from the primary's already-fetched
-         context (or fall back to MangaFire's capture_series_meta when
-         the cloudscraper-based fetch_comic_context returned a stub).
+         context (fetch_comic_context; for MangaFire this is now a plain
+         JSON API call — no browser fallback needed).
       2. Run the search orchestrator using that title — finds candidates
          across all search-capable handlers.
       3. Take the top candidate's sources, drop any whose host matches
@@ -783,18 +799,9 @@ def find_alternatives_for_direct_url(
         or ""
     )
     title = (title or "").strip()
-    # MangaFire's fetch_comic_context returns "Unknown Title" when CF blocks
-    # the page (the JSON wrapper response we couldn't parse). The series-meta
-    # bridge bypasses that.
-    if (not title or title.lower() == "unknown title") and "mangafire.to" in (primary_url or ""):
-        try:
-            from sites.mangafire_vrf_simple import get_vrf_generator, PLAYWRIGHT_AVAILABLE
-            if PLAYWRIGHT_AVAILABLE:
-                meta = get_vrf_generator().capture_series_meta(primary_url)
-                title = (meta or {}).get("title") or title
-        except Exception as exc:
-            if on_status:
-                on_status(f"  multi-source: capture_series_meta failed: {type(exc).__name__}")
+    # (MangaFire's fetch_comic_context now returns a real title from JSON — the
+    # old Playwright "Unknown Title" CF-block fallback was removed with the 2026
+    # REST-API rewrite.)
     if not title:
         if on_status:
             on_status("[!] Multi-source: couldn't determine title from URL; skipping alternatives discovery")
@@ -828,7 +835,7 @@ def find_alternatives_for_direct_url(
     # _quality_for then falls back to SourceEntry.seed_quality (loaded
     # from sites/quality_seed.json) for the tiebreaker. Designed for the
     # Library tab's Check All path where the per-series probe cost
-    # (~30-60 s on MangaFire, depending on Playwright VRF latency)
+    # (up to tens of seconds on slow Playwright-driven handlers)
     # dwarfs the actual download for a 1-5 chapter delta. Off by default
     # so the legacy / New-tab download path still gets full probe
     # accuracy. Cross-file: --seeded-rating-only flag is declared in
@@ -860,9 +867,9 @@ def find_alternatives_for_direct_url(
         # probe — the score wouldn't affect our use of it, only ranking,
         # and the primary_host filter below drops it from alternatives
         # anyway so its score has no effect on the multi-source merge
-        # either. On MangaFire (the canonical primary), this cuts ~30 s
-        # of chapter-VRF + image-fetch work that the probe would otherwise
-        # spend on the source we already chose. Redundant when img_cache
+        # either. On the canonical primary, this cuts the chapter-list +
+        # image-fetch work that the probe would otherwise spend on the
+        # source we already chose. Redundant when img_cache
         # is already None (--seeded-rating-only short-circuited above),
         # but cheap to pass through.
         skip_probe_sites=(
