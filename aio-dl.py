@@ -2673,6 +2673,32 @@ def combine_images(images: List[Image.Image], width: int) -> Image.Image:
     return combined_img
 
 
+# ── CPU-pool budget (Settings → Resource Limits → Max CPU usage) ──────────
+# _CPU_POOL_PERCENT scales the logical-core budget the CPU-BOUND image pools
+# may use. Set from --max-cpu-percent (env AIO_MAX_CPU_PERCENT) in
+# _apply_runtime_tunables; re-seeded on --restore-parameters. 100 = the prior
+# default (os.cpu_count()), so a default run is byte-for-byte unchanged.
+#
+# Consumed by the THREE CPU-bound pool sites — grep _cpu_pool_budget:
+#   process_chapter_images (PDF/img decode), save_final_images (final encode),
+#   _run_recompress_pool (modernize + webp recompress). Each does
+#   ``workers = cpu//2`` and (recompress) ``enc_threads = cpu//workers``, so
+#   scaling the budget scales workers AND per-encode threads together — total
+#   threads track the budget (reducing only workers would keep total flat).
+# NOT applied to the network pools (prefetch / foreground download) — those are
+# throttled via --image-concurrency / --image-workers / --image-prefetch-*.
+# UI: electron/main.js resolves Settings.cpuLimit → --max-cpu-percent (grep
+# cpuPercentForLevel in UI-source/electron/resource-limits.js).
+_CPU_POOL_PERCENT = 100
+
+
+def _cpu_pool_budget() -> int:
+    """Effective logical-core budget for the CPU-bound image pools, scaled by
+    --max-cpu-percent. Returns os.cpu_count() at 100% (the unchanged default)."""
+    cpu = os.cpu_count() or 4
+    return max(1, round(cpu * globals().get("_CPU_POOL_PERCENT", 100) / 100.0))
+
+
 def process_chapter_images(
     input_paths: List[str], target_w: int, target_h: int
 ) -> List[Image.Image]:
@@ -2764,7 +2790,8 @@ def process_chapter_images(
                 log_debug(f"    (END) Finalizing last buffered page in memory.")
 
     if len(input_paths) > 1:
-        cpu = os.cpu_count() or 4
+        # CPU budget, scaled by --max-cpu-percent (grep _cpu_pool_budget)
+        cpu = _cpu_pool_budget()
         workers = max(1, min(cpu // 2 or 1, len(input_paths)))
         # `pool.map` returns a lazy iterator that yields results in submission
         # order. Workers run concurrently up to `workers`; consumed results
@@ -3053,7 +3080,8 @@ def save_final_images(
         # up idle workers for short page lists. The same cap works for
         # both WebP-lossless and JPEG paths since memory is dominated
         # by the decoded RGB buffer, not the encoder state.
-        cpu = os.cpu_count() or 4
+        # CPU budget, scaled by --max-cpu-percent (grep _cpu_pool_budget)
+        cpu = _cpu_pool_budget()
         half_cores = max(1, cpu // 2)
         workers = max(1, min(half_cores, len(plan)))
         # Thread-name prefix reflects the dominant format in the plan so log
@@ -3112,7 +3140,8 @@ def _run_recompress_pool(
     ``max(1, min(max(1, cpu//2), len))`` for every cpu>=1, and raw_paths is
     always non-empty here (both callers early-return on the empty list).
     """
-    cpu = os.cpu_count() or 4
+    # CPU budget, scaled by --max-cpu-percent (grep _cpu_pool_budget)
+    cpu = _cpu_pool_budget()
     workers = max(1, min(cpu // 2, len(raw_paths)))
     enc_threads = max(1, cpu // workers)
 
@@ -5770,6 +5799,19 @@ def _apply_runtime_tunables(args):
     # worker (which doesn't have args in scope as a closure capture) can
     # read it without parameter threading.
     globals()["_NO_FAST_DOWNLOAD"] = bool(getattr(args, "no_fast_download", False))
+    # --max-cpu-percent: scale the CPU-bound image-pool budget (grep
+    # _cpu_pool_budget). Clamped [1,100]. Module-global so the three pool sites
+    # read it without threading args through. Re-applied on --restore-parameters
+    # so a resumed run honors the CURRENT --max-cpu-percent — the resume CLI
+    # passes it explicitly (downloader.js resume()), and the restore loop keeps
+    # explicit CLI dests. NOT in _RESUME_GATING_DESTS (speed knob, never changes
+    # decoded pixels — mirrors modernize_effort).
+    _cpu_pct = getattr(args, "max_cpu_percent", 100)
+    # `is not None` (not `or`) so an explicit 0 clamps DOWN to the floor of 1
+    # rather than being read as falsy and reset to 100 (full).
+    globals()["_CPU_POOL_PERCENT"] = max(
+        1, min(100, int(_cpu_pct if _cpu_pct is not None else 100))
+    )
     # --image-prefetch-parallel: how many concurrent image-prefetch worker
     # threads. Same module-global pattern as _vrf_async_batch_state since
     # the workers are spawned by _ensure_image_prefetch_workers without
@@ -7327,6 +7369,24 @@ def main():
              "Escape hatch for curl_cffi version regressions or weird CDN-vs-"
              "impersonation issues. Equivalent to setting "
              "SUPPORTS_FAST_DOWNLOAD=False per-handler, but global.",
+    )
+    # ── CPU budget (2026-07-05: Settings → Resource Limits → Max CPU usage) ──
+    # Scales the CPU-BOUND image pools only (grep _cpu_pool_budget). Speed knob,
+    # NOT image-affecting → deliberately NOT in _RESUME_GATING_DESTS (mirrors
+    # modernize_effort). Resume passes the CURRENT value explicitly so it wins
+    # over the persisted one (see downloader.js resume()).
+    p.add_argument(
+        "--max-cpu-percent",
+        type=int,
+        default=int(os.getenv("AIO_MAX_CPU_PERCENT", "100")),
+        help="Cap CPU-bound image processing (modernize/webp transcode, final "
+             "encode, PDF/image decode) to roughly this percentage of logical "
+             "cores (1-100; default 100 = prior behaviour). Lower values run "
+             "fewer parallel page-encode workers AND fewer threads per encoder, "
+             "so the whole pipeline stays under the budget — useful to keep the "
+             "machine responsive during a download. Does NOT affect network "
+             "concurrency (see --image-concurrency et al.). Clamped to [1,100]. "
+             "Env: AIO_MAX_CPU_PERCENT.",
     )
 
     # Deprecated 2026-05-13 — superseded by --image-concurrency (generalized

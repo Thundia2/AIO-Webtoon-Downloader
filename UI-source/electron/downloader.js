@@ -67,6 +67,11 @@ function buildCliArgs(args) {
     imageConcurrency: "--image-concurrency",
     imagePrefetchDepth: "--image-prefetch-depth",
     imagePrefetchParallel: "--image-prefetch-parallel",
+    // CPU-pool budget (Settings → Resource Limits → Max CPU usage). main.js
+    // resolves settings.cpuLimit → args.maxCpuPercent and sets it ONLY when
+    // < 100, so default (Unlimited) spawns never carry the flag. Python side:
+    // aio-dl.py:_cpu_pool_budget scales the modernize/webp/encode/decode pools.
+    maxCpuPercent: "--max-cpu-percent",
     // Back-compat: kept alongside imageConcurrency so saved settings dicts
     // that still carry mangafireImageConcurrency (pre-2026-05-13) keep
     // working. aio-dl.py installs a deprecation shim that routes
@@ -586,7 +591,7 @@ class Downloader {
    *   overrides whatever format was used in the original download.
    * @param {string} epubLayout - EPUB layout (vertical/page), only used when format is epub.
    */
-  resume({ pythonCmd, scriptPath, workingDir, url, tmpDir, format, epubLayout }) {
+  resume({ pythonCmd, scriptPath, workingDir, url, tmpDir, format, epubLayout, resourceFlags }) {
     const downloadId = `dl_${this._nextId++}_${Date.now()}`;
 
     // If no format specified, read the original from disk. Try run_meta.json
@@ -619,6 +624,16 @@ class Downloader {
     // Add EPUB layout if format is epub
     if (format === "epub" && epubLayout) {
       cliArgs.push("--epub-layout", epubLayout);
+    }
+
+    // Resource-limit throttle (Settings → Resource Limits). resourceFlags is
+    // resolved from the CURRENT settings by main.js (resumeThrottleFlags) — NOT
+    // restored from run_params.json — so a resume in a different environment
+    // (slower link, busy machine) honors the user's current limit. These are
+    // explicit resume-CLI dests, so aio-dl.py's --restore-parameters keeps them
+    // over the saved values (grep _user_set_dests) and none are resume-gating.
+    if (Array.isArray(resourceFlags) && resourceFlags.length) {
+      cliArgs.push(...resourceFlags);
     }
 
     cliArgs.push("--verbose", url);
