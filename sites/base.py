@@ -10,7 +10,7 @@ from urllib.parse import unquote, urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
 
-from ._image_io import finalize_pending_image
+from ._image_io import finalize_pending_image, looks_like_real_image
 
 # Preferred BeautifulSoup parser, detected once at import. lxml is faster and
 # more lenient than the stdlib parser; handlers used to copy this probe into
@@ -590,7 +590,13 @@ class BaseSiteHandler:
                             except Exception:
                                 pass
                         return page_idx, None
-                if r.status_code != 200 or not r.content or len(r.content) < 256:
+                # Accept any HTTP-200 body that is a real image — INCLUDING a
+                # legitimately tiny one (an 800x40 webtoon divider compresses to
+                # ~128B). looks_like_real_image() rejects only sub-256B junk
+                # (HTML/JSON stubs, 1x1 tracking pixels, truncated bodies); the
+                # old blanket len<256 gate false-positived on real dividers and
+                # aborted whole runs (bench/webtoonCanvasShelterLogs.md).
+                if r.status_code != 200 or not looks_like_real_image(r.content):
                     import sys
                     body_len = len(r.content) if r.content else 0
                     print(
@@ -1123,7 +1129,7 @@ class BaseSiteHandler:
         if isinstance(item, dict):
             if item.get("type") == "binary_image":
                 blob = item.get("data")
-                if isinstance(blob, (bytes, bytearray)) and len(blob) >= 256:
+                if isinstance(blob, (bytes, bytearray)) and looks_like_real_image(blob):
                     return bytes(blob)
             return None
         if isinstance(item, str) and item:
@@ -1132,7 +1138,7 @@ class BaseSiteHandler:
                 if response.status_code >= 400:
                     return None
                 data = response.content
-                if not data or len(data) < 256:
+                if not looks_like_real_image(data):
                     return None
                 return data
             except Exception:
@@ -1592,7 +1598,7 @@ class BaseSiteHandler:
                     path = path[1:]
                 with open(path, "rb") as f:
                     data = f.read()
-                if not data or len(data) < 256:
+                if not looks_like_real_image(data):
                     return None
                 return data
             except Exception:
@@ -1602,7 +1608,7 @@ class BaseSiteHandler:
             if response.status_code >= 400:
                 return None
             data = response.content
-            if not data or len(data) < 256:
+            if not looks_like_real_image(data):
                 return None
             return data
         except Exception:
