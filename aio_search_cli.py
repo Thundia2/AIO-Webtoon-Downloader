@@ -295,6 +295,18 @@ def _fetch_chapters_for_winner(
             }
         if not isinstance(chapters, list):
             chapters = []
+        # An ALT source must never OFFER a chapter it can't serve. tapas emits
+        # premium/wait-to-unlock episodes as `_locked` placeholders — meaningful
+        # only when tapas is the PRIMARY (where --multi-source fills them from
+        # peers). Acting as an alternative here, tapas can't deliver those pages,
+        # so drop them; otherwise the aligner would advertise a tapas-alt locked
+        # placeholder as a "fallback" that always fails when tried. Cross-file:
+        # grep _locked / _process_chapter_strict in aio-dl.py. No-op for sites
+        # that never emit _locked.
+        chapters = [
+            c for c in chapters
+            if not (isinstance(c, dict) and c.get("_locked"))
+        ]
         return {
             "site": source.site, "url": source.url,
             "chapters": chapters, "scraper": scraper, "handler": handler, "context": ctx,
@@ -791,6 +803,7 @@ def find_alternatives_for_direct_url(
         "alternatives_by_chap_num": {},
         "consensus_set": None,
         "consensus_max": None,
+        "resolved_sources": [],
     }
     # Step 1: title.
     title = (
@@ -968,6 +981,17 @@ def find_alternatives_for_direct_url(
             alignment.consensus_set if alignment.consensus_set else None
         ),
         "consensus_max": alignment.consensus_max,
+        # The (site, url, title, cover) of the alternatives that survived
+        # host/quality filtering. aio-dl.py persists these into
+        # run_params.json's `multi_source_cache` so a later resume can rebuild
+        # the alternatives via build_alternatives_from_payload without re-running
+        # this cross-site search. grep _build_multi_source_cache_payload.
+        "resolved_sources": [
+            {"site": s.site, "url": s.url,
+             "title": getattr(s, "title", "") or "",
+             "cover": getattr(s, "cover", None)}
+            for s in alt_sources
+        ],
     }
 
 
@@ -1025,6 +1049,7 @@ def build_alternatives_from_prefetched(
         "alternatives_by_chap_num": {},
         "consensus_set": None,
         "consensus_max": None,
+        "resolved_sources": [],
     }
 
     if not prefetched_path or not _os.path.exists(prefetched_path):
@@ -1043,6 +1068,59 @@ def build_alternatives_from_prefetched(
             on_status(
                 f"[!] Multi-source: failed to read prefetched alts: "
                 f"{type(exc).__name__}: {exc}"
+            )
+        return _empty_result
+
+    return build_alternatives_from_payload(
+        payload,
+        primary_handler=primary_handler,
+        primary_context=primary_context,
+        primary_chapters=primary_chapters,
+        args=args,
+        make_request=make_request,
+        on_status=on_status,
+    )
+
+
+def build_alternatives_from_payload(
+    payload,
+    primary_handler,
+    primary_context,
+    primary_chapters,
+    args,
+    make_request,
+    on_status=None,
+):
+    """Shared core of the prefetched / resume-cache multi-source path.
+
+    Takes an ALREADY-PARSED payload dict — the same shape the UI's
+    --multi-source-prefetched file uses AND the shape aio-dl.py persists into
+    run_params.json's `multi_source_cache` for resume:
+        {"title": str, "year": int|None,
+         "alternatives": [{"site", "url", "title"?, "cover"?}, ...]}
+    Fetches each alternative's chapter list in parallel, aligns against the
+    user's primary chapters, and returns the alternatives_by_chap_num dict
+    shape find_alternatives_for_direct_url produces — WITHOUT the expensive
+    cross-site title search. build_alternatives_from_prefetched reads a file
+    then delegates here; aio-dl.py's resume path passes the persisted cache
+    dict straight in (grep _read_multi_source_resume_cache in aio-dl.py).
+
+    `resolved_sources` in the return echoes the (site, url, title, cover) of
+    the alternatives that survived filtering, so the caller can re-persist a
+    cleaned resume cache.
+    """
+    _empty_result = {
+        "alternatives_by_chap_num": {},
+        "consensus_set": None,
+        "consensus_max": None,
+        "resolved_sources": [],
+    }
+
+    if not isinstance(payload, dict):
+        if on_status:
+            on_status(
+                "[!] Multi-source: prefetched payload was not a JSON object; "
+                "skipping discovery"
             )
         return _empty_result
 
@@ -1176,6 +1254,16 @@ def build_alternatives_from_prefetched(
             alignment.consensus_set if alignment.consensus_set else None
         ),
         "consensus_max": alignment.consensus_max,
+        # Echo the sources that survived the SKIP_MULTI_SOURCE / validity
+        # filter so aio-dl.py can re-persist a cleaned resume cache. Same
+        # (site, url, title, cover) shape find_alternatives_for_direct_url
+        # returns. grep _build_multi_source_cache_payload.
+        "resolved_sources": [
+            {"site": s.site, "url": s.url,
+             "title": getattr(s, "title", "") or "",
+             "cover": getattr(s, "cover", None)}
+            for s in alt_sources
+        ],
     }
 
 
@@ -1184,4 +1272,5 @@ __all__ = [
     "take_latest_multi_source_state",
     "find_alternatives_for_direct_url",
     "build_alternatives_from_prefetched",
+    "build_alternatives_from_payload",
 ]

@@ -218,12 +218,18 @@ class ChapterPermanentSkipError(Exception):
         )
 
 
-# Deterministic per-chapter failure reasons that no inline retry or alternate
-# source can clear — routed to ChapterPermanentSkipError (skip + continue) by
-# _process_chapter_strict instead of the inline-retry→abort path. A set so
-# future handlers can add their own login/paywall gate reasons; grep
-# mature_login_required (sites/tapas.py) for the sole producer today.
-_PERMANENT_SKIP_REASONS = frozenset({"mature_login_required"})
+# Deterministic per-chapter failure reasons that no inline retry can clear —
+# routed to ChapterPermanentSkipError (skip + continue) by
+# _process_chapter_strict instead of the inline-retry→abort path, AFTER the
+# multi-source alt-rescue loop has been tried (a permanent reason on the
+# PRIMARY can still be delivered by an alternative site — so these are "primary
+# can't, and no alt did either" by the time they convert). A set so handlers
+# can add their own login/paywall gate reasons; producers today (sites/tapas.py):
+#   - "mature_login_required": logged-out mature interstitial replaced the panels.
+#   - "locked": premium/wait-to-unlock episode emitted as a placeholder
+#     (get_chapter_images short-circuits it) so --multi-source can fill it; when
+#     no alt has it, this clean-skips instead of aborting the whole run.
+_PERMANENT_SKIP_REASONS = frozenset({"mature_login_required", "locked"})
 
 
 # -----------------------------------------------------------
@@ -5721,6 +5727,148 @@ def gating_hash(params):
     return hashlib.sha256(blob).hexdigest()
 
 
+# ── Multi-source resume cache (run_params.json `multi_source_cache` key) ──
+# The direct-URL --multi-source discovery (aio_search_cli.find_alternatives_
+# for_direct_url) costs ~30-80s: a cross-site title search + a chapter-list
+# fetch per candidate + alignment. On resume that whole probe re-runs even
+# though the discovered *sources* (which sites carry this series) essentially
+# never change between an interrupted run and its resume minutes/hours later.
+# We persist the resolved (site, url) alternatives + a timestamp into
+# run_params.json under a TOP-LEVEL `multi_source_cache` key (NOT inside
+# `params`, so it never enters gating_hash) and, on resume, feed them through
+# aio_search_cli.build_alternatives_from_payload — the same code the UI's
+# --multi-source-prefetched file uses. That skips the search but still
+# re-fetches chapter lists + re-aligns (cheap, and keeps the alt chapter data
+# fresh). A TTL bounds staleness so a long-idle tmp re-probes.
+#
+# Two write triggers (run_params.json is written ONCE, and discovery is eager
+# OR lazy): the eager path runs before the tmp dir exists, so its payload
+# rides `_ms_resume_cache_payload` into main()'s run_params write block; the
+# lazy path fires mid-run after that block, so it read-modify-writes the file
+# via _persist_multi_source_cache. The chapter loop is sequential on the main
+# thread (grep `for ch_idx, ch in enumerate(chapters)`), so that write is
+# race-free. Cross-file: consumed in _discover_multi_source_alternatives.
+_MULTI_SOURCE_CACHE_TTL_SECONDS = 72 * 3600  # 72h; override via AIO_MULTISOURCE_CACHE_TTL_HOURS
+
+
+def _multi_source_cache_ttl_seconds() -> float:
+    """Resolve the multi-source resume-cache TTL in seconds.
+
+    Default 72h. Env override AIO_MULTISOURCE_CACHE_TTL_HOURS (float hours);
+    <= 0 disables the cache entirely (every resume re-probes). A malformed
+    env value falls back to the default.
+    """
+    raw = os.environ.get("AIO_MULTISOURCE_CACHE_TTL_HOURS")
+    if raw is None or not str(raw).strip():
+        return float(_MULTI_SOURCE_CACHE_TTL_SECONDS)
+    try:
+        return float(raw) * 3600.0
+    except (TypeError, ValueError):
+        return float(_MULTI_SOURCE_CACHE_TTL_SECONDS)
+
+
+def _read_multi_source_resume_cache(params_path: str) -> Optional[Dict[str, Any]]:
+    """Return the cached multi-source payload from run_params.json if present
+    and younger than the TTL, else None.
+
+    The returned dict has the --multi-source-prefetched payload shape
+    ({"title", "year"?, "alternatives": [{"site","url",...}, ...]}) plus a
+    "saved_at" epoch float, so it can be handed straight to
+    aio_search_cli.build_alternatives_from_payload. Best-effort: a missing
+    file / malformed JSON / stale-or-future timestamp / empty alt list all
+    yield None so the caller falls back to a fresh cross-site search.
+    """
+    ttl = _multi_source_cache_ttl_seconds()
+    if ttl <= 0:
+        return None
+    try:
+        if not params_path or not os.path.exists(params_path):
+            return None
+        with open(params_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    cache = data.get("multi_source_cache")
+    if not isinstance(cache, dict):
+        return None
+    alts = cache.get("alternatives")
+    if not isinstance(alts, list) or not alts:
+        return None
+    saved_at = cache.get("saved_at")
+    if not isinstance(saved_at, (int, float)) or isinstance(saved_at, bool):
+        return None
+    age = time.time() - float(saved_at)
+    # age < 0 → clock moved backwards / future-dated cache; re-probe rather
+    # than trust it. age > ttl → stale.
+    if age < 0 or age > ttl:
+        return None
+    return cache
+
+
+def _persist_multi_source_cache(params_path: str, cache_payload: Optional[Dict[str, Any]]) -> None:
+    """Read-modify-write the `multi_source_cache` top-level key into an
+    EXISTING run_params.json.
+
+    Used by the lazy-discovery path, which fires AFTER main()'s one-shot
+    run_params write block — so the cache must be merged into the file that
+    already holds {gating_hash, params}. Deliberately a NO-OP when the file
+    doesn't exist yet: the eager path hasn't created the tmp dir at discovery
+    time, and that case rides `_ms_resume_cache_payload` into the write block
+    instead — creating a params-less run_params.json here would break the
+    resume-compat check. Best-effort; never raises.
+    """
+    if not cache_payload or not cache_payload.get("alternatives"):
+        return
+    if not params_path or not os.path.exists(params_path):
+        return
+    try:
+        with open(params_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        data["multi_source_cache"] = cache_payload
+        with open(params_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+    except (OSError, ValueError):
+        pass
+
+
+def _build_multi_source_cache_payload(ms_result, title, saved_at, year=None):
+    """Assemble the persistable `multi_source_cache` dict from a discovery
+    result's `resolved_sources` (grep that key in aio_search_cli.py).
+
+    Returns None when there are no usable (site, url) sources — nothing worth
+    caching, so the caller leaves run_params.json untouched.
+    """
+    sources = (ms_result or {}).get("resolved_sources") or []
+    clean: List[Dict[str, Any]] = []
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        site = (s.get("site") or "").strip()
+        url = (s.get("url") or "").strip()
+        if not site or not url:
+            continue
+        entry: Dict[str, Any] = {"site": site, "url": url}
+        if s.get("title"):
+            entry["title"] = s["title"]
+        if s.get("cover"):
+            entry["cover"] = s["cover"]
+        clean.append(entry)
+    if not clean:
+        return None
+    payload: Dict[str, Any] = {
+        "saved_at": float(saved_at),
+        "title": title or "",
+        "alternatives": clean,
+    }
+    if year:
+        payload["year"] = year
+    return payload
+
+
 def _validate_resume_categories(parser):
     """Startup sanity check: dests in the category sets must exist
     in the parser, and the two sets must not overlap.
@@ -8391,6 +8539,14 @@ def main():
     # group helper falls through to original in-source-only heuristics.
     _multi_source_consensus_set: Optional[Set[float]] = None
 
+    # Persistable multi-source resume cache (run_params.json `multi_source_cache`).
+    # Set by _discover_multi_source_alternatives on a successful discovery. The
+    # run_params write block folds it into the freshly-written file (EAGER path —
+    # the tmp dir doesn't exist yet at discovery time), while the LAZY path writes
+    # it directly via _persist_multi_source_cache. grep this name + the module
+    # helpers _read/_persist/_build_multi_source_cache*.
+    _ms_resume_cache_payload: Optional[Dict[str, Any]] = None
+
     if getattr(args, "search", None):
         from aio_search_cli import run_search_mode, take_latest_multi_source_state
         winner_url = run_search_mode(
@@ -8954,17 +9110,53 @@ def main():
         for a direct-URL --multi-source run. Never raises: any discovery
         failure degrades to standard single-source behavior."""
         nonlocal _multi_source_alternatives, _multi_source_consensus_set
-        # Fix B (2026-05-07): when the UI passes --multi-source-prefetched, use
-        # the JSON-listed alts instead of running cross-site search again. The
-        # search-tab download path writes this file just before spawning aio-dl
-        # so we skip the redundant ~80s search. Falls back to search if the
-        # file is missing or malformed (defensive — doesn't fail the download).
+        nonlocal _ms_resume_cache_payload
+        # Source of alternatives, in priority order:
+        #   1. UI-supplied --multi-source-prefetched file (authoritative for
+        #      THIS spawn; the search-tab writes it just before launch, saving
+        #      the redundant ~80s search).
+        #   2. Resume cache persisted by a PRIOR run of this series into
+        #      run_params.json (< TTL old) — reused via the SAME payload path
+        #      as the prefetched file, skipping the ~30-80s cross-site search
+        #      but still re-fetching chapter lists so the alt data stays fresh.
+        #   3. Fresh cross-site search (find_alternatives_for_direct_url).
+        # Anything discovered fresh (2/3) is re-persisted so the NEXT resume is
+        # cheap. grep _read/_persist/_build_multi_source_cache*.
         prefetched_path = getattr(args, "multi_source_prefetched", None)
+        _run_params_path = os.path.join(main_tmp_dir, "run_params.json")
+        cache_from_disk = (
+            None if prefetched_path
+            else _read_multi_source_resume_cache(_run_params_path)
+        )
+        _cache_hit = False
         try:
             if prefetched_path:
                 from aio_search_cli import build_alternatives_from_prefetched
                 _ms_result = build_alternatives_from_prefetched(
                     prefetched_path=prefetched_path,
+                    primary_handler=handler,
+                    primary_context=context,
+                    primary_chapters=pool,
+                    args=args,
+                    make_request=make_request,
+                    on_status=lambda m: print(m, file=sys.stderr),
+                )
+            elif cache_from_disk is not None:
+                from aio_search_cli import build_alternatives_from_payload
+                _cache_hit = True
+                _age_h = max(
+                    0.0,
+                    (time.time() - float(cache_from_disk.get("saved_at", 0))) / 3600.0,
+                )
+                print(
+                    f"[*] Multi-source: reusing "
+                    f"{len(cache_from_disk.get('alternatives') or [])} cached "
+                    f"alternative source(s) from run_params.json "
+                    f"(discovered {_age_h:.1f}h ago); skipping cross-site search",
+                    file=sys.stderr,
+                )
+                _ms_result = build_alternatives_from_payload(
+                    cache_from_disk,
                     primary_handler=handler,
                     primary_context=context,
                     primary_chapters=pool,
@@ -9004,6 +9196,30 @@ def main():
                     f"alternative sources ({n_alts} total fallback paths)",
                     file=sys.stderr,
                 )
+                # Persist the discovered sources so a future resume of this
+                # series skips the search. On a cache HIT the payload is already
+                # on disk and unchanged — just retain it for the write block /
+                # post-wipe rewrite (keeps the original saved_at, so the TTL
+                # counts from first discovery, not from each resume). On a fresh
+                # search or prefetched-file run, build a fresh payload
+                # (saved_at=now) and BOTH stash it (eager path: run_params write
+                # block folds it in) AND write it now (lazy path: that block has
+                # already run). grep _persist_multi_source_cache.
+                if _cache_hit:
+                    _ms_resume_cache_payload = cache_from_disk
+                else:
+                    _cache_year = None
+                    try:
+                        if comic_data.get("year"):
+                            _cache_year = int(comic_data["year"])
+                    except (TypeError, ValueError, AttributeError):
+                        _cache_year = None
+                    _new_cache = _build_multi_source_cache_payload(
+                        _ms_result, title, time.time(), year=_cache_year,
+                    )
+                    if _new_cache:
+                        _ms_resume_cache_payload = _new_cache
+                        _persist_multi_source_cache(_run_params_path, _new_cache)
         except Exception as exc:
             # Don't let alternatives discovery block the main download. If it
             # fails, the user gets standard single-source behavior.
@@ -9064,7 +9280,24 @@ def main():
         # the optional collapse pass see the same canonical keys.
         seen_nums = set()
         deduped_pool: List[Dict[str, Any]] = []
+        # Premium/locked placeholders (tapas.get_chapters emits them for
+        # WAIT_OR_MUST_PAY episodes) are surfaced SEPARATELY as locked_chapters
+        # so the UI can badge them + nudge multi-source — but they are NEVER
+        # folded into `chapters`, which drives the UI's "+N new" update diff.
+        # They don't download without --multi-source (and even with it, only if
+        # an alt carries them), so counting them there would show a perpetual
+        # "+N new". Cross-file: consumed by UI-source (grep locked_chapters).
+        locked_labels: List[str] = []
         for ch in pool:
+            if ch.get("_locked"):
+                lk = ch.get("chap")
+                if isinstance(lk, (int, float)):
+                    lk = f"{lk:g}"
+                elif lk is not None:
+                    lk = str(lk)
+                if lk is not None and _chap_as_float(lk) is not None:
+                    locked_labels.append(lk)
+                continue
             num = ch.get("chap")
             if num is None:
                 continue
@@ -9124,6 +9357,8 @@ def main():
         except (ValueError, TypeError):
             pass
 
+        locked_chapters = sorted(set(locked_labels), key=lambda x: float(x))
+
         result = {
             "hid": hid,
             "title": title,
@@ -9135,10 +9370,36 @@ def main():
             "genres": comic_data.get("genres", []),
             "total": len(unique_chapters),
             "chapters": unique_chapters,
+            # Premium/locked placeholders surfaced for the UI (badge + multi-source
+            # nudge). Empty for every non-tapas site today. NOT part of `total`
+            # or the "+N new" diff — see the locked_labels comment above.
+            "locked_chapters": locked_chapters,
             "collapse_applied": collapse_splits_enabled,
         }
         print(json.dumps(result))
         sys.exit(0)
+
+    # Download path only (--list-chapters exited above): drop premium/locked
+    # placeholders unless --multi-source can fill them. tapas.get_chapters emits
+    # WAIT_OR_MUST_PAY episodes as bare `_locked` placeholders so the multi-
+    # source alt-rescue can fetch them from another site; with multi-source OFF
+    # there is no rescue path, so each would only attempt → short-circuit
+    # ("locked") → clean-skip, and be re-attempted every run. Dropping them here
+    # restores the clean single-source behavior (matches the pre-feature "N
+    # locked skipped" outcome). Kept when multi-source is on so the alignment
+    # includes their chapter numbers and _process_chapter_strict can rescue
+    # them (grep aux_veto / _PERMANENT_SKIP_REASONS). Non-tapas pools have no
+    # `_locked` entries, so this is a no-op there.
+    if not getattr(args, "multi_source", False):
+        _locked_dropped = sum(1 for c in pool if c.get("_locked"))
+        if _locked_dropped:
+            pool = [c for c in pool if not c.get("_locked")]
+            print(
+                f"[i] {_locked_dropped} premium/locked chapter(s) skipped — "
+                f"they need a site login we don't have. Enable --multi-source "
+                f"to fetch them from an alternative site.",
+                file=sys.stderr,
+            )
 
     # Output goes into a per-title folder under ./manga (title, with hid only on collision)
     # Capture the user-facing ROOT before mutating args.output_dir / args.epub_dir to the
@@ -9474,11 +9735,18 @@ def main():
         # Wrapped schema. Legacy flat-dict format is detected on read above;
         # any tmp folder created from this point forward uses the wrapped
         # {"gating_hash", "params"} structure.
+        _run_params_obj: Dict[str, Any] = {
+            "gating_hash": current_hash, "params": current_params,
+        }
+        # Fold in the multi-source resume cache discovered earlier this run.
+        # EAGER discovery ran before this tmp dir existed, so
+        # _persist_multi_source_cache no-op'd and its payload waited here; the
+        # LAZY path writes the file itself later (grep _ms_resume_cache_payload).
+        # Top-level key, NOT in `params`, so gating_hash is unaffected.
+        if _ms_resume_cache_payload:
+            _run_params_obj["multi_source_cache"] = _ms_resume_cache_payload
         with open(params_path, "w") as f:
-            json.dump(
-                {"gating_hash": current_hash, "params": current_params},
-                f, indent=4,
-            )
+            json.dump(_run_params_obj, f, indent=4)
 
     # Save UI metadata (URL, format, title) separately from processing params.
     # This file is read by the Electron UI to auto-fill the URL when resuming,
@@ -11384,23 +11652,30 @@ def main():
                     # Alt rescue succeeded. Record the rescue in the
                     # cross-chapter tally so the timing summary can
                     # surface multi-source value. Also print an explicit
-                    # "rescued" line when the primary failure was the
-                    # ghost-signature shape (the canonical case the user
-                    # said "multi-source exists exactly for this" about).
-                    # For other reasons (host_poison / time_budget /
-                    # incomplete) the existing "[Multi-source] -> X"
-                    # line + the per-chapter "CBZ saved" already make
-                    # the rescue obvious; we only need the extra line for
-                    # ghost because the in-chapter log claimed "every
-                    # failure had identical signature" and we want to
-                    # close the loop visually.
+                    # "filled/rescued" line for the two reasons where the
+                    # in-chapter log didn't already make the rescue obvious:
+                    #   - locked: a premium tapas placeholder the primary can
+                    #     NEVER serve — this fill IS the feature the user asked
+                    #     for ("paid chapter → next highest rated site"), so
+                    #     name it plainly.
+                    #   - ghost: the in-chapter log claimed "every failure had
+                    #     identical signature"; close the loop visually.
+                    # For other reasons (host_poison / time_budget / incomplete)
+                    # the existing "[Multi-source] -> X" line + the per-chapter
+                    # "CBZ saved" already make the rescue obvious.
                     multi_source_rescues.append({
                         "chap": n_for_log,
                         "alt_site": alt_handler.name,
                         "primary_site": primary_state[0].name,
                         "primary_reason": primary_err.reason,
                     })
-                    if primary_err.reason == "ghost_chapter":
+                    if primary_err.reason == "locked":
+                        print(
+                            f"    [Multi-source] ✓ Chapter {n_for_log} "
+                            f"(premium/locked on {primary_state[0].name}) "
+                            f"filled from {alt_handler.name}"
+                        )
+                    elif primary_err.reason == "ghost_chapter":
                         print(
                             f"    [Multi-source] ✓ Chapter {n_for_log} rescued "
                             f"from {primary_state[0].name} ({primary_err.reason}) "
@@ -11687,15 +11962,24 @@ def main():
             )
             continue
         except ChapterPermanentSkipError as cpse:
-            # Deterministic per-chapter gate (mature/age/login) — record missed
-            # and continue, with NO consecutive-host-block escalation (unlike the
-            # ghost soft-skip above). See ChapterPermanentSkipError +
-            # _PERMANENT_SKIP_REASONS; the sole producer today is sites/tapas.py's
-            # mature_login_required. Fixes the old abort-on-one-gated-episode.
+            # Deterministic per-chapter gate — record missed and continue, with
+            # NO consecutive-host-block escalation (unlike the ghost soft-skip
+            # above). See ChapterPermanentSkipError + _PERMANENT_SKIP_REASONS;
+            # producers are sites/tapas.py's mature_login_required and "locked".
+            # By the time we're here the alt-rescue loop already ran and failed
+            # (or multi-source was off), so a "locked" chapter means no alt site
+            # could supply it either. Fixes the old abort-on-one-gated-episode.
+            if cpse.reason == "locked":
+                _gate_note = (
+                    "premium/locked episode — no alternative source could "
+                    "supply it (enable/broaden --multi-source to fill it)"
+                )
+            else:
+                _gate_note = "content is gated (needs a site login we don't have)"
             print(
                 f"\n[!] Chapter {cpse.chap}: {cpse.reason} on "
-                f"{cpse.host or '?'} — content is gated (needs a site login we "
-                f"don't have). Recorded as missed; the run continues."
+                f"{cpse.host or '?'} — {_gate_note}. Recorded as missed; the "
+                f"run continues."
             )
             _record_missed(
                 ch, grp_name, cpse.reason,

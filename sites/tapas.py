@@ -300,6 +300,12 @@ class TapasSiteHandler(BaseSiteHandler):
 
         chapters: List[Dict] = []
         skipped: Dict[str, int] = {}
+        # "locked" is NOT a skip anymore — premium/wait-to-unlock episodes are
+        # emitted as bare placeholders (get_chapter_images short-circuits them)
+        # so --multi-source can fill them from an alternative site. Counted
+        # separately from `skipped` for the summary. See _episode_to_chapter's
+        # `locked=` branch and aio-dl.py's _PERMANENT_SKIP_REASONS / aux_veto.
+        locked_count = 0
         page = 1
         while page <= _MAX_EPISODE_PAGES:
             api = (
@@ -319,6 +325,12 @@ class TapasSiteHandler(BaseSiteHandler):
 
             for ep in episodes:
                 reason = self._skip_reason(ep)
+                if reason == "locked":
+                    chap = self._episode_to_chapter(ep, locked=True)
+                    if chap is not None:
+                        locked_count += 1
+                        chapters.append(chap)
+                    continue
                 if reason:
                     skipped[reason] = skipped.get(reason, 0) + 1
                     continue
@@ -330,34 +342,41 @@ class TapasSiteHandler(BaseSiteHandler):
                 break
             page += 1
 
-        # Surface why episodes were dropped — the "locked" bucket is the one
-        # users notice (a popular series shows far fewer chapters than its
-        # episode count) and is actionable (a Tapas login unlocks them).
+        # Surface genuinely-dropped episodes (scheduled/novel/invalid — nothing
+        # can recover these).
         if skipped:
             summary = ", ".join(f"{v} {k}" for k, v in sorted(skipped.items()))
-            note = f"  [tapas] skipped {sum(skipped.values())} episode(s): {summary}"
-            if skipped.get("locked"):
-                note += (
-                    " — 'locked' are premium/wait-to-unlock and need a Tapas "
-                    "login (no --cookies support yet)"
-                )
-            print(note)
+            print(f"  [tapas] skipped {sum(skipped.values())} episode(s): {summary}")
+        # Locked/premium episodes ride the list as placeholders. State the fact
+        # here; aio-dl.py prints the ACTION (dropped when multi-source is off,
+        # per-chapter alt-rescue logs when it's on).
+        if locked_count:
+            print(
+                f"  [tapas] {locked_count} premium/locked episode(s) can't be "
+                f"fetched directly (no Tapas login) — kept as placeholders so "
+                f"--multi-source can fill them from an alternative site."
+            )
 
         return chapters
 
     @staticmethod
     def _skip_reason(ep: Dict) -> Optional[str]:
-        """Classify an episode for skipping, or None to keep. Split from the
-        mapper so get_chapters can COUNT reasons for a user-facing summary.
+        """Classify an episode, or None to keep as a normal chapter. Split from
+        the mapper so get_chapters can COUNT reasons for a user-facing summary.
 
-        - "scheduled": not yet published.
-        - "novel":     `book` text episode — this handler is comic-only.
+        - "scheduled": not yet published — genuinely dropped.
+        - "novel":     `book` text episode — this handler is comic-only; dropped.
         - "locked":    not free AND not unlocked AND not free_access. Tapas's
                        WAIT_OR_MUST_PAY model marks these free=false/
                        must_pay=false, but logged-out they render a paywall with
                        zero .content__img (verified 2026-07-01 on ep 1477227),
-                       so we can't fetch them without a login.
-        - "invalid":   missing/zero id."""
+                       so we can't fetch them without a login. NO LONGER a hard
+                       skip: get_chapters emits these as bare placeholders
+                       (_episode_to_chapter(locked=True)) so --multi-source can
+                       fetch them from an alternative site. get_chapter_images
+                       short-circuits them; aio-dl.py routes them to alt-rescue
+                       or a clean skip (grep _PERMANENT_SKIP_REASONS).
+        - "invalid":   missing/zero id — genuinely dropped."""
         try:
             ep_id = int(ep.get("id") or 0)
         except (TypeError, ValueError):
@@ -378,13 +397,22 @@ class TapasSiteHandler(BaseSiteHandler):
         return None
 
     @staticmethod
-    def _episode_to_chapter(ep: Dict) -> Optional[Dict]:
-        """Map one accessible episodes-API entry to a chapter dict. Gating is
-        done by _skip_reason (called first in get_chapters); this only maps.
+    def _episode_to_chapter(ep: Dict, *, locked: bool = False) -> Optional[Dict]:
+        """Map one episodes-API entry to a chapter dict. Gating is done by
+        _skip_reason (called first in get_chapters); this only maps.
         Chapter number is `scene` (the site's monotonic per-episode sequence,
         which counts Extras too) — NOT parsed from the freeform title ("1.",
         "Extra", "Side Story"), which would collide (linewebtoon.py documents
-        the same pitfall)."""
+        the same pitfall).
+
+        locked=True builds a BARE placeholder for a premium/wait-to-unlock
+        episode: it deliberately OMITS the _bgm_url/_has_bgm/_bgm_title aux
+        hints so that (a) _chapter_carries_aux(ch) stays False and the
+        multi-source alt-rescue is NOT vetoed (grep aux_veto in aio-dl.py —
+        we can't fetch the tapas BGM logged-out anyway, so there's no real
+        content to lose), and (b) the CBZ/ComicInfo never advertises a
+        has_bgm we can't satisfy. get_chapter_images short-circuits on
+        chapter["_locked"] before issuing any request."""
         try:
             ep_id = int(ep.get("id") or 0)
         except (TypeError, ValueError):
@@ -401,22 +429,26 @@ class TapasSiteHandler(BaseSiteHandler):
         title = (ep.get("title") or ep.get("escape_title") or "").strip()
         uploaded = TapasSiteHandler._parse_iso_epoch(ep.get("publish_date"))
 
-        bgm_url = (ep.get("bgm_url") or "").strip()
-        has_bgm = bool(ep.get("has_bgm"))
-
-        return {
+        chapter: Dict = {
             "hid": str(ep_id),
             "chap": chap,
             "title": title or f"Episode {scene or ep_id}",
             "url": f"{_BASE_URL}/episode/{ep_id}",
             "uploaded": uploaded,
             "group_name": "Tapas",
-            # Aux hints consumed by get_chapter_images (below) to build
-            # AssetSpecs. bgm_url is a REAL downloadable URL when present.
-            "_bgm_url": bgm_url,
-            "_has_bgm": has_bgm,
-            "_bgm_title": (ep.get("bgm_title") or "").strip(),
         }
+        if locked:
+            # Premium/wait-to-unlock: no pages and no fetchable BGM logged-out.
+            # Keep it aux-free (see docstring) and flag it for the short-circuit.
+            chapter["_locked"] = True
+            return chapter
+
+        # Accessible episode: attach aux hints consumed by get_chapter_images
+        # to build AssetSpecs. bgm_url is a REAL downloadable URL when present.
+        chapter["_bgm_url"] = (ep.get("bgm_url") or "").strip()
+        chapter["_has_bgm"] = bool(ep.get("has_bgm"))
+        chapter["_bgm_title"] = (ep.get("bgm_title") or "").strip()
+        return chapter
 
     @staticmethod
     def _parse_iso_epoch(value: Optional[str]) -> int:
@@ -441,6 +473,22 @@ class TapasSiteHandler(BaseSiteHandler):
         scraper,
         make_request,
     ) -> List[str]:
+        if chapter.get("_locked"):
+            # Premium/wait-to-unlock episode flagged at list time
+            # (_episode_to_chapter(locked=True)). Short-circuit BEFORE any
+            # request: logged-out these render a paywall with zero
+            # .content__img, so a fetch just wastes a round-trip and the
+            # resulting reason would depend on brittle interstitial-text
+            # sniffing. Raise a deterministic "locked" reason instead —
+            # aio-dl.py's _process_chapter_strict tries the best-rated
+            # multi-source alternative on this, and if none delivers, routes it
+            # to a clean skip via _PERMANENT_SKIP_REASONS (never an abort).
+            # If Tapas --cookies/login support is ever added, gate this on
+            # "no active session" so genuinely-unlocked episodes still attempt.
+            raise IncompleteChapterError(
+                pages_ok=0, pages_total=0, host="tapas.io", reason="locked",
+            )
+
         chapter_url = chapter.get("url")
         if not chapter_url:
             raise IncompleteChapterError(
