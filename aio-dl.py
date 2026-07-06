@@ -806,12 +806,29 @@ _CHAPTER_FAIL_SIG_LOCK = threading.Lock()
 # Phase D (2026-05-13): per-host concurrency cap that dials DOWN on
 # confirmed CDN failures during a run. Distinct from _HOST_FAIL_COUNT
 # (per-chapter, drives the chapter-skip threshold) — this lives across
-# the whole run so a CDN that 520s on chapter 5 stays capped through
-# chapter 50. Reset only by _reset_host_concurrency_caps at run start.
+# the whole run. Reset by _reset_host_concurrency_caps at run start.
 # Floor is 1; we never reduce below "one request at a time" because
 # concurrency reduction is a coarse control and the polite-delay
 # machinery handles fine-grained request pacing separately.
+#
+# AIMD recovery (2026-07-03; reverses the original "capped for the rest of
+# the run" decision): once the prefetch fast path started feeding this cap
+# (grep record_host_failure in _run_image_prefetch_job), descent got fast
+# enough that one bad patch could pin a 400-chapter run at cap 1-3 for hours
+# after the CDN recovered. So: _HOST_CLEAN_STREAK counts gate-accepted
+# chapters since the host's last recorded failure (any failure resets it);
+# every _HOST_CAP_RECOVERY_STREAK consecutive clean chapters buy +1 cap
+# (grep _record_host_clean_chapter). _HOST_CAP_BASELINE remembers the
+# pre-reduction cap from the host's FIRST reduction; on climbing back to it
+# the cap entry is DELETED rather than set to a number — deletion is the
+# true fully-recovered state because _effective_concurrency clamps to
+# min(base, cap) and a pool whose base exceeds the default 8 (e.g.
+# --image-workers 10) must return to its own base, not to 8.
+# All three structures share _HOST_CAP_LOCK.
 _HOST_CONCURRENCY_CAP: Dict[str, int] = {}
+_HOST_CAP_BASELINE: Dict[str, int] = {}
+_HOST_CLEAN_STREAK: Dict[str, int] = {}
+_HOST_CAP_RECOVERY_STREAK = 3
 _HOST_CAP_LOCK = threading.Lock()
 
 # Set by the per-chapter watchdog Timer in _process_chapter when the chapter's
@@ -1192,7 +1209,11 @@ def _reset_host_failures_for_chapter() -> None:
 def _record_host_failure_for_backoff(host: str, cls: str) -> None:
     """Reduce _HOST_CONCURRENCY_CAP[host] in response to a confirmed failure.
 
-    Called from _record_failure right after the URL bookkeeping. Floor is 1.
+    Called from _record_failure right after the URL bookkeeping, and directly
+    from the prefetch fast path's _prefetch_backoff_feedback callback
+    (backoff-ONLY feedback — grep _run_image_prefetch_job; it deliberately
+    bypasses _record_failure so background failures can't leak into the
+    FOREGROUND chapter's poison tally or ghost signatures). Floor is 1.
     Class behavior:
       - rate_limit:   cap //= 2  (aggressive — server is mad at request rate)
       - retryable:    cap -= 1   (we got unlucky; light decrement)
@@ -1201,6 +1222,11 @@ def _record_host_failure_for_backoff(host: str, cls: str) -> None:
                                   when origin comes back)
       - permanent:    no-op      (4xx — already filtered by _record_failure)
 
+    Every non-permanent call also resets the host's AIMD clean-chapter streak
+    (even when the cap doesn't move, e.g. already at floor or origin_error) —
+    a fresh failure means recovery must re-earn its next +1 step. Grep
+    _record_host_clean_chapter for the increase side.
+
     Cross-process backoff (sibling worker processes via _COORD) is NOT
     triggered from here — that path goes through _record_rate_limit which
     is hit by the in-band retry logic. The concurrency cap is purely
@@ -1208,11 +1234,16 @@ def _record_host_failure_for_backoff(host: str, cls: str) -> None:
 
     No-op for empty host (defensive — _record_failure already guards but
     we re-check for cheap insurance)."""
-    if cls in ("permanent", "origin_error"):
+    if cls == "permanent":
         return
     if not host:
         return
     with _HOST_CAP_LOCK:
+        # Any qualifying failure restarts the recovery clock first, so the
+        # streak resets even on classes that don't move the cap.
+        _HOST_CLEAN_STREAK.pop(host, None)
+        if cls == "origin_error":
+            return
         # Default base is 8 (matches --image-concurrency default). First
         # failure for this host: start from 8, then reduce per the class.
         # If user passed --image-concurrency 4 and we've already capped to
@@ -1225,6 +1256,9 @@ def _record_host_failure_for_backoff(host: str, cls: str) -> None:
         else:
             return
         if new_cap < current:
+            # First reduction remembers where the host started so recovery
+            # knows when it is fully healed (grep _HOST_CAP_BASELINE).
+            _HOST_CAP_BASELINE.setdefault(host, current)
             _HOST_CONCURRENCY_CAP[host] = new_cap
             log_verbose(
                 f"  [Backoff] Reducing {host} concurrency: {current} -> "
@@ -1247,14 +1281,78 @@ def _effective_concurrency(host: str, base: int) -> int:
     return min(base, cap) if cap is not None else base
 
 
+def _host_concurrency_capped(host: str) -> bool:
+    """True while `host` is under a reduced concurrency cap (it has recorded
+    failures this run and hasn't fully recovered — full recovery DELETES the
+    cap entry). Used by the prefetch chain-push to shrink queue pressure
+    against a struggling CDN (grep 'chain depth' in _process_chapter_impl)."""
+    if not host:
+        return False
+    with _HOST_CAP_LOCK:
+        return host in _HOST_CONCURRENCY_CAP
+
+
+def _record_host_clean_chapter(host: str) -> None:
+    """AIMD additive-increase: credit one gate-accepted chapter to `host`;
+    after _HOST_CAP_RECOVERY_STREAK consecutive clean chapters, step the
+    concurrency cap back up by 1. Climbing back to the host's pre-reduction
+    baseline DELETES the cap entry (every pool returns to its own base) —
+    see the _HOST_CAP_BASELINE comment at the declarations.
+
+    Called once per chapter from _process_chapter_impl right after the
+    completeness gate accepts. Prefetch-adopted chapters count: the host
+    served those bytes cleanly too, just on a background worker, and the
+    gate fires exactly once per chapter regardless of who downloaded.
+    Chapters served by an alt source credit the ALT host (host is the
+    chapter's blame host, not the primary's) — correct, since it's the host
+    that demonstrated health. The decrease side (_record_host_failure_for_
+    backoff) resets the streak on any non-permanent failure, including
+    failures recorded concurrently by prefetch workers — so a see-saw under
+    sustained sickness settles near the capacity point instead of ratcheting
+    to zero or climbing on luck."""
+    if not host:
+        return
+    with _HOST_CAP_LOCK:
+        cap = _HOST_CONCURRENCY_CAP.get(host)
+        if cap is None:
+            # Healthy host: drop any stale streak so the dict can't grow
+            # unbounded over a long multi-host run.
+            _HOST_CLEAN_STREAK.pop(host, None)
+            return
+        streak = _HOST_CLEAN_STREAK.get(host, 0) + 1
+        if streak < _HOST_CAP_RECOVERY_STREAK:
+            _HOST_CLEAN_STREAK[host] = streak
+            return
+        # Streak complete — spend it on one +1 step.
+        _HOST_CLEAN_STREAK.pop(host, None)
+        baseline = _HOST_CAP_BASELINE.get(host, 8)
+        new_cap = cap + 1
+        if new_cap >= baseline:
+            _HOST_CONCURRENCY_CAP.pop(host, None)
+            _HOST_CAP_BASELINE.pop(host, None)
+            log_verbose(
+                f"  [Backoff] {host} concurrency fully recovered "
+                f"({cap} -> uncapped)"
+            )
+        else:
+            _HOST_CONCURRENCY_CAP[host] = new_cap
+            log_verbose(
+                f"  [Backoff] Recovering {host} concurrency: {cap} -> "
+                f"{new_cap} (after {_HOST_CAP_RECOVERY_STREAK} clean chapters)"
+            )
+
+
 def _reset_host_concurrency_caps() -> None:
-    """Clear per-run concurrency caps. Called by _apply_runtime_tunables at
-    run start so each run begins with fresh CDN trust. The polite-delay
-    decay (_cool_polite_delay) handles fine-grained request-pacing recovery
-    within a run; concurrency stays capped for the rest of the run once
-    reduced, intentionally — a CDN that 520s once is likely to 520 again."""
+    """Clear per-run concurrency-cap state (cap + AIMD baseline/streak).
+    Called by _apply_runtime_tunables at run start so each run begins with
+    fresh CDN trust. Within a run, recovery is handled by the AIMD increase
+    (_record_host_clean_chapter) — the old "capped for the rest of the run"
+    rule was retired 2026-07-03 when the prefetch path started feeding the
+    cap and descent became fast enough to need an exit ramp."""
     with _HOST_CAP_LOCK:
         _HOST_CONCURRENCY_CAP.clear()
+        _HOST_CAP_BASELINE.clear()
+        _HOST_CLEAN_STREAK.clear()
 
 
 def _chapter_cancelled() -> bool:
@@ -2880,6 +2978,16 @@ def recompress_chapter_images_to_webp(
         dst = base + ".webp"
         try:
             with Image.open(src) as im:
+                # Animated source (animated GIF / APNG): a static WebP re-encode
+                # would collapse it to frame 0. Preserve the original bytes.
+                # Flatten guard — grep _is_animated_image. (.webp sources
+                # already passed through above; animated WebP is handled there.)
+                if getattr(im, "is_animated", False):
+                    log_debug(
+                        f"    Recompress skip (animated, preserved): "
+                        f"{os.path.basename(src)}"
+                    )
+                    return idx, src
                 # WebP encode wants RGB or L; webtoon pages are color so
                 # almost always already RGB, but be defensive against PNG
                 # palette / RGBA modes from older site formats.
@@ -2977,8 +3085,10 @@ def recompress_chapter_images_to_webp(
 
 # Pages larger than this in either dimension route to JXL regardless of color:
 # AVIF encodes them fine but its on-device (Android) decode at extreme heights
-# (long-strip webtoons up to ~15000px) is unverified, and JXL ties AVIF on size
-# for tall strips while decoding large dimensions more robustly. Under an
+# (long-strip webtoons up to ~15000px) is unverified, and JXL measured strictly
+# better on tall strips anyway — 12 MP strip: JXL d1 968,501 B / butteraugli
+# 1.23 / 27.6 MP/s decode vs AVIF-444 1,072,135 B / bt 2.28 / 13.0 MP/s
+# (libavif 1.4.2, 2026-07-02 bench). Under an
 # avif-only policy the user opted out of JXL, so oversized pages are skipped
 # (original kept) instead of emitting an unasked-for format.
 _MODERNIZE_MAX_DIM = 8192
@@ -3028,6 +3138,59 @@ def _page_is_grayscale(im, chroma_thresh: int = 16, area_frac: float = 0.005) ->
     return float((chroma > chroma_thresh).mean()) < area_frac
 
 
+def _is_animated_image(path: str) -> bool:
+    """True if the file at ``path`` holds more than one frame — animated GIF,
+    APNG (animated PNG), or animated WebP.
+
+    WHY generic multi-frame detection instead of format-name matching: APNG
+    reports Image.format == "PNG" (so it slips straight through
+    _MODERN_SKIP_FORMATS, which only catches literal GIF/WEBP/AVIF/JXL), and a
+    static single-frame GIF should NOT be treated as animated. PIL's
+    is_animated / n_frames is the reliable signal. Used by the transform-path
+    flatten guard (grep '_is_animated_image'): the WebP/modern recompress fast
+    paths pass the animated original through byte-for-byte instead of decoding
+    it to frame 0, and the lossy slow path (EPUB/PDF/scaling) emits a one-time
+    warning. Any open failure returns False — treat as static and let the
+    caller's existing decode path deal with a genuinely broken file.
+
+    Callers that already have the PIL image open (recompress _convert_one)
+    check ``getattr(im, "is_animated", False)`` inline to avoid a second open;
+    this helper is for the path-only sites (the slow-path warning scan).
+    """
+    try:
+        with Image.open(path) as im:
+            if getattr(im, "is_animated", False):
+                return True
+            return int(getattr(im, "n_frames", 1) or 1) > 1
+    except Exception:
+        return False
+
+
+def _warn_animated_flatten_once(raw_paths: List[str], fmt: str) -> None:
+    """Emit ONE run-wide warning when a page on the lossy transform path
+    (EPUB / PDF / --width / --scaling≠100 / --quality<100) is animated — those
+    paths decode to a single PIL frame and drop the animation.
+
+    The default CBZ fast-path and the --webtoon-recompress / --modernize paths
+    preserve animation byte-for-byte (grep _is_animated_image); this fires only
+    where flattening is structural, so the user is told instead of silently
+    losing frames. Once-per-run state lives on a function attribute (no global
+    needed from the nested caller). Short-circuits on the first animated page,
+    so it's cheap even on the slow path we're already decoding.
+    """
+    if getattr(_warn_animated_flatten_once, "_warned", False):
+        return
+    if any(_is_animated_image(p) for p in raw_paths):
+        _warn_animated_flatten_once._warned = True  # type: ignore[attr-defined]
+        print(
+            f"[!] Animated page(s) detected but --format {fmt} flattens them "
+            f"to the first frame. Use the default --format cbz with no "
+            f"--width/--scaling/--quality override to preserve animated "
+            f"GIF/APNG byte-for-byte.",
+            file=sys.stderr,
+        )
+
+
 def recompress_chapter_images_modern(
     raw_paths: List[str],
     *,
@@ -3036,6 +3199,7 @@ def recompress_chapter_images_modern(
     color_quality: int,
     min_saving: float,
     effort: int = 7,
+    speed: int = 6,
 ) -> List[str]:
     """Content-aware transcode of JPEG/PNG pages to JXL (B&W) / AVIF (color).
 
@@ -3046,6 +3210,18 @@ def recompress_chapter_images_modern(
     ``min_saving`` is the keep-threshold: the new file replaces the original
     only if its size < orig_size * min_saving, else the original is kept
     byte-for-byte (so already-dense pages are auto-skipped and nothing bloats).
+
+    ``effort`` (JXL, 1-9) and ``speed`` (AVIF, 0-10) are the pure CPU<->size
+    knobs, surfaced as --modernize-effort / --modernize-avif-speed. They change
+    encode time and output size ONLY — never the decoded pixels — so they are
+    deliberately NOT in _RESUME_GATING_DESTS (a mid-run change keeps completed
+    chapters and applies the new value going forward, rather than nuking the
+    partial). Axes are INVERSE: higher JXL effort = slower + smaller; higher
+    AVIF speed = faster + larger. Defaults 7 / 6 are the measured sweet spot —
+    e9 is a CPU trap (~7.5x slower than e7 for ~5% smaller; e8 matches e9 size
+    at ~1.5x speed), and AVIF s4 is ~5x slower than s6 for ~2% smaller while
+    s10 bloats ~13%. Bench: tools/modernize_library.py header + the memory
+    note modernize-effort9-cpu-trap.
 
     Returns the per-slot path list (new .jxl/.avif where it helped, otherwise
     the unchanged original path), matching recompress_chapter_images_to_webp's
@@ -3093,20 +3269,43 @@ def recompress_chapter_images_modern(
             return "both"
         return "jxl" if _page_is_grayscale(im) else "avif"  # auto
 
-    def _convert_one(entry: Tuple[int, str]) -> Tuple[int, str]:
+    def _convert_one(
+        entry: Tuple[int, str], nthreads: int
+    ) -> Tuple[int, str, Optional[Exception]]:
+        """Transcode one page; return (idx, result_path, error).
+
+        error is None on success OR a legitimate keep (skip format, animated
+        source, no min_saving headroom). It carries the exception ONLY when the
+        encode itself raised — those slots keep the original for now and are
+        handed to the serial mop-up pass in the driver below. ``nthreads`` bounds
+        each encoder's internal thread pool (grep enc_threads — the fix for the
+        intermittent libjxl JXL_ENC_ERROR under pool oversubscription).
+        """
         idx, src = entry
         base, _ = os.path.splitext(src)
         try:
             orig_size = os.path.getsize(src)
             with Image.open(src) as im:
                 src_fmt = (im.format or "").upper()
-                if src_fmt in _MODERN_SKIP_FORMATS:
-                    return idx, src
+                # Skip already-efficient/modern codecs AND any animated source.
+                # APNG reports src_fmt == "PNG" (so it slips _MODERN_SKIP_FORMATS)
+                # yet is_animated catches it — flattening it to a single JXL/AVIF
+                # frame would drop the animation. Flatten guard: grep
+                # _is_animated_image.
+                if src_fmt in _MODERN_SKIP_FORMATS or getattr(im, "is_animated", False):
+                    return idx, src, None
                 w, h = im.size
                 target = _pick_target(im, w, h)
                 if target == "skip":
-                    return idx, src
-                candidates: List[Tuple[int, str]] = []
+                    return idx, src, None
+                # (size, path, is_recon). is_recon marks the JXL save that ran
+                # pillow_jxl's bit-exact JPEG->JXL *reconstruction* (JPEG file
+                # source + strict-lossless tier + no mode conversion): zero
+                # quality cost AND byte-recoverable (djxl reconstructs the
+                # original .jpg), so the adopt guard below exempts it from
+                # min_saving — any saving is pure win. Mirrored in
+                # tools/modernize_library.py (grep is_recon).
+                candidates: List[Tuple[int, str, bool]] = []
                 if target in ("jxl", "both"):
                     jxl_path = base + ".jxl"
                     # Encode as-is (no convert("L") — see header). Keep alpha-
@@ -3135,15 +3334,35 @@ def recompress_chapter_images_modern(
                     #     reconstruction (~78%) for JPEG and pixel-lossless for
                     #     PNG automatically — exactly the two lossless tiers, no
                     #     external cjxl needed. (PNG/other sources ignore
-                    #     lossless_jpeg either way.)
+                    #     lossless_jpeg either way.) Bench 2026-07-02:
+                    #     reconstruction = 12.7-92.6% of the source JPEG,
+                    #     sha256-verified reversible; see
+                    #     ~/.claude/plans/compression-modernize-handoff.md.
+                    # num_threads caps pillow_jxl's internal Encoder pool
+                    # (default -1 = ALL cores) so `workers` concurrent encodes
+                    # don't oversubscribe — the fix for the intermittent
+                    # JXL_ENC_ERROR on large pages (grep enc_threads in the
+                    # driver). Bit-identical output, verified across 1/2/4/-1.
                     jxl_src.save(
                         jxl_path,
                         format="JXL",
                         effort=effort,
+                        num_threads=nthreads,
                         **({"lossless": True} if gray_quality == 0.0
                            else {"distance": gray_quality, "lossless_jpeg": False}),
                     )
-                    candidates.append((os.path.getsize(jxl_path), jxl_path))
+                    # A CMYK JPEG went through convert("RGB") above, severing
+                    # pillow_jxl's access to the original bitstream — that save
+                    # is a pixel-lossless encode of converted pixels, NOT a
+                    # byte-recoverable reconstruction, hence the `is im` term.
+                    is_recon = (
+                        src_fmt == "JPEG"
+                        and gray_quality == 0.0
+                        and jxl_src is im
+                    )
+                    candidates.append(
+                        (os.path.getsize(jxl_path), jxl_path, is_recon)
+                    )
                 if target in ("avif", "both"):
                     avif_path = base + ".avif"
                     # AVIF carries alpha — never flatten it. The CBZ byte-
@@ -3163,35 +3382,55 @@ def recompress_chapter_images_modern(
                         avif_src = im.convert("RGBA")
                     else:
                         avif_src = im.convert("RGB")
+                    # 4:4:4 chroma, NOT Pillow's 4:2:0 default: q90 at 4:2:0
+                    # measured butteraugli ~7.1 / SSIMULACRA2 ~78 on saturated
+                    # color (chroma bleed on fine colored detail), reproduced on
+                    # libavif 1.4.2 — subsampling-inherent, not encoder vintage.
+                    # 4:4:4 measured bt ~1.3 at ~+12% bytes (2026-07-02 bench).
+                    # Hardcoded, not a flag: no new argparse dest, so no
+                    # resume-gating impact (grep _RESUME_GATING_DESTS).
+                    # max_threads caps libavif's pool (default = all cores) for
+                    # the same anti-oversubscription reason as JXL's num_threads.
                     avif_src.save(
-                        avif_path, format="AVIF", quality=color_quality, speed=6
+                        avif_path,
+                        format="AVIF",
+                        quality=color_quality,
+                        speed=speed,
+                        subsampling="4:4:4",
+                        max_threads=nthreads,
                     )
-                    candidates.append((os.path.getsize(avif_path), avif_path))
+                    candidates.append(
+                        (os.path.getsize(avif_path), avif_path, False)
+                    )
         except Exception as e:
-            # Corrupt page, missing encoder, DecompressionBomb, etc. Keep the
-            # original; clean up any partial temp. One bad page never aborts the
+            # Corrupt page, missing encoder, DecompressionBomb, OR a transient
+            # encoder failure under load (libjxl JXL_ENC_ERROR — grep
+            # enc_threads). Clean the partial temp and report the error UP: the
+            # driver's serial mop-up retries this page single-file (no pool
+            # contention) before conceding, so we do NOT warn here — the mop-up
+            # warns only if the retry also fails. One bad page never aborts the
             # chapter (mirrors the webp fn's broad catch at ~line 2894).
-            log_verbose(
-                f"  Warning: modernize transcode failed for "
-                f"{os.path.basename(src)}: {e}. Keeping original."
-            )
             for _ext in (".jxl", ".avif"):
                 try:
                     os.remove(base + _ext)
                 except OSError:
                     pass
-            return idx, src
+            return idx, src, e
 
         # Pick the smallest candidate; discard the rest (jxl+avif loser).
         candidates.sort(key=lambda c: c[0])
-        best_size, best_path = candidates[0]
-        for _sz, loser in candidates[1:]:
+        best_size, best_path, best_is_recon = candidates[0]
+        for _sz, loser, _recon in candidates[1:]:
             try:
                 os.remove(loser)
             except OSError:
                 pass
         # Guard: adopt the new file only if it clears the savings threshold.
-        if best_size < orig_size * min_saving:
+        # JPEG reconstructions are exempt (adopt iff strictly smaller): the
+        # candidate is byte-recoverable, so unlike a lossy candidate there is
+        # no quality cost to weigh a marginal saving against — 92-93%-ratio
+        # line-art JPEGs would otherwise keep their originals for no benefit.
+        if best_size < orig_size * (1.0 if best_is_recon else min_saving):
             try:
                 os.remove(src)
             except OSError as e:
@@ -3202,24 +3441,40 @@ def recompress_chapter_images_modern(
                     f"{os.path.splitext(best_path)[1]} ({e}): "
                     f"{os.path.basename(src)}"
                 )
-            return idx, best_path
+            return idx, best_path, None
         # Not enough headroom — drop the new file, keep the original bytes.
         try:
             os.remove(best_path)
         except OSError:
             pass
-        return idx, src
+        return idx, src, None
 
+    # Encoder-thread budget — the fix for the intermittent modernize failure
+    # "... Generic Error. Please build `libjxl` from source ...". pillow_jxl's
+    # Encoder AND Pillow's native AVIF encoder each default to an ALL-CORES
+    # internal thread pool (num_threads=-1 / max_threads=cpu). Nested under this
+    # `workers`-thread page pool that compounds to workers*cpu threads (e.g.
+    # 6*12=72 on a 12-core box), and the oversubscription intermittently trips
+    # libjxl's parallel runner into a bare JXL_ENC_ERROR on very large pages
+    # under real-world load — reproduced on ~62 MP progressive JPEGs while the
+    # background image-prefetch chain ran (bench: 3/42 byte-identical pages
+    # failed intermittently; all pass single-threaded). Sizing each encode at
+    # cpu//workers keeps every core busy with NO oversubscription. Thread count
+    # NEVER changes the output bytes (sha-identical + reconstruction bit-exact
+    # across 1/2/4/-1), so it is invisible to the CBZ and to resume gating.
     cpu = os.cpu_count() or 4
-    half_cores = max(1, cpu // 2)
-    workers = max(1, min(half_cores, len(raw_paths)))
+    workers = max(1, min(cpu // 2, len(raw_paths)))
+    enc_threads = max(1, cpu // workers)
 
     out: List[Optional[str]] = [None] * len(raw_paths)
+    failed: List[Tuple[int, str]] = []  # (idx, src) whose encode raised
     with _cpu_guard("recompress_modern"):
         if workers == 1 or len(raw_paths) == 1:
             for entry in enumerate(raw_paths):
-                idx, dst = _convert_one(entry)
+                idx, dst, err = _convert_one(entry, enc_threads)
                 out[idx] = dst
+                if err is not None:
+                    failed.append((idx, raw_paths[idx]))
                 if idx % 8 == 0:
                     _hb("cpu", f"modernize {idx+1}/{len(raw_paths)}")
         else:
@@ -3230,12 +3485,43 @@ def recompress_chapter_images_modern(
                 # heavy encode (like libwebp/libjpeg), so workers translate to
                 # speedup; if a given pillow_jxl build holds the GIL the pool
                 # just serializes (correct, only slower). Part B uses processes.
-                for idx, dst in pool.map(
-                    _convert_one, list(enumerate(raw_paths))
+                for idx, dst, err in pool.map(
+                    lambda e: _convert_one(e, enc_threads),
+                    list(enumerate(raw_paths)),
                 ):
                     out[idx] = dst
+                    if err is not None:
+                        failed.append((idx, raw_paths[idx]))
                     if idx % 8 == 0:
                         _hb("cpu", f"modernize {idx+1}/{len(raw_paths)}")
+
+        # Serial mop-up: a page whose encode raised almost always succeeds when
+        # retried single-file — no sibling encoders competing for cores/memory
+        # is exactly the low-contention condition that never failed in testing.
+        # Give the lone encode the full core count (nothing else runs now) and
+        # retry twice with a short backoff before conceding. This turns the
+        # transient libjxl failure from "page silently left un-modernized" into
+        # "page transcoded a beat later".
+        if failed:
+            log_verbose(
+                f"  [modernize] Retrying {len(failed)} page(s) that failed "
+                f"under load (serial)..."
+            )
+            for idx, src in failed:
+                dst = src
+                err: Optional[Exception] = None
+                for _attempt in range(2):
+                    _hb("cpu", f"modernize retry {os.path.basename(src)}")
+                    _, dst, err = _convert_one((idx, src), cpu)
+                    if err is None:
+                        break
+                    time.sleep(0.3 * (_attempt + 1))
+                out[idx] = dst
+                if err is not None:
+                    log_verbose(
+                        f"  Warning: modernize transcode failed for "
+                        f"{os.path.basename(src)}: {err}. Keeping original."
+                    )
 
     return [p for p in out if p is not None]
 
@@ -3434,6 +3720,7 @@ def build_per_chapter_comic_info_xml(
     publishers: List[str],
     lang: str,
     page_count: int,
+    aux_records: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Per-chapter ComicInfo.xml string for Komikku-mode CBZs.
 
@@ -3566,6 +3853,53 @@ def build_per_chapter_comic_info_xml(
     if mal_id is not None:
         lines.append(f'  <MalId>{int(mal_id)}</MalId>')
 
+    # Auxiliary assets (audio / motion-toon) that ride INSIDE this CBZ under the
+    # _aio/ prefix. Aio-prefixed custom elements — dropped silently by Komga/
+    # Kavita exactly like <AnilistId>, parsed by the user's own reader.
+    # <AioChapterResources> is the compact machine-readable JSON blob (paths
+    # CBZ-relative, e.g. _aio/bgm_<ep>_<n>.m4a); the <AioMotionManifest>/
+    # <AioAudioFile>/<AioAudioReference> children are human-scannable duplicates.
+    # Written only when a handler stashed aux (webtoons motion+BGM, tapas audio)
+    # — see _materialize_chapter_aux. --refresh-rewrite-cbz preserves both the
+    # _aio/ members (blob-copied) AND this blob (re-parsed from the old ComicInfo
+    # and passed back as aux_records — grep 'acr = _gx').
+    if aux_records and isinstance(aux_records, dict):
+        has_payload = (
+            aux_records.get("motion_manifest")
+            or aux_records.get("audio")
+            or aux_records.get("audio_refs")
+            or aux_records.get("has_bgm")
+            or aux_records.get("layers")
+        )
+        if has_payload:
+            try:
+                blob = json.dumps(aux_records, ensure_ascii=False, sort_keys=True)
+            except (TypeError, ValueError):
+                blob = ""
+            if blob:
+                lines.append(
+                    f'  <AioChapterResources>{escape(blob)}</AioChapterResources>'
+                )
+            manifest_rel = aux_records.get("motion_manifest")
+            if manifest_rel:
+                lines.append(
+                    f'  <AioMotionManifest>{escape(manifest_rel)}</AioMotionManifest>'
+                )
+            for audio_rel in aux_records.get("audio") or []:
+                lines.append(f'  <AioAudioFile>{escape(audio_rel)}</AioAudioFile>')
+            for ref in aux_records.get("audio_refs") or []:
+                ref_url = ref.get("url") if isinstance(ref, dict) else None
+                if ref_url:
+                    provider = (
+                        ref.get("provider") if isinstance(ref, dict) else None
+                    ) or ""
+                    attr = f' provider="{escape(provider)}"' if provider else ""
+                    lines.append(
+                        f'  <AioAudioReference{attr}>{escape(ref_url)}</AioAudioReference>'
+                    )
+            if aux_records.get("has_bgm"):
+                lines.append('  <AioHasBgm>true</AioHasBgm>')
+
     lines.append('</ComicInfo>')
     return "\n".join(lines) + "\n"
 
@@ -3654,6 +3988,344 @@ def _komikku_chapter_filename(chap: Any, vol: Any, title: Optional[str]) -> str:
     return f"{vol_prefix}Ch.{chap_label}{title_suffix}.cbz"
 
 
+# -----------------------------------------------------------
+# Sidecar auxiliary assets (audio / motion-toon manifest / layer map)
+# -----------------------------------------------------------
+# Faithful-archival feature (local branch — see
+# ~/.claude/plans/i-want-to-add-rustling-penguin.md). Handlers (tapas,
+# linewebtoon motion) stash sites.base.AssetSpec objects on the mutable
+# chapter dict as chapter["_aux_assets"]; the CBZ-build path calls
+# _materialize_chapter_aux to fetch them into in-memory ZIP members written
+# INTO the chapter CBZ under the reserved _aio/ prefix (audio bytes + motion
+# manifest), plus a metadata record embedded in the per-chapter ComicInfo.xml
+# (<AioChapterResources>, grep 'aux_records'). _aio/ members are renumber-
+# EXEMPT: build_cbz_from_content skips + preserves them (else the combined-
+# archive renumber would turn an in-CBZ .m4a into a bogus page). No loose
+# _assets/ sidecar anymore; details.json gets a chapter_assets rollup rebuilt
+# from the CBZs' ComicInfo at end-of-run (grep '_scan_chapter_cbz_aux').
+
+def _fetch_binary_asset_bytes(
+    url: str,
+    scraper,
+    make_request_fn,
+    *,
+    retries: int = 3,
+) -> Optional[bytes]:
+    """Fetch a non-image binary asset (audio, manifest) and RETURN ITS BYTES,
+    or None on failure. Bytes not a file: aux assets are written straight into
+    the chapter CBZ via zipfile.writestr (grep _materialize_chapter_aux), never
+    a loose sidecar.
+
+    Deliberately NOT dl_image: dl_image sniffs image magic bytes and would
+    mislabel an .mp3/.m4a. Routes through make_request (the project's canonical
+    GET with backoff + rate-limit coordination).
+
+    Deliberately IGNORES the per-chapter watchdog (2026-07-03; it used to
+    fast-fail on _chapter_cancelled): aux materialization only runs AFTER the
+    completeness gate accepted the chapter (grep _materialize_chapter_aux's
+    call site — inside `if process_this_chapter:` post-gate), so the pages are
+    already secured and the deadline has nothing left to protect. Honoring it
+    meant a chapter whose page phase ran long SILENTLY dropped its BGM (the
+    record kept has_bgm=True but no _aio/ audio member). Wall-clock stays
+    bounded by retries x make_request's own timeout/backoff budget, and the
+    host-poison guard still stops a dead audio CDN from grinding.
+    """
+    host = urlparse(url).netloc
+    poison = int(globals().get("_CHAPTER_HOST_POISON", 5))
+    for attempt in range(1, max(1, retries) + 1):
+        if poison > 0 and _host_fail_count(host) >= poison:
+            return None
+        try:
+            resp = make_request_fn(url, scraper)
+            body = getattr(resp, "content", None)
+            status = getattr(resp, "status_code", 200)
+            if body and status < 400:
+                return bytes(body)
+            log_verbose(f"    [assets] non-OK response ({status}) for {url}")
+        except Exception as exc:
+            log_verbose(
+                f"    [assets] fetch attempt {attempt}/{retries} failed "
+                f"for {url}: {type(exc).__name__}: {exc}"
+            )
+        if attempt < retries:
+            time.sleep(0.5 * attempt)
+    return None
+
+
+def _materialize_chapter_aux(
+    specs: List[Any],
+    scraper,
+    make_request_fn,
+) -> Tuple[Optional[Dict[str, Any]], List[Tuple[str, bytes]]]:
+    """Fetch a chapter's AssetSpec list into (record, members):
+      - members: [(arcname, bytes)] written verbatim INTO the chapter CBZ under
+        the reserved `_aio/` prefix (renumber-exempt). Audio is fetched with
+        _fetch_binary_asset_bytes (NOT dl_image); the motion manifest rides
+        inline on the spec.
+      - record: the reader-facing metadata dict embedded in the per-chapter
+        ComicInfo.xml <AioChapterResources> blob. Paths are CBZ-relative
+        (`_aio/<name>`). Only successfully-fetched audio is listed, but has_bgm
+        is set from spec meta even on a fetch failure so the reader still learns
+        BGM existed. audio_reference (SoundCloud, BGM-presence marker) is
+        record-only — never downloaded (locked design decision).
+
+    Returns (None, []) for empty specs — the common case for every normal site,
+    so the CBZ-build path adds nothing and the archive is byte-identical to
+    before this feature.
+    """
+    if not specs:
+        return None, []
+
+    record: Dict[str, Any] = {
+        "motion_manifest": None,
+        "audio": [],
+        "audio_refs": [],
+        "layers": None,
+        "has_bgm": False,
+    }
+    members: List[Tuple[str, bytes]] = []
+    used_names: set = set()
+
+    def _uniq(preferred: Optional[str], fallback: str) -> str:
+        base = _sanitize_folder_component(preferred or "") or fallback
+        stem, ext = os.path.splitext(base)
+        candidate = base
+        i = 1
+        while candidate.lower() in used_names:
+            candidate = f"{stem}_{i}{ext}"
+            i += 1
+        used_names.add(candidate.lower())
+        return candidate
+
+    for spec in specs:
+        stype = getattr(spec, "type", None)
+        meta = getattr(spec, "meta", None) or {}
+
+        if stype == "audio_reference":
+            ref: Dict[str, Any] = {}
+            src = getattr(spec, "source_url", None)
+            if src:
+                ref["url"] = src
+            for k, v in meta.items():
+                ref[k] = v
+            if ref:
+                record["audio_refs"].append(ref)
+            if meta.get("has_bgm"):
+                record["has_bgm"] = True
+            continue
+
+        if stype == "motion_manifest":
+            data = getattr(spec, "data", None)
+            if data:
+                fname = _uniq(
+                    getattr(spec, "filename", None) or "motion.json", "motion.json"
+                )
+                payload = (
+                    bytes(data) if isinstance(data, (bytes, bytearray))
+                    else str(data).encode("utf-8")
+                )
+                members.append((f"_aio/{fname}", payload))
+                record["motion_manifest"] = f"_aio/{fname}"
+            if meta.get("layers"):
+                record["layers"] = meta["layers"]
+            continue
+
+        if stype == "motion_layer":
+            if meta.get("layers"):
+                record["layers"] = meta["layers"]
+            continue
+
+        if stype == "audio_download":
+            src = getattr(spec, "source_url", None)
+            if not src:
+                continue
+            # A handler can flag an audio_download as background music (webtoons
+            # BGM) so the chapter is marked has_bgm even if the fetch below
+            # fails — same has_bgm signal the audio_reference branch sets.
+            if meta.get("has_bgm"):
+                record["has_bgm"] = True
+            url_name = os.path.basename(urlparse(src).path) or "audio.bin"
+            fname = _uniq(getattr(spec, "filename", None) or url_name, "audio.bin")
+            data = _fetch_binary_asset_bytes(src, scraper, make_request_fn)
+            if data:
+                members.append((f"_aio/{fname}", data))
+                record["audio"].append(f"_aio/{fname}")
+            continue
+        # Unknown spec.type — ignored (forward-compatible).
+
+    return record, members
+
+
+def _chapter_carries_aux(ch: Dict[str, Any]) -> bool:
+    """True when this chapter is known to carry faithful-archival aux content
+    on the PRIMARY source (BGM audio, motion-toon manifest/sounds, or an
+    audio-reference marker). Consulted by _process_chapter_strict to VETO the
+    multi-source alt rescue: alternative sites only mirror flattened pages, so
+    a rescue would silently trade real content (audio/motion) for availability
+    (user directive 2026-07-03 — "BGM or animation chapters shouldn't be
+    rescuable by --multi-source").
+
+    Signals, most specific first:
+      - ch["_aux_assets"]: AssetSpec list stashed by get_chapter_images
+        (linewebtoon._stash_normal_audio / _stash_motion_aux,
+        tapas._stash_aux_assets). Present whenever the failed attempt got as
+        far as the episode page — the overwhelmingly common failure point is
+        Phase 2 page downloads, which is after the stash.
+      - list-time BGM flags, covering attempts that died before/inside
+        get_chapter_images: linewebtoon.get_chapters stamps has_bgm from the
+        episode API's hasBgm; tapas.get_chapters stamps _has_bgm/_bgm_url.
+        Motion-toons have no list-time flag — an attempt that fails that
+        early stays rescue-eligible (nothing was fetched to lose, and we
+        can't know it's motion without the page).
+      - merged collapse-split parts (_merged_parts): any part carrying
+        either signal vetoes the whole synthesized chapter.
+    """
+    def _one(d: Dict[str, Any]) -> bool:
+        return bool(
+            d.get("_aux_assets")
+            or d.get("has_bgm")
+            or d.get("_has_bgm")
+            or d.get("_bgm_url")
+        )
+
+    if _one(ch):
+        return True
+    return any(
+        _one(p) for p in ch.get("_merged_parts") or [] if isinstance(p, dict)
+    )
+
+
+def _scan_chapter_cbz_aux(out_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Rebuild the per-chapter aux rollup by reading each chapter CBZ's embedded
+    ComicInfo.xml <AioChapterResources> JSON blob. This is the source of truth
+    now that aux lives INSIDE the CBZs (no _assets/ sidecar to scan). Keyed by
+    the ComicInfo <Number> (falls back to the filename stem). Self-healing for
+    incremental/resume: prior-run CBZs on disk are re-read, so the rollup stays
+    complete. Only CBZs that carry aux contribute (others have no blob). Reads
+    just the ComicInfo member of each zip (central-directory + one entry), so
+    the end-of-run cost is a few ms per chapter."""
+    records: Dict[str, Dict[str, Any]] = {}
+    try:
+        names = os.listdir(out_dir)
+    except OSError:
+        return records
+    for name in sorted(names):
+        if not name.lower().endswith(".cbz"):
+            continue
+        path = os.path.join(out_dir, name)
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                if "ComicInfo.xml" not in zf.namelist():
+                    continue
+                xml_text = zf.read("ComicInfo.xml").decode("utf-8", "replace")
+        except Exception:
+            continue
+        m = re.search(
+            r"<AioChapterResources>(.*?)</AioChapterResources>", xml_text, re.DOTALL
+        )
+        if not m:
+            continue
+        try:
+            rec = json.loads(xml.sax.saxutils.unescape(m.group(1)))
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        num_m = re.search(r"<Number>([^<]*)</Number>", xml_text)
+        chap = (num_m.group(1).strip() if num_m else "") or os.path.splitext(name)[0]
+        records[chap] = rec
+    return records
+
+
+def _warn_aux_needs_cbz_once(fmt: str) -> None:
+    """One-time notice that a handler produced audio/motion extras but the
+    current output format can't embed them (aux rides INSIDE the CBZ under
+    _aio/; EPUB/PDF have no per-chapter equivalent). Function-attribute flag →
+    fires once per run."""
+    if getattr(_warn_aux_needs_cbz_once, "_warned", False):
+        return
+    _warn_aux_needs_cbz_once._warned = True
+    print(
+        f"  [assets] Note: this series has audio/motion extras, but --format "
+        f"{fmt} can't archive them — use --format cbz (or --komikku)."
+    )
+
+
+def _patch_details_json_with_assets(
+    out_dir: str,
+    aux_seen: Dict[str, bool],
+) -> None:
+    """Merge the sidecar-asset rollup into an EXISTING details.json (Komikku
+    mode): has_motion / has_audio series flags + a chapter_assets map keyed by
+    chapter label, rebuilt from each chapter CBZ's ComicInfo <AioChapterResources>
+    (grep _scan_chapter_cbz_aux) — the source of truth now that aux lives INSIDE
+    the CBZs.
+
+    WHY end-of-run: details.json is written ONCE up front (grep
+    'details_payload.update'), BEFORE any chapter, so the rollup can't be made
+    in that pass. Rebuilding from the on-disk CBZ scan keeps incremental/resume
+    runs complete (prior chapters' CBZs are re-read). Non-destructive: adds the
+    three keys, preserves the six canonical + AniList extras. The refresh flow
+    (grep 'new_details.update') copies them forward via dict(existing_details).
+
+    Cheap on aux-free series: skips the CBZ scan entirely unless this run
+    produced aux (aux_seen) OR details.json already carries the flags. `aux_seen`
+    is {"audio": bool, "motion": bool} accumulated during the run.
+    """
+    details_path = os.path.join(out_dir, "details.json")
+    if not os.path.isfile(details_path):
+        return
+    try:
+        with open(details_path, "r", encoding="utf-8") as fh:
+            details = json.load(fh)
+        if not isinstance(details, dict):
+            return
+    except (OSError, ValueError):
+        return
+
+    had_flags = any(
+        k in details for k in ("has_audio", "has_motion", "chapter_assets")
+    )
+    ran_aux = bool(aux_seen.get("audio") or aux_seen.get("motion"))
+    if not ran_aux and not had_flags:
+        # Aux-free series (this run + never before) — keep details.json clean
+        # and skip the CBZ scan entirely (zero cost on every normal download).
+        return
+
+    records = _scan_chapter_cbz_aux(out_dir)
+
+    chapter_assets: Dict[str, Any] = {}
+    has_motion = False
+    has_audio = False
+    for chap, rec in records.items():
+        entry: Dict[str, Any] = {
+            "motion_manifest": rec.get("motion_manifest"),
+            "audio": list(rec.get("audio") or []),
+            "audio_refs": list(rec.get("audio_refs") or []),
+            "has_bgm": bool(rec.get("has_bgm")),
+        }
+        if rec.get("layers"):
+            entry["layers"] = rec["layers"]
+        chapter_assets[str(chap)] = entry
+        if entry["motion_manifest"] or entry.get("layers"):
+            has_motion = True
+        if entry["audio"] or entry["audio_refs"] or entry["has_bgm"]:
+            has_audio = True
+
+    details["has_motion"] = has_motion
+    details["has_audio"] = has_audio
+    details["chapter_assets"] = chapter_assets
+    try:
+        with open(details_path, "w", encoding="utf-8") as fh:
+            json.dump(details, fh, ensure_ascii=False, indent=2)
+        log_verbose(
+            f"  [assets] patched details.json: has_motion={has_motion}, "
+            f"has_audio={has_audio}, {len(chapter_assets)} chapter(s)"
+        )
+    except OSError as exc:
+        log_verbose(f"  [assets] details.json patch failed: {exc}")
+
+
 def build_cbz(
     slices: List[str],
     out_path: str,
@@ -3662,6 +4334,7 @@ def build_cbz(
     publishers: List[str],
     lang: str,
     chapter_comic_info_xml: Optional[str] = None,
+    extra_members: Optional[List[Tuple[str, bytes]]] = None,
 ):
     """Builds a CBZ file from a list of image slices with metadata.
 
@@ -3672,6 +4345,11 @@ def build_cbz(
     at cache-creation time; this is the slow-path equivalent for pre-Phase-D
     resumes where chapter_content carries 'image' entries instead of
     'cbz_cache' entries).
+
+    extra_members: optional [(arcname, bytes)] written verbatim — used for the
+    _aio/ aux sidecars (audio/motion) in this legacy image-entry path. Names are
+    NOT renumbered, so keep them under the reserved _aio/ prefix (grep
+    _materialize_chapter_aux); the fast cbz_cache path writes them inline.
     """
     xml_content = chapter_comic_info_xml or build_comic_info_xml(
         title, comic_info, publishers, lang, len(slices)
@@ -3680,6 +4358,8 @@ def build_cbz(
         for i, image_path in enumerate(slices):
             arcname = f"{i:04d}{os.path.splitext(image_path)[1]}"
             zf.write(image_path, arcname)
+        for arcname, data in (extra_members or []):
+            zf.writestr(arcname, data)
         zf.writestr("ComicInfo.xml", xml_content, compress_type=zipfile.ZIP_DEFLATED)
     print(f"CBZ saved → {os.path.basename(out_path)}")
 
@@ -3706,7 +4386,17 @@ def build_cbz_from_content(
     The series-level ComicInfo.xml is written once at the end; member
     copies skip any per-chapter ComicInfo.xml so we don't get duplicate
     entries that confuse readers.
+
+    Aux sidecars (audio/motion) inside a cbz_cache live under the reserved
+    `_aio/` prefix. They are NOT pages, so they're excluded from page_count and
+    copied VERBATIM (never renumbered — a renumbered `_aio/…m4a` would become a
+    bogus 0001.m4a "page"). Combined archives namespace them per source chapter
+    (`_aio/ch_<n>/…`, from item["chap"]) so parts don't collide; per-chapter
+    Komikku output skips this function entirely (--no-final-file forced).
     """
+    def _is_aux_member(fn: str) -> bool:
+        return fn.startswith("_aio/")
+
     page_count = 0
     for item in content:
         t = item.get("type")
@@ -3718,6 +4408,7 @@ def build_cbz_from_content(
                     page_count += sum(
                         1 for info in zin.infolist()
                         if info.filename != "ComicInfo.xml"
+                        and not _is_aux_member(info.filename)
                     )
             except Exception:
                 # Cache file unreadable — skip its page contribution. The
@@ -3737,10 +4428,21 @@ def build_cbz_from_content(
                 zout.write(item["path"], f"{idx:04d}{ext}")
                 idx += 1
             elif t == "cbz_cache":
+                chap = item.get("chap")
                 try:
                     with zipfile.ZipFile(item["path"], "r") as zin:
                         for info in zin.infolist():
                             if info.filename == "ComicInfo.xml":
+                                continue
+                            if _is_aux_member(info.filename):
+                                # Preserve verbatim, namespaced per chapter so
+                                # combined archives don't collide. NOT a page.
+                                rel = info.filename[len("_aio/"):]
+                                arc = (
+                                    f"_aio/ch_{_sanitize_folder_component(str(chap))}/{rel}"
+                                    if chap is not None else info.filename
+                                )
+                                zout.writestr(arc, zin.read(info))
                                 continue
                             ext = os.path.splitext(info.filename)[1]
                             zout.writestr(
@@ -4342,6 +5044,14 @@ _RESUME_GATING_DESTS = frozenset({
     "modernize_quality",
     "modernize_distance",
     "modernize_min_saving",
+    # NOTE: modernize_effort / modernize_avif_speed are DELIBERATELY not here.
+    # This set is "image-affecting" params (a mismatch WIPES the partial via
+    # rm_tree). effort/speed change encode time + file size ONLY, never the
+    # decoded pixels — so a mid-run change should keep completed chapters and
+    # apply the new value going forward, not nuke a 200-chapter partial to shave
+    # ~5% off. They ARE still persisted (get_resumable_params auto-collects all
+    # non-transient dests) so --restore-parameters restores them; they are just
+    # not gating. See recompress_chapter_images_modern()'s docstring.
 })
 
 # Dests that must NEVER be persisted to run_params.json. Every other
@@ -4469,6 +5179,20 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
             if getattr(args, "modernize_min_saving", 0.92) is not None
             else 0.92
         ),
+        # CPU<->size knobs (no `or` default — AVIF speed 0 is valid-but-falsy,
+        # like distance 0.0 above). Persisted so --update-all keeps encoding new
+        # chapters at the user's chosen effort/speed; replay: _append_saved_
+        # update_options. Non-gating (see _RESUME_GATING_DESTS note).
+        "modernize_effort": int(
+            getattr(args, "modernize_effort", 7)
+            if getattr(args, "modernize_effort", 7) is not None
+            else 7
+        ),
+        "modernize_avif_speed": int(
+            getattr(args, "modernize_avif_speed", 6)
+            if getattr(args, "modernize_avif_speed", 6) is not None
+            else 6
+        ),
     }
     if getattr(args, "format", None) == "epub":
         data["epub_layout"] = getattr(args, "epub_layout", "vertical")
@@ -4593,8 +5317,9 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
     # metadata_source replay above: saved by _save_download_params, absent in
     # older download_params.json (get → None → skipped, forward-compatible).
     # Emit the master flag + only NON-default knobs (argparse defaults:
-    # format=auto, quality=90, distance=1.0, min-saving=0.92) to keep the spawn
-    # line clean. The child re-runs the parse-time compat checks; because the
+    # format=auto, quality=90, distance=1.0, min-saving=0.92, effort=7,
+    # avif-speed=6) to keep the spawn line clean. The child re-runs the
+    # parse-time compat checks; because the
     # width/aspect/quality emissions above are suppressed under _replay_modernize
     # and --format cbz / --scaling 100 are replayed, it satisfies the fast-path.
     if _replay_modernize:
@@ -4611,6 +5336,13 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
         mms = params.get("modernize_min_saving")
         if isinstance(mms, (int, float)) and float(mms) != 0.92:
             child_cmd.extend(["--modernize-min-saving", str(mms)])
+        me = params.get("modernize_effort")
+        if isinstance(me, (int, float)) and int(me) != 7:
+            child_cmd.extend(["--modernize-effort", str(int(me))])
+        # AVIF speed 0 is valid and != default 6, so it emits correctly here.
+        ms = params.get("modernize_avif_speed")
+        if isinstance(ms, (int, float)) and int(ms) != 6:
+            child_cmd.extend(["--modernize-avif-speed", str(int(ms))])
     if params.get("metadata_refresh"):
         child_cmd.append("--metadata-refresh")
 
@@ -5192,12 +5924,15 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                     if not blob:
                         continue
                     explicit_ext = entry.get("extension")
+                    custom_name = entry.get("name")
                     if explicit_ext:
                         ext = (
                             explicit_ext
                             if explicit_ext.startswith(".")
                             else "." + explicit_ext
                         )
+                    elif custom_name and os.path.splitext(custom_name)[1]:
+                        ext = os.path.splitext(custom_name)[1]
                     else:
                         ext = _sniff_image_extension(
                             blob[:32]
@@ -5205,12 +5940,12 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                             else b"",
                             entry.get("content_type"),
                         )
-                    custom_name = entry.get("name")
-                    filename = (
-                        custom_name
-                        if custom_name
-                        else f"{chap_label}_{page_counter:04d}{ext}"
-                    )
+                    # Unique per-page name (continuous page_counter), never the
+                    # handler's bare `name` — a per-chapter name like MangaDex's
+                    # "0001.png" collides when --collapse-splits merges parts
+                    # into one tdir. Full rationale at the foreground twin (grep
+                    # collapseSplitsModernize.md / _merged_parts).
+                    filename = f"{chap_label}_{page_counter:04d}{ext}"
                     pth = os.path.join(target_tdir, filename)
                     try:
                         with open(pth, "wb") as fh:
@@ -5253,13 +5988,38 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                 fast_conc,
             )
             fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
-            # No host-poison feedback here: prefetch is best-effort. If
-            # it fails, the partial-failure branch below wipes tdir and
-            # main's foreground download retries with full instrumentation.
+            # Backoff feedback (2026-07-03): prefetch hard-failures dial down
+            # the shared per-host concurrency cap. Before this, the prefetch
+            # path — which does nearly ALL the downloading in steady state —
+            # fed the backoff NOTHING, so a saturated CDN kept getting hit at
+            # full concurrency while only the rare foreground failure stepped
+            # the cap down (bench/unordinaryLogs.md: 8->3 took 50 minutes,
+            # five single steps, each from a foreground chapter failure).
+            # Deliberately backoff-ONLY (_record_host_failure_for_backoff,
+            # NOT _record_failure): per-chapter poison counts and ghost
+            # signatures must stay scoped to the FOREGROUND chapter — this
+            # worker runs concurrently with some other chapter's window.
+            # 4xx-status failures are skipped (stricter than the foreground's
+            # blanket "retryable"): prefetch has no ghost detector downstream,
+            # and a prefetched placeholder chapter of uniform 403s must not
+            # throttle the whole run's CDN trust. Timeouts/5xx (status None
+            # or >= 500) are the congestion signal we want.
+            #
+            # Still NO poison feedback: if prefetch fails, the partial-failure
+            # branch below wipes tdir and main's foreground download retries
+            # with full instrumentation.
+            def _prefetch_backoff_feedback(
+                h: str, u: str, *, status=None, body_size=None
+            ) -> None:
+                if status is not None and 400 <= int(status) < 500:
+                    return
+                _record_host_failure_for_backoff(h, "retryable")
+
             fast_results = handler.fast_download_images(
                 download_tasks,
                 concurrency=fast_conc,
                 timeout=fast_timeout,
+                record_host_failure=_prefetch_backoff_feedback,
                 # Forward cookies (e.g. age-gate cookies for LineWebtoon)
                 # so prefetch can fetch the same content the foreground
                 # path would. Base impl filters to host-relevant cookies.
@@ -5617,6 +6377,11 @@ def _rewrite_cbz_comicinfo(
         page_count = 0
         uploaded_epoch: Optional[int] = None
         publishers: List[str] = []
+        # Preserve the embedded aux rollup (<AioChapterResources>) across the
+        # ComicInfo rebuild so a metadata refresh doesn't orphan the _aio/ audio
+        # still inside this CBZ (grep _materialize_chapter_aux). ET .text is
+        # already entity-unescaped, so the blob parses straight as JSON.
+        aux_records: Optional[Dict[str, Any]] = None
         if ci_name and blobs.get(ci_name):
             root = None
             try:
@@ -5652,6 +6417,14 @@ def _rewrite_cbz_comicinfo(
                         )
                     except (ValueError, OverflowError):
                         uploaded_epoch = None
+                acr = _gx("AioChapterResources")
+                if acr:
+                    try:
+                        parsed_acr = json.loads(acr)
+                        if isinstance(parsed_acr, dict):
+                            aux_records = parsed_acr
+                    except (ValueError, TypeError):
+                        aux_records = None
 
         # Preserve the archive's existing Writer/Penciller (authors/artists).
         # AniList v1 supplies no staff, so the refresh must carry author/artist
@@ -5676,6 +6449,7 @@ def _rewrite_cbz_comicinfo(
             publishers=publishers,
             lang=lang or lang_default or "",
             page_count=page_count,
+            aux_records=aux_records,
         )
         target = ci_name or "ComicInfo.xml"
         had_ci = target in blobs
@@ -6425,6 +7199,34 @@ def main():
              "Quietly falls back to the search path if the file is missing/"
              "malformed.",
     )
+    p.add_argument(
+        "--multi-source-lazy",
+        action="store_true",
+        help="Defer the --multi-source cross-site alternatives discovery "
+             "until a chapter download actually fails, instead of running "
+             "it upfront before the first chapter. The upfront discovery "
+             "(title search across handlers + chapter-list fetch per "
+             "candidate + alignment) costs ~30-80+ s even with "
+             "--seeded-rating-only — longer than a typical 1-5 chapter "
+             "update download takes end to end. With this flag the run "
+             "starts downloading immediately; the first chapter that "
+             "raises a strict-mode failure pays the discovery cost once, "
+             "and every later chapter (including the end-of-run missed "
+             "retry pass) reuses the result. The Electron UI injects "
+             "this for EVERY multi-source download by default — it is an "
+             "opt-out nested in the multi-source opt-in (untick it under "
+             "Settings → Default Multi-source Fallback or per-job in the "
+             "New tab). Tradeoffs vs eager: (a) the collapse-splits "
+             "cross-source consensus refinement can't apply — the chapter "
+             "list is grouped before any failure can fire discovery; "
+             "(b) ghost-chapter classification runs without the "
+             "primary-only corroboration signal until discovery has "
+             "fired. Both degrade to exactly the multi-source-OFF "
+             "behavior, never worse. No effect without --multi-source, "
+             "in --search mode (alternatives already come from the "
+             "search), or with --multi-source-prefetched (reading the "
+             "prefetched JSON skips the expensive search anyway).",
+    )
     p.add_argument("--cookies", default="")
     p.add_argument(
         "--group",
@@ -6784,7 +7586,10 @@ def main():
         help="JXL Butteraugli distance for grayscale pages under --modernize "
              "(default: 1.0 ~ visually lossless; lower = higher quality/larger; "
              "0.0 selects JXL mathematically-lossless mode). Ignored for color "
-             "(AVIF) pages.",
+             "(AVIF) pages. Sub-1.0 lossy distances are a trap on JPEG "
+             "sources: 0.5 measured 101-129%% of the already-lossy source "
+             "(bigger than the original) — for archival fidelity use 0.0 "
+             "(bit-exact JPEG reconstruction), not a lower lossy distance.",
     )
     p.add_argument(
         "--modernize-min-saving",
@@ -6794,6 +7599,56 @@ def main():
              "of the original (default: 0.92 = must save at least 8%%). Guards "
              "against bloating already-dense pages and auto-skips low-headroom "
              "sources; the original bytes are kept otherwise.",
+    )
+    # effort/speed are the pure CPU<->size knobs for the two encoders — they
+    # change encode time and file size ONLY, never the decoded pixels, so they
+    # are intentionally NOT in _RESUME_GATING_DESTS (grep that set for the
+    # matching note). The axes are INVERSE (higher JXL effort = slower+smaller;
+    # higher AVIF speed = faster+larger). Defaults 7 / 6 are the measured sweet
+    # spot; see recompress_chapter_images_modern()'s docstring + the memory note
+    # modernize-effort9-cpu-trap for the benchmark rationale.
+    p.add_argument(
+        "--modernize-effort",
+        type=int,
+        default=7,
+        choices=range(1, 10),
+        metavar="[1-9]",
+        help="JXL encode effort for grayscale pages under --modernize "
+             "(default: 7 = sweet spot). Higher = slower encode, smaller files, "
+             "SAME pixels. 8 matches 9's size at ~1.5x the speed; 9 is a CPU "
+             "trap (~7.5x slower than 7 for only ~5%% smaller). Ignored for "
+             "color (AVIF) pages.",
+    )
+    p.add_argument(
+        "--modernize-avif-speed",
+        type=int,
+        default=6,
+        choices=range(0, 11),
+        metavar="[0-10]",
+        help="AVIF encode speed for color pages under --modernize (default: 6 "
+             "= sweet spot). INVERSE of JXL effort: higher = faster encode, "
+             "LARGER files, same pixels; lower = slower, smaller. 4 is ~5x "
+             "slower than 6 for ~2%% smaller; speeds <=3 measured <=0.5%% "
+             "smaller than 4 for 2.3-3.9x the time; 10 encodes fast but "
+             "bloats ~13%%. Ignored for grayscale (JXL) pages.",
+    )
+    # ── Auxiliary chapter assets (audio / motion-toon archival) ──
+    # tapas.io + webtoons.com carry .mp3/.m4a audio (motion sounds + episode
+    # BGM), a motion timeline manifest, and SoundCloud embeds. By default those
+    # ride INSIDE the chapter CBZ under the reserved _aio/ prefix (renumber-
+    # exempt) and are indexed in the per-chapter ComicInfo.xml <AioChapterResources>
+    # + a series-level rollup in details.json, for a custom reader. CBZ-only
+    # (EPUB/PDF can't embed them → skipped, logged once). Zero cost on every
+    # site that emits no aux. See _materialize_chapter_aux + sites.base.AssetSpec.
+    p.add_argument(
+        "--no-sidecar-assets",
+        action="store_true",
+        help="Disable capture of auxiliary chapter assets (webtoons motion-toon "
+             "manifests + audio + episode BGM, tapas SoundCloud references). By "
+             "default these are embedded INSIDE each chapter CBZ under _aio/ and "
+             "indexed in ComicInfo.xml / details.json for a custom reader; this "
+             "flag skips all of that (images are unaffected). Not a resume-gating "
+             "flag — toggling it doesn't invalidate downloaded images.",
     )
     # ── Komikku-compatible per-chapter CBZ output (Komikku LocalSource format) ──
     # Writes per-chapter CBZs with per-chapter ComicInfo.xml, plus
@@ -7238,11 +8093,14 @@ def main():
     # With --auto-pick: replace args.comic_url with the winner URL and fall
     # through into the normal single-URL flow below. The search resolves to
     # one URL — multi-URL/--prompt-urls modes are blocked at validation above.
-    # Closure-scope multi-source state. Populated when --search --multi-source
-    # --auto-pick is set: dict mapping chapter_num_float → list of alternative
-    # source dicts (each with handler/scraper/context/chapter). Consumed by
-    # _process_chapter_strict for per-chapter fallback. Empty/None means
-    # single-source mode (existing behavior unchanged).
+    # Closure-scope multi-source state. Dict mapping chapter_num_float → list
+    # of alternative source dicts (each with handler/scraper/context/chapter).
+    # Three writers: --search --multi-source --auto-pick (right below), the
+    # direct-URL discovery (grep _discover_multi_source_alternatives — eager
+    # by default, deferred to first chapter failure under
+    # --multi-source-lazy), and the prefetched-JSON path inside that same
+    # closure. Consumed by _process_chapter_strict for per-chapter fallback.
+    # Empty/None means single-source mode (existing behavior unchanged).
     _multi_source_alternatives: Dict[float, List[Dict[str, Any]]] = {}
     # consensus_set for the refined collapse-splits Rule 2 / 3b / 6 drops at
     # group_chapters_for_download (2026-05-27). Populated alongside
@@ -7796,13 +8654,24 @@ def main():
     # alternatives to try. Skipped when --list-chapters is set (read-only
     # mode, no downloads happening, alternatives discovery would just waste
     # time).
-    if (
-        getattr(args, "multi_source", False)
-        and not getattr(args, "search", None)
-        and not getattr(args, "list_chapters", False)
-        and not getattr(args, "download_volumes", False)
-        and not _multi_source_alternatives  # not already populated
-    ):
+    #
+    # The discovery lives in a closure so it can run at either of two times:
+    #   - eagerly, right below (CLI default — unchanged legacy behavior), or
+    #   - lazily, from _process_chapter_strict's first-failure path when
+    #     --multi-source-lazy is set (grep _ms_lazy_pending). The Electron
+    #     UI injects that flag for every multi-source download by default
+    #     (opt-out chokepoint in UI-source/electron/downloader.js, grep
+    #     multiSourceLazy) because the upfront discovery costs more
+    #     wall-clock than a typical 1-5 chapter delta download.
+    # It reads handler/context/pool from main()'s scope at CALL time; at the
+    # lazy call site those still hold the primary source (the strict
+    # wrapper's alt-swap happens after, and its finally restores primary),
+    # and `pool` is never reassigned after get_chapters.
+    def _discover_multi_source_alternatives() -> None:
+        """Populate _multi_source_alternatives / _multi_source_consensus_set
+        for a direct-URL --multi-source run. Never raises: any discovery
+        failure degrades to standard single-source behavior."""
+        nonlocal _multi_source_alternatives, _multi_source_consensus_set
         # Fix B (2026-05-07): when the UI passes --multi-source-prefetched, use
         # the JSON-listed alts instead of running cross-site search again. The
         # search-tab download path writes this file just before spawning aio-dl
@@ -7860,6 +8729,34 @@ def main():
                 f"[!] Multi-source alternatives discovery failed: {type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
+
+    # Armed = discovery deferred; _process_chapter_strict flips it False and
+    # fires the closure on the first ChapterSkippedError (one-shot, even when
+    # discovery fails or yields nothing — re-running per failed chapter would
+    # just repeat an expensive no-op). Prefetched mode stays eager: reading
+    # the UI's JSON skips the expensive search, and its temp file lifetime is
+    # tied to this spawn (downloader.js unlinks on close), so defer-reading
+    # it buys nothing.
+    _ms_lazy_pending = False
+    if (
+        getattr(args, "multi_source", False)
+        and not getattr(args, "search", None)
+        and not getattr(args, "list_chapters", False)
+        and not getattr(args, "download_volumes", False)
+        and not _multi_source_alternatives  # not already populated
+    ):
+        if (
+            getattr(args, "multi_source_lazy", False)
+            and not getattr(args, "multi_source_prefetched", None)
+        ):
+            _ms_lazy_pending = True
+            print(
+                "[*] Multi-source ON (lazy): alternatives discovery deferred "
+                "until a chapter fails",
+                file=sys.stderr,
+            )
+        else:
+            _discover_multi_source_alternatives()
 
     # ── --list-chapters: print metadata + chapter list as JSON, then exit ──
     # Used by the UI to check for new chapters without downloading anything.
@@ -8440,6 +9337,14 @@ def main():
         missed_entries.append(entry)
         _save_missed(missed_entries)
 
+    # Run-level flags: did ANY chapter this run carry audio / motion aux? Read
+    # at end-of-run to OR the has_audio/has_motion booleans into details.json AND
+    # gate the (Komikku-only) chapter_assets rebuild scan. Per-chapter detail now
+    # lives INSIDE each CBZ's ComicInfo (<AioChapterResources>) — the rollup is
+    # rebuilt from those CBZs (grep _scan_chapter_cbz_aux), so we no longer
+    # accumulate a per-chapter map here. All-False for every normal site.
+    aux_seen: Dict[str, bool] = {"audio": False, "motion": False}
+
     def _process_chapter_impl(ch: Dict[str, Any], *, force_redownload: bool = False, next_chapter: Optional[Dict[str, Any]] = None, is_alt_source: bool = False, upcoming_chapters: Optional[List[Dict[str, Any]]] = None):
         # Implementation body. _process_chapter() (defined below) wraps this with
         # the per-chapter watchdog timer + host-failure reset so we can fast-fail
@@ -8503,7 +9408,9 @@ def main():
                 cached_cbz_path = os.path.join(processed_tdir, f"{n}.cbz")
                 if os.path.exists(cached_cbz_path) and os.path.getsize(cached_cbz_path) > 0:
                     process_this_chapter = False
-                    chapter_content = [{"type": "cbz_cache", "path": cached_cbz_path}]
+                    chapter_content = [
+                        {"type": "cbz_cache", "path": cached_cbz_path, "chap": n}
+                    ]
                     chapter_content_size = os.path.getsize(cached_cbz_path)
                 else:
                     # No cached archive — fall back to the broadened image
@@ -8599,6 +9506,10 @@ def main():
             # have already downloaded everything into tdir + written
             # `.download_prefetched`. Without the join we'd race the wipe
             # against the prefetch worker writing files.
+            # 2026-07-03: the REAL (blocking) join now happens in
+            # _process_chapter BEFORE the watchdog timer is armed, so queue
+            # wait no longer burns the chapter's deadline; this call is a
+            # no-op backstop for any future direct-impl caller.
             _consume_image_prefetch(n)
             prefetch_marker_path = os.path.join(tdir, ".download_prefetched")
             if force_redownload:
@@ -8629,6 +9540,14 @@ def main():
             # chap label was already replaced with group.label at synthesis
             # time, so tdir / output filename use the floor (e.g., "1") not
             # any individual part's label.
+            # Reset aux-asset state before (re)fetching so a retry /
+            # force_redownload of the same ch dict can't duplicate sidecars.
+            # Non-merged: get_chapter_images(ch) re-assigns ch["_aux_assets"]
+            # fresh (or leaves it absent for the ~all normal handlers). Merged:
+            # each part's aux is merged up below, so ch must start clean.
+            ch.pop("_aux_assets", None)
+            ch.pop("_aux_records", None)
+            ch.pop("_aux_members", None)
             merged_parts = ch.get("_merged_parts")
             if merged_parts:
                 media_entries = []
@@ -8668,6 +9587,12 @@ def main():
                             pages_total=0,
                         ) from exc
                     media_entries.extend(part_entries)
+                    # Merge this part's aux assets up into the synthesized
+                    # parent chapter — the sidecar writer reads ch["_aux_assets"]
+                    # once for the whole collapsed chapter (grep AssetSpec).
+                    part_aux = part.get("_aux_assets")
+                    if part_aux:
+                        ch.setdefault("_aux_assets", []).extend(part_aux)
             else:
                 try:
                     media_entries = handler.get_chapter_images(
@@ -8764,25 +9689,36 @@ def main():
                         if not blob:
                             continue
                         # Phase A (2026-05-07): if the handler provided an
-                        # explicit extension, trust it. Otherwise sniff from
-                        # blob magic + the optional content-type hint, falling
-                        # back to .jpg only when nothing matches. Same logic
-                        # as dl_image so binary_image entries don't bypass the
-                        # CBZ byte-preservation guarantee.
+                        # explicit extension, trust it; else honor a suffix on
+                        # the handler's `name` hint; else sniff blob magic + the
+                        # optional content-type hint (falling back to .jpg).
+                        # Same logic as dl_image so binary_image entries don't
+                        # bypass the CBZ byte-preservation guarantee.
                         explicit_ext = entry.get("extension")
+                        custom_name = entry.get("name")
                         if explicit_ext:
                             ext = explicit_ext if explicit_ext.startswith(".") else "." + explicit_ext
+                        elif custom_name and os.path.splitext(custom_name)[1]:
+                            ext = os.path.splitext(custom_name)[1]
                         else:
                             ext = _sniff_image_extension(
                                 blob[:32] if isinstance(blob, (bytes, bytearray)) else b"",
                                 entry.get("content_type"),
                             )
-                        custom_name = entry.get("name")
-                        filename = (
-                            custom_name
-                            if custom_name
-                            else f"{n}_{page_counter:04d}{ext}"
-                        )
+                        # On-disk page name is ALWAYS the continuous
+                        # page_counter, never the handler's bare `name`: a
+                        # per-chapter name (MangaDex "0001.png", no chapter
+                        # prefix) collides when --collapse-splits concatenates
+                        # parts into one tdir — part 2's "0001.png" overwrites
+                        # part 1's, so immediate_images collects duplicate paths.
+                        # That drops part-1 pages, and under --modernize races the
+                        # transcode pool on the shared path (winner deletes the
+                        # source, the dup slot's except-cleanup deletes the
+                        # winner's .jxl) → CBZ FileNotFoundError, chapter missed.
+                        # The archive never shows this name (build_cbz renumbers
+                        # by arcname). Mirrored in _run_image_prefetch_job; see
+                        # bench/collapseSplitsModernize.md.
+                        filename = f"{n}_{page_counter:04d}{ext}"
                         pth = os.path.join(tdir, filename)
                         with open(pth, "wb") as fh:
                             fh.write(blob)
@@ -8978,40 +9914,81 @@ def main():
                     poisoned_hosts = [h for h, c in _HOST_FAIL_COUNT.items() if c >= poison_threshold]
             deadline_hit = _chapter_cancelled()
             incomplete = (pages_total > 0 and pages_ok < pages_total)
-            if incomplete or deadline_hit or poisoned_hosts:
-                # host_blame fallback chain. download_tasks is empty for
-                # handlers that return all binary_image entries (e.g.
-                # MangaDex's resilient pipeline that pre-fetches blobs at
-                # the handler level). Fall back to the first media_entries
-                # URL, then the chapter's source URL, so the diagnostic
-                # log line always shows a concrete host instead of '-'.
-                def _resolve_host_blame() -> str:
-                    if download_tasks:
-                        try:
-                            return urlparse(download_tasks[0][1]).netloc
-                        except Exception:
-                            pass
-                    if media_entries:
-                        first = media_entries[0]
-                        if isinstance(first, dict):
-                            url = first.get("url")
-                            if url:
-                                try:
-                                    return urlparse(url).netloc
-                                except Exception:
-                                    pass
-                        elif isinstance(first, str):
+            # Host attribution, shared by three consumers: the AIMD clean-
+            # chapter credit (accept branch below), the failure diagnostic +
+            # skip reason (elif branch), and the cap-aware prefetch chain
+            # clamp (grep 'chain depth'). download_tasks is empty for
+            # handlers that return all binary_image entries (e.g. MangaDex's
+            # resilient pipeline) AND for prefetch-adopted chapters (every
+            # page arrives as immediate_images) — fall back to the first
+            # media_entries URL, then the chapter's source URL, so every
+            # consumer sees a concrete host instead of ''.
+            def _resolve_host_blame() -> str:
+                if download_tasks:
+                    try:
+                        return urlparse(download_tasks[0][1]).netloc
+                    except Exception:
+                        pass
+                if media_entries:
+                    first = media_entries[0]
+                    if isinstance(first, dict):
+                        url = first.get("url")
+                        if url:
                             try:
-                                return urlparse(first).netloc
+                                return urlparse(url).netloc
                             except Exception:
                                 pass
-                    chap_url = ch.get("url")
-                    if chap_url:
+                    elif isinstance(first, str):
                         try:
-                            return urlparse(str(chap_url)).netloc
+                            return urlparse(first).netloc
                         except Exception:
                             pass
-                    return ""
+                chap_url = ch.get("url")
+                if chap_url:
+                    try:
+                        return urlparse(str(chap_url)).netloc
+                    except Exception:
+                        pass
+                return ""
+            # A COMPLETE chapter is never discarded (2026-07-03). The watchdog
+            # deadline and the host-poison counter exist to stop WAITING on
+            # failing downloads; once every page has landed there is nothing
+            # left to protect, and wiping finished work turns a slow-but-
+            # successful chapter into a spurious multi-source rescue that can
+            # REPLACE it with an inferior alt copy. Real case
+            # (bench/unordinaryLogs.md): chs 130/135/143 finished 141/141,
+            # 121/121, 124/124 via the background prefetch, but the deadline
+            # had expired while the main thread was blocked in
+            # _consume_image_prefetch, so the old `or deadline_hit` gate wiped
+            # them and the atsumaru rescues delivered 119/107/122 pages —
+            # strictly worse archives. Deadline/poison still fail the chapter
+            # when pages ARE missing (the elif below is the pre-existing gate).
+            if pages_total > 0 and not incomplete:
+                if deadline_hit or poisoned_hosts:
+                    why = (
+                        "time budget elapsed"
+                        if deadline_hit
+                        else f"host failures on {poisoned_hosts[0]}"
+                    )
+                    print(
+                        f"  [i] Chapter {n} complete ({pages_ok}/{pages_total} "
+                        f"pages) — accepting despite {why}."
+                    )
+                if deadline_hit and _CHAPTER_CANCEL is not None:
+                    # Stand the watchdog down for the rest of this chapter's
+                    # pipeline (recompress/modernize/aux/CBZ). The one-shot
+                    # timer has already fired; leaving the Event set would
+                    # make _respect_rate_limit skip politeness sleeps and any
+                    # remaining cancel-aware helper fast-fail for no reason.
+                    _CHAPTER_CANCEL.clear()
+                # AIMD additive-increase: a gate-accepted chapter is the
+                # "clean" signal that earns a capped host its concurrency
+                # back (grep _record_host_clean_chapter). Credited even on
+                # accept-despite-deadline/poison — those failure events
+                # already reset the streak themselves; the credit just marks
+                # "a full chapter's bytes landed from this host".
+                _record_host_clean_chapter(_resolve_host_blame())
+            elif incomplete or deadline_hit or poisoned_hosts:
                 # Ghost-chapter check FIRST. The detector uses pages_ok=0 +
                 # uniform signatures across all recorded failures, which is
                 # disjoint from "any pages succeeded" — so a chapter that
@@ -9019,10 +9996,15 @@ def main():
                 # primary_only feeds the threshold knob: when the alignment
                 # data shows no non-primary source for this chapter, drop
                 # the pages_total floor from 5 to 3 (independent corroboration
-                # the chapter is fake). Cross-file:
-                # _is_ghost_chapter_signature lives at ~line 990 here, the
-                # alignment dict (_multi_source_alternatives) is populated
-                # in main() at ~line 5821 / 6388.
+                # the chapter is fake). Grep anchors:
+                # _is_ghost_chapter_signature (this file), and the alignment
+                # dict writers under _discover_multi_source_alternatives /
+                # take_latest_multi_source_state. Under --multi-source-lazy
+                # the dict is empty until the first failure fires discovery,
+                # so this classification runs with primary_only=None (same
+                # as multi-source off) for that first chapter; the strict
+                # wrapper re-derives primary_only afterwards for the
+                # ChapterGhostError it raises.
                 primary_only_for_ghost: Optional[bool] = None
                 if _multi_source_alternatives:
                     try:
@@ -9180,9 +10162,6 @@ def main():
                     f"{time.monotonic() - _t0_recompress:.1f}s."
                 )
 
-            _t0_proc = time.monotonic()
-            os.makedirs(processed_tdir, exist_ok=True)
-
             # Phase G7 (2026-05-08; Phase B chain 2026-05-13): kick off
             # image prefetch chain for upcoming chapters NOW — after this
             # chapter's downloads + validation succeeded, before the CPU-
@@ -9192,6 +10171,13 @@ def main():
             # images in parallel (up to `image_prefetch_parallel` workers).
             # _process_chapter_impl's next iteration consumes the prefetch
             # via the .download_prefetched marker.
+            #
+            # 2026-07-03: deliberately fires BEFORE the sidecar-aux block
+            # below — a slow BGM/motion fetch (network) then overlaps with
+            # the next chapters' background image downloads instead of
+            # stalling them (the aux insertion for PR #56 had landed above
+            # this block and pushed the chain later by the aux fetch
+            # duration).
             #
             # Worker count knobs:
             #   --prefetch-image-workers: parallelism WITHIN one chapter
@@ -9223,6 +10209,21 @@ def main():
             else:
                 effective_prefetch_workers = int(prefetch_workers_raw)
             depth = max(0, int(getattr(args, "image_prefetch_depth", 2) or 0))
+            # Cap-aware prefetch pressure (2026-07-03): while this chapter's
+            # image host is under a reduced concurrency cap, push at most ONE
+            # chapter ahead. Depth-N pushes against a struggling CDN grow the
+            # prefetch queue backlog (slow jobs, busy workers) — exactly what
+            # produced the 90-300s consume waits behind the unordinaryLogs.md
+            # time-budget failures. Depth 1 keeps the pipeline overlap alive
+            # without stacking pressure; the AIMD recovery (grep
+            # _record_host_clean_chapter) lifts the cap — and with it this
+            # clamp — once the host runs clean again.
+            if depth > 1 and _host_concurrency_capped(_resolve_host_blame()):
+                log_verbose(
+                    f"  [Img Prefetch] host under backoff cap — "
+                    f"chain depth {depth} -> 1"
+                )
+                depth = 1
             if (
                 effective_prefetch_workers > 0
                 and depth > 0
@@ -9248,6 +10249,58 @@ def main():
                         depth=depth,
                         no_processing=bool(args.no_processing),
                     )
+
+            # Sidecar auxiliary assets (audio / motion-toon manifest / layer
+            # map) — faithful-archival feature. Materialize the handler's
+            # _aux_assets into in-memory CBZ members (audio bytes + motion
+            # manifest) + a ComicInfo record; the members are EMBEDDED into the
+            # chapter CBZ at build time under _aio/ (grep 'cached_cbz_path'),
+            # never a loose _assets/ file. CBZ-only: EPUB/PDF can't hold
+            # per-chapter sidecars, so aux is skipped there (logged once). Inside
+            # `if process_this_chapter:` so a resume-collect skips it — the prior
+            # run's CBZ already carries the aux. Handler-scoped: an alt source
+            # that set no _aux_assets is inert. Opt-out: --no-sidecar-assets. See
+            # _materialize_chapter_aux + sites.base.AssetSpec; the record feeds
+            # the per-chapter ComicInfo (_aux_records) + the series has_audio/
+            # has_motion flags (aux_seen, patched into details.json at run end).
+            if (
+                ch.get("_aux_assets")
+                and not getattr(args, "no_sidecar_assets", False)
+            ):
+                if args.format == "cbz":
+                    try:
+                        _aux_rec, _aux_members = _materialize_chapter_aux(
+                            ch["_aux_assets"], scraper, make_request
+                        )
+                    except Exception as _aux_exc:
+                        # Never let an aux-asset failure abort the chapter — the
+                        # images are the deliverable; sidecars are a bonus.
+                        log_verbose(
+                            f"  [assets] aux materialize failed for Ch {n}: "
+                            f"{type(_aux_exc).__name__}: {_aux_exc}"
+                        )
+                        _aux_rec, _aux_members = None, []
+                    if _aux_rec:
+                        ch["_aux_records"] = _aux_rec
+                        ch["_aux_members"] = _aux_members
+                        if (
+                            _aux_rec.get("audio")
+                            or _aux_rec.get("audio_refs")
+                            or _aux_rec.get("has_bgm")
+                        ):
+                            aux_seen["audio"] = True
+                        if _aux_rec.get("motion_manifest") or _aux_rec.get("layers"):
+                            aux_seen["motion"] = True
+                        log_verbose(
+                            f"  [assets] Ch {n}: {len(_aux_rec.get('audio') or [])} "
+                            f"audio, motion={bool(_aux_rec.get('motion_manifest'))}, "
+                            f"{len(_aux_rec.get('audio_refs') or [])} ref(s)"
+                        )
+                else:
+                    _warn_aux_needs_cbz_once(args.format)
+
+            _t0_proc = time.monotonic()
+            os.makedirs(processed_tdir, exist_ok=True)
 
             chapter_content = []
 
@@ -9306,6 +10359,8 @@ def main():
                         gray_quality=args.modernize_distance,
                         color_quality=args.modernize_quality,
                         min_saving=args.modernize_min_saving,
+                        effort=args.modernize_effort,
+                        speed=args.modernize_avif_speed,
                     )
                     log_verbose(
                         f"  [modernize] Done in "
@@ -9337,6 +10392,12 @@ def main():
                     log_verbose(
                         f"  Processing {len(raw_image_paths)} downloaded images..."
                     )
+                    # Flatten guard (warn-only leg): this branch decodes each
+                    # page to a single PIL frame (process_chapter_images /
+                    # save_final_images), so any animated GIF/APNG loses its
+                    # animation here. Tell the user once. The fast-path +
+                    # recompress/modernize legs above already preserve it.
+                    _warn_animated_flatten_once(raw_image_paths, args.format)
                     if args.format == "cbz" or (
                         args.format == "epub" and not text_blocks
                     ):
@@ -9573,6 +10634,13 @@ def main():
                     ) as zf:
                         for i, p in enumerate(processed_page_images):
                             zf.write(p, f"{i:04d}{os.path.splitext(p)[1]}")
+                        # Aux sidecars (audio / motion manifest) ride INSIDE the
+                        # CBZ under the reserved _aio/ prefix — renumber-exempt
+                        # (build_cbz_from_content preserves _aio/ members instead
+                        # of turning them into bogus pages). Empty for every
+                        # normal site. Grep _materialize_chapter_aux.
+                        for _arc, _data in ch.get("_aux_members") or []:
+                            zf.writestr(_arc, _data)
                         if getattr(args, "komikku", False):
                             per_chap_xml = build_per_chapter_comic_info_xml(
                                 series_title=title,
@@ -9586,6 +10654,7 @@ def main():
                                 publishers=[grp_name] if grp_name else [],
                                 lang=args.language,
                                 page_count=len(processed_page_images),
+                                aux_records=ch.get("_aux_records"),
                             )
                             zf.writestr(
                                 "ComicInfo.xml",
@@ -9593,7 +10662,7 @@ def main():
                                 compress_type=zipfile.ZIP_DEFLATED,
                             )
                     chapter_content = [
-                        {"type": "cbz_cache", "path": cached_cbz_path}
+                        {"type": "cbz_cache", "path": cached_cbz_path, "chap": n}
                     ]
                 else:
                     chapter_content = []
@@ -9789,6 +10858,7 @@ def main():
                             publishers=[grp_name] if grp_name else [],
                             lang=args.language,
                             page_count=len(cbz_images),
+                            aux_records=ch.get("_aux_records"),
                         )
                     with _cpu_guard('build_cbz'):
                         build_cbz(
@@ -9799,6 +10869,7 @@ def main():
                             [grp_name] if grp_name else [],
                             args.language,
                             chapter_comic_info_xml=chapter_xml,
+                            extra_members=ch.get("_aux_members"),
                         )
             elif args.format == "pdf":
                 if chapter_content:
@@ -9831,6 +10902,18 @@ def main():
         next_chapter is still in the primary's chapter list).
         """
         global _CHAPTER_CANCEL
+        # Join any in-flight background prefetch for this chapter BEFORE
+        # arming the watchdog (2026-07-03). The join can block up to 300s on
+        # a backlogged prefetch queue (grep _consume_image_prefetch) — time
+        # spent on the pool's other jobs, not on this chapter's own work.
+        # When the join ran inside the deadline window (the impl's old call
+        # site), a slow prefetch consumed the whole budget before the chapter
+        # even started: unordinaryLogs.md ch 141 opened with "0/114
+        # (reason=time_budget)" in the same second, and ch 143's fully
+        # prefetched 124/124 pages were wiped at the completeness gate. The
+        # impl's own _consume_image_prefetch call stays as a no-op backstop
+        # (this join pops the done-event).
+        _consume_image_prefetch(ch.get("chap"))
         # Reset per-chapter host-failure tally so the poison threshold is
         # scoped per chapter, not per run.
         _reset_host_failures_for_chapter()
@@ -9871,7 +10954,11 @@ def main():
 
         Behavior the user explicitly asked for after seeing partial PDFs:
           1. Never accept a partial chapter (any missing page → fallback or retry).
-          2. Try alternative sources first (cheap — no sleep).
+          2. Try alternative sources first (cheap — no sleep) — EXCEPT
+             aux-bearing chapters (webtoons BGM/motion, tapas BGM): those are
+             never alt-rescued because alt sites lack the audio/motion content
+             (2026-07-03 directive; grep _chapter_carries_aux). They go
+             straight to the inline retry on the primary.
           3. If all sources fail: long inline retry on primary (CDN recovery).
           4. If inline retries don't recover: stop the run with a clear error.
 
@@ -9880,10 +10967,12 @@ def main():
 
         Cross-file: cooperates with _process_chapter (watchdog wrapper) which
         bounds each individual attempt's wall-clock time. Multi-source state
-        comes from `_multi_source_alternatives` populated in main() when
-        --search --multi-source --auto-pick is set.
+        comes from `_multi_source_alternatives`, populated in main() by
+        --search --multi-source --auto-pick, by the eager direct-URL
+        discovery, or — under --multi-source-lazy — by the first-failure
+        hook right below (grep _ms_lazy_pending).
         """
-        nonlocal handler, scraper, context, comic_data
+        nonlocal handler, scraper, context, comic_data, _ms_lazy_pending
         primary_state = (handler, scraper, context, comic_data)
         n_for_log = ch.get("chap")
         max_retries = int(globals().get("_INLINE_CHAPTER_RETRIES", 2))
@@ -9896,18 +10985,62 @@ def main():
         except ChapterSkippedError as cse_primary:
             primary_err: ChapterSkippedError = cse_primary
 
+        # Faithful-archival veto (2026-07-03): a chapter that carries sidecar
+        # aux content on the primary (webtoons BGM / motion-toon, tapas BGM —
+        # grep _chapter_carries_aux) is NEVER rescued from an alternative
+        # source. Alt sites only mirror the flattened pages, so a rescue
+        # silently drops the audio/motion. Recovery for these chapters is
+        # inline-retry on the primary only (below). The veto also skips the
+        # lazy-discovery trigger: no point paying the one-time cross-site
+        # search for a chapter that won't consult the result —
+        # _ms_lazy_pending stays armed for the next aux-free failure.
+        # Scoped to runs where the sidecar would actually be embedded: aux is
+        # CBZ-only and --no-sidecar-assets opts out entirely (mirrors the
+        # gating at _materialize_chapter_aux's call site) — when aux wouldn't
+        # land in the archive anyway, a rescue loses nothing and stays allowed.
+        aux_veto = (
+            args.format == "cbz"
+            and not getattr(args, "no_sidecar_assets", False)
+            and _chapter_carries_aux(ch)
+        )
+        if aux_veto and (_ms_lazy_pending or _multi_source_alternatives):
+            print(
+                f"  [Multi-source] Chapter {n_for_log} carries sidecar assets "
+                f"(BGM/motion) that alt sources can't provide; skipping "
+                f"alt-source rescue, will inline-retry on "
+                f"{primary_state[0].name}."
+            )
+
+        # --multi-source-lazy: the upfront cross-site discovery was deferred
+        # at startup; the first failed chapter pays for it here, once, so the
+        # alts lookup below (and every later chapter, including the missed-
+        # retry pass which also routes through this wrapper) sees the result.
+        # Disarm BEFORE running so a discovery that fails or finds nothing
+        # isn't re-attempted on every subsequent failure. Runs outside the
+        # per-attempt watchdog (_process_chapter cancelled its timer before
+        # this except arm), so the chapter deadline can't kill the discovery.
+        if _ms_lazy_pending and not aux_veto:
+            _ms_lazy_pending = False
+            print(
+                f"  [Multi-source] Chapter {n_for_log} failed on "
+                f"{primary_state[0].name}; running deferred alternatives "
+                f"discovery now (--multi-source-lazy)..."
+            )
+            _discover_multi_source_alternatives()
+
         # Phase 4b: try alternative sources before the inline-retry sleep.
         # Look up alternatives by chapter number (float). Numeric extraction
         # mirrors chapter_merger._extract_chapter_num.
         alts: List[Dict[str, Any]] = []
-        try:
-            chap_str = str(ch.get("chap") or "").strip()
-            m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
-            if m:
-                chap_float = float(m.group(1))
-                alts = list(_multi_source_alternatives.get(chap_float, []))
-        except (TypeError, ValueError):
-            alts = []
+        if not aux_veto:
+            try:
+                chap_str = str(ch.get("chap") or "").strip()
+                m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
+                if m:
+                    chap_float = float(m.group(1))
+                    alts = list(_multi_source_alternatives.get(chap_float, []))
+            except (TypeError, ValueError):
+                alts = []
 
         if alts:
             print(
@@ -10516,6 +11649,15 @@ def main():
                             os.remove(item["path"])
                         except OSError:
                             pass
+
+    # --- Patch details.json with the sidecar-asset rollup (Komikku mode) ---
+    # details.json was written once up front (before the chapter loop), so the
+    # has_motion/has_audio/chapter_assets rollup is merged in now that every
+    # chapter's CBZ (with its embedded _aio/ aux) has landed. The helper rebuilds
+    # the map from the on-disk CBZ ComicInfo scan (so an incremental/resume run
+    # stays complete) and skips the scan entirely on every aux-free series.
+    if getattr(args, "komikku", False):
+        _patch_details_json_with_assets(out_dir, aux_seen)
 
     # --- Save series metadata for the UI's update-checking feature ---
     # .aio_series.json is written to the output folder (alongside PDFs) and

@@ -419,6 +419,19 @@ export default function SettingsTab({ settings, onSave }) {
       // session restarts. Per-job overrides in DownloadTab don't save back.
       multiSource: false,
       multiSourceQualityMin: 0.65,
+      // Lazy-discovery modifier for multi-source (2026-07-02): defer the
+      // ~30-80 s cross-site alternatives discovery until a chapter actually
+      // fails, instead of running it before the first chapter. Opt-OUT
+      // nested inside the multi-source opt-in: the multiSource toggle's
+      // handler force-resets this to true on every enable, and every
+      // consumer treats ABSENT as on (`!== false`) so settings dicts saved
+      // before this field existed stay lazy. Only an explicit false (user
+      // unticked the nested toggle) reverts to eager discovery.
+      // downloader.js emits --multi-source-lazy from a dedicated
+      // chokepoint (grep multiSourceLazy there — NOT in boolMap, because
+      // boolMap's `=== true` test would break absent-means-on); Python
+      // side: aio-dl.py --multi-source-lazy + _ms_lazy_pending.
+      multiSourceLazy: true,
       // CBZ byte-preservation default (added 2026-05-07). When ON (default),
       // CBZ output uses the original wire bytes from the CDN (lossless,
       // fastest, smallest archives). Setting this to false emits
@@ -458,10 +471,24 @@ export default function SettingsTab({ settings, onSave }) {
       // they're ever violated. DownloadTab's DEFAULT_FORM spread + App.jsx's
       // search/library defaults spread propagate these to every download path.
       modernize: false,
+      // Fully-reversible archival preset. UI-level only — no dedicated CLI
+      // flag: downloader.js:buildCliArgs forces the PAIR --modernize-format
+      // jxl + --modernize-distance 0 while this is on and ignores the stored
+      // routing/distance/AVIF values (kept, so switching the preset off
+      // restores them). A PAIR because auto + distance 0 is NOT reversible —
+      // auto still routes color pages to the always-lossy AVIF branch.
+      modernizeReversible: false,
       modernizeFormat: "auto",      // auto | jxl | avif | jxl+avif
       modernizeQuality: 90,         // AVIF color quality (1-100)
       modernizeDistance: 1.0,       // JXL grayscale distance (0.0 = lossless)
       modernizeMinSaving: 0.92,     // keep transcode only if < orig * this
+      // CPU<->size knobs (no pixel change; NON-gating on the Python side).
+      // INVERSE axes — higher JXL effort = slower/smaller, higher AVIF speed =
+      // faster/larger. Defaults are the measured sweet spot (see the effort-9
+      // CPU-trap benchmark). downloader.js emits --modernize-effort /
+      // --modernize-avif-speed only when they differ from these.
+      modernizeEffort: 7,           // JXL effort 1-9
+      modernizeAvifSpeed: 6,        // AVIF speed 0-10
     },
     // Per-search defaults — read by SearchTab on mount via the same
     // settings.searchOpts namespace. Surfaced here so the user has one
@@ -669,6 +696,7 @@ export default function SettingsTab({ settings, onSave }) {
         cbzPreserveOriginals: true,
         multiSource: false,
         multiSourceQualityMin: 0.65,
+        multiSourceLazy: true,
         // Mirror webtoonRecompress* initial-state defaults so Reset clears
         // them too. See the rationale block in the initial useState above.
         webtoonRecompress: false,
@@ -676,10 +704,13 @@ export default function SettingsTab({ settings, onSave }) {
         webtoonRecompressMethod: 4,
         // Modernize transcode defaults — mirror the initial-state block above.
         modernize: false,
+        modernizeReversible: false,
         modernizeFormat: "auto",
         modernizeQuality: 90,
         modernizeDistance: 1.0,
         modernizeMinSaving: 0.92,
+        modernizeEffort: 7,
+        modernizeAvifSpeed: 6,
         // Komikku-mode default. Reset mirrors initial-state; see the
         // rationale block in the initial useState above.
         komikku: false,
@@ -1019,7 +1050,10 @@ export default function SettingsTab({ settings, onSave }) {
             / scaling 100 / preserve-originals on / no-processing off) so the
             saved config can't hard-error at spawn — mirrors the format=none →
             keepImages auto-enable precedent above. The valued knobs map 1:1 to
-            the CLI: codec routing, JXL distance, AVIF quality, min-saving.
+            the CLI: codec routing, JXL distance, AVIF quality, min-saving —
+            plus a UI-level fully-reversible preset (modernizeReversible, no
+            dedicated CLI flag) that buildCliArgs resolves to the forced pair
+            jxl + distance 0 and that hides the knobs it overrides.
             DownloadTab's DEFAULT_FORM spread + App.jsx's defaults spread carry
             these to every download; downloader.js:buildCliArgs maps modernize*
             → --modernize* and strips them if the fast-path is disabled. Needs
@@ -1109,6 +1143,41 @@ export default function SettingsTab({ settings, onSave }) {
                   No&nbsp;processing off).
                 </p>
               )}
+              {/* Fully-reversible archival preset. buildCliArgs (downloader.js)
+                  forces the PAIR --modernize-format jxl + --modernize-distance
+                  0 while this is on — a PAIR because auto + distance 0 is NOT
+                  reversible (auto still routes color pages to the always-lossy
+                  AVIF branch). The routing/distance/AVIF controls below are
+                  hidden meanwhile; their stored values are untouched so
+                  switching the preset off restores them. Python side: distance
+                  0 = bit-exact JPEG->JXL reconstruction + pixel-lossless PNG,
+                  reconstructions exempt from min-saving (aio-dl.py, grep
+                  is_recon). */}
+              <div className="flex items-start gap-3">
+                <Switch
+                  checked={!!local.defaults.modernizeReversible}
+                  onCheckedChange={(v) => setDefault("modernizeReversible", !!v)}
+                  className="mt-0.5"
+                />
+                <div className="flex-1">
+                  <Label className="text-xs cursor-pointer">
+                    Fully reversible (archival)
+                  </Label>
+                  <p className="text-[10px] text-muted-foreground mt-0.5 leading-snug">
+                    Every page becomes lossless JXL: JPEGs are stored as
+                    bit-exact reversible reconstructions (the original .jpg is
+                    recoverable byte-for-byte; measured 7–87% smaller than the
+                    source), PNGs become pixel-lossless, WebP/GIF stay
+                    untouched. Locks routing to JXL-only — under Auto, color
+                    pages would still take the lossy AVIF path. Larger than the
+                    visually-lossless tiers, but the archive stays a faithful
+                    master copy.
+                  </p>
+                </div>
+              </div>
+              {/* Routing / distance / AVIF-quality are moot while the
+                  reversible preset forces jxl + d0 — hidden, values kept. */}
+              {!local.defaults.modernizeReversible && (<>
               <div>
                 <Label className="text-xs">Codec routing</Label>
                 <Select
@@ -1150,7 +1219,10 @@ export default function SettingsTab({ settings, onSave }) {
                     <span className="font-mono">1.0</span> = visually lossless
                     (default); lower = larger/closer to source;{" "}
                     <span className="font-mono">0.0</span> = mathematically
-                    lossless (much larger; only wins on PNG sources).
+                    lossless — JPEGs become byte-exact reversible
+                    reconstructions (measured 7–87% smaller than the source),
+                    PNGs pixel-lossless. For a fully reversible archive use the
+                    toggle above; routing must be JXL-only too.
                   </p>
                 </div>
                 <div>
@@ -1174,6 +1246,102 @@ export default function SettingsTab({ settings, onSave }) {
                   </p>
                 </div>
               </div>
+              </>)}
+              {/* Encoder effort ─ pure CPU↔size knobs (--modernize-effort /
+                  --modernize-avif-speed). Split from the quality grid above
+                  because these change encode TIME and file SIZE only, never the
+                  decoded pixels — hence non-gating on the Python side (grep the
+                  _RESUME_GATING_DESTS note). The two axes are INVERSE (higher
+                  JXL effort = slower+smaller; higher AVIF speed = faster+larger),
+                  so each slider carries mirrored end-labels + a hint that only
+                  surfaces at the wasteful "lots of CPU for marginal size" end
+                  (effort 9 / avif-speed ≤4). Bench rationale: the effort-9
+                  CPU-trap memory note. */}
+              <div className="border-t border-border/50 pt-3">
+                <div className="flex items-baseline justify-between mb-0.5">
+                  <Label className="text-xs">Encoder effort</Label>
+                  <span className="text-[9px] uppercase tracking-wider text-muted-foreground/80 font-medium">
+                    speed&nbsp;↔&nbsp;size · same pixels
+                  </span>
+                </div>
+                <p className="text-[10px] text-muted-foreground mb-2.5 leading-snug">
+                  How hard the encoders work — changes{" "}
+                  <span className="text-foreground/90 font-medium">encode time
+                  and file size only</span>, never how a page looks. Defaults
+                  (JXL&nbsp;7, AVIF&nbsp;6) are the measured sweet spot.
+                </p>
+                <div className="grid grid-cols-2 gap-x-6 gap-y-3">
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <Label className="text-xs">
+                        JXL effort {local.defaults.modernizeReversible ? "(all pages)" : "(B&W)"}
+                      </Label>
+                      <Badge variant="secondary" className="font-mono tabular-nums">
+                        {local.defaults.modernizeEffort ?? 7}
+                      </Badge>
+                    </div>
+                    <Slider
+                      value={local.defaults.modernizeEffort ?? 7}
+                      onValueChange={(v) => setDefault("modernizeEffort", v)}
+                      min={1}
+                      max={9}
+                      step={1}
+                    />
+                    <div className="flex justify-between text-[9px] font-mono text-muted-foreground/70 mt-1 px-0.5">
+                      <span>1 · faster</span>
+                      <span>smaller · 9</span>
+                    </div>
+                    <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                      Grayscale → JXL. <span className="font-mono">7</span> is the
+                      sweet spot; <span className="font-mono">8</span> matches
+                      9's size at ~1.5× the speed.
+                    </p>
+                    {(local.defaults.modernizeEffort ?? 7) >= 9 && (
+                      <p className="text-[10px] text-yellow-500 dark:text-yellow-400 mt-1 leading-snug">
+                        Effort 9 is a CPU trap — ~7.5× slower than 7 for only
+                        ~5% smaller. Use 8 for near-identical size, or 7 to
+                        encode fast.
+                      </p>
+                    )}
+                  </div>
+                  {/* Hidden under the reversible preset — jxl-only routing
+                      means the AVIF branch never runs. */}
+                  {!local.defaults.modernizeReversible && (
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <Label className="text-xs">AVIF speed (color)</Label>
+                      <Badge variant="secondary" className="font-mono tabular-nums">
+                        {local.defaults.modernizeAvifSpeed ?? 6}
+                      </Badge>
+                    </div>
+                    <Slider
+                      value={local.defaults.modernizeAvifSpeed ?? 6}
+                      onValueChange={(v) => setDefault("modernizeAvifSpeed", v)}
+                      min={0}
+                      max={10}
+                      step={1}
+                    />
+                    <div className="flex justify-between text-[9px] font-mono text-muted-foreground/70 mt-1 px-0.5">
+                      <span>0 · smaller</span>
+                      <span>faster · 10</span>
+                    </div>
+                    <p className="text-[10px] text-muted-foreground mt-1 leading-snug">
+                      Color → AVIF, axis{" "}
+                      <span className="text-foreground/90 font-medium">reversed</span>:{" "}
+                      <span className="font-mono">6</span> is the sweet spot —
+                      lower is slower &amp; smaller, higher faster &amp; larger.
+                    </p>
+                    {(local.defaults.modernizeAvifSpeed ?? 6) <= 4 && (
+                      <p className="text-[10px] text-yellow-500 dark:text-yellow-400 mt-1 leading-snug">
+                        Speed {local.defaults.modernizeAvifSpeed} is ~5× slower
+                        than 6 for only ~2% smaller (more so below 4). These
+                        don't change quality — 6 is usually the better trade.
+                      </p>
+                    )}
+                  </div>
+                  )}
+                </div>
+              </div>
               <div>
                 <div className="flex items-center justify-between mb-1">
                   <Label className="text-xs">Minimum saving to replace a page</Label>
@@ -1193,7 +1361,10 @@ export default function SettingsTab({ settings, onSave }) {
                   smaller than the original — otherwise the original bytes stay.
                   Default <span className="font-mono">≥8%</span>{" "}
                   (<span className="font-mono">min-saving 0.92</span>) skips
-                  already-dense pages so the archive never grows.
+                  already-dense pages so the archive never grows. At distance{" "}
+                  <span className="font-mono">0</span>, JPEG→JXL reconstructions
+                  are exempt — being byte-recoverable, they're adopted whenever
+                  they're smaller at all.
                 </p>
               </div>
             </div>
@@ -1342,7 +1513,20 @@ export default function SettingsTab({ settings, onSave }) {
           <div className="flex items-start gap-3">
             <Switch
               checked={!!local.defaults.multiSource}
-              onCheckedChange={(v) => setDefault("multiSource", v)}
+              onCheckedChange={(v) =>
+                // Enabling multi-source force-resets the nested lazy toggle
+                // to ON (opt-out inside the opt-in): a previous opt-out
+                // shouldn't survive a fresh opt-in. One combined update so
+                // both fields land in the same render.
+                setLocal((prev) => ({
+                  ...prev,
+                  defaults: {
+                    ...prev.defaults,
+                    multiSource: v,
+                    ...(v ? { multiSourceLazy: true } : {}),
+                  },
+                }))
+              }
               className="mt-0.5"
             />
             <div className="flex-1">
@@ -1350,31 +1534,60 @@ export default function SettingsTab({ settings, onSave }) {
                 Use alternate sources when the primary fails
               </Label>
               <p className="text-[10px] text-muted-foreground mt-0.5">
-                Adds ~30-60s of cross-site discovery before each download.
                 When the primary CDN throttles or 404s a page, the chapter
                 falls over to the next source automatically.
               </p>
             </div>
           </div>
           {local.defaults.multiSource && (
-            <div className="pl-12 animate-slide-up">
-              <div className="flex items-center justify-between mb-1">
-                <Label className="text-xs">Alternative quality floor</Label>
-                <Badge variant="secondary" className="font-mono tabular-nums">
-                  {(local.defaults.multiSourceQualityMin ?? 0.65).toFixed(2)}
-                </Badge>
+            <div className="pl-12 animate-slide-up space-y-3">
+              {/* Lazy discovery — opt-out nested in the multi-source opt-in.
+                  Absent-means-on everywhere (`!== false`): older saved
+                  settings dicts without the field behave as ON, and the
+                  master switch above force-resets it to true on enable.
+                  Applies to EVERY multi-source download (New tab, Search,
+                  Library update checks) via the downloader.js chokepoint;
+                  search-driven downloads with a prefetched payload ignore
+                  it (Python reads the prefetched JSON eagerly — cheap). */}
+              <div className="flex items-start gap-3">
+                <Switch
+                  checked={local.defaults.multiSourceLazy !== false}
+                  onCheckedChange={(v) => setDefault("multiSourceLazy", v)}
+                  className="mt-0.5"
+                />
+                <div className="flex-1">
+                  <Label className="text-xs cursor-pointer">
+                    Only search alternatives after a chapter fails (recommended)
+                  </Label>
+                  <p className="text-[10px] text-muted-foreground mt-0.5">
+                    <strong>On:</strong> downloads start immediately; the ~30-80s
+                    cross-site discovery only runs if a chapter actually needs a
+                    fallback — for a 1-5 chapter update it usually costs more than
+                    the whole download. <strong>Off:</strong> discover up front:
+                    slower start, but split-collapse gets cross-source consensus
+                    and ghost detection has alignment data from chapter one.
+                  </p>
+                </div>
               </div>
-              <Slider
-                value={local.defaults.multiSourceQualityMin ?? 0.65}
-                onValueChange={(v) => setDefault("multiSourceQualityMin", v)}
-                min={0.3}
-                max={0.95}
-                step={0.05}
-              />
-              <p className="text-[10px] text-muted-foreground mt-1">
-                Sources below this seed/measured quality won't be used as
-                fallbacks. Default 0.65 keeps unknown-language Madara extras out.
-              </p>
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <Label className="text-xs">Alternative quality floor</Label>
+                  <Badge variant="secondary" className="font-mono tabular-nums">
+                    {(local.defaults.multiSourceQualityMin ?? 0.65).toFixed(2)}
+                  </Badge>
+                </div>
+                <Slider
+                  value={local.defaults.multiSourceQualityMin ?? 0.65}
+                  onValueChange={(v) => setDefault("multiSourceQualityMin", v)}
+                  min={0.3}
+                  max={0.95}
+                  step={0.05}
+                />
+                <p className="text-[10px] text-muted-foreground mt-1">
+                  Sources below this seed/measured quality won't be used as
+                  fallbacks. Default 0.65 keeps unknown-language Madara extras out.
+                </p>
+              </div>
             </div>
           )}
         </div>
