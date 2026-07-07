@@ -9594,6 +9594,33 @@ def main():
         collapse_splits=collapse_splits_enabled,
         consensus_set=_multi_source_consensus_set,
     )
+    # Skip-set for the UI update-check (Option 2, 2026-07-07). A consensus-armed
+    # collapse DROPS source-only fragment-shaped decimals (mangafire's duplicate
+    # 52.1 next to 52, this series' lone .3 == its integer counterpart) via Rule
+    # 2/3b/6. But the Library update-check spawns `--list-chapters` with NO peer
+    # data — discovery is skipped there (grep the list_chapters gate above
+    # _discover_multi_source_alternatives), so its consensus-free collapse KEEPS
+    # those labels, and the main.js diff (siteChapters − chapters_downloaded)
+    # flags them as a perpetual "+N new" that a "Download Missing" click then
+    # refetches as duplicates. Record exactly the labels THIS run dropped-under-
+    # consensus so the UI can subtract them. free_labels ⊇ consensus_labels
+    # always (consensus only ever removes more), so the difference is precisely
+    # the consensus-gated drops — Rule 3a/5 sequential-split merges collapse
+    # identically with or without consensus and never appear here. Empty unless
+    # collapse is ON and consensus actually fired (single-source / lazy runs
+    # contribute nothing; the UNION at the .aio_series.json write below preserves
+    # an earlier eager run's set). Cross-file: UI-source/electron/main.js:
+    # _checkSeriesUpdates (grep chapters_skipped_fragments).
+    _skipped_fragment_labels: Set[str] = set()
+    if collapse_splits_enabled and _multi_source_consensus_set:
+        _consensus_labels = {g.label for g in groups}
+        _free_labels = {
+            g.label
+            for g in group_chapters_for_download(
+                chapters, collapse_splits=True, consensus_set=None,
+            )
+        }
+        _skipped_fragment_labels = _free_labels - _consensus_labels
     grouped_chapters: List[Dict[str, Any]] = []
     for group in groups:
         if len(group.parts) == 1:
@@ -12332,6 +12359,25 @@ def main():
             key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
         )
 
+        # Fragment labels this (or a prior eager) run dropped under multi-source
+        # consensus — the UI update-check subtracts these so duplicate .1-.4
+        # fragments don't show as a perpetual "+N new" (see _skipped_fragment_labels
+        # at the group_chapters_for_download site). UNION with any prior set so a
+        # later lazy "Download Missing" run (no consensus → empty THIS run) can't
+        # wipe an eager run's set; MINUS merged_downloaded so a force-downloaded
+        # fragment counts as present rather than skipped (the two on-disk sets stay
+        # disjoint). Same normalized :g labels as chapters_downloaded so the main.js
+        # Set difference matches. grep chapters_skipped_fragments.
+        prev_skipped = set(
+            _chap_label_str(x)
+            for x in existing_meta.get("chapters_skipped_fragments", [])
+        )
+        merged_skipped = sorted(
+            (prev_skipped | {_chap_label_str(x) for x in _skipped_fragment_labels})
+            - set(merged_downloaded),
+            key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
+        )
+
         # Serialize AniList tags via the module-level _serialize_anilist_tag —
         # the same serializer the refresh writer + _build_aio_reader_extras use,
         # so the on-disk schema stays identical across all three writers (the
@@ -12352,6 +12398,10 @@ def main():
             "cover": comic_data.get("cover"),
             "genres": comic_data.get("genres", []),
             "chapters_downloaded": merged_downloaded,
+            # Consensus-dropped duplicate fragments; subtracted by the UI
+            # update-check (main.js:_checkSeriesUpdates). Empty for single-source
+            # / lazy / collapse-off series. grep chapters_skipped_fragments.
+            "chapters_skipped_fragments": merged_skipped,
             "total_available_at_download": len(pool),
             "last_downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             # --- AniList enrichment fields (--metadata-source=anilist) ---

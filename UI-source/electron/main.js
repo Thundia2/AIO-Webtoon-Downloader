@@ -1113,16 +1113,28 @@ function setupIPC() {
         checkMode = "json";
       }
 
-      // Compare: site chapters minus on-device chapters = missing/new
+      // Fragment labels the download path dropped under multi-source consensus
+      // (mangafire's duplicate .1-.4 sitting next to the integer floor).
+      // --list-chapters runs consensus-free, so it re-lists them; without this
+      // subtraction they'd show as a perpetual "+N new" that a "Download Missing"
+      // click would refetch as duplicates. Applied in BOTH check modes — a
+      // skipped fragment is never on disk, so the file-based path needs it too.
+      // Cross-file: aio-dl.py writes chapters_skipped_fragments into
+      // .aio_series.json (grep _skipped_fragment_labels).
+      const skippedFragments = new Set((meta.chapters_skipped_fragments || []).map(String));
+
+      // Compare: site chapters (minus intentionally-skipped fragments) not yet
+      // on device = missing/new.
       const siteChapters = new Set((result.chapters || []).map(String));
-      const newChapters = [...siteChapters]
+      const relevantSiteChapters = [...siteChapters].filter((ch) => !skippedFragments.has(ch));
+      const newChapters = relevantSiteChapters
         .filter((ch) => !downloadedChapters.has(ch))
         .sort((a, b) => parseFloat(a) - parseFloat(b));
 
       return {
         ok: true,
         newChapters,
-        total: result.total || siteChapters.size,
+        total: relevantSiteChapters.length,
         downloaded: downloadedChapters.size,
         checkMode,
         status: result.status || meta.status,
