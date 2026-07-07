@@ -272,12 +272,10 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings }) {
     // Start with the user's saved default settings from the Settings tab,
     // then override format/language/site from the series metadata and set
     // the chapter range to only the missing ones. Shared with the Updates
-    // Center per-row queue via buildLibraryDownloadArgs (@/lib/downloadArgs);
-    // the detail view never injects seededRatingOnly (that's Updates-Center
-    // only). Multi-source lazy discovery needs no injection here: the App.jsx
-    // wrapper spreads settings.defaults (carrying multiSource + multiSourceLazy)
-    // under these args, and downloader.js's chokepoint emits --multi-source-lazy
-    // whenever multiSource is on and multiSourceLazy isn't an explicit false.
+    // Center per-row queue via buildLibraryDownloadArgs (@/lib/downloadArgs),
+    // which forces lazy multi-source for both update-check download paths
+    // (this is a "check for updates" flow — a 1-2 chapter delta shouldn't pay
+    // the eager cross-site discovery). See that builder's header note.
     const args = buildLibraryDownloadArgs(
       meta,
       settings?.defaults,
@@ -1078,39 +1076,23 @@ export default function LibraryTab({
   // Chapters" path so the user gets identical behavior whether they queue
   // from the panel or the detail view. Pulls defaults from settings.
   //
-  // One UpdatesCenter-specific override: seededRatingOnly is injected by
-  // default. The probe phase in search_all (run when --multi-source is on)
-  // costs seconds per series on slow Playwright-driven handlers (browser
-  // navigation per sample chapter) plus image-quality scoring. For an update download
-  // that's typically 1-5 new chapters, that probe cost dominates the
-  // actual download. Skipping it falls back to sites/quality_seed.json's
-  // curated per-site quality priors for ranking (which is what the
-  // multi-source picker uses as a tiebreaker anyway when title-match
-  // scores are within 0.10 of each other). Cross-file: --seeded-rating-only
-  // is defined in aio-dl.py near --enable-ml-rating; downloader.js maps it
-  // via boolMap; aio_search_cli.find_alternatives_for_direct_url honors
-  // it by passing img_quality_cache=None into search_all. Opt out per the
-  // settings.updateChecksUseSeededRating toggle for users on stable
-  // handlers who want full probe accuracy.
+  // Both paths force lazy multi-source via buildLibraryDownloadArgs: an
+  // update-check download is a 1-2 chapter delta, so when --multi-source is
+  // on in settings the ~30-80 s eager cross-site discovery would dwarf the
+  // actual download. The builder sets multiSourceLazy:true (overriding a
+  // global lazy opt-out); downloader.js emits --multi-source-lazy whenever
+  // multiSource is on and multiSourceLazy !== false. See the builder header.
   const buildDownloadArgsForRow = useCallback((row, entry) => {
     const meta = entry?.seriesMeta || {};
     const rangeStr = chaptersToRangeString(row.newChapters);
     // Shared with the detail-view "Download Missing Chapters" path via
-    // buildLibraryDownloadArgs (@/lib/downloadArgs). The one Updates-Center
-    // difference is seededRatingOnly: default on —
-    // settings.updateChecksUseSeededRating !== false catches both explicit-true
-    // and default-undefined. Has no effect when --multi-source isn't on
-    // (nothing to probe). Multi-source lazy discovery (--multi-source-lazy)
-    // needs no injection here either: App.jsx's wrapper spreads
-    // settings.defaults (multiSource + multiSourceLazy) under these args, and
-    // downloader.js's chokepoint emits the flag whenever multiSource is on and
-    // multiSourceLazy isn't an explicit false.
+    // buildLibraryDownloadArgs (@/lib/downloadArgs) — identical args now
+    // that both paths force lazy multi-source (no per-path options).
     const args = buildLibraryDownloadArgs(
       meta,
       settings?.defaults,
       rangeStr,
       settings?.verboseAlways,
-      { seededRatingOnly: settings?.updateChecksUseSeededRating !== false },
     );
     return { url: meta.url, args };
   }, [settings]);

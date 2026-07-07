@@ -840,28 +840,7 @@ def find_alternatives_for_direct_url(
     )
 
     cache = ProbeFailureCache(record_cooldown=record_rate_limit)
-    # --seeded-rating-only skips the entire image-quality probe phase by
-    # passing img_quality_cache=None into search_all. That hits the
-    # `if img_cache is not None and candidates:` gate at the top of the
-    # probe-phase block in sites/search_orchestrator.search_all, leaving
-    # every SourceEntry.img_quality_score=None. The comparator's
-    # _quality_for then falls back to SourceEntry.seed_quality (loaded
-    # from sites/quality_seed.json) for the tiebreaker. Designed for the
-    # Library tab's Check All path where the per-series probe cost
-    # (up to tens of seconds on slow Playwright-driven handlers)
-    # dwarfs the actual download for a 1-5 chapter delta. Off by default
-    # so the legacy / New-tab download path still gets full probe
-    # accuracy. Cross-file: --seeded-rating-only flag is declared in
-    # aio-dl.py near --enable-ml-rating; injected from
-    # UI-source/src/components/LibraryTab.jsx's buildDownloadArgsForRow
-    # for any download spawned from the UpdatesCenter panel.
-    seeded_rating_only = bool(getattr(args, "seeded_rating_only", False))
-    img_cache = None if seeded_rating_only else ImageQualityCache()
-    if seeded_rating_only and on_status:
-        on_status(
-            "[*] Multi-source: --seeded-rating-only set; skipping image-quality "
-            "probe (ranking falls back to sites/quality_seed.json priors)"
-        )
+    img_cache = ImageQualityCache()
     factory = _scraper_factory_for(args)
     search_mr = _search_make_request_factory(timeout=timeout, attempts=2)
 
@@ -882,9 +861,7 @@ def find_alternatives_for_direct_url(
         # anyway so its score has no effect on the multi-source merge
         # either. On the canonical primary, this cuts the chapter-list +
         # image-fetch work that the probe would otherwise spend on the
-        # source we already chose. Redundant when img_cache
-        # is already None (--seeded-rating-only short-circuited above),
-        # but cheap to pass through.
+        # source we already chose.
         skip_probe_sites=(
             {primary_handler.name} if primary_handler is not None else None
         ),

@@ -242,20 +242,6 @@ const DEFAULT_SETTINGS = {
   // (the provider-aware scheduler in main.js further fans across distinct
   // sites when possible).
   checkAllConcurrency: 4,
-  // When ON (default), downloads queued from the UpdatesCenter panel get
-  // --seeded-rating-only injected so the multi-source rating skips its
-  // image-quality probe phase and ranks alternatives from
-  // sites/quality_seed.json's per-site priors instead. Saves seconds
-  // per series on slow Playwright-driven handlers (the probe runs a
-  // browser navigation per sample chapter plus image-quality scoring). For a 1-5
-  // chapter update delta, the probe cost dwarfs the actual download.
-  // Off restores full probe accuracy at the per-download cost — pick
-  // off only if you've tuned multi-source ranking carefully and want
-  // every download to use measured scores. Read in LibraryTab.jsx's
-  // buildDownloadArgsForRow; flag plumbed via downloader.js's
-  // seededRatingOnly boolMap entry; honored in aio_search_cli.
-  // find_alternatives_for_direct_url.
-  updateChecksUseSeededRating: true,
   // ── External metadata enrichment (--metadata-source family) ──
   // Top-level "global setting" semantic: applies to EVERY download
   // regardless of which tab spawned it (New / Search / Library / queue).
@@ -1962,10 +1948,12 @@ export default function SettingsTab({ settings, onSave }) {
               Absent-means-on everywhere (`!== false`): older saved
               settings dicts without the field behave as ON, and the
               master switch above force-resets it to true on enable.
-              Applies to EVERY multi-source download (New tab, Search,
-              Library update checks) via the downloader.js chokepoint;
-              search-driven downloads with a prefetched payload ignore
-              it (Python reads the prefetched JSON eagerly — cheap). */}
+              This toggle governs New-tab + Search downloads; Library
+              update-check downloads ALWAYS force lazy regardless of it
+              (a 1-2 chapter delta shouldn't pay eager discovery — see
+              lib/downloadArgs.js:buildLibraryDownloadArgs). Search-driven
+              downloads with a prefetched payload ignore lazy entirely
+              (Python reads the prefetched JSON eagerly — cheap). */}
           <div className="flex items-start gap-3">
             <Switch
               checked={local.defaults.multiSourceLazy !== false}
@@ -1983,6 +1971,9 @@ export default function SettingsTab({ settings, onSave }) {
                 the whole download. <strong>Off:</strong> discover up front:
                 slower start, but split-collapse gets cross-source consensus
                 and ghost detection has alignment data from chapter one.
+                <br />
+                Downloads started from a library update check always use lazy
+                discovery regardless of this setting.
               </p>
             </div>
           </div>
@@ -2292,39 +2283,6 @@ export default function SettingsTab({ settings, onSave }) {
       <p className="text-[10px] text-muted-foreground mt-1">
         How many series the "Check All" sweep checks at the same time. Workers prefer
         jobs on different sites so no single CDN gets hammered. Default 4.
-      </p>
-
-      {/* ── Update-check downloads: skip image-quality probe ──
-          Multi-source ranks alternatives by running an image-quality probe
-          (download sample images, score them). On MangaFire-class handlers
-          the probe burns ~30-60+ s per series. For a 1-5 chapter update
-          delta that probe cost dwarfs the actual download. With this on
-          (default), the multi-source picker uses sites/quality_seed.json
-          priors as the ranking signal instead of running the probe. The
-          picker's tiebreaker logic ALREADY falls back to the seed when
-          probe scores are equal, so the seed-only mode is a "trust the
-          curated priors" shortcut. Only affects downloads queued from
-          the UpdatesCenter; regular New-tab downloads still get full
-          probe accuracy. */}
-      <div className="flex items-center gap-2 mt-4">
-        <Checkbox
-          checked={local.updateChecksUseSeededRating !== false}
-          onCheckedChange={(v) => set("updateChecksUseSeededRating", v)}
-        />
-        <Label className="text-xs cursor-pointer">
-          Update-check downloads use fast seed-based rating (recommended)
-        </Label>
-      </div>
-      <p className="text-[10px] text-muted-foreground mt-1 ml-6">
-        <strong>On (default):</strong> Downloads queued from the Updates Center skip the
-        multi-source image-quality probe (which runs Playwright + per-source image scoring
-        and adds ~30-60+ seconds per series). Ranking falls back to the curated quality
-        priors in <code className="font-mono text-[9px]">sites/quality_seed.json</code>.
-        For a typical 1-5 chapter update delta the probe takes ~10× longer than the
-        actual download.
-        <br />
-        <strong>Off:</strong> Update-check downloads run the full probe like any other
-        multi-source download. More accurate per-source ranking; significantly slower.
       </p>
     </>
   );
