@@ -313,52 +313,56 @@ class AsuraSiteHandler(BaseSiteHandler):
         s = re.sub(r"\n{3,}", "\n\n", s)
         return s.strip()
 
-    def _series_domain_order(self) -> List[str]:
-        """Hosts to try for a series page, live-first: _BASE_URL's host leads
-        (asurascans.com — the live domain as of 2026-07) then the rest of
-        self.domains, so the dead-domain retry lands on a working host on its
-        first extra request in the common case."""
-        lead = urlparse(self._BASE_URL).netloc
-        order = [lead] + [d for d in self.domains if d != lead]
-        seen: set = set()
-        return [d for d in order if not (d in seen or seen.add(d))]
-
     def _fetch_series_page(
         self, url: str, scraper, make_request
     ) -> Tuple[str, str]:
-        """Fetch a comic page, healing Asura's constant domain rotation.
+        """Fetch a comic page, healing Asura's domain rotation with ONE targeted
+        retry.
 
-        Stale Asura domains now 301 every /comics/<slug> to the LIVE host's
-        HOMEPAGE (dropping the path) — e.g. 2026-07 asuracomic.net ->
-        asurascans.com/. make_request follows the redirect, so a stored URL on a
-        dead domain silently yields the homepage and the whole scrape (title,
-        author, chapters) comes from the wrong page. We detect that (no
-        series-detail props in the result) and retry the SAME path on the other
-        known hosts until one serves a real series page. Returns
-        (resolved_url, html); the caller builds base_url / chapter URLs from the
-        RESOLVED url so chapter fetches use the live host too. Raises when every
-        host fails so we fail loud instead of scraping the homepage.
+        Stale Asura domains 301 every /comics/<slug> to the LIVE host's HOMEPAGE
+        (dropping the path) — e.g. 2026-07 asuracomic.net -> asurascans.com/.
+        make_request follows the redirect, so a stored URL on a dead domain
+        silently yields the homepage and the whole scrape (title, author,
+        chapters) comes from the wrong page. We detect that (no series-detail
+        props) and retry the path ONCE on the known-live host (_BASE_URL,
+        asurascans.com).
+
+        We try ONLY _BASE_URL, NOT a sweep over self.domains: the other domains
+        are the dead ones that 301 straight back to the homepage, so sweeping
+        them adds latency + a hardening cooldown per dead host. During a
+        multi-source SEARCH that turned one slow asurascans.com fetch into a
+        storm of dead-domain retries and (via the pre-fix stdout cooldown lines)
+        corrupted --search-json (2026-07-08 TBATE regression). We also skip the
+        retry when the origin IS already _BASE_URL — re-fetching the same host
+        just yields the same homepage. Returns (resolved_url, html); the caller
+        builds base_url / chapter URLs from the RESOLVED url so chapter fetches
+        use the live host.
+
+        Raises when nothing served a series page so a genuine dead-everywhere
+        DOWNLOAD fails loud instead of scraping the homepage. In multi-source
+        SEARCH this raise is caught per-source by aio_search_cli.py:_fetch_one
+        (try/except around fetch_comic_context → logs via on_status to stderr),
+        so asura is simply skipped and the search still completes.
         """
         html = self._fetch_html(url, scraper, make_request)
         if self._extract_series_props(html):
             return url, html
-        path = urlparse(url).path
+        live_host = urlparse(self._BASE_URL).netloc
         origin_host = urlparse(url).netloc
-        for domain in self._series_domain_order():
-            if domain == origin_host or not path:
-                continue
-            candidate = f"https://{domain}{path}"
+        path = urlparse(url).path
+        if live_host and path and origin_host != live_host:
+            candidate = f"{self._BASE_URL.rstrip('/')}{path}"
             try:
                 alt_html = self._fetch_html(candidate, scraper, make_request)
             except Exception:
-                continue
-            if self._extract_series_props(alt_html):
+                alt_html = ""
+            if alt_html and self._extract_series_props(alt_html):
                 return candidate, alt_html
         raise RuntimeError(
-            f"Asura: '{url}' resolved to the homepage (no series data found) "
-            f"and no known Asura domain served a series page for '{path}'. The "
-            f"domain is likely dead — re-add the series from the current Asura "
-            f"URL. (see _fetch_series_page / _extract_series_props)"
+            f"Asura: '{url}' has no series-detail data — it likely 301'd to the "
+            f"homepage (dead domain) or the series isn't on Asura. Retried the "
+            f"live host '{live_host}' without success. Re-add the series from the "
+            f"current Asura URL. (see _fetch_series_page / _extract_series_props)"
         )
 
     # -- Base overrides ----------------------------------------------

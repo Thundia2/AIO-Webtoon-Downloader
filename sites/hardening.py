@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import sys
 import threading
 import time
 from typing import Dict, Optional, Tuple, Union
@@ -239,7 +240,14 @@ def configure_throttling(
                     if looks_like_cloudflare_rate_limit(resp):
                         if has_next_attempt:
                             cooldown = backoff_base * (2 ** attempt) + random.uniform(0.0, 4.0)
-                            print(f"[!] {domains[0]} rate-limit/challenge (HTTP {getattr(resp, 'status_code', '???')}). Cooling down {cooldown:.1f}s...")
+                            # STDERR, not stdout: these progress lines must never
+                            # pollute --search-json's stdout (that broke a TBATE
+                            # search 2026-07-08 when asurascans.com timed out mid-
+                            # probe). Label with the ACTUAL host being fetched, not
+                            # domains[0] — for Asura domains[0] is the DEAD
+                            # asuracomic.net, which looked like "still hitting the
+                            # dead domain" when the real request was asurascans.com.
+                            print(f"[!] {urlparse(url).netloc or domains[0]} rate-limit/challenge (HTTP {getattr(resp, 'status_code', '???')}). Cooling down {cooldown:.1f}s...", file=sys.stderr)
                             time.sleep(cooldown)
                             continue
                         # Last attempt: return the rate-limited response without cooling down.
@@ -251,7 +259,8 @@ def configure_throttling(
                     last_err = e
                     if has_next_attempt:
                         cooldown = backoff_base * (2 ** attempt) + random.uniform(0.0, 4.0)
-                        print(f"[!] {domains[0]} request error: {e}. Cooling down {cooldown:.1f}s...")
+                        # STDERR + actual-host label (see the rate-limit branch above).
+                        print(f"[!] {urlparse(url).netloc or domains[0]} request error: {e}. Cooling down {cooldown:.1f}s...", file=sys.stderr)
                         time.sleep(cooldown)
 
             if last_resp is not None:
