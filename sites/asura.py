@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from html import unescape
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -214,50 +214,219 @@ class AsuraSiteHandler(BaseSiteHandler):
     def _chapter_url(self, base: str, slug: str, chapter_value: str) -> str:
         return f"{base}/comics/{slug}/chapter/{chapter_value}"
 
+    # -- Series-detail props (the real metadata source) --------------
+    # Asura is an Astro/RSC app (mid-2026 rebuild). The series title, author,
+    # artist, cover, status, genres and description live ONLY in an
+    # <astro-island props="{...}"> attribute as RSC wire format
+    # ([type, value] pairs), NOT in the <h1>/<h3> DOM the legacy scrape
+    # targeted (soup.find("h1") grabbed the site-header title on a redirected
+    # homepage; _extract_people_from_html finds nothing). Everything below
+    # sources from that props blob and only falls back to the DOM when it's
+    # genuinely absent. grep _extract_series_props for the null-author /
+    # homepage-title bug this fixes.
+
+    # Author/artist strings Asura emits when it simply has no data — never let
+    # these masquerade as a real credit. Compared lowercased.
+    _PEOPLE_PLACEHOLDERS = frozenset(
+        {"", "-", "_", "n/a", "na", "none", "null", "updating", "unknown", "tba", "?"}
+    )
+
+    def _extract_series_props(self, html: str) -> Optional[Dict]:
+        """Return the SERIES-DETAIL props object, or None if this page has none.
+
+        A comic page carries several `props="{...}"` blobs — the series detail
+        plus homepage-style sidebar sections (TrendingSection, LatestUpdates,
+        PopularSidebar) that ride every page. We pick the one with the
+        series-detail shape: a `title` PLUS one of author/chapterCount/seriesId
+        (the sidebar cards never carry all of those). The attribute value is
+        HTML-entity-encoded, so every inner quote is &quot; and the ONLY literal
+        double-quote is the attribute delimiter — that lets `props="([^"]*)"`
+        capture the whole value without truncating on a nested brace (the old
+        _extract_props_json used a non-greedy `.*?}` that stopped at the FIRST
+        brace and grabbed a nav fragment, which is why series metadata was
+        empty).
+
+        None is ALSO the reliable "we landed on the homepage / were 301'd off a
+        dead domain" signal that _fetch_series_page keys its cross-domain retry
+        on — a redirected homepage has sidebar blobs but no series-detail one.
+        """
+        for enc in re.findall(r'props="([^"]*)"', html):
+            if "&quot;title&quot;" not in enc:
+                continue
+            if not any(
+                k in enc
+                for k in (
+                    "&quot;author&quot;",
+                    "&quot;chapterCount&quot;",
+                    "&quot;seriesId&quot;",
+                )
+            ):
+                continue
+            try:
+                data = json.loads(unescape(enc))
+            except (json.JSONDecodeError, ValueError):
+                continue
+            obj = self._unwrap_rsc(data)
+            if isinstance(obj, dict) and obj.get("title"):
+                return obj
+        return None
+
+    @classmethod
+    def _split_people(cls, value) -> List[str]:
+        """Split an Asura author/artist string on ','/'/' into a clean name list,
+        dropping placeholder tokens (see _PEOPLE_PLACEHOLDERS). Real-but-odd
+        values (pen names, studio credits) are kept as-is — Asura's own credit,
+        which the AniList always-wins overwrite (sites/external_metadata.py,
+        grep _staff_names_by_role) supersedes on a confident match."""
+        if not value:
+            return []
+        out: List[str] = []
+        for part in re.split(r"[,/]", str(value)):
+            name = part.strip()
+            if name and name.lower() not in cls._PEOPLE_PLACEHOLDERS:
+                out.append(name)
+        return out
+
+    @staticmethod
+    def _split_alt_titles(value) -> List[str]:
+        """Asura's `alternativeTitles` is a single bullet-joined string
+        ('SSS级重生猎人 • SSS급 죽어야 사는 헌터 • …'). Split on the bullet into
+        alt_names — extra AniList search/scoring titles for obscure series whose
+        primary romaji drifts between the site and AniList (harmless for the
+        common case: enrich stops at the primary-title hit before touching
+        them)."""
+        if not value:
+            return []
+        return [t.strip() for t in str(value).split("•") if t.strip()]
+
+    @staticmethod
+    def _clean_description(value) -> str:
+        """Strip the <p>/<br> markup Asura wraps its synopsis in → plain text
+        suitable for ComicInfo <Summary>. Replaced by AniList's description on a
+        confident enrichment match; this is the site fallback."""
+        if not value:
+            return ""
+        s = re.sub(r"<br\s*/?>", "\n", str(value), flags=re.IGNORECASE)
+        s = re.sub(r"</p\s*>", "\n\n", s, flags=re.IGNORECASE)
+        s = re.sub(r"<[^>]+>", "", s)
+        s = unescape(s)
+        s = re.sub(r"\n{3,}", "\n\n", s)
+        return s.strip()
+
+    def _series_domain_order(self) -> List[str]:
+        """Hosts to try for a series page, live-first: _BASE_URL's host leads
+        (asurascans.com — the live domain as of 2026-07) then the rest of
+        self.domains, so the dead-domain retry lands on a working host on its
+        first extra request in the common case."""
+        lead = urlparse(self._BASE_URL).netloc
+        order = [lead] + [d for d in self.domains if d != lead]
+        seen: set = set()
+        return [d for d in order if not (d in seen or seen.add(d))]
+
+    def _fetch_series_page(
+        self, url: str, scraper, make_request
+    ) -> Tuple[str, str]:
+        """Fetch a comic page, healing Asura's constant domain rotation.
+
+        Stale Asura domains now 301 every /comics/<slug> to the LIVE host's
+        HOMEPAGE (dropping the path) — e.g. 2026-07 asuracomic.net ->
+        asurascans.com/. make_request follows the redirect, so a stored URL on a
+        dead domain silently yields the homepage and the whole scrape (title,
+        author, chapters) comes from the wrong page. We detect that (no
+        series-detail props in the result) and retry the SAME path on the other
+        known hosts until one serves a real series page. Returns
+        (resolved_url, html); the caller builds base_url / chapter URLs from the
+        RESOLVED url so chapter fetches use the live host too. Raises when every
+        host fails so we fail loud instead of scraping the homepage.
+        """
+        html = self._fetch_html(url, scraper, make_request)
+        if self._extract_series_props(html):
+            return url, html
+        path = urlparse(url).path
+        origin_host = urlparse(url).netloc
+        for domain in self._series_domain_order():
+            if domain == origin_host or not path:
+                continue
+            candidate = f"https://{domain}{path}"
+            try:
+                alt_html = self._fetch_html(candidate, scraper, make_request)
+            except Exception:
+                continue
+            if self._extract_series_props(alt_html):
+                return candidate, alt_html
+        raise RuntimeError(
+            f"Asura: '{url}' resolved to the homepage (no series data found) "
+            f"and no known Asura domain served a series page for '{path}'. The "
+            f"domain is likely dead — re-add the series from the current Asura "
+            f"URL. (see _fetch_series_page / _extract_series_props)"
+        )
+
     # -- Base overrides ----------------------------------------------
     def fetch_comic_context(
         self, url: str, scraper, make_request
     ) -> SiteComicContext:
-        html = self._fetch_html(url, scraper, make_request)
+        # Heal dead-domain redirects: returns the RESOLVED url (live host) so
+        # base_url / chapter URLs below are built from a host that actually
+        # serves the series, not a stale one that 301s to the homepage.
+        resolved_url, html = self._fetch_series_page(url, scraper, make_request)
 
-        parsed = urlparse(url)
+        parsed = urlparse(resolved_url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
-        slug = self._slug_from_url(url)
+        slug = self._slug_from_url(resolved_url)
 
-        # Extract title
-        title = self._extract_title_from_html(html)
+        # Series metadata comes from the astro-island props JSON, not the DOM
+        # (see _extract_series_props). Title: props title is authoritative;
+        # fall back to the <h1> then the slug only if props is somehow absent.
+        series = self._extract_series_props(html)
+        title = str((series or {}).get("title") or "").strip()
         if not title:
-            title = slug
+            title = self._extract_title_from_html(html) or slug
 
-        # Try RSC props first for metadata
-        props = self._extract_props_json(html)
-
-        comic: Dict = {}
-        if props:
-            comic = {
-                "name": props.get("seriesName") or title,
-                "slug": props.get("seriesSlug") or slug,
-                "id": props.get("seriesId"),
-                "cover": props.get("seriesCover"),
-            }
-        else:
-            comic = {
-                "name": title,
-                "slug": slug,
-            }
+        # BOTH "name" (what SiteComicContext.title mirrors + legacy readers) and
+        # "title" (the key AniList enrichment reads: comic_data = context.comic,
+        # and enrich_from_anilist keys off comic_data["title"] — grep raw_titles).
+        # The pre-2026-07-07 handler set only "name", so a LIVE download passed
+        # enrich a null title and NEVER matched on the primary title (it only
+        # enriched if the series was later --refresh-library-metadata'd, which
+        # builds comic_data["title"] from the stored meta). That was the real
+        # reason a freshly-downloaded Asura series stayed un-enriched regardless
+        # of author data. Dynasty (the model handler) keys "title"; match it.
+        comic: Dict = {"name": title, "title": title, "slug": slug}
+        if series:
+            cover = series.get("coverUrl")
+            if cover:
+                comic["cover"] = str(cover)
+            status = series.get("status")
+            if status:
+                comic["status"] = str(status)
+            desc = self._clean_description(series.get("description"))
+            if desc:
+                comic["desc"] = desc
+            authors = self._split_people(series.get("author"))
+            if authors:
+                comic["authors"] = authors
+            artists = self._split_people(series.get("artist"))
+            if artists:
+                comic["artists"] = artists
+            genres = series.get("genres")
+            if isinstance(genres, list) and genres:
+                # RSC-unwrapped list of {id,name,slug}; extract_additional_metadata
+                # maps these to name strings.
+                comic["genres"] = genres
+            alt_names = self._split_alt_titles(series.get("alternativeTitles"))
+            if alt_names:
+                comic["alt_names"] = alt_names
 
         comic.setdefault("slug", slug)
         comic.setdefault("name", title)
         # Stabilize the series hid against Asura's rotating slug hash. Asura
         # bakes a rotating hex suffix into the slug
-        # ("sss-class-suicide-hunter-46f09241") and the prop-embedded seriesId
-        # is unreliable here (the generic props extractor grabs the nav block,
-        # not the series object — comic.get("id") is almost always None). Using
-        # the raw slug made the hid drift across crashes/resumes/site migrations
-        # (asurascans.com -> asuracomic.net, /comics/ -> /series/), which spawned
-        # duplicate "(hid=...)" folders and broke resume. Strip the trailing hash
-        # so one series maps to one stable folder. The downloader keys folders
-        # and resume off context.identifier (aio-dl.py:6877:
+        # ("sss-class-suicide-hunter-46f09241"). Using the raw slug made the hid
+        # drift across crashes/resumes/site migrations (asurascans.com <->
+        # asuracomic.net, /comics/ <-> /series/), which spawned duplicate
+        # "(hid=...)" folders and broke resume. Strip the trailing hash so one
+        # series maps to one stable folder. The downloader keys folders and
+        # resume off context.identifier (aio-dl.py:6877:
         # `hid, title = context.identifier, ...`), NOT comic["hid"], so we
         # return stable_hid as the identifier below. The FULL slug stays in
         # comic["slug"] and is what get_chapters uses to build
@@ -271,11 +440,13 @@ class AsuraSiteHandler(BaseSiteHandler):
             comic["thumb"] = comic["cover"]
         comic["_base_url"] = base_url
 
-        # Extract people metadata
-        extra_people = self._extract_people_from_html(html)
-        for key, value in extra_people.items():
-            if value:
-                comic[key] = value
+        # Legacy DOM author fallback — only if the props blob carried none
+        # (partial/older pages). No-op on the current site where props wins;
+        # kept as a safety net. Uses setdefault so it never clobbers props data.
+        if not comic.get("authors"):
+            for key, value in self._extract_people_from_html(html).items():
+                if value:
+                    comic.setdefault(key, value)
 
         # Extract chapter list from HTML
         chapter_list = self._extract_chapters_from_html(html)
