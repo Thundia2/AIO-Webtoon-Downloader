@@ -7116,13 +7116,17 @@ def _refresh_library_metadata(args) -> int:
         # Rewrite Komikku details.json (preserve extra keys + existing artist).
         new_details = dict(existing_details)
         new_details["title"] = title
-        # Preserve a previously-recorded author when the refresh source has none
-        # (AniList enrichment doesn't populate `authors`, and a legacy
-        # .aio_series.json may lack it) — the old unconditional assign BLANKED a
-        # good author to "". Mirrors the artist setdefault below. Finding S3-1.
+        # Author/artist: prefer the (possibly AniList-overwritten) comic_data
+        # values — AniList now populates staff on a confident match ("always
+        # wins", grep _staff_names_by_role in external_metadata.py). Fall back to
+        # the previously-recorded value when this match carried no staff
+        # (comic_data keeps the seeded credit then — see the always-wins guard in
+        # _apply_anilist_match), so a blank-source refresh never wipes a good
+        # author/artist. Finding S3-1.
         new_authors = ", ".join(comic_data.get("authors") or [])
         new_details["author"] = new_authors or existing_details.get("author", "")
-        new_details.setdefault("artist", existing_details.get("artist", ""))
+        new_artists = ", ".join(comic_data.get("artists") or [])
+        new_details["artist"] = new_artists or existing_details.get("artist", "")
         new_details["description"] = (
             comic_data.get("desc") or existing_details.get("description", "")
         )
@@ -7151,6 +7155,13 @@ def _refresh_library_metadata(args) -> int:
 
         # Rewrite .aio_series.json enrichment fields (preserve the rest).
         meta["genres"] = list(comic_data.get("genres") or [])
+        # authors: AniList overwrites these on a confident match ("always wins",
+        # grep _staff_names_by_role). comic_data["authors"] is AniList's staff, or
+        # the seeded meta value when the match carried no staff — never blank, so
+        # the unconditional assign is safe and keeps the live-download writer's
+        # behavior (aio-dl.py:12375). (.aio_series.json has no "artists" key by
+        # schema; the artist credit lives in details.json + ComicInfo only.)
+        meta["authors"] = list(comic_data.get("authors") or [])
         if comic_data.get("status"):
             meta["status"] = comic_data["status"]
         # Repoint the cover URL to AniList's when enrichment supplied one so

@@ -471,6 +471,65 @@ def _candidate_author_names(media: Dict[str, Any]) -> List[str]:
     return names
 
 
+# Staff roles to DROP entirely when writing the author/artist credit — the
+# production + localization edges AniList mixes into staff{}. Everything that
+# survives is split by role in _staff_names_by_role: "story" -> author, "art"
+# -> artist. Mirrors _candidate_author_names' drop-list (kept in sync); "edit"
+# catches both "Editor" and "Editing (…)".
+_STAFF_DROP_ROLE = (
+    "translator",
+    "lettering",
+    "design",
+    "assistant",
+    "edit",
+    "proofread",
+)
+
+
+def _staff_names_by_role(
+    media: Dict[str, Any],
+) -> Tuple[List[str], List[str]]:
+    """(authors, artists) written from a candidate's `staff` connection.
+
+    author = roles containing "story" (Story / Original Story / Story & Art);
+    artist = roles containing "art" (Art / Story & Art) — so a single "Story &
+    Art" credit (One Piece's Oda) lands in BOTH. Production/localization roles
+    (_STAFF_DROP_ROLE) are dropped first. Prefers name.full (romaji) over
+    name.native, dedupes case-insensitively, preserves AniList's edge order.
+
+    Both lists are empty when the candidate carries no authorship staff, so the
+    caller (_apply_anilist_match) leaves the site's own author/artist untouched
+    instead of blanking a good credit. This is the WRITE side of staff{}; the
+    MATCH side (_author_match_score / _candidate_author_names) keeps returning
+    both romaji+native for fuzzy comparison. grep caller: _apply_anilist_match.
+    """
+    edges = ((media.get("staff") or {}).get("edges")) or []
+    authors: List[str] = []
+    artists: List[str] = []
+    seen_a: set = set()
+    seen_r: set = set()
+    for edge in edges:
+        role = str(edge.get("role") or "").lower()
+        if any(bad in role for bad in _STAFF_DROP_ROLE):
+            continue
+        is_author = "story" in role
+        is_artist = "art" in role
+        if not (is_author or is_artist):
+            continue
+        name_block = (edge.get("node") or {}).get("name") or {}
+        name = str(name_block.get("full") or name_block.get("native") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if is_author and key not in seen_a:
+            seen_a.add(key)
+            authors.append(name)
+        if is_artist and key not in seen_r:
+            seen_r.add(key)
+            artists.append(name)
+    return authors, artists
+
+
 # Site author strings that carry no identifying signal — never let these
 # manufacture an author "match". Compared after default_process lowercasing.
 _AUTHOR_PLACEHOLDERS = frozenset(
@@ -850,10 +909,17 @@ def _apply_anilist_match(
         the 50+-tag taxonomy dumps. Spoilers are excluded from this
         visible field. Falls back to the site genres only when AniList
         contributed nothing (changed from UNION 2026-06-06 per user req).
-      - authors / artists: NOT written here. AniList `staff{}` IS now
-        fetched, but only to DISAMBIGUATE matches (_author_match_score /
-        _pick_best_candidate); the site's own author/artist strings are
-        kept as-is. Filling them from staff is left for future expansion.
+      - authors / artists: OVERWRITE from AniList `staff{}` on a confident
+        match (user decision 2026-07-07 "AniList author always wins", via
+        _staff_names_by_role: Story/Original Story -> authors, Art -> artists,
+        Story & Art -> both). Only overwrites when AniList supplies staff of
+        that kind, so a candidate lacking authorship data never blanks the
+        site's own credit. staff{} is STILL the match disambiguator
+        (_author_match_score / _pick_best_candidate); the overwrite runs only
+        AFTER a match is chosen, so it can't feed its own result into that run's
+        scoring. Trade-off accepted with eyes open: this replaces site author
+        strings AniList romanizes differently (Eleceed "Jeho Son / ZHENA",
+        One-Punch Man "ONE / Yusuke Murata") with AniList's spelling.
       - status: REPLACE with AniList enum spelling. The existing
         aio-dl.py:_komikku_status_to_digit helper already handles
         AniList's enum spellings via its lowercase mapping
@@ -877,6 +943,18 @@ def _apply_anilist_match(
         comic_data["anilist_id"] = int(media["id"])
     if media.get("idMal"):
         comic_data["mal_id"] = int(media["idMal"])
+
+    # authors / artists: OVERWRITE from AniList staff (see docstring; user
+    # decision 2026-07-07 "AniList author always wins"). Guarded so a candidate
+    # with no authorship staff leaves the site's own author/artist intact
+    # rather than blanking it. Flows to ComicInfo <Writer>/<Penciller>, Komikku
+    # details.json author/artist, and .aio_series.json authors (grep the two
+    # details.json writers + _anilist_meta_fields in aio-dl.py).
+    staff_authors, staff_artists = _staff_names_by_role(media)
+    if staff_authors:
+        comic_data["authors"] = staff_authors
+    if staff_artists:
+        comic_data["artists"] = staff_artists
 
     cleaned_desc = _strip_anilist_html(media.get("description"))
     if cleaned_desc:
