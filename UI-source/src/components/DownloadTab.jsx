@@ -14,8 +14,9 @@ import {
   Button, Input, Textarea, Label, Switch, Slider, Select,
   Checkbox, SectionHeader, Collapsible, Badge,
 } from "@/components/ui/primitives";
-import { Download } from "lucide-react";
+import { Download, Lock, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { LANGUAGES } from "@/lib/constants";
 
 // ── DEFAULT VALUES ──
 // Match aio-dl.py's defaults so you can start a basic download
@@ -133,20 +134,107 @@ const FORMATS = [
   { value: "none", label: "None", desc: "Images only" },
 ];
 
-const LANGUAGES = [
-  { value: "en", label: "English" },
-  { value: "ja", label: "Japanese" },
-  { value: "ko", label: "Korean" },
-  { value: "zh", label: "Chinese" },
-  { value: "es", label: "Spanish" },
-  { value: "fr", label: "French" },
-  { value: "pt-br", label: "Portuguese (BR)" },
-  { value: "de", label: "German" },
-  { value: "it", label: "Italian" },
-  { value: "ru", label: "Russian" },
-  { value: "ar", label: "Arabic" },
-  { value: "tr", label: "Turkish" },
-];
+// LANGUAGES moved to @/lib/constants (shared with SearchTab + SettingsTab).
+
+// ── Tapas premium-episode → multi-source callout ──────────────────────────
+// Tapas serves premium / wait-to-unlock episodes we can't fetch logged-out.
+// The downloader now emits them as `_locked` placeholders so --multi-source
+// fills each from the highest-rated alternative site (grep _locked in
+// aio-dl.py + sites/tapas.py; _PERMANENT_SKIP_REASONS is the no-alt fallback).
+// With multi-source OFF that whole feature is a SILENT no-op — the placeholders
+// are dropped before download — so the moment a tapas.io URL is pasted we
+// surface the situation and offer a one-click enable. Amber = "premium/gated";
+// the panel flips to a calm green "handled" state once multi-source is on
+// (color/icon/copy cross-fade via the duration-300 transitions).
+const TAPAS_URL_RE = /\btapas\.io/i;
+function hasTapasUrl(urls) {
+  return typeof urls === "string" && TAPAS_URL_RE.test(urls);
+}
+
+function TapasPremiumCallout({ active, onEnable }) {
+  return (
+    <div
+      className={cn(
+        "relative mt-2 overflow-hidden rounded-lg border px-4 py-3",
+        "animate-slide-up transition-colors duration-300",
+        active
+          ? "border-success/40 bg-gradient-to-br from-success/10 to-success/[0.02]"
+          : "border-warning/40 bg-gradient-to-br from-warning/10 to-warning/[0.02]"
+      )}
+    >
+      {/* Left accent bar — the spine that reads instantly as a status band. */}
+      <div
+        className={cn(
+          "absolute inset-y-0 left-0 w-1 transition-colors duration-300",
+          active ? "bg-success" : "bg-warning"
+        )}
+      />
+      <div className="flex items-start gap-3 pl-1.5">
+        {/* Icon chip — ringed for a touch of depth against the flat form. */}
+        <div
+          className={cn(
+            "mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
+            "ring-1 transition-colors duration-300",
+            active
+              ? "bg-success/15 text-success ring-success/30"
+              : "bg-warning/15 text-warning ring-warning/30"
+          )}
+        >
+          {active ? (
+            <Sparkles className="h-4 w-4" />
+          ) : (
+            <Lock className="h-4 w-4" />
+          )}
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <p className="text-xs font-semibold text-foreground">
+              {active
+                ? "Premium episodes will be filled in"
+                : "Tapas locks premium episodes"}
+            </p>
+            <Badge
+              variant="secondary"
+              className="h-4 px-1.5 font-mono text-[9px] uppercase tracking-wider"
+            >
+              tapas.io
+            </Badge>
+          </div>
+          <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+            {active ? (
+              <>
+                Paid / wait-to-unlock episodes will be pulled from the
+                highest-rated alternative site, so your download stays gap-free.
+              </>
+            ) : (
+              <>
+                Paid / wait-to-unlock episodes can&rsquo;t be fetched directly
+                and would leave gaps. Multi-source pulls each from the
+                highest-rated alternative site instead.
+              </>
+            )}
+          </p>
+          {!active && (
+            <div className="mt-2.5 flex items-center gap-2.5">
+              <Button
+                size="sm"
+                onClick={onEnable}
+                className="h-7 gap-1.5 px-2.5 text-[11px] shadow-sm transition-transform active:scale-[0.97]"
+              >
+                <Sparkles className="h-3 w-3" />
+                Enable Multi-source
+              </Button>
+              <span className="text-[10px] text-muted-foreground">
+                otherwise premium episodes are skipped
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function formDefaults(settings) {
   return { ...DEFAULT_FORM, ...(settings?.defaults || {}) };
@@ -183,6 +271,16 @@ export default function DownloadTab({
 
   // Helper to update one form field
   const set = (key, value) => updateForm((prev) => ({ ...prev, [key]: value }));
+
+  // UIR-3: clamp numeric inputs whose raw Number() read is forwarded straight
+  // to the CLI (Network Tuning). Empty/NaN (e.g. the user cleared the field)
+  // falls back to the field's DEFAULT_FORM value instead of emitting 0/null;
+  // `min` enforces a sane floor so e.g. --http-timeout can't go to 0.
+  const setNum = (key, raw, min) => {
+    const n = Number(raw);
+    const value = raw === "" || Number.isNaN(n) ? DEFAULT_FORM[key] : Math.max(min, n);
+    updateForm((prev) => ({ ...prev, [key]: value }));
+  };
 
   // --webtoon-recompress needs an archive to write the converted pages into,
   // so aio-dl.py rejects it for --format pdf/none (hard error at startup,
@@ -337,9 +435,25 @@ export default function DownloadTab({
             id="urls"
             value={form.urls}
             onChange={(e) => set("urls", e.target.value)}
-            placeholder="https://mangafire.to/manga/title.id"
+            placeholder="https://mangafire.to/title/id-slug"
             className="font-mono text-sm min-h-[70px]"
           />
+          {/* Tapas-only: premium episodes need multi-source (grep hasTapasUrl /
+              _locked). Slides in the instant a tapas.io URL is present. */}
+          {hasTapasUrl(form.urls) && (
+            <TapasPremiumCallout
+              active={form.multiSource}
+              onEnable={() =>
+                // Mirror the Multi-source switch: enabling force-resets the
+                // nested lazy toggle ON (opt-out inside the opt-in).
+                updateForm((prev) => ({
+                  ...prev,
+                  multiSource: true,
+                  multiSourceLazy: true,
+                }))
+              }
+            />
+          )}
         </div>
 
         {/* Output Format */}
@@ -758,23 +872,23 @@ export default function DownloadTab({
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <Label className="text-xs">HTTP Timeout (sec)</Label>
-                <Input type="number" value={form.httpTimeout} onChange={(e) => set("httpTimeout", Number(e.target.value))} className="mt-1" />
+                <Input type="number" min={1} value={form.httpTimeout} onChange={(e) => setNum("httpTimeout", e.target.value, 1)} className="mt-1" />
               </div>
               <div>
                 <Label className="text-xs">Max Retries</Label>
-                <Input type="number" value={form.httpMaxRetries} onChange={(e) => set("httpMaxRetries", Number(e.target.value))} className="mt-1" />
+                <Input type="number" min={0} value={form.httpMaxRetries} onChange={(e) => setNum("httpMaxRetries", e.target.value, 0)} className="mt-1" />
               </div>
               <div>
                 <Label className="text-xs">Backoff Base (sec)</Label>
-                <Input type="number" step="0.1" value={form.httpBackoffBase} onChange={(e) => set("httpBackoffBase", Number(e.target.value))} className="mt-1" />
+                <Input type="number" step="0.1" min={0.1} value={form.httpBackoffBase} onChange={(e) => setNum("httpBackoffBase", e.target.value, 0.1)} className="mt-1" />
               </div>
               <div>
                 <Label className="text-xs">Backoff Cap (sec)</Label>
-                <Input type="number" value={form.httpBackoffCap} onChange={(e) => set("httpBackoffCap", Number(e.target.value))} className="mt-1" />
+                <Input type="number" min={1} value={form.httpBackoffCap} onChange={(e) => setNum("httpBackoffCap", e.target.value, 1)} className="mt-1" />
               </div>
               <div>
                 <Label className="text-xs">Net Min Gap (sec)</Label>
-                <Input type="number" step="0.05" value={form.netMinGap} onChange={(e) => set("netMinGap", Number(e.target.value))} className="mt-1" />
+                <Input type="number" step="0.05" min={0} value={form.netMinGap} onChange={(e) => setNum("netMinGap", e.target.value, 0)} className="mt-1" />
               </div>
             </div>
           </Collapsible>
@@ -788,7 +902,7 @@ export default function DownloadTab({
               </div>
               <div>
                 <Label className="text-xs">Image Workers</Label>
-                <Input type="number" min={1} max={10} value={form.imageWorkers} onChange={(e) => set("imageWorkers", Number(e.target.value))} className="mt-1" />
+                <Input type="number" min={1} max={10} value={form.imageWorkers} onChange={(e) => setNum("imageWorkers", e.target.value, 1)} className="mt-1" />
                 <p className="text-[10px] text-muted-foreground mt-1">Threads per chapter for image downloads</p>
               </div>
             </div>
@@ -802,7 +916,7 @@ export default function DownloadTab({
               </div>
               <div>
                 <Label className="text-xs">Retry Attempts</Label>
-                <Input type="number" min={0} max={10} value={form.missedRetries} onChange={(e) => set("missedRetries", Number(e.target.value))} disabled={form.noRetryMissedChapters} className="mt-1 w-24" />
+                <Input type="number" min={0} max={10} value={form.missedRetries} onChange={(e) => setNum("missedRetries", e.target.value, 0)} disabled={form.noRetryMissedChapters} className="mt-1 w-24" />
               </div>
             </div>
           </Collapsible>

@@ -67,7 +67,7 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 
 from .base import (
     AssetSpec,
@@ -146,6 +146,16 @@ _AUDIOCLOUD_CODEC_EXT = {"AAC": ".m4a", "MP3": ".mp3"}
 
 # ---------------------------------------------------------------- the handler
 
+def _own_text(node) -> Optional[str]:
+    """Direct text under a BeautifulSoup tag, excluding child elements (ownText).
+    Returns the stripped string, or None if the node is absent/blank."""
+    if node is None:
+        return None
+    texts = [c for c in node.children if isinstance(c, str)]
+    stripped = "".join(texts).strip()
+    return stripped or None
+
+
 class LineWebtoonSiteHandler(BaseSiteHandler):
     """Handler for webtoons.com (LINE Webtoon, English).
 
@@ -185,25 +195,7 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
     # The cloudscraper session's _DEFAULT_UA pins Chrome/120 too, so the two
     # sessions stay roughly in sync without us hard-coding it twice.
 
-    def __init__(self) -> None:
-        super().__init__()
-        # lxml-with-fallback parser cache (mirrors weebcentral.py:21–37).
-        # lxml is faster for the long viewer HTML; html.parser is the
-        # always-available stdlib fallback so this handler still works
-        # if a user hasn't installed lxml.
-        try:
-            import lxml  # type: ignore  # noqa: F401
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ----------------------------------------------------------------- helpers
-
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html, self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html, "html.parser")
 
     @staticmethod
     def _normalize_url(url: str) -> str:
@@ -388,34 +380,18 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
         )
         if meta_author and meta_author.get("content"):
             author = meta_author["content"].strip() or None
+        # Fallbacks read DOM ownText from the modern (.author:nth-of-type) and
+        # legacy (.author_area) layouts.
         if not author:
-            a_first = soup.select_one(
-                ".detail_header .info .author:nth-of-type(1)"
-            )
-            if a_first is not None:
-                # ownText: text directly under tag, excluding child elements.
-                texts = [c for c in a_first.children if isinstance(c, str)]
-                stripped = "".join(texts).strip()
-                if stripped:
-                    author = stripped
+            author = _own_text(soup.select_one(".detail_header .info .author:nth-of-type(1)"))
         if not author:
-            a_area = soup.select_one(".detail_header .info .author_area")
-            if a_area is not None:
-                texts = [c for c in a_area.children if isinstance(c, str)]
-                stripped = "".join(texts).strip()
-                if stripped:
-                    author = stripped
+            author = _own_text(soup.select_one(".detail_header .info .author_area"))
 
         # Artist: separate slot when the series credits writer + illustrator;
         # most webtoons have a single creator (default to author).
-        artist = None
-        a_second = soup.select_one(".detail_header .info .author:nth-of-type(2)")
-        if a_second is not None:
-            texts = [c for c in a_second.children if isinstance(c, str)]
-            stripped = "".join(texts).strip()
-            if stripped:
-                artist = stripped
-        artist = artist or author
+        artist = _own_text(
+            soup.select_one(".detail_header .info .author:nth-of-type(2)")
+        ) or author
 
         # Genre: modern layout uses h2[class*=genre]; legacy uses
         # `.detail_header .info .genre` (multiple, joined). Both surfaces
@@ -796,10 +772,29 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
         start = html.find("[", i)
         if start < 0:
             return []
+        # CL-5: string-aware bracket scan. A bare [/] depth count miscounts when
+        # a JSON string VALUE contains a bracket (e.g. bgmTitle "Track [Mix]"):
+        # the slice then ends at the wrong ] and json.loads fails, silently
+        # degrading real BGM to a presence marker. Skip brackets inside quoted
+        # strings (honoring backslash escapes). NOTE: artlapsa._extract_json_array
+        # is the SAME shape but is NOT yet string-aware — it still carries the
+        # latent version of this exact bug; don't cite it as a correct reference.
         depth = 0
+        in_str = False
+        esc = False
         for j in range(start, len(html)):
             c = html[j]
-            if c == "[":
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "[":
                 depth += 1
             elif c == "]":
                 depth -= 1
@@ -1203,9 +1198,17 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                 # safe-degrade outcome (source ranked by title_match alone).
                 pass
 
-        with _cf.ThreadPoolExecutor(
+        # AUX-2: do NOT use `with ... as pool:` — its implicit shutdown(wait=True)
+        # JOINS every straggler (~1.6s each) at block exit, blowing total_budget_s
+        # into minutes on a large hit set (the budget check below only stops the
+        # as_completed LOOP, not the join). Manage the pool manually and
+        # shutdown(wait=False) so the call returns at the deadline; unfinished
+        # probes just leave actual_chapter_count=None (the documented safe-degrade)
+        # and finish harmlessly in the background.
+        pool = _cf.ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="webtoons-count"
-        ) as pool:
+        )
+        try:
             futures = [pool.submit(_count_one, h) for h in hits]
             for fut in _cf.as_completed(futures):
                 remaining = deadline - _t.monotonic()
@@ -1215,6 +1218,13 @@ class LineWebtoonSiteHandler(BaseSiteHandler):
                     fut.result(timeout=max(0.1, remaining))
                 except Exception:
                     pass
+        finally:
+            # cancel_futures (Py3.9+) drops queued-but-unstarted probes; running
+            # ones aren't waited on (wait=False).
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
 
 
 __all__ = ["LineWebtoonSiteHandler"]

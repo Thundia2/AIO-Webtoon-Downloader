@@ -22,7 +22,8 @@ import {
   Save,
   X,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn, chaptersToRangeString, getInitials } from "@/lib/utils";
+import { buildLibraryDownloadArgs } from "@/lib/downloadArgs";
 import UpdatesCenter from "./UpdatesCenter";
 
 // Convert a Windows file path to a localfile:// URL the renderer can load.
@@ -58,6 +59,43 @@ const SORT_OPTIONS = [
   { value: "size-asc", label: "Smallest first" },
 ];
 
+// ── Badge components ──
+// Collapse the repeated FORMAT_COLORS / STATUS_COLORS <span> markup (grid card,
+// detail header, per-chapter/file rows). Each keeps the color-map lookup +
+// fallback in one place; the caller passes size/position/padding via className.
+// The color class goes LAST (after className) to match the original ordering
+// where the color set followed the sizing set. `fallback` is a prop because
+// the two status call sites use different muted fallbacks (bg-muted/80 vs
+// bg-muted); `label` lets the image-chapter row render "IMG" while still
+// keying the color on fmt="images".
+function FormatBadge({ fmt, label, className }) {
+  return (
+    <span
+      className={cn(
+        "font-bold uppercase rounded border",
+        className,
+        FORMAT_COLORS[fmt] || "bg-muted text-muted-foreground border-border"
+      )}
+    >
+      {label ?? fmt}
+    </span>
+  );
+}
+
+function StatusBadge({ status, className, fallback = "bg-muted text-muted-foreground border-border" }) {
+  return (
+    <span
+      className={cn(
+        "font-bold uppercase rounded border",
+        className,
+        STATUS_COLORS[status] || fallback
+      )}
+    >
+      {status}
+    </span>
+  );
+}
+
 // ============================================================
 // HELPERS
 // ============================================================
@@ -87,26 +125,8 @@ function getEntryFormats(entry) {
   return [];
 }
 
-/**
- * Turn ["51","52","53","55","60"] into "51-53, 55, 60"
- */
-function chaptersToRangeString(chapters) {
-  if (!chapters || chapters.length === 0) return "";
-  const nums = chapters.map(Number).sort((a, b) => a - b);
-  const ranges = [];
-  let start = nums[0], end = nums[0];
-  for (let i = 1; i < nums.length; i++) {
-    if (nums[i] - end <= 1.001) {
-      end = nums[i];
-    } else {
-      ranges.push(start === end ? String(start) : `${start}-${end}`);
-      start = nums[i];
-      end = nums[i];
-    }
-  }
-  ranges.push(start === end ? String(start) : `${start}-${end}`);
-  return ranges.join(", ");
-}
+// chaptersToRangeString ("51","52","53" → "51-53") now lives in
+// @/lib/utils (shared with UpdatesCenter). Imported above.
 
 // ============================================================
 // PDF COVER THUMBNAIL
@@ -140,12 +160,7 @@ function PdfCover({ entry }) {
   if (entry.coverPdfPath) {
     return <div className="w-full h-full bg-muted animate-pulse rounded" />;
   }
-  const initials = entry.title
-    .split(/[\s-]+/)
-    .slice(0, 2)
-    .map((w) => w[0] || "")
-    .join("")
-    .toUpperCase();
+  const initials = getInitials(entry.title);
   return (
     <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-primary/20 to-primary/5 rounded">
       <span className="text-2xl font-bold text-primary/60">{initials}</span>
@@ -177,14 +192,11 @@ function MangaCard({ entry, newCount, onClick }) {
 
         {/* Status badge (top-left) */}
         {status && (
-          <span
-            className={cn(
-              "absolute top-1.5 left-1.5 text-[8px] font-bold uppercase px-1.5 py-0.5 rounded border backdrop-blur-sm",
-              STATUS_COLORS[status] || "bg-muted/80 text-muted-foreground border-border"
-            )}
-          >
-            {status}
-          </span>
+          <StatusBadge
+            status={status}
+            className="absolute top-1.5 left-1.5 text-[8px] px-1.5 py-0.5 backdrop-blur-sm"
+            fallback="bg-muted/80 text-muted-foreground border-border"
+          />
         )}
 
         {/* New chapters badge (top-right) */}
@@ -202,15 +214,7 @@ function MangaCard({ entry, newCount, onClick }) {
         </h3>
         <div className="flex gap-1 flex-wrap">
           {formats.map((fmt) => (
-            <span
-              key={fmt}
-              className={cn(
-                "text-[8px] font-bold uppercase px-1.5 py-0.5 rounded border",
-                FORMAT_COLORS[fmt] || "bg-muted text-muted-foreground border-border"
-              )}
-            >
-              {fmt}
-            </span>
+            <FormatBadge key={fmt} fmt={fmt} className="text-[8px] px-1.5 py-0.5" />
           ))}
         </div>
         <div className="flex items-center gap-2 text-[10px] text-muted-foreground mt-0.5">
@@ -267,32 +271,17 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings }) {
 
     // Start with the user's saved default settings from the Settings tab,
     // then override format/language/site from the series metadata and set
-    // the chapter range to only the missing ones.
-    const d = settings?.defaults || {};
-    const args = {
-      format: meta.format || d.format || "pdf",
-      quality: d.quality ?? 85,
-      chapters: rangeStr,
-      language: meta.language || "en",
-      site: meta.site || undefined,
-      verbose: settings?.verboseAlways ?? true,
-    };
-
-    // Apply all the same toggles that DownloadTab uses
-    if (d.scaling && d.scaling !== 100) args.scaling = d.scaling;
-    if (d.keepChapters) args.keepChapters = true;
-    if (d.noFinalFile) args.noFinalFile = true;
-    if (d.keepImages) args.keepImages = true;
-    if (d.noProcessing) args.noProcessing = true;
-    if (d.noCleanup) args.noCleanup = true;
-    if (d.imageWorkers && d.imageWorkers !== 3) args.imageWorkers = d.imageWorkers;
-    if (d.httpTimeout && d.httpTimeout !== 30) args.httpTimeout = d.httpTimeout;
-    if (d.httpMaxRetries && d.httpMaxRetries !== 6) args.httpMaxRetries = d.httpMaxRetries;
-    // Multi-source lazy discovery needs no injection here: the App.jsx
-    // wrapper spreads settings.defaults (which carries multiSource +
-    // multiSourceLazy) under these args, and downloader.js's chokepoint
-    // emits --multi-source-lazy whenever multiSource is on and
-    // multiSourceLazy isn't an explicit false.
+    // the chapter range to only the missing ones. Shared with the Updates
+    // Center per-row queue via buildLibraryDownloadArgs (@/lib/downloadArgs),
+    // which forces lazy multi-source for both update-check download paths
+    // (this is a "check for updates" flow — a 1-2 chapter delta shouldn't pay
+    // the eager cross-site discovery). See that builder's header note.
+    const args = buildLibraryDownloadArgs(
+      meta,
+      settings?.defaults,
+      rangeStr,
+      settings?.verboseAlways,
+    );
 
     onStartDownload(meta.url, args);
     onSwitchTab("queue");
@@ -331,7 +320,7 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings }) {
           <Input
             value={manualUrl}
             onChange={(e) => setManualUrl(e.target.value)}
-            placeholder="https://mangafire.to/manga/..."
+            placeholder="https://mangafire.to/title/..."
             className="h-8 text-xs flex-1"
           />
           <Button
@@ -637,14 +626,7 @@ function DetailView({ entry, onBack, onRefresh, onStartDownload, onSwitchTab, se
             {meta && (
               <div className="space-y-1.5">
                 {meta.status && (
-                  <span
-                    className={cn(
-                      "inline-block text-[10px] font-bold uppercase px-2 py-0.5 rounded border",
-                      STATUS_COLORS[meta.status] || "bg-muted text-muted-foreground border-border"
-                    )}
-                  >
-                    {meta.status}
-                  </span>
+                  <StatusBadge status={meta.status} className="inline-block text-[10px] px-2 py-0.5" />
                 )}
                 {meta.authors?.length > 0 && (
                   <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -679,15 +661,7 @@ function DetailView({ entry, onBack, onRefresh, onStartDownload, onSwitchTab, se
             {/* Format badges */}
             <div className="flex gap-1.5">
               {formats.map((fmt) => (
-                <span
-                  key={fmt}
-                  className={cn(
-                    "text-[10px] font-bold uppercase px-2 py-1 rounded border",
-                    FORMAT_COLORS[fmt] || "bg-muted text-muted-foreground border-border"
-                  )}
-                >
-                  {fmt}
-                </span>
+                <FormatBadge key={fmt} fmt={fmt} className="text-[10px] px-2 py-1" />
               ))}
             </div>
 
@@ -787,14 +761,11 @@ function DetailView({ entry, onBack, onRefresh, onStartDownload, onSwitchTab, se
                       "transition-all duration-100 group"
                     )}
                   >
-                    <span
-                      className={cn(
-                        "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border shrink-0",
-                        FORMAT_COLORS.images
-                      )}
-                    >
-                      IMG
-                    </span>
+                    <FormatBadge
+                      fmt="images"
+                      label="IMG"
+                      className="text-[9px] px-1.5 py-0.5 shrink-0"
+                    />
                     <span className="text-xs font-medium truncate flex-1">
                       {chap.name.replace(/_/g, " ")}
                     </span>
@@ -815,14 +786,7 @@ function DetailView({ entry, onBack, onRefresh, onStartDownload, onSwitchTab, se
                       "transition-all duration-100 group"
                     )}
                   >
-                    <span
-                      className={cn(
-                        "text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border shrink-0",
-                        FORMAT_COLORS[file.ext] || "bg-muted text-muted-foreground border-border"
-                      )}
-                    >
-                      {file.ext}
-                    </span>
+                    <FormatBadge fmt={file.ext} className="text-[9px] px-1.5 py-0.5 shrink-0" />
                     <span className="text-xs font-medium truncate flex-1">{file.name}</span>
                     <span className="text-[10px] text-muted-foreground shrink-0">
                       {formatSize(file.size)}
@@ -1112,53 +1076,24 @@ export default function LibraryTab({
   // Chapters" path so the user gets identical behavior whether they queue
   // from the panel or the detail view. Pulls defaults from settings.
   //
-  // One UpdatesCenter-specific override: seededRatingOnly is injected by
-  // default. The probe phase in search_all (run when --multi-source is on)
-  // costs ~30-60 s per series on MangaFire-class handlers — Playwright VRF
-  // per sample chapter plus image-quality scoring. For an update download
-  // that's typically 1-5 new chapters, that probe cost dominates the
-  // actual download. Skipping it falls back to sites/quality_seed.json's
-  // curated per-site quality priors for ranking (which is what the
-  // multi-source picker uses as a tiebreaker anyway when title-match
-  // scores are within 0.10 of each other). Cross-file: --seeded-rating-only
-  // is defined in aio-dl.py near --enable-ml-rating; downloader.js maps it
-  // via boolMap; aio_search_cli.find_alternatives_for_direct_url honors
-  // it by passing img_quality_cache=None into search_all. Opt out per the
-  // settings.updateChecksUseSeededRating toggle for users on stable
-  // handlers who want full probe accuracy.
+  // Both paths force lazy multi-source via buildLibraryDownloadArgs: an
+  // update-check download is a 1-2 chapter delta, so when --multi-source is
+  // on in settings the ~30-80 s eager cross-site discovery would dwarf the
+  // actual download. The builder sets multiSourceLazy:true (overriding a
+  // global lazy opt-out); downloader.js emits --multi-source-lazy whenever
+  // multiSource is on and multiSourceLazy !== false. See the builder header.
   const buildDownloadArgsForRow = useCallback((row, entry) => {
     const meta = entry?.seriesMeta || {};
     const rangeStr = chaptersToRangeString(row.newChapters);
-    const d = settings?.defaults || {};
-    const args = {
-      format: meta.format || d.format || "pdf",
-      quality: d.quality ?? 85,
-      chapters: rangeStr,
-      language: meta.language || "en",
-      site: meta.site || undefined,
-      verbose: settings?.verboseAlways ?? true,
-    };
-    if (d.scaling && d.scaling !== 100) args.scaling = d.scaling;
-    if (d.keepChapters) args.keepChapters = true;
-    if (d.noFinalFile) args.noFinalFile = true;
-    if (d.keepImages) args.keepImages = true;
-    if (d.noProcessing) args.noProcessing = true;
-    if (d.noCleanup) args.noCleanup = true;
-    if (d.imageWorkers && d.imageWorkers !== 3) args.imageWorkers = d.imageWorkers;
-    if (d.httpTimeout && d.httpTimeout !== 30) args.httpTimeout = d.httpTimeout;
-    if (d.httpMaxRetries && d.httpMaxRetries !== 6) args.httpMaxRetries = d.httpMaxRetries;
-    // Default on — settings.updateChecksUseSeededRating !== false catches
-    // both the explicit-true case and the default-undefined case. Has no
-    // effect when --multi-source isn't on (the alternatives discovery
-    // doesn't run, so there's nothing to probe in the first place).
-    if (settings?.updateChecksUseSeededRating !== false) {
-      args.seededRatingOnly = true;
-    }
-    // Multi-source lazy discovery (--multi-source-lazy) needs no injection
-    // here: App.jsx's wrapper spreads settings.defaults (multiSource +
-    // multiSourceLazy) under these args, and downloader.js's chokepoint
-    // emits the flag whenever multiSource is on and multiSourceLazy isn't
-    // an explicit false — update downloads inherit the global default.
+    // Shared with the detail-view "Download Missing Chapters" path via
+    // buildLibraryDownloadArgs (@/lib/downloadArgs) — identical args now
+    // that both paths force lazy multi-source (no per-path options).
+    const args = buildLibraryDownloadArgs(
+      meta,
+      settings?.defaults,
+      rangeStr,
+      settings?.verboseAlways,
+    );
     return { url: meta.url, args };
   }, [settings]);
 

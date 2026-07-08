@@ -13,10 +13,72 @@ export function cn(...inputs) {
 // Returns "" when ms is falsy so callers can safely conditional-render.
 // Used by QueueTab's per-row duration label and useDownloader's log divider
 // entry that punctuates each completed run.
+//
+// NOTE: UpdatesCenter.jsx has its OWN formatDuration with a DIFFERENT format
+// ("Nms" / "N.Ns" / "MmSSs", e.g. "5.3s", "1m05s") for the scan-duration
+// readout — deliberately not merged here because its output differs from this
+// one's ("5s", "1m 5s"). Grep formatDuration if you touch either.
 export function formatDuration(ms) {
   if (!ms) return "";
   const sec = Math.floor(ms / 1000);
   if (sec < 60) return `${sec}s`;
   const min = Math.floor(sec / 60);
   return `${min}m ${sec % 60}s`;
+}
+
+// Collapse a list of chapter numbers into a compact human range string:
+// ["51","52","53","55","60"] → "51-53, 55, 60". Consecutive runs (gap ≤ 1.001,
+// so decimals like 60.1 join their neighbor) collapse to "start-end"; isolated
+// numbers stay bare. Returns "" for an empty/missing list.
+//
+// Canonical home for what used to be copy-pasted in LibraryTab.jsx and
+// UpdatesCenter.jsx (both rendered "new chapters" ranges). Grep
+// chaptersToRangeString. Input may be strings or numbers — mapped through
+// Number() before sorting.
+export function chaptersToRangeString(chapters) {
+  if (!chapters || chapters.length === 0) return "";
+  const nums = chapters.map(Number).sort((a, b) => a - b);
+  const ranges = [];
+  let start = nums[0], end = nums[0];
+  for (let i = 1; i < nums.length; i++) {
+    if (nums[i] - end <= 1.001) {
+      end = nums[i];
+    } else {
+      ranges.push(start === end ? String(start) : `${start}-${end}`);
+      start = nums[i];
+      end = nums[i];
+    }
+  }
+  ranges.push(start === end ? String(start) : `${start}-${end}`);
+  return ranges.join(", ");
+}
+
+// Two-letter monogram for a cover fallback when no image is available.
+// Splits the title into words, takes the first letter of the first two,
+// uppercases them.
+//
+// Parameterized because the two call sites differ in EXACT output and both
+// must be preserved byte-for-byte (this helper only DEDUPES them, it does not
+// change either result):
+//   - LibraryTab PdfCover: getInitials(title) — split on /[\s-]+/, NO
+//     filter-empties, NO fallback. `title` is always a non-empty card title
+//     there. (Keeping filter off matters for titles with a leading separator:
+//     " A B" must yield "A", not "AB".)
+//   - UpdatesCenter RowCover: getInitials(title, { splitUnderscore: true,
+//     filterEmpty: true, fallback: "??" }) — underscore is also a separator,
+//     empty segments dropped, "??" when nothing usable remains.
+// Grep getInitials.
+export function getInitials(
+  title,
+  { splitUnderscore = false, filterEmpty = false, fallback = "" } = {}
+) {
+  const sep = splitUnderscore ? /[\s\-_]+/ : /[\s-]+/;
+  let words = (title || "").split(sep);
+  if (filterEmpty) words = words.filter(Boolean);
+  return (
+    words
+      .slice(0, 2)
+      .map((w) => (w[0] || "").toUpperCase())
+      .join("") || fallback
+  );
 }

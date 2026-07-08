@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import datetime as dt
 import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
@@ -17,21 +16,7 @@ class WeebCentralSiteHandler(BaseSiteHandler):
     _BASE_URL = "https://weebcentral.com"
     _SERIES_HREF_RE = re.compile(r"/series/[A-Z0-9]+/")
 
-    def __init__(self) -> None:
-        super().__init__()
-        try:
-            import lxml  # type: ignore  # noqa: F401
-
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ----------------------------------------------------------------- helpers
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html, self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html, "html.parser")
 
     def _extract_slug(self, url: str) -> str:
         parsed = urlparse(url)
@@ -134,19 +119,15 @@ class WeebCentralSiteHandler(BaseSiteHandler):
         return urljoin(self._BASE_URL, "/" + path)
 
     def _extract_datetime(self, iso_text: Optional[str]) -> Optional[int]:
+        # Thin wrapper over the shared BaseSiteHandler._parse_iso_z_timestamp
+        # (grep it); the strip is kept here because this call site historically
+        # trimmed whitespace before parsing (the <time datetime=…> attr).
         if not iso_text:
             return None
-        iso_text = iso_text.strip()
-        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
-            try:
-                return int(dt.datetime.strptime(iso_text, fmt).timestamp())
-            except ValueError:
-                continue
-        return None
+        return self._parse_iso_z_timestamp(iso_text.strip())
 
     def _extract_chapter_number(self, text: str) -> Optional[str]:
-        match = re.search(r"(\d+(?:\.\d+)?)", text)
-        return match.group(1) if match else None
+        return self._chapter_number_from_text(text)
 
     # ----------------------------------------------------------- Base overrides
     def configure_session(self, scraper, args) -> None:
@@ -286,119 +267,6 @@ class WeebCentralSiteHandler(BaseSiteHandler):
         group = chapter_version.get("scanlator")
         return group if isinstance(group, str) else None
 
-    # ----------------------------------------------------------------- search
-    # WeebCentral search: HTMX-style endpoint at /search/data with full filter
-    # query string. Returns a fragment of <article class="bg-base-300...">
-    # blocks per result. Each block contains an <a href="/series/<UUID>/<slug>">
-    # wrapping <picture><source srcset=...><img alt="<title> cover"></picture>
-    # and a "Official"/"tooltip 'Official Translation'" affordance for licensed
-    # series — that's a Phase 3 signal for is_official, not used here.
-    _SERIES_HREF_RE = re.compile(r"/series/[A-Z0-9]+/")
-
-    def search(
-        self,
-        query: str,
-        scraper,
-        make_request,
-        *,
-        language: str = "en",
-        limit: int = 20,
-    ) -> List[SearchHit]:
-        clean = (query or "").strip()
-        if not clean:
-            return []
-        from urllib.parse import quote_plus
-        # The /search HTML page is JS-driven; /search/data returns the
-        # already-rendered result list as an HTMX fragment.
-        url = (
-            f"{self._BASE_URL}/search/data"
-            f"?text={quote_plus(clean)}"
-            f"&sort=Best+Match&order=Descending&official=Any&anime=Any"
-            f"&adult=Any&display_mode=Full+Display&series_status=Any"
-        )
-        # HTTP errors propagate; orchestrator records the host in the
-        # probe-failure cache.
-        response = make_request(url, scraper)
-        html = response.text
-        if not html or len(html) < 100:
-            return []
-
-        soup = self._make_soup(html)
-        articles = soup.select("article.bg-base-300, article")
-        # Filter to only those that contain a /series/ anchor.
-        articles = [
-            a for a in articles
-            if a.find("a", href=self._SERIES_HREF_RE)
-        ]
-        hits: List[SearchHit] = []
-        seen: set = set()
-        for idx, art in enumerate(articles):
-            if len(hits) >= limit:
-                break
-            anchor = art.find("a", href=self._SERIES_HREF_RE)
-            if not anchor:
-                continue
-            href = (anchor.get("href") or "").strip()
-            abs_url = href if href.startswith("http") else urljoin(self._BASE_URL, href)
-            abs_url = abs_url.split("?")[0].split("#")[0]
-            if abs_url in seen:
-                continue
-            seen.add(abs_url)
-
-            # Title: the <img alt="Foo cover">. Strip trailing " cover".
-            img = art.select_one("img[alt]")
-            title: Optional[str] = None
-            if img:
-                alt = (img.get("alt") or "").strip()
-                if alt.lower().endswith(" cover"):
-                    alt = alt[:-len(" cover")].strip()
-                if alt:
-                    title = alt
-            if not title:
-                # Fallback to the truncated display title.
-                disp = art.select_one(".text-ellipsis")
-                if disp:
-                    title = disp.get_text(strip=True)
-            if not title:
-                # Last resort: derive from URL slug.
-                slug = abs_url.rstrip("/").rsplit("/", 1)[-1]
-                title = slug.replace("-", " ").strip() or slug
-            # Cover: prefer the normal-size source srcset, fall back to <img src>.
-            cover: Optional[str] = None
-            source = art.select_one("source[srcset]")
-            if source:
-                srcset = (source.get("srcset") or "").strip()
-                if srcset:
-                    cover = srcset.split()[0]
-            if not cover and img:
-                src = img.get("src")
-                if src:
-                    cover = src
-
-            # Alt title: derive from URL slug (which on WeebCentral is the
-            # canonical romaji, while the displayed title is usually EN).
-            alt_titles: List[str] = []
-            slug = abs_url.rstrip("/").rsplit("/", 1)[-1]
-            slug_alt = slug.replace("-", " ").strip()
-            if slug_alt and slug_alt.lower() != (title or "").lower():
-                alt_titles.append(slug_alt)
-
-            raw_score = max(0.05, 1.0 - (idx / max(1, len(articles))))
-            hits.append(
-                SearchHit(
-                    site=self.name,
-                    title=title,
-                    url=abs_url,
-                    cover=cover,
-                    alt_titles=alt_titles,
-                    year=None,
-                    language=None,
-                    chapter_count_hint=None,
-                    raw_score=raw_score,
-                )
-            )
-        return hits
-
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         chapter_url = chapter.get("url")
         if not chapter_url:
@@ -454,6 +322,9 @@ class WeebCentralSiteHandler(BaseSiteHandler):
             raise RuntimeError("Unable to locate images for chapter.")
         return images
 
+    # WeebCentral's /search page is JS-driven; /search/data returns the rendered
+    # results as an HTMX fragment of <article class="bg-base-300"> blocks, each
+    # with an <a href="/series/<UUID>/<slug>"> wrapping the cover <img alt="… cover">.
     def search(
         self,
         query: str,

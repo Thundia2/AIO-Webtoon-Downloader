@@ -455,12 +455,7 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
             selector = self.chapter_selector
         else:
             selector = "#chapterlist li, .eplister li, .chapter-list li"
-            
-        if self._chapter_filter:
-            # Apply filter to selector(s)
-            # This is a bit complex if selector is a list string, but assuming simple cases
-            pass 
-        
+
         for item in soup.select(selector):
             # Check if item is 'a' or 'li'
             if item.name == 'a':
@@ -508,7 +503,15 @@ class MangaThemesiaSiteHandler(BaseSiteHandler):
                 else:
                     # Fallback to first number found
                     chap_match = re.search(r'(\d+(?:\.\d+)?)', title)
-                    chap = float(chap_match.group(1)) if chap_match else 0.0
+                    if chap_match:
+                        chap = float(chap_match.group(1))
+                    else:
+                        # HA-3: no number extractable from URL or title. Defaulting
+                        # to 0.0 made every numberless entry collide into one bucket
+                        # downstream, so only one survived (Prologue/Extra/etc.
+                        # silently dropped). Skip it — a real "Chapter 0" still
+                        # matches the regex above and is kept.
+                        continue
             
             date_text = ""
             date_node = link.select_one(".chapterdate, .epl-date")

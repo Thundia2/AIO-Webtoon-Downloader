@@ -206,7 +206,7 @@ def _write_cover_file(folder: str, ext: str, data: bytes) -> Optional[str]:
     return out_path
 
 
-def _extract_cover_from_zip(book_path: str, folder: str) -> Optional[str]:
+def _extract_cover_from_zip(book_path: str, folder: str, write_cache: bool = False) -> Optional[str]:
     try:
         with zipfile.ZipFile(book_path) as archive:
             members = [
@@ -223,10 +223,17 @@ def _extract_cover_from_zip(book_path: str, folder: str) -> Optional[str]:
         return None
 
     ext = os.path.splitext(member)[1].lower() or ".jpg"
+    # MISC-3: only materialize the .cover.* cache when explicitly asked. The
+    # read-only library scan must not write (concurrent GET /api/library + GUI
+    # refresh + Electron scans raced → torn .cover.* writes). The zip-embedded
+    # cover has no standalone on-disk path, so the read path returns None and
+    # find_cover_path falls through to the next book / raw-images extractor.
+    if not write_cache:
+        return None
     return _write_cover_file(folder, ext, data)
 
 
-def _extract_cover_from_raw_images(folder: str) -> Optional[str]:
+def _extract_cover_from_raw_images(folder: str, write_cache: bool = False) -> Optional[str]:
     candidates = []
 
     for name in sorted(os.listdir(folder)):
@@ -250,6 +257,10 @@ def _extract_cover_from_raw_images(folder: str) -> Optional[str]:
         if not image_names:
             continue
         image_path = os.path.join(chapter_dir, image_names[0])
+        # MISC-3: read-only scan returns the real on-disk page path directly;
+        # only write the .cover.* cache copy when explicitly opted in.
+        if not write_cache:
+            return image_path
         ext = os.path.splitext(image_path)[1].lower() or ".jpg"
         try:
             with open(image_path, "rb") as handle:
@@ -260,7 +271,12 @@ def _extract_cover_from_raw_images(folder: str) -> Optional[str]:
     return None
 
 
-def find_cover_path(folder: str) -> Optional[str]:
+def find_cover_path(folder: str, write_cache: bool = False) -> Optional[str]:
+    # MISC-3: read-only by default. The library scan (scan_library) must NOT
+    # write a .cover.* cache file as a side effect — concurrent scanners
+    # (GET /api/library + GUI refresh + Electron) raced and produced torn
+    # writes. Pass write_cache=True only from a single-owner caller that
+    # deliberately wants the cache materialized.
     existing = _find_existing_cover(folder)
     if existing:
         return existing
@@ -280,11 +296,11 @@ def find_cover_path(folder: str) -> Optional[str]:
             book_files.append(path)
 
     for book_path in book_files:
-        cover = _extract_cover_from_zip(book_path, folder)
+        cover = _extract_cover_from_zip(book_path, folder, write_cache=write_cache)
         if cover:
             return cover
 
-    return _extract_cover_from_raw_images(folder)
+    return _extract_cover_from_raw_images(folder, write_cache=write_cache)
 
 
 def list_saved_books(folder: str) -> List[str]:

@@ -31,6 +31,7 @@ import {
   SlidersHorizontal,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { LANGUAGES } from "@/lib/constants";
 import SearchSourceCard from "./SearchSourceCard";
 import SearchChapterMap from "./SearchChapterMap";
 
@@ -55,23 +56,7 @@ function normalizeUrl(u) {
   }
 }
 
-// Reuse the language list shape from DownloadTab so the user sees the same
-// labels (changing one place would normally drift; the cost of duplicating
-// is one row when a new language is added — kept inline because it's tiny).
-const LANGUAGES = [
-  { value: "en", label: "English" },
-  { value: "ja", label: "Japanese" },
-  { value: "ko", label: "Korean" },
-  { value: "zh", label: "Chinese" },
-  { value: "es", label: "Spanish" },
-  { value: "fr", label: "French" },
-  { value: "pt-br", label: "Portuguese (BR)" },
-  { value: "de", label: "German" },
-  { value: "it", label: "Italian" },
-  { value: "ru", label: "Russian" },
-  { value: "ar", label: "Arabic" },
-  { value: "tr", label: "Turkish" },
-];
+// LANGUAGES moved to @/lib/constants (shared with DownloadTab + SettingsTab).
 
 // Defaults match aio-dl.py argparse defaults.
 //

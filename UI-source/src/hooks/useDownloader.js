@@ -372,8 +372,6 @@ export function useDownloader() {
     if (q.length === 0 || currentIdRef.current || startingRef.current) return;
 
     const next = q[0];
-    // Remove it from the queue
-    setQueue((prev) => prev.slice(1));
 
     // Spawn the Python process. Reserve the slot synchronously before the
     // await so a concurrent queueDownload (e.g. user clicks Download again
@@ -385,6 +383,15 @@ export function useDownloader() {
         url: next.url,
         args: next.args,
       });
+
+      // UIR-1: only dequeue AFTER a successful spawn, so a throw leaves the
+      // item in place to be retried (the startingRef guard above prevents a
+      // concurrent call from double-spawning q[0] during the await). Dequeue by
+      // IDENTITY, not slice(1): if the user removed a DIFFERENT row during the
+      // spawn await, q[0] may no longer be `next`, and slice(1) would drop that
+      // other item instead. Each queued entry is a distinct object, so `!==`
+      // removes exactly the spawned one.
+      setQueue((prev) => prev.filter((item) => item !== next));
 
       setActiveDownloads((prev) => ({
         ...prev,
@@ -422,7 +429,10 @@ export function useDownloader() {
       const s = settingsRef.current;
       const finalArgs = {
         verbose: s?.verboseAlways !== false,
-        collapseSplits: s?.collapseSplits !== false,
+        // XF-4: opt-in default OFF (absent → OFF). Matches main.js/searcher.js's
+        // `=== true`; the old `!== false` collapsed on download but not on the
+        // update-check, so fragments stuck as "+N new" forever.
+        collapseSplits: s?.collapseSplits === true,
         // Curated-sites toggle. Persisted under settings.searchOpts.seededOnly
         // because SettingsTab + SearchTab both write that namespace; we mirror
         // it here so download paths see the same flag. Only takes effect when
@@ -446,10 +456,7 @@ export function useDownloader() {
         // the spawn so older saved settings dicts that don't have the field
         // still produce identical CLI invocations. Python defaults:
         //   imageConcurrency=8, imagePrefetchDepth=2, imagePrefetchParallel=2.
-        // MangaFire VRF capture knobs (--mangafire-vrf-prefetch-depth,
-        // --mangafire-vrf-parallel) were dropped from the UI on 2026-05-13
-        // — argparse defaults serve everyone now; advanced users pass the
-        // CLI flags directly. Migration note: settings dicts persisted
+        // Migration note: settings dicts persisted
         // before 2026-05-13 carry `mangafireImageConcurrency` instead of
         // `imageConcurrency`. The SettingsTab loader migrates them at read
         // time, so by the time we get here `s.imageConcurrency` is live.

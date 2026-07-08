@@ -233,7 +233,7 @@ class DynastySiteHandler(BaseSiteHandler):
     # where <dir> ∈ {series, anthologies, doujins, issues}. There are no
     # cover thumbnails in the search HTML — the chapter-probe path fetches
     # /<dir>/<slug>.json which has the cover, so cover=None here is fine
-    # (probe_sample_image's chapter path doesn't need hit.cover).
+    # (the _probe_chapter_aggregate chapter path doesn't need hit.cover).
     _SEARCH_HREF_RE = re.compile(r"^/(series|anthologies|doujins|issues)/[^/?#]+/?$")
 
     def search(

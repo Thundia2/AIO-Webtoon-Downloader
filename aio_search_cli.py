@@ -101,37 +101,53 @@ def _try_extract_seed_hit(query: str) -> Optional[SearchHit]:
             "intermittency is what motivated this feature). For other sites, "
             "search by title."
         )
-    # MangaFire URL → scrape via Playwright bridge.
+    # MangaFire URL → resolve via the handler's REST API. Since the 2026
+    # MangaFire relaunch this is a plain JSON GET (no browser/VRF) — see
+    # sites/mangafire.py. fetch_comic_context extracts the hid from either the
+    # new /title/{hid}-{slug} or the old /manga/{slug}.{hid} URL shape.
+    handler = get_handler_by_name("mangafire")
+    if handler is None:
+        sys.exit("MangaFire handler unavailable")
+    session = requests.Session()
     try:
-        from sites.mangafire_vrf_simple import get_vrf_generator, PLAYWRIGHT_AVAILABLE
-    except Exception as exc:
-        sys.exit(f"MangaFire bridge unavailable: {exc}")
-    if not PLAYWRIGHT_AVAILABLE:
-        sys.exit(
-            "URL-mode --search requires Patchright. "
-            "Install with: pip install patchright && python -m patchright install chromium"
-        )
+        handler.configure_session(session, None)
+    except Exception:
+        pass
+
+    def _mk(url, scraper):
+        return scraper.get(url, timeout=30)
+
     try:
-        meta = get_vrf_generator().capture_series_meta(q)
+        ctx = handler.fetch_comic_context(q, session, _mk)
     except Exception as exc:
-        sys.exit(f"Failed to scrape MangaFire URL: {exc}")
-    title = (meta or {}).get("title")
-    if not title:
+        sys.exit(f"Failed to resolve MangaFire URL: {exc}")
+    comic = ctx.comic or {}
+    title = ctx.title or comic.get("title")
+    if not title or title == "Unknown Title":
         sys.exit(f"MangaFire URL didn't yield a title: {q}")
+    # Accurate chapter count — one (or few) cheap JSON GET(s). Feeds the
+    # orchestrator's DMCA/count heuristics; non-fatal if it fails.
+    count: Optional[int] = None
+    try:
+        chaps = handler.get_chapters(ctx, session, "en", _mk)
+        count = len(chaps) if chaps else None
+    except Exception:
+        count = None
     return SearchHit(
         site="mangafire",
         title=title,
-        url=meta.get("final_url") or q,
-        cover=meta.get("cover"),
-        alt_titles=[],
-        year=None,
+        url=comic.get("url") or q,
+        cover=comic.get("cover"),
+        alt_titles=comic.get("alt_names") or [],
+        year=comic.get("year"),
         language=None,
-        chapter_count_hint=meta.get("chapter_count"),
-        actual_chapter_count=None,
+        chapter_count_hint=count,
+        actual_chapter_count=count,
         dmca_likely=False,
         # 1.0 because the title came directly from the URL's series page —
         # the user's intent is unambiguous, so seed it as a perfect match.
         raw_score=1.0,
+        is_official=False,
     )
 
 
@@ -279,6 +295,18 @@ def _fetch_chapters_for_winner(
             }
         if not isinstance(chapters, list):
             chapters = []
+        # An ALT source must never OFFER a chapter it can't serve. tapas emits
+        # premium/wait-to-unlock episodes as `_locked` placeholders — meaningful
+        # only when tapas is the PRIMARY (where --multi-source fills them from
+        # peers). Acting as an alternative here, tapas can't deliver those pages,
+        # so drop them; otherwise the aligner would advertise a tapas-alt locked
+        # placeholder as a "fallback" that always fails when tried. Cross-file:
+        # grep _locked / _process_chapter_strict in aio-dl.py. No-op for sites
+        # that never emit _locked.
+        chapters = [
+            c for c in chapters
+            if not (isinstance(c, dict) and c.get("_locked"))
+        ]
         return {
             "site": source.site, "url": source.url,
             "chapters": chapters, "scraper": scraper, "handler": handler, "context": ctx,
@@ -352,9 +380,9 @@ def run_search_mode(
     set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
 
     # URL-mode: if the user supplied a MangaFire URL instead of a title text,
-    # scrape the series page once via Playwright and turn it into a seed hit.
+    # resolve the series via MangaFire's REST API and turn it into a seed hit.
     # The orchestrator then runs the normal cross-site search using the
-    # scraped title, with MangaFire's data already guaranteed to be present.
+    # resolved title, with MangaFire's data already guaranteed to be present.
     seed_hits: list = []
     seed = _try_extract_seed_hit(query)
     if seed is not None:
@@ -746,8 +774,8 @@ def find_alternatives_for_direct_url(
 
     Flow:
       1. Determine the series title from the primary's already-fetched
-         context (or fall back to MangaFire's capture_series_meta when
-         the cloudscraper-based fetch_comic_context returned a stub).
+         context (fetch_comic_context; for MangaFire this is now a plain
+         JSON API call — no browser fallback needed).
       2. Run the search orchestrator using that title — finds candidates
          across all search-capable handlers.
       3. Take the top candidate's sources, drop any whose host matches
@@ -775,6 +803,7 @@ def find_alternatives_for_direct_url(
         "alternatives_by_chap_num": {},
         "consensus_set": None,
         "consensus_max": None,
+        "resolved_sources": [],
     }
     # Step 1: title.
     title = (
@@ -783,18 +812,9 @@ def find_alternatives_for_direct_url(
         or ""
     )
     title = (title or "").strip()
-    # MangaFire's fetch_comic_context returns "Unknown Title" when CF blocks
-    # the page (the JSON wrapper response we couldn't parse). The series-meta
-    # bridge bypasses that.
-    if (not title or title.lower() == "unknown title") and "mangafire.to" in (primary_url or ""):
-        try:
-            from sites.mangafire_vrf_simple import get_vrf_generator, PLAYWRIGHT_AVAILABLE
-            if PLAYWRIGHT_AVAILABLE:
-                meta = get_vrf_generator().capture_series_meta(primary_url)
-                title = (meta or {}).get("title") or title
-        except Exception as exc:
-            if on_status:
-                on_status(f"  multi-source: capture_series_meta failed: {type(exc).__name__}")
+    # (MangaFire's fetch_comic_context now returns a real title from JSON — the
+    # old Playwright "Unknown Title" CF-block fallback was removed with the 2026
+    # REST-API rewrite.)
     if not title:
         if on_status:
             on_status("[!] Multi-source: couldn't determine title from URL; skipping alternatives discovery")
@@ -820,28 +840,7 @@ def find_alternatives_for_direct_url(
     )
 
     cache = ProbeFailureCache(record_cooldown=record_rate_limit)
-    # --seeded-rating-only skips the entire image-quality probe phase by
-    # passing img_quality_cache=None into search_all. That hits the
-    # `if img_cache is not None and candidates:` gate at the top of the
-    # probe-phase block in sites/search_orchestrator.search_all, leaving
-    # every SourceEntry.img_quality_score=None. The comparator's
-    # _quality_for then falls back to SourceEntry.seed_quality (loaded
-    # from sites/quality_seed.json) for the tiebreaker. Designed for the
-    # Library tab's Check All path where the per-series probe cost
-    # (~30-60 s on MangaFire, depending on Playwright VRF latency)
-    # dwarfs the actual download for a 1-5 chapter delta. Off by default
-    # so the legacy / New-tab download path still gets full probe
-    # accuracy. Cross-file: --seeded-rating-only flag is declared in
-    # aio-dl.py near --enable-ml-rating; injected from
-    # UI-source/src/components/LibraryTab.jsx's buildDownloadArgsForRow
-    # for any download spawned from the UpdatesCenter panel.
-    seeded_rating_only = bool(getattr(args, "seeded_rating_only", False))
-    img_cache = None if seeded_rating_only else ImageQualityCache()
-    if seeded_rating_only and on_status:
-        on_status(
-            "[*] Multi-source: --seeded-rating-only set; skipping image-quality "
-            "probe (ranking falls back to sites/quality_seed.json priors)"
-        )
+    img_cache = ImageQualityCache()
     factory = _scraper_factory_for(args)
     search_mr = _search_make_request_factory(timeout=timeout, attempts=2)
 
@@ -860,11 +859,9 @@ def find_alternatives_for_direct_url(
         # probe — the score wouldn't affect our use of it, only ranking,
         # and the primary_host filter below drops it from alternatives
         # anyway so its score has no effect on the multi-source merge
-        # either. On MangaFire (the canonical primary), this cuts ~30 s
-        # of chapter-VRF + image-fetch work that the probe would otherwise
-        # spend on the source we already chose. Redundant when img_cache
-        # is already None (--seeded-rating-only short-circuited above),
-        # but cheap to pass through.
+        # either. On the canonical primary, this cuts the chapter-list +
+        # image-fetch work that the probe would otherwise spend on the
+        # source we already chose.
         skip_probe_sites=(
             {primary_handler.name} if primary_handler is not None else None
         ),
@@ -961,6 +958,17 @@ def find_alternatives_for_direct_url(
             alignment.consensus_set if alignment.consensus_set else None
         ),
         "consensus_max": alignment.consensus_max,
+        # The (site, url, title, cover) of the alternatives that survived
+        # host/quality filtering. aio-dl.py persists these into
+        # run_params.json's `multi_source_cache` so a later resume can rebuild
+        # the alternatives via build_alternatives_from_payload without re-running
+        # this cross-site search. grep _build_multi_source_cache_payload.
+        "resolved_sources": [
+            {"site": s.site, "url": s.url,
+             "title": getattr(s, "title", "") or "",
+             "cover": getattr(s, "cover", None)}
+            for s in alt_sources
+        ],
     }
 
 
@@ -1018,6 +1026,7 @@ def build_alternatives_from_prefetched(
         "alternatives_by_chap_num": {},
         "consensus_set": None,
         "consensus_max": None,
+        "resolved_sources": [],
     }
 
     if not prefetched_path or not _os.path.exists(prefetched_path):
@@ -1036,6 +1045,59 @@ def build_alternatives_from_prefetched(
             on_status(
                 f"[!] Multi-source: failed to read prefetched alts: "
                 f"{type(exc).__name__}: {exc}"
+            )
+        return _empty_result
+
+    return build_alternatives_from_payload(
+        payload,
+        primary_handler=primary_handler,
+        primary_context=primary_context,
+        primary_chapters=primary_chapters,
+        args=args,
+        make_request=make_request,
+        on_status=on_status,
+    )
+
+
+def build_alternatives_from_payload(
+    payload,
+    primary_handler,
+    primary_context,
+    primary_chapters,
+    args,
+    make_request,
+    on_status=None,
+):
+    """Shared core of the prefetched / resume-cache multi-source path.
+
+    Takes an ALREADY-PARSED payload dict — the same shape the UI's
+    --multi-source-prefetched file uses AND the shape aio-dl.py persists into
+    run_params.json's `multi_source_cache` for resume:
+        {"title": str, "year": int|None,
+         "alternatives": [{"site", "url", "title"?, "cover"?}, ...]}
+    Fetches each alternative's chapter list in parallel, aligns against the
+    user's primary chapters, and returns the alternatives_by_chap_num dict
+    shape find_alternatives_for_direct_url produces — WITHOUT the expensive
+    cross-site title search. build_alternatives_from_prefetched reads a file
+    then delegates here; aio-dl.py's resume path passes the persisted cache
+    dict straight in (grep _read_multi_source_resume_cache in aio-dl.py).
+
+    `resolved_sources` in the return echoes the (site, url, title, cover) of
+    the alternatives that survived filtering, so the caller can re-persist a
+    cleaned resume cache.
+    """
+    _empty_result = {
+        "alternatives_by_chap_num": {},
+        "consensus_set": None,
+        "consensus_max": None,
+        "resolved_sources": [],
+    }
+
+    if not isinstance(payload, dict):
+        if on_status:
+            on_status(
+                "[!] Multi-source: prefetched payload was not a JSON object; "
+                "skipping discovery"
             )
         return _empty_result
 
@@ -1169,6 +1231,16 @@ def build_alternatives_from_prefetched(
             alignment.consensus_set if alignment.consensus_set else None
         ),
         "consensus_max": alignment.consensus_max,
+        # Echo the sources that survived the SKIP_MULTI_SOURCE / validity
+        # filter so aio-dl.py can re-persist a cleaned resume cache. Same
+        # (site, url, title, cover) shape find_alternatives_for_direct_url
+        # returns. grep _build_multi_source_cache_payload.
+        "resolved_sources": [
+            {"site": s.site, "url": s.url,
+             "title": getattr(s, "title", "") or "",
+             "cover": getattr(s, "cover", None)}
+            for s in alt_sources
+        ],
     }
 
 
@@ -1177,4 +1249,5 @@ __all__ = [
     "take_latest_multi_source_state",
     "find_alternatives_for_direct_url",
     "build_alternatives_from_prefetched",
+    "build_alternatives_from_payload",
 ]

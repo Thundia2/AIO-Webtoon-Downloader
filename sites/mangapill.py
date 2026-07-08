@@ -35,23 +35,16 @@ class MangaPillSiteHandler(BaseSiteHandler):
             return path_parts[1] # Return ID as slug/identifier
         return path_parts[-1]
 
-    # Extract the first numeric token from a chapter title or URL path.
-    # Mirrors sites/madara.py:_extract_chapter_number / weebcentral.py.
-    # Without this, get_chapters() below stored the full "Chapter 123"
-    # title as `chap`, and aio-dl.py's bucketing at ~line 5885 calls
-    # float(chap) which raises ValueError → every chapter logged as
-    # "Skipping chapter with invalid number: Chapter 123" → zero
-    # chapters downloaded. The regex matches both integer and decimal
-    # chapters ("Chapter 47.5" → "47.5"). Returns None when no numeric
-    # token is present (oneshots, omake, side stories) so the caller
-    # can decide whether to skip or surface them as non-numeric.
-    _CHAP_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
-
+    # Extract the first numeric token from a chapter title. Without this,
+    # get_chapters() below stored the full "Chapter 123" title as `chap`,
+    # and aio-dl.py's bucketing at ~line 5885 calls float(chap) which raises
+    # ValueError → every chapter logged as "Skipping chapter with invalid
+    # number: Chapter 123" → zero chapters downloaded. Delegates to the shared
+    # BaseSiteHandler._chapter_number_from_text (grep it); returns None on a
+    # non-numeric label (oneshots, omake) so get_chapters can fall back to the
+    # URL or skip. Pinned by tests/test_chap_number_parsing.py.
     def _extract_chapter_number(self, text: Optional[str]) -> Optional[str]:
-        if not text:
-            return None
-        match = self._CHAP_NUM_RE.search(text)
-        return match.group(1) if match else None
+        return self._chapter_number_from_text(text)
 
     # -- Base overrides ----------------------------------------------
     def fetch_comic_context(
@@ -180,8 +173,8 @@ class MangaPillSiteHandler(BaseSiteHandler):
             # float(chap) for bucketing and ValueErrors on the non-numeric
             # text, skipping every chapter. Try title first; on failure,
             # extract the segment after `chapter-` in the URL (MangaPill
-            # chapter URLs are /chapters/<id>-chapter-<num>, so the bare
-            # _CHAP_NUM_RE would mis-grab the leading <id>). When NEITHER
+            # chapter URLs are /chapters/<id>-chapter-<num>, so a bare
+            # \d+ search would mis-grab the leading <id>). When NEITHER
             # surfaces a number, skip the entry — surfacing a non-numeric
             # `chap` would just trigger the same skip downstream with a
             # misleading log line.

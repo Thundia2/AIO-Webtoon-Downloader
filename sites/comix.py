@@ -1106,7 +1106,30 @@ class _ComixBrowserSession:
         is ready, False if Patchright/Playwright unavailable or launch failed.
         Subsequent calls are cheap (already-started fast path)."""
         if self._page is not None:
-            return True
+            # CX-1: a non-None page is NOT proof of health. A mid-run browser
+            # or context crash leaves the dead page object in place; reusing
+            # it makes every later chapter silently yield 0 images. Health-check
+            # the page + browser connection before trusting the fast path; if
+            # either is dead (or the check itself throws because the underlying
+            # transport is gone), tear the whole stack down and relaunch fresh.
+            # _cleanup() nulls self._page, so control falls through to the
+            # launch block below on the same call.
+            try:
+                page_dead = self._page.is_closed()
+                browser_dead = (
+                    self._browser is not None and not self._browser.is_connected()
+                )
+            except Exception:
+                page_dead = browser_dead = True
+            if page_dead or browser_dead:
+                print(
+                    "[!] Comix: cached Patchright page/browser is dead "
+                    "(crash or context loss); relaunching.",
+                    flush=True,
+                )
+                self._cleanup()
+            else:
+                return True
         try:
             from patchright.sync_api import sync_playwright  # type: ignore
         except ImportError:

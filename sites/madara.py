@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import quote_plus, urljoin, urlparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 import requests
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
@@ -398,19 +398,7 @@ class MadaraSiteHandler(BaseSiteHandler):
         self.name = site_name
         self.use_zendriver = use_zendriver
 
-        try:
-            import lxml  # type: ignore  # noqa: F401
-
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ------------------------------------------------------------------ helpers
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html, self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html, "html.parser")
 
     def _slug_from_url(self, url: str) -> str:
         parsed = urlparse(url)
@@ -489,8 +477,7 @@ class MadaraSiteHandler(BaseSiteHandler):
         return [e for e in entries if e]
 
     def _extract_chapter_number(self, title: str) -> Optional[str]:
-        match = re.search(r"(\d+(?:\.\d+)?)", title)
-        return match.group(1) if match else None
+        return self._chapter_number_from_text(title)
 
     def _parse_date(self, text: Optional[str]) -> Optional[str]:
         if not text:
@@ -524,7 +511,6 @@ class MadaraSiteHandler(BaseSiteHandler):
         chapters: List[_MadaraChapter] = []
 
         # Try common first chapter URLs
-        from urllib.parse import urljoin
         potential_chapter_urls = [
             urljoin(page_url, "chapter-1/"),
             urljoin(page_url, "chapter-01/"),
@@ -533,7 +519,6 @@ class MadaraSiteHandler(BaseSiteHandler):
 
         for test_url in potential_chapter_urls:
             try:
-                import requests
                 # Use basic requests here to avoid circular dependency
                 response = requests.get(test_url, timeout=10)
                 if response.status_code == 200:
@@ -584,10 +569,6 @@ class MadaraSiteHandler(BaseSiteHandler):
         NOTE: This method is not recommended as it makes many requests.
         It should only be used when all other methods fail.
         """
-        import requests
-        from urllib.parse import urljoin
-        import re
-
         chapters: List[_MadaraChapter] = []
 
         # Detect the chapter number format from first_chapter_url
@@ -757,24 +738,31 @@ class MadaraSiteHandler(BaseSiteHandler):
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
 
-
-    def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
+    def _fetch_html(self, url: str, scraper, make_request) -> str:
+        """Fetch page HTML, solving a Cloudflare challenge if the plain request
+        hits one. Zendriver-first when self.use_zendriver, else a plain request
+        with a zendriver fallback on a detected CF challenge. Shared by
+        fetch_comic_context / get_chapters / get_chapter_images (grep _fetch_html)."""
         if self.use_zendriver:
             from .crawlee_utils import fetch_html_with_cf_cookies, sync_cf_cookies
 
             html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
             sync_cf_cookies(scraper, url)
-        else:
-            response = make_request(url, scraper)
-            html = response.text
-            try:
-                from .crawlee_utils import ZENDRIVER_AVAILABLE, is_cf_challenge, fetch_html_with_cf_cookies, sync_cf_cookies
+            return html
+        response = make_request(url, scraper)
+        html = response.text
+        try:
+            from .crawlee_utils import ZENDRIVER_AVAILABLE, is_cf_challenge, fetch_html_with_cf_cookies, sync_cf_cookies
 
-                if ZENDRIVER_AVAILABLE and is_cf_challenge(response.status_code, html):
-                    html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
-                    sync_cf_cookies(scraper, url)
-            except Exception:
-                pass
+            if ZENDRIVER_AVAILABLE and is_cf_challenge(response.status_code, html):
+                html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
+                sync_cf_cookies(scraper, url)
+        except Exception:
+            pass
+        return html
+
+    def fetch_comic_context(self, url: str, scraper, make_request) -> SiteComicContext:
+        html = self._fetch_html(url, scraper, make_request)
         soup = self._make_soup(html)
 
         title = (
@@ -817,22 +805,7 @@ class MadaraSiteHandler(BaseSiteHandler):
         if soup is None:
             source_url = context.comic.get("url")
             url = source_url if isinstance(source_url, str) else urljoin(self.base_url + "/", context.identifier)
-            if self.use_zendriver:
-                from .crawlee_utils import fetch_html_with_cf_cookies, sync_cf_cookies
-
-                html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
-                sync_cf_cookies(scraper, url)
-            else:
-                response = make_request(url, scraper)
-                html = response.text
-                try:
-                    from .crawlee_utils import ZENDRIVER_AVAILABLE, is_cf_challenge, fetch_html_with_cf_cookies, sync_cf_cookies
-
-                    if ZENDRIVER_AVAILABLE and is_cf_challenge(response.status_code, html):
-                        html = fetch_html_with_cf_cookies(url, base_url=self.base_url)
-                        sync_cf_cookies(scraper, url)
-                except Exception:
-                    pass
+            html = self._fetch_html(url, scraper, make_request)
             soup = self._make_soup(html)
         page_url = None
         source_url = context.comic.get("url")
@@ -862,45 +835,29 @@ class MadaraSiteHandler(BaseSiteHandler):
         chapter_url = chapter.get("url")
         if not chapter_url:
             raise RuntimeError("Chapter URL missing.")
-        if self.use_zendriver:
-            from .crawlee_utils import fetch_html_with_cf_cookies, sync_cf_cookies
-
-            html = fetch_html_with_cf_cookies(chapter_url, base_url=self.base_url)
-            sync_cf_cookies(scraper, chapter_url)
-        else:
-            response = make_request(chapter_url, scraper)
-            html = response.text
-            try:
-                from .crawlee_utils import ZENDRIVER_AVAILABLE, is_cf_challenge, fetch_html_with_cf_cookies, sync_cf_cookies
-
-                if ZENDRIVER_AVAILABLE and is_cf_challenge(response.status_code, html):
-                    html = fetch_html_with_cf_cookies(chapter_url, base_url=self.base_url)
-                    sync_cf_cookies(scraper, chapter_url)
-            except Exception:
-                pass
+        html = self._fetch_html(chapter_url, scraper, make_request)
         soup = self._make_soup(html)
 
         image_urls: List[str] = []
         for selector in self.reader_selectors:
             for img in soup.select(selector):
-                src = (
-                    img.get("data-src")
-                    or img.get("data-srcset")
-                    or img.get("data-cfsrc")
-                    or img.get("src")
-                )
+                src = img.get("data-src")
+                if not src:
+                    # HA-2: data-srcset is a comma-separated candidate list
+                    # ("url1 720w, url2 1080w"), NOT a single URL. Using it raw
+                    # yields a garbage URL on srcset-only Madara sites. Take the
+                    # first candidate, then its URL token (before any whitespace
+                    # descriptor). The normal src/data-src path is untouched.
+                    srcset = img.get("data-srcset")
+                    if srcset:
+                        first_candidate = srcset.split(",", 1)[0].strip()
+                        src = first_candidate.split()[0] if first_candidate else None
+                if not src:
+                    src = img.get("data-cfsrc") or img.get("src")
                 if not src:
                     continue
-                src = src.strip()
-                if not src:
-                    continue
-                if src.startswith("//"):
-                    src = "https:" + src
-                elif src.startswith("/"):
-                    src = urljoin(chapter_url, src)
-                elif not src.startswith("http"):
-                    src = urljoin(chapter_url, src)
-                if src not in image_urls:
+                src = _normalize_madara_image_url(src, chapter_url)
+                if src and src not in image_urls:
                     image_urls.append(src)
             if image_urls:
                 break

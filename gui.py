@@ -972,58 +972,94 @@ class AIODownloaderGUI:
         })
         save_prefs(self.prefs)
 
+    # ── Command construction ─────────────────────────────────
+    # Single source of truth for option -> CLI flag spellings, shared by
+    # _build_cmd (live download, values from Tk vars) and _build_update_cmd
+    # (library update, values from a saved-params dict). The two builders emit
+    # OVERLAPPING-BUT-NOT-IDENTICAL flag sets in DIFFERENT orders and with
+    # different value sources/conditionals, so each builder keeps its own
+    # ordered emission and its unique flags inline; only the spelling table and
+    # the append/extend mechanics live here. Keep spellings in sync with
+    # aio-dl.py's argparse dests (grep add_argument).
+    _VALUE_ARG_FLAGS = {
+        "chapters": "--chapters",
+        "format": "--format",
+        "language": "--language",
+        "output_dir": "--output-dir",
+        "site": "--site",
+        "epub_layout": "--epub-layout",
+        "width": "--width",
+        "aspect_ratio": "--aspect-ratio",
+        "quality": "--quality",
+        "scaling": "--scaling",
+        "cookies": "--cookies",
+        "split": "--split",
+        "group": "--group",
+        "jobs": "--jobs",
+    }
+    _BOOL_ARG_FLAGS = {
+        "save_params": "--save-params",
+        "download_volumes": "--download-volumes",
+        "keep_chapters": "--keep-chapters",
+        "keep_images": "--keep-images",
+        "mix_by_upvote": "--mix-by-upvote",
+        "no_group_fallback": "--no-group-fallback",
+        "no_partials": "--no-partials",
+        "no_processing": "--no-processing",
+        "no_cleanup": "--no-cleanup",
+        "verbose": "--verbose",
+        "debug": "--debug",
+    }
+
+    def _emit_value(self, cmd: list, key: str, value, always: bool = False):
+        """Append `[flag, value]` for `key`. With `always=False` (default) the
+        caller passes None to skip (it owns the include/skip condition and the
+        exact value expression); with `always=True` the pair is appended
+        unconditionally, matching the four base args' original list-literal
+        placement (so a None value is passed through verbatim, not dropped).
+        Either way this only maps `key` to its flag spelling."""
+        if always or value is not None:
+            cmd.extend([self._VALUE_ARG_FLAGS[key], value])
+
+    def _emit_bool(self, cmd: list, key: str, condition):
+        """Append the bare flag for `key` iff `condition` is truthy."""
+        if condition:
+            cmd.append(self._BOOL_ARG_FLAGS[key])
+
     def _build_cmd(self, urls: list, chapters: str = None) -> list:
         cmd = [sys.executable, "-u", str(AIO_DL)]
         cmd.extend(urls)
-        cmd.extend(["--chapters", chapters or self.chapters.get()])
-        cmd.extend(["--format", self.fmt.get()])
-        cmd.extend(["--language", self.language.get()])
-        cmd.extend(["--output-dir", self.output_dir.get()])
+        self._emit_value(cmd, "chapters", chapters or self.chapters.get(), always=True)
+        self._emit_value(cmd, "format", self.fmt.get(), always=True)
+        self._emit_value(cmd, "language", self.language.get(), always=True)
+        self._emit_value(cmd, "output_dir", self.output_dir.get(), always=True)
 
-        if self.site_name.get().strip():
-            cmd.extend(["--site", self.site_name.get().strip()])
-        if self.fmt.get() == "epub":
-            cmd.extend(["--epub-layout", self.epub_layout.get()])
-        if self.width.get().strip():
-            cmd.extend(["--width", self.width.get().strip()])
-        if self.aspect_ratio.get().strip():
-            cmd.extend(["--aspect-ratio", self.aspect_ratio.get().strip()])
+        self._emit_value(cmd, "site", self.site_name.get().strip() or None)
+        self._emit_value(cmd, "epub_layout", self.epub_layout.get() if self.fmt.get() == "epub" else None)
+        self._emit_value(cmd, "width", self.width.get().strip() or None)
+        self._emit_value(cmd, "aspect_ratio", self.aspect_ratio.get().strip() or None)
         if not self.no_processing.get():
-            cmd.extend(["--quality", str(self.quality.get())])
-            cmd.extend(["--scaling", str(self.scaling.get())])
-        if self.cookies.get():
-            cmd.extend(["--cookies", self.cookies.get()])
+            self._emit_value(cmd, "quality", str(self.quality.get()))
+            self._emit_value(cmd, "scaling", str(self.scaling.get()))
+        self._emit_value(cmd, "cookies", self.cookies.get() or None)
         if self.group.get():
             for g in self.group.get().split(","):
                 g = g.strip()
                 if g:
-                    cmd.extend(["--group", g])
-        if self.split.get():
-            cmd.extend(["--split", self.split.get()])
-        if len(urls) > 1 and self.jobs.get() > 1:
-            cmd.extend(["--jobs", str(self.jobs.get())])
-        if self.save_params.get():
-            cmd.append("--save-params")
-        if self.download_volumes.get():
-            cmd.append("--download-volumes")
-        if self.keep_chapters.get():
-            cmd.append("--keep-chapters")
-        if self.keep_images.get():
-            cmd.append("--keep-images")
-        if self.mix_by_upvote.get():
-            cmd.append("--mix-by-upvote")
-        if self.no_group_fallback.get():
-            cmd.append("--no-group-fallback")
-        if self.no_partials.get():
-            cmd.append("--no-partials")
-        if self.no_processing.get():
-            cmd.append("--no-processing")
-        if self.no_cleanup.get():
-            cmd.append("--no-cleanup")
-        if self.verbose.get():
-            cmd.append("--verbose")
-        if self.debug_mode.get():
-            cmd.append("--debug")
+                    self._emit_value(cmd, "group", g)
+        self._emit_value(cmd, "split", self.split.get() or None)
+        self._emit_value(cmd, "jobs", str(self.jobs.get()) if len(urls) > 1 and self.jobs.get() > 1 else None)
+        self._emit_bool(cmd, "save_params", self.save_params.get())
+        self._emit_bool(cmd, "download_volumes", self.download_volumes.get())
+        self._emit_bool(cmd, "keep_chapters", self.keep_chapters.get())
+        self._emit_bool(cmd, "keep_images", self.keep_images.get())
+        self._emit_bool(cmd, "mix_by_upvote", self.mix_by_upvote.get())
+        self._emit_bool(cmd, "no_group_fallback", self.no_group_fallback.get())
+        self._emit_bool(cmd, "no_partials", self.no_partials.get())
+        self._emit_bool(cmd, "no_processing", self.no_processing.get())
+        self._emit_bool(cmd, "no_cleanup", self.no_cleanup.get())
+        self._emit_bool(cmd, "verbose", self.verbose.get())
+        self._emit_bool(cmd, "debug", self.debug_mode.get())
         return cmd
 
     def _set_running(self, running: bool):
@@ -1079,6 +1115,28 @@ class AIODownloaderGUI:
             except Exception:
                 pass
 
+    def _pump_process(self, cmd: list, on_stop_detected=None):
+        """Spawn `cmd`, stream its stdout line-by-line into the output pane, and
+        return `(returncode, error)` where `error` is the caught Exception or None.
+
+        Shared subprocess pump for _run_cmd (single) and _run_cmd_sequence (batch):
+        sets self.running_proc, honors self.stop_flag mid-stream (terminating the
+        child and invoking on_stop_detected() on each detection), and marshals every
+        line to the Tk thread via root.after(0, _append_output, line). Runs on the
+        worker thread. Callers own completion messaging, the post-loop stop re-check,
+        and finally-block bookkeeping (single vs batch handling diverge)."""
+        try:
+            self.running_proc = self._spawn_process(cmd)
+            for line in self.running_proc.stdout:
+                if self.stop_flag.is_set() and self.running_proc.poll() is None:
+                    if on_stop_detected is not None:
+                        on_stop_detected()
+                    self._terminate_running_process()
+                self.root.after(0, self._append_output, line)
+            return self.running_proc.wait(), None
+        except Exception as exc:
+            return None, exc
+
     def _run_cmd(self, cmd: list, on_done=None, status_text: str = "Running command..."):
         self.stop_flag.clear()
         self.sequence_cancelled = False
@@ -1088,28 +1146,23 @@ class AIODownloaderGUI:
         self._append_output(f"$ {self._format_cmd_for_output(cmd)}\n\n")
 
         def _worker():
-            stopped = False
-            try:
-                self.running_proc = self._spawn_process(cmd)
-                for line in self.running_proc.stdout:
-                    if self.stop_flag.is_set() and self.running_proc.poll() is None:
-                        stopped = True
-                        self._terminate_running_process()
-                    self.root.after(0, self._append_output, line)
-                code = self.running_proc.wait()
-                if self.stop_flag.is_set():
-                    stopped = True
-                    self.root.after(0, self._append_output, "\n--- Stopped by user ---\n\n")
-                else:
-                    self.root.after(0, self._append_output, f"\n--- Process exited with code {code} ---\n\n")
-            except Exception as exc:
-                self.root.after(0, self._append_output, f"\n--- Error: {exc} ---\n\n")
-            finally:
-                self.running_proc = None
-                self.root.after(0, self._set_running, False)
-                self.root.after(0, self._set_status, "Stopped" if stopped else "Ready")
-                if on_done:
-                    self.root.after(0, on_done)
+            # `stopped` mirrors the pre-refactor local: True once a stop is
+            # observed mid-stream (set via the callback so it survives an
+            # exception on the terminated pipe) or on the post-pump re-check.
+            stopped = [False]
+            code, error = self._pump_process(cmd, on_stop_detected=lambda: stopped.__setitem__(0, True))
+            if error is not None:
+                self.root.after(0, self._append_output, f"\n--- Error: {error} ---\n\n")
+            elif self.stop_flag.is_set():
+                stopped[0] = True
+                self.root.after(0, self._append_output, "\n--- Stopped by user ---\n\n")
+            else:
+                self.root.after(0, self._append_output, f"\n--- Process exited with code {code} ---\n\n")
+            self.running_proc = None
+            self.root.after(0, self._set_running, False)
+            self.root.after(0, self._set_status, "Stopped" if stopped[0] else "Ready")
+            if on_done:
+                self.root.after(0, on_done)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1124,30 +1177,24 @@ class AIODownloaderGUI:
         self._append_output(f"\n{'=' * 60}\n{label}\n{'=' * 60}\n")
 
         def _worker():
-            try:
-                self.running_proc = self._spawn_process(cmd)
-                for line in self.running_proc.stdout:
-                    if self.stop_flag.is_set() and self.running_proc.poll() is None:
-                        self.sequence_cancelled = True
-                        self._terminate_running_process()
-                    self.root.after(0, self._append_output, line)
-                code = self.running_proc.wait()
-                if self.stop_flag.is_set():
-                    self.sequence_cancelled = True
-                    self.root.after(0, self._append_output, "\n--- Stopped by user ---\n")
-                else:
-                    self.root.after(0, self._append_output, f"\n--- Exited with code {code} ---\n")
-            except Exception as exc:
+            code, error = self._pump_process(
+                cmd, on_stop_detected=lambda: setattr(self, "sequence_cancelled", True)
+            )
+            if error is not None:
                 self.sequence_cancelled = True
-                self.root.after(0, self._append_output, f"\n--- Error: {exc} ---\n")
-            finally:
-                self.running_proc = None
-                if self.sequence_cancelled or self.stop_flag.is_set():
-                    self.root.after(0, self._set_running, False)
-                    self.root.after(0, self._set_status, "Stopped")
-                    self.root.after(0, self._refresh_library)
-                else:
-                    self.root.after(100, self._run_cmd_sequence, cmds, index + 1)
+                self.root.after(0, self._append_output, f"\n--- Error: {error} ---\n")
+            elif self.stop_flag.is_set():
+                self.sequence_cancelled = True
+                self.root.after(0, self._append_output, "\n--- Stopped by user ---\n")
+            else:
+                self.root.after(0, self._append_output, f"\n--- Exited with code {code} ---\n")
+            self.running_proc = None
+            if self.sequence_cancelled or self.stop_flag.is_set():
+                self.root.after(0, self._set_running, False)
+                self.root.after(0, self._set_status, "Stopped")
+                self.root.after(0, self._refresh_library)
+            else:
+                self.root.after(100, self._run_cmd_sequence, cmds, index + 1)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -1402,51 +1449,43 @@ class AIODownloaderGUI:
         chapters_arg = series.get("next_update") or build_update_chapters_arg(
             series.get("chapter_numbers", set())
         )
-        cmd = [
-            sys.executable, "-u", str(AIO_DL), p["url"],
-            "--chapters", chapters_arg,
-            "--format", p.get("format", "epub"),
-            "--language", p.get("language", "en"),
-            "--output-dir", self.output_dir.get(),
-            "--save-params", "--keep-chapters",
-        ]
-        if p.get("site"):
-            cmd.extend(["--site", p["site"]])
-        if p.get("epub_layout"):
-            cmd.extend(["--epub-layout", p["epub_layout"]])
-        if p.get("width"):
-            cmd.extend(["--width", str(p["width"])])
-        if p.get("aspect_ratio"):
-            cmd.extend(["--aspect-ratio", str(p["aspect_ratio"])])
+        # Base positionals + the four always-present valued flags, then the two
+        # always-on booleans (--save-params/--keep-chapters were hardcoded in the
+        # original list literal; kept always-on here via condition=True). Update
+        # runs deliberately omit --jobs and --download-volumes and do NOT strip
+        # --site / skip-empty --group the way _build_cmd does — those divergences
+        # are intentional and stay inline below.
+        cmd = [sys.executable, "-u", str(AIO_DL), p["url"]]
+        self._emit_value(cmd, "chapters", chapters_arg, always=True)
+        self._emit_value(cmd, "format", p.get("format", "epub"), always=True)
+        self._emit_value(cmd, "language", p.get("language", "en"), always=True)
+        self._emit_value(cmd, "output_dir", self.output_dir.get(), always=True)
+        self._emit_bool(cmd, "save_params", True)
+        self._emit_bool(cmd, "keep_chapters", True)
+
+        self._emit_value(cmd, "site", p["site"] if p.get("site") else None)
+        self._emit_value(cmd, "epub_layout", p["epub_layout"] if p.get("epub_layout") else None)
+        self._emit_value(cmd, "width", str(p["width"]) if p.get("width") else None)
+        self._emit_value(cmd, "aspect_ratio", str(p["aspect_ratio"]) if p.get("aspect_ratio") else None)
         if not p.get("no_processing"):
-            cmd.extend(["--quality", str(p.get("quality", 85))])
-            cmd.extend(["--scaling", str(p.get("scaling", 100))])
-        if p.get("cookies"):
-            cmd.extend(["--cookies", p["cookies"]])
+            self._emit_value(cmd, "quality", str(p.get("quality", 85)))
+            self._emit_value(cmd, "scaling", str(p.get("scaling", 100)))
+        self._emit_value(cmd, "cookies", p["cookies"] if p.get("cookies") else None)
         if p.get("group"):
             groups = p["group"]
             if isinstance(groups, str):
                 groups = [groups]
             for g in groups:
-                cmd.extend(["--group", g])
-        if p.get("split"):
-            cmd.extend(["--split", str(p["split"])])
-        if p.get("mix_by_upvote"):
-            cmd.append("--mix-by-upvote")
-        if p.get("no_group_fallback"):
-            cmd.append("--no-group-fallback")
-        if p.get("no_partials"):
-            cmd.append("--no-partials")
-        if p.get("keep_images"):
-            cmd.append("--keep-images")
-        if p.get("no_processing"):
-            cmd.append("--no-processing")
-        if p.get("no_cleanup"):
-            cmd.append("--no-cleanup")
-        if p.get("verbose", True):
-            cmd.append("--verbose")
-        if p.get("debug"):
-            cmd.append("--debug")
+                self._emit_value(cmd, "group", g)
+        self._emit_value(cmd, "split", str(p["split"]) if p.get("split") else None)
+        self._emit_bool(cmd, "mix_by_upvote", p.get("mix_by_upvote"))
+        self._emit_bool(cmd, "no_group_fallback", p.get("no_group_fallback"))
+        self._emit_bool(cmd, "no_partials", p.get("no_partials"))
+        self._emit_bool(cmd, "keep_images", p.get("keep_images"))
+        self._emit_bool(cmd, "no_processing", p.get("no_processing"))
+        self._emit_bool(cmd, "no_cleanup", p.get("no_cleanup"))
+        self._emit_bool(cmd, "verbose", p.get("verbose", True))
+        self._emit_bool(cmd, "debug", p.get("debug"))
         return cmd
 
     def _update_selected(self):

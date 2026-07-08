@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime as dt
 from typing import Dict, List, Optional
 from urllib.parse import quote_plus, urljoin, urlparse
 
@@ -147,15 +146,11 @@ class AtsumaruSiteHandler(BaseSiteHandler):
         chap_number = entry.get("number")
         title = entry.get("title")
         date = entry.get("createdAt")
+        # Shared ISO-8601 'Z' parser (grep _parse_iso_z_timestamp); None on a
+        # miss -> keep the 0 default this entry path expects.
         uploaded = 0
         if isinstance(date, str):
-            try:
-                uploaded = int(dt.datetime.strptime(date, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp())
-            except ValueError:
-                try:
-                    uploaded = int(dt.datetime.strptime(date, "%Y-%m-%dT%H:%M:%SZ").timestamp())
-                except ValueError:
-                    uploaded = 0
+            uploaded = self._parse_iso_z_timestamp(date) or 0
 
         # Determine the chapter number string used for filtering.
         # If chap_number is set, use it directly. Otherwise fall back to the
@@ -166,10 +161,9 @@ class AtsumaruSiteHandler(BaseSiteHandler):
             chap_str = str(chap_number)
         elif title is not None:
             # Try to parse a number out of the title first
-            import re as _re
-            m = _re.search(r"(\d+(?:\.\d+)?)", str(title))
-            if m:
-                chap_str = m.group(1)
+            num = self._chapter_number_from_text(str(title))
+            if num is not None:
+                chap_str = num
             else:
                 # Non-numeric title — use a positional index so the chapter
                 # isn't discarded by the float-parsing filter in aio-dl.py.

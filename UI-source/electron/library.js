@@ -60,6 +60,25 @@ const THUMB_WIDTH = 180;
 // 75 is a good balance for small thumbnail files.
 const JPEG_QUALITY = 75;
 
+// ── THUMBNAIL CACHE PATHS ──
+// Every cached thumbnail keys off an MD5 of some source string and lands in
+// thumbCacheDir as "<prefix><hash>.jpg". Two families share this scheme:
+//   - PDF page-1 thumbs → bare hash of the PDF path      → "<hash>.jpg"
+//   - official web covers → "cover_"-prefixed hash of URL → "cover_<hash>.jpg"
+// (the "cover_" prefix is what cleanupOrphanCovers keys on to know which files
+// it owns). This is the single source of truth for that key derivation —
+// scanLibrary's lookups, generateThumbnail, saveThumbnail, downloadCoverImage,
+// and cleanupOrphanCovers all route through it so the keys never drift apart.
+// PURE: no fs side effects — callers that need the dir created still call
+// fs.mkdirSync themselves (a bare read-path scan must NOT create the cache dir).
+function cacheKeyHash(source) {
+  return crypto.createHash("md5").update(source).digest("hex");
+}
+
+function cachePath(thumbCacheDir, source, prefix = "") {
+  return path.join(thumbCacheDir, prefix + cacheKeyHash(source) + ".jpg");
+}
+
 // ── MUPDF (lazy-loaded) ──
 // mupdf is an ESM-only package, so we use dynamic import().
 // It's loaded once on first use and cached for subsequent calls.
@@ -508,6 +527,21 @@ function scanLibrary(mangasDir, thumbCacheDir) {
       lastModified = seriesMeta.last_downloaded_at;
     }
 
+    // UIE-1: The Python downloader writes a real cover.jpg at the series-folder
+    // root (Komikku layout; grep _refresh_cover_jpg / cover_dst in aio-dl.py).
+    // Archive series (cbz/epub — webtoons/manhwa) have no PDF and no
+    // coverImagePath, so without this probe they show no cover unless a web
+    // cover happened to be cached. Feed the on-disk cover into coverImagePath
+    // (the field LibraryTab already renders); prefer it over the image-only
+    // page-1 fallback since a real cover.jpg is a better thumbnail.
+    for (const coverName of ["cover.jpg", "cover.png", "cover.webp", "cover.jpeg"]) {
+      const candidate = path.join(folderPath, coverName);
+      if (fs.existsSync(candidate)) {
+        coverImagePath = candidate;
+        break;
+      }
+    }
+
     // ── Check for cached thumbnail ──
     // Priority: web cover (from seriesMeta.cover) > PDF page-1 render
     let thumbPath = null;
@@ -516,11 +550,7 @@ function scanLibrary(mangasDir, thumbCacheDir) {
     // 1. Check for cached web cover image (official cover from the site).
     //    These are keyed by the cover URL hash with a "cover_" prefix.
     if (seriesMeta?.cover && thumbCacheDir) {
-      const coverHash = crypto
-        .createHash("md5")
-        .update(seriesMeta.cover)
-        .digest("hex");
-      const coverCandidate = path.join(thumbCacheDir, "cover_" + coverHash + ".jpg");
+      const coverCandidate = cachePath(thumbCacheDir, seriesMeta.cover, "cover_");
       if (fs.existsSync(coverCandidate)) {
         thumbPath = coverCandidate;
         webCoverCached = true;
@@ -529,11 +559,7 @@ function scanLibrary(mangasDir, thumbCacheDir) {
 
     // 2. Fallback: check for cached PDF page-1 thumbnail (rendered by mupdf)
     if (!thumbPath && coverPdfPath && thumbCacheDir) {
-      const hash = crypto
-        .createHash("md5")
-        .update(coverPdfPath)
-        .digest("hex");
-      const candidate = path.join(thumbCacheDir, hash + ".jpg");
+      const candidate = cachePath(thumbCacheDir, coverPdfPath);
       if (fs.existsSync(candidate)) {
         thumbPath = candidate;
       }
@@ -588,8 +614,7 @@ async function generateThumbnail(pdfPath, thumbCacheDir) {
 
   // ── Output path: MD5 hash of the PDF path → .jpg ──
   fs.mkdirSync(thumbCacheDir, { recursive: true });
-  const hash = crypto.createHash("md5").update(pdfPath).digest("hex");
-  const thumbFile = path.join(thumbCacheDir, hash + ".jpg");
+  const thumbFile = cachePath(thumbCacheDir, pdfPath);
 
   // Skip if already generated (race condition guard)
   if (fs.existsSync(thumbFile)) return thumbFile;
@@ -665,8 +690,7 @@ async function generateMissingThumbnails(items, thumbCacheDir, onReady) {
  */
 function saveThumbnail(pdfPath, base64Data, thumbCacheDir) {
   fs.mkdirSync(thumbCacheDir, { recursive: true });
-  const hash = crypto.createHash("md5").update(pdfPath).digest("hex");
-  const thumbFile = path.join(thumbCacheDir, hash + ".jpg");
+  const thumbFile = cachePath(thumbCacheDir, pdfPath);
   fs.writeFileSync(thumbFile, Buffer.from(base64Data, "base64"));
   return thumbFile;
 }
@@ -715,8 +739,7 @@ function downloadCoverImage(imageUrl, thumbCacheDir, redirectsLeft = COVER_MAX_R
     fs.mkdirSync(thumbCacheDir, { recursive: true });
     // Hash the ORIGINAL URL (not the redirect target) so the cache key stays
     // stable across redirect-chain reconfiguration on the upstream CDN.
-    const hash = crypto.createHash("md5").update(imageUrl).digest("hex");
-    const coverFile = path.join(thumbCacheDir, "cover_" + hash + ".jpg");
+    const coverFile = cachePath(thumbCacheDir, imageUrl, "cover_");
 
     // Skip if already downloaded
     if (fs.existsSync(coverFile)) {
@@ -727,9 +750,25 @@ function downloadCoverImage(imageUrl, thumbCacheDir, redirectsLeft = COVER_MAX_R
     // Pick http or https based on the URL
     const client = imageUrl.startsWith("https") ? https : http;
 
+    // UIE-2: pstatic/webtoons cover CDNs reject a Referer-less request with
+    // 403, so the cover never caches. Send a Referer: use the webtoons
+    // homepage for its own CDN hosts (pstatic/webtoon), otherwise the cover
+    // URL's own origin. Merged per-request so the shared COVER_REQUEST_HEADERS
+    // constant stays intact across the redirect recursion.
+    let referer;
+    try {
+      const origin = new URL(imageUrl).origin;
+      referer = /(?:pstatic\.net|webtoon)/i.test(imageUrl)
+        ? "https://www.webtoons.com/"
+        : origin + "/";
+    } catch {
+      referer = "https://www.webtoons.com/";
+    }
+    const requestHeaders = { ...COVER_REQUEST_HEADERS, Referer: referer };
+
     const request = client.get(
       imageUrl,
-      { timeout: 15000, headers: COVER_REQUEST_HEADERS },
+      { timeout: 15000, headers: requestHeaders },
       (response) => {
         // Follow redirects up to COVER_MAX_REDIRECTS deep. A 3xx without a
         // Location header is malformed; reject with a clear error rather
@@ -841,8 +880,9 @@ function cleanupOrphanCovers(entries, thumbCacheDir) {
   const referenced = new Set();
   for (const e of entries) {
     if (e?.seriesMeta?.cover) {
-      const h = crypto.createHash("md5").update(e.seriesMeta.cover).digest("hex");
-      referenced.add("cover_" + h + ".jpg");
+      // Basename form (not cachePath's full path) — compared against readdir
+      // entries below. Same "cover_<hash>.jpg" key cachePath(..., "cover_") builds.
+      referenced.add("cover_" + cacheKeyHash(e.seriesMeta.cover) + ".jpg");
     }
   }
   let removed = 0;

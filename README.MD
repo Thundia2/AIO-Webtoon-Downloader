@@ -176,7 +176,7 @@ Build installers:
 
 ```bash
 npm run dist:win           # Windows NSIS installer
-npm run dist:mac           # macOS DMG/ZIP
+npm run dist:mac           # macOS DMG
 npm run dist:linux         # Linux AppImage
 ```
 

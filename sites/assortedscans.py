@@ -4,7 +4,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
@@ -15,21 +15,7 @@ class AssortedScansSiteHandler(BaseSiteHandler):
 
     _BASE_URL = "https://assortedscans.com"
 
-    def __init__(self) -> None:
-        super().__init__()
-        try:
-            import lxml  # type: ignore  # noqa: F401
-
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ----------------------------------------------------------------- helpers
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html, self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html, "html.parser")
 
     def _normalize_url(self, url: str) -> str:
         if not url.lower().startswith("http"):
@@ -55,22 +41,6 @@ class AssortedScansSiteHandler(BaseSiteHandler):
         if link:
             return link.get_text(strip=True)
         return main_heading.get_text(strip=True)
-
-    def _meta_content(
-        self,
-        soup: BeautifulSoup,
-        name: Optional[str] = None,
-        property_name: Optional[str] = None,
-    ) -> Optional[str]:
-        if name:
-            tag = soup.find("meta", attrs={"name": name})
-            if tag and tag.get("content"):
-                return tag["content"].strip()
-        if property_name:
-            tag = soup.find("meta", attrs={"property": property_name})
-            if tag and tag.get("content"):
-                return tag["content"].strip()
-        return None
 
     def _has_dropdown(self, soup: BeautifulSoup) -> bool:
         return bool(soup.select_one("div.chapter-list"))
@@ -425,31 +395,18 @@ class AssortedScansSiteHandler(BaseSiteHandler):
             if href_norm not in seen_hrefs:
                 seen_hrefs[href_norm] = title
 
-        ql = clean.lower()
-        query_tokens = set(t for t in ql.split() if t)
-
-        scored: List = []
-        for href, title in seen_hrefs.items():
-            tl = title.lower()
-            if ql in tl:
-                relevance = 1.0
-            elif query_tokens and all(tok in tl for tok in query_tokens):
-                relevance = 0.7
-            else:
-                continue
-            scored.append((relevance, title, href))
-
-        scored.sort(key=lambda x: -x[0])
-
+        # Shared client-side catalog filter (grep _rank_client_filter_hits);
+        # payload carries title+href for the emit loop's URL build.
+        candidates = ((title, (title, href)) for href, title in seen_hrefs.items())
         hits: List[SearchHit] = []
-        for idx, (relevance, title, href) in enumerate(scored[:limit]):
-            url_full = urljoin(self._BASE_URL, href + "/")
-            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
+        for raw_score, (title, href) in self._rank_client_filter_hits(
+            clean, candidates, limit=limit
+        ):
             hits.append(
                 SearchHit(
                     site=self.name,
                     title=title,
-                    url=url_full,
+                    url=urljoin(self._BASE_URL, href + "/"),
                     cover=None,  # /reader/ index has no thumbnails — chapter probe fetches via fetch_comic_context which has og:image
                     alt_titles=[],
                     year=None,

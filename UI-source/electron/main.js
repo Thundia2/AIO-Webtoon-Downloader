@@ -22,6 +22,15 @@ const fs = require("fs");
 const { spawn } = require("child_process");
 const { Downloader } = require("./downloader");
 const { Searcher } = require("./searcher");
+// Resource Limits (Settings → Max network / Max CPU usage). Resolved HERE, the
+// universal live-settings spawn chokepoint, so manual/search/library/resume all
+// honor the CURRENT limit. Hard-override semantics — see resource-limits.js.
+const {
+  applyNetworkLimit,
+  cpuPercentForLevel,
+  searchParallelismForLevel,
+  resumeThrottleFlags,
+} = require("./resource-limits");
 const { HistoryManager } = require("./history");
 const { PythonSetup, isSetupComplete, deleteEnv, PYTHON_VERSION } = require("./setup");
 const { scanLibrary, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, getChaptersOnDevice, getImageChaptersOnDevice } = require("./library");
@@ -197,8 +206,9 @@ function readHidMarker(folderPath) {
 function runMetadataCli(args, stdinData = null) {
   const metadataScript = path.join(path.dirname(defaultScriptPath), "metadata_cli.py");
   const settings = history?.getSettings?.() || {};
-  const pythonCmd = settings.pythonCmd || defaultPythonCmd;
-  const workingDir = settings.workingDir || defaultWorkingDir;
+  // metadata_cli always runs against the bundled defaultScriptPath dir (below),
+  // so we only need pythonCmd + workingDir from the resolver here.
+  const { pythonCmd, workingDir } = resolveSpawnPaths(settings);
   return new Promise((resolve, reject) => {
     const proc = spawn(pythonCmd, [metadataScript, ...args], {
       cwd: workingDir,
@@ -224,6 +234,13 @@ function runMetadataCli(args, stdinData = null) {
       } catch (err) {
         reject(new Error(`Invalid metadata JSON: ${err.message}`));
       }
+    });
+    // UIE-3: if the child exits early, writing to its stdin raises EPIPE.
+    // Without a listener that surfaces as an unhandled 'error' that crashes
+    // the Electron main process — swallow it (the 'close' handler above
+    // already rejects with the child's exit code/stderr).
+    proc.stdin.on("error", (e) => {
+      console.warn("metadata_cli stdin write error:", e.message || e);
     });
     if (stdinData) proc.stdin.write(stdinData);
     proc.stdin.end();
@@ -284,6 +301,64 @@ function ensurePythonSrcInPth() {
   } catch (err) {
     console.error("Failed to update ._pth file:", err.message);
   }
+}
+
+// ============================================================
+// HELPER: resolve the spawn paths (python / script / workingDir)
+// ============================================================
+//
+// Every IPC handler that spawns aio-dl.py resolves the same three paths
+// from saved settings, each falling back to the runtime-computed default
+// when the saved value is empty/missing. The empty-string fallback is
+// load-bearing: get-settings deliberately does NOT merge the resolved
+// paths, and the renderer saves "" for un-customized fields — so
+// `settings.X || defaultX` is the ONLY place the default gets applied on
+// the spawn side (see the get-settings handler's comment + history.js's
+// volatile-path filter for the AppImage/Gatekeeper stale-path story).
+// Kept as one helper so all spawn sites stay in lockstep; callers that
+// only need workingDir just destructure that field.
+function resolveSpawnPaths(settings) {
+  return {
+    pythonCmd: settings.pythonCmd || defaultPythonCmd,
+    scriptPath: settings.scriptPath || defaultScriptPath,
+    workingDir: settings.workingDir || defaultWorkingDir,
+  };
+}
+
+// ============================================================
+// HELPER: build the extra environment for a spawned Python process
+// ============================================================
+//
+// PLAYWRIGHT_BROWSERS_PATH (all platforms, packaged only): points
+// patchright at the bundled Chromium that setup.js downloaded, so the
+// Playwright-driven handlers don't re-download into a system path. Gated on
+// fs.existsSync(playwrightDir) — if the browser dir isn't on disk yet
+// (setup incomplete), we DON'T pin a nonexistent path and let patchright
+// fall back to its own resolution. This existsSync guard is the "most
+// complete" form; _checkSeriesUpdates used to omit it (drift, unified
+// 2026-07 dedup sweep).
+//
+// PYTHONPATH (packaged Unix only): puts resources/python-src/ on sys.path
+// so aio-dl.py can `import sites` / `import aio_search_cli`. On Windows the
+// embed Python ignores PYTHONPATH and ensurePythonSrcInPth() writes the
+// path into ._pth instead.
+//
+// opts.unbuffered — when true, folds in PYTHONUNBUFFERED="1". Direct-spawn
+// callers (like _checkSeriesUpdates) that don't add it separately at spawn
+// time need it here; the Downloader/Searcher spawn path adds PYTHONUNBUFFERED
+// itself, so those callers omit it. NOTE: this is deliberately NOT the same
+// env as runMetadataCli, which sets an unconditional PYTHONPATH=<script dir>
+// and no Playwright var — that call site stays hand-rolled on purpose.
+function buildPythonEnv(opts = {}) {
+  const env = {};
+  if (opts.unbuffered) env.PYTHONUNBUFFERED = "1";
+  if (IS_PACKAGED && playwrightDir && fs.existsSync(playwrightDir)) {
+    env.PLAYWRIGHT_BROWSERS_PATH = playwrightDir;
+  }
+  if (IS_PACKAGED && process.platform !== "win32" && pythonSrcDir) {
+    env.PYTHONPATH = pythonSrcDir;
+  }
+  return env;
 }
 
 // ============================================================
@@ -448,23 +523,11 @@ function applyTheme() {
 // ============================================================
 
 function initDownloader() {
-  // Build the extra environment variables for the Python process.
-  //
-  // PLAYWRIGHT_BROWSERS_PATH (all platforms in packaged mode): points
-  // patchright at the bundled Chromium that setup.js downloaded, so
-  // VRF/Playwright handlers don't try to re-download into a system path.
-  //
-  // PYTHONPATH (packaged Unix only): puts resources/python-src/ on
-  // sys.path so aio-dl.py can `import sites` and `import aio_search_cli`.
-  // On Windows the embed Python ignores PYTHONPATH entirely and we use
-  // ensurePythonSrcInPth() to write the same path into ._pth instead.
-  const extraEnv = {};
-  if (IS_PACKAGED && playwrightDir && fs.existsSync(playwrightDir)) {
-    extraEnv.PLAYWRIGHT_BROWSERS_PATH = playwrightDir;
-  }
-  if (IS_PACKAGED && process.platform !== "win32" && pythonSrcDir) {
-    extraEnv.PYTHONPATH = pythonSrcDir;
-  }
+  // Build the extra environment variables for the Python process
+  // (PLAYWRIGHT_BROWSERS_PATH + Unix PYTHONPATH — see buildPythonEnv).
+  // No PYTHONUNBUFFERED here: the Downloader/Searcher _spawn path adds it
+  // at spawn time, so the constructors want just the Playwright/PYTHONPATH pair.
+  const extraEnv = buildPythonEnv();
 
   downloader = new Downloader({
     extraEnv,
@@ -486,7 +549,7 @@ function initDownloader() {
   //
   // Searcher gets the SAME extraEnv as Downloader (PLAYWRIGHT_BROWSERS_PATH
   // in packaged mode). Without this, search would still run but Playwright-
-  // using handlers (mangafire, violetscans, rizzfables, mangathemesia with
+  // using handlers (comix, violetscans, rizzfables, mangathemesia with
   // use_playwright=True) would silently fail and drop out of the candidate
   // list — making search results in installed builds inferior to dev builds.
   searcher = new Searcher({
@@ -566,20 +629,29 @@ function setupIPC() {
   // ── Start a download ──
   ipcMain.handle("start-download", async (_event, { url, args }) => {
     const settings = history.getSettings();
-    const pythonCmd = settings.pythonCmd || defaultPythonCmd;
-    const scriptPath = settings.scriptPath || defaultScriptPath;
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
 
     // Create the working directory on-demand (not at startup, so we don't
     // leave an empty "AIO Downloader" folder if the user never downloads)
     try { fs.mkdirSync(workingDir, { recursive: true }); } catch {}
+
+    // Resource Limits (hard override): a Max-network preset REPLACES the
+    // image-concurrency family; a Max-CPU preset sets --max-cpu-percent (only
+    // when < 100 so Unlimited spawns stay byte-identical to before). Applied
+    // here — the single main-side spawn chokepoint — so every download path
+    // (New tab, search result, library UpdatesCenter) honors the current level.
+    let throttledArgs = applyNetworkLimit(args, settings.networkLimit);
+    const cpuPct = cpuPercentForLevel(settings.cpuLimit);
+    if (cpuPct < 100) {
+      throttledArgs = { ...throttledArgs, maxCpuPercent: cpuPct };
+    }
 
     const downloadId = downloader.start({
       pythonCmd,
       scriptPath,
       workingDir,
       url,
-      args,
+      args: throttledArgs,
     });
 
     return { downloadId };
@@ -597,10 +669,19 @@ function setupIPC() {
   // UI via 'search-log' events. UI shows results when this resolves.
   ipcMain.handle("search:run", async (_event, { query, opts }) => {
     const settings = history.getSettings();
-    const pythonCmd = settings.pythonCmd || defaultPythonCmd;
-    const scriptPath = settings.scriptPath || defaultScriptPath;
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
     try { fs.mkdirSync(workingDir, { recursive: true }); } catch {}
+
+    // Resource Limits: a Max-network preset caps the search fan-out
+    // (--search-parallelism). Hard override — the preset wins when a level is
+    // active; Unlimited passes the caller's value through (null → Python default 6).
+    const throttledOpts = {
+      ...opts,
+      searchParallelism: searchParallelismForLevel(
+        opts ? opts.searchParallelism : undefined,
+        settings.networkLimit,
+      ),
+    };
 
     try {
       const result = await searcher.runSearch({
@@ -608,7 +689,7 @@ function setupIPC() {
         scriptPath,
         workingDir,
         query,
-        opts,
+        opts: throttledOpts,
       });
       return { ok: true, result };
     } catch (err) {
@@ -624,9 +705,16 @@ function setupIPC() {
   // ── Resume a download ──
   ipcMain.handle("resume-download", async (_event, { url, tmpDir, format, epubLayout }) => {
     const settings = history.getSettings();
-    const pythonCmd = settings.pythonCmd || defaultPythonCmd;
-    const scriptPath = settings.scriptPath || defaultScriptPath;
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
+
+    // Resource Limits on resume: honor the CURRENT limit, NOT the value saved in
+    // run_params.json — the resume may run in a different environment (slower
+    // link, busier machine). resumeThrottleFlags emits concrete current values
+    // (network 4 knobs + --max-cpu-percent); downloader.resume appends them to
+    // the --restore-parameters spawn line and aio-dl.py keeps explicit CLI dests
+    // over the restored ones (grep _user_set_dests). None are resume-gating, so
+    // this never re-downloads completed chapters.
+    const resourceFlags = resumeThrottleFlags(settings);
 
     const downloadId = downloader.resume({
       pythonCmd,
@@ -636,6 +724,7 @@ function setupIPC() {
       tmpDir,
       format,
       epubLayout,
+      resourceFlags,
     });
 
     return { downloadId };
@@ -656,7 +745,7 @@ function setupIPC() {
   // ── Scan for resumable downloads ──
   ipcMain.handle("scan-resumable", async () => {
     const settings = history.getSettings();
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { workingDir } = resolveSpawnPaths(settings);
     const resumable = downloader.scanResumable(workingDir);
 
     const allHistory = history.getAll();
@@ -718,7 +807,7 @@ function setupIPC() {
   // sent to the renderer so it can update that card's cover image.
   ipcMain.handle("scan-library", async () => {
     const settings = history.getSettings();
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { workingDir } = resolveSpawnPaths(settings);
     const mangaDir = getConfiguredOutputRoot(workingDir);
     const thumbCacheDir = path.join(app.getPath("userData"), "thumb-cache");
 
@@ -861,9 +950,7 @@ function setupIPC() {
     }
 
     const settings = history.getSettings();
-    const pythonCmd = settings.pythonCmd || defaultPythonCmd;
-    const workingDir = settings.workingDir || defaultWorkingDir;
-    const scriptPath = settings.scriptPath || defaultScriptPath;
+    const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
 
     if (!fs.existsSync(scriptPath)) {
       return { error: "no_script", message: "aio-dl.py not found at " + scriptPath };
@@ -900,13 +987,9 @@ function setupIPC() {
         // on Unix (mirrors initDownloader; needed because the bundled
         // python-src lives under resources/ and won't be on sys.path
         // otherwise on standard CPython). Windows uses ._pth instead.
-        const extraEnv = { PYTHONUNBUFFERED: "1" };
-        if (IS_PACKAGED && playwrightDir) {
-          extraEnv.PLAYWRIGHT_BROWSERS_PATH = playwrightDir;
-        }
-        if (IS_PACKAGED && process.platform !== "win32" && pythonSrcDir) {
-          extraEnv.PYTHONPATH = pythonSrcDir;
-        }
+        // unbuffered:true folds in PYTHONUNBUFFERED since this spawn adds
+        // env inline (no separate PYTHONUNBUFFERED at the spawn call).
+        const extraEnv = buildPythonEnv({ unbuffered: true });
 
         const proc = spawn(pythonCmd, args, {
           cwd: workingDir,
@@ -1030,16 +1113,28 @@ function setupIPC() {
         checkMode = "json";
       }
 
-      // Compare: site chapters minus on-device chapters = missing/new
+      // Fragment labels the download path dropped under multi-source consensus
+      // (mangafire's duplicate .1-.4 sitting next to the integer floor).
+      // --list-chapters runs consensus-free, so it re-lists them; without this
+      // subtraction they'd show as a perpetual "+N new" that a "Download Missing"
+      // click would refetch as duplicates. Applied in BOTH check modes — a
+      // skipped fragment is never on disk, so the file-based path needs it too.
+      // Cross-file: aio-dl.py writes chapters_skipped_fragments into
+      // .aio_series.json (grep _skipped_fragment_labels).
+      const skippedFragments = new Set((meta.chapters_skipped_fragments || []).map(String));
+
+      // Compare: site chapters (minus intentionally-skipped fragments) not yet
+      // on device = missing/new.
       const siteChapters = new Set((result.chapters || []).map(String));
-      const newChapters = [...siteChapters]
+      const relevantSiteChapters = [...siteChapters].filter((ch) => !skippedFragments.has(ch));
+      const newChapters = relevantSiteChapters
         .filter((ch) => !downloadedChapters.has(ch))
         .sort((a, b) => parseFloat(a) - parseFloat(b));
 
       return {
         ok: true,
         newChapters,
-        total: result.total || siteChapters.size,
+        total: relevantSiteChapters.length,
         downloaded: downloadedChapters.size,
         checkMode,
         status: result.status || meta.status,
@@ -1097,7 +1192,7 @@ function setupIPC() {
   // events are dispatched by `kind` in the renderer.
   ipcMain.handle("check-all-updates", async () => {
     const settings = history.getSettings();
-    const workingDir = settings.workingDir || defaultWorkingDir;
+    const { workingDir } = resolveSpawnPaths(settings);
     const mangaDir = getConfiguredOutputRoot(workingDir);
     const thumbCacheDir = path.join(app.getPath("userData"), "thumb-cache");
 

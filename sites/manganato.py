@@ -4,7 +4,7 @@ import re
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
@@ -43,20 +43,7 @@ class ManganatoSiteHandler(BaseSiteHandler):
 
     _BASE_URL = "https://www.manganato.gg"
 
-    def __init__(self) -> None:
-        try:
-            import lxml  # type: ignore  # noqa: F401
-
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ------------------------------------------------------------------ helpers
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html, self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html, "html.parser")
 
     def _slug_from_url(self, url: str) -> str:
         parsed = urlparse(url)
@@ -231,7 +218,18 @@ class ManganatoSiteHandler(BaseSiteHandler):
                     "uploaded": row.get("uploaded"),
                 }
             )
-        chapters.sort(key=lambda c: float(c.get("chap") or 0), reverse=True)
+        # Tolerant sort key: a non-numeric chapter title (e.g. "Oneshot",
+        # "Extra") makes a bare float() raise ValueError and abort get_chapters
+        # for the whole series. Bucket non-numeric labels together instead of
+        # crashing — their exact position is irrelevant (the aio-dl.py download
+        # loop re-buckets by float and re-sorts; under reverse=True here they
+        # actually LEAD the numeric run, not trail it). Review finding HB-1/PYP-1.
+        def _chap_key(c):
+            try:
+                return (0, float(c.get("chap")))
+            except (TypeError, ValueError):
+                return (1, 0.0)
+        chapters.sort(key=_chap_key, reverse=True)
         return chapters
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:

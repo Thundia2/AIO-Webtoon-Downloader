@@ -9,61 +9,15 @@
 const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
+// Shared line hygiene (ANSI strip + Playwright-teardown noise drop +
+// severity classify). NOISY_LINE_RE and stripAnsi were byte-identical
+// copies in searcher.js before the dedup sweep; classifyLogLevel's
+// success branch is caller-specific, injected below via DOWNLOAD_SUCCESS_RE.
+const { NOISY_LINE_RE, stripAnsi, classifyLogLevel } = require("./log-filter");
 
-// Drop-list for stdout/stderr noise we can't usefully surface. Playwright's
-// BrowserContext teardown races aio-dl.py's chapter loop and produces:
-//   - "Error: write EPIPE" / Python "BrokenPipeError" / "ConnectionResetError"
-//     on simple bridge closes, AND
-//   - a full Node.js crash dump (15-20 lines of JS stack trace + errno
-//     object + "Node.js vX.Y.Z" footer) when the PipeTransport hits a
-//     write-after-shutdown on Windows (errno -4047 = libuv UV_ESHUTDOWN).
-// None of this is actionable — the chapter either succeeded (download
-// already finished) or will be retried by the missed-chapter pass.
-//
-// First-pass filter only matched the literal EPIPE/BrokenPipeError/
-// ConnectionResetError substrings; the full Node crash dump contains NONE
-// of those, so this extended pattern covers every line of the format:
-//   - JavaScript stack frames with `at Func (node:internal/...)`
-//   - Playwright driver paths / dispatcher class names (PipeTransport,
-//     DispatcherConnection, BrowserContextDispatcher, CRBrowserContext)
-//   - Crash markers: `Unhandled '<event>' event`, `Emitted '<event>' event`,
-//     the literal `throw er;` line and its `^` caret pointer
-//   - The `{ errno: ..., syscall: '...' }` object dump
-//   - The trailing `Node.js vX.Y.Z` footer
-//
-// Duplicated in searcher.js since the search subprocess hits the same
-// Playwright bridge.
-const NOISY_LINE_RE = new RegExp(
-  [
-    // Original EPIPE-family literal substrings (still useful for the
-    // single-line "Error: write EPIPE" path).
-    String.raw`\b(EPIPE|BrokenPipeError|ConnectionResetError)\b`,
-    // Node.js internal stack frame paths.
-    String.raw`node:events:\d`,
-    String.raw`node:internal\/(net|streams|process|timers|destroy)`,
-    // Playwright driver internals.
-    String.raw`playwright[\\/]driver`,
-    String.raw`\bPipeTransport\b`,
-    String.raw`\bDispatcherConnection\b`,
-    String.raw`\bBrowserContextDispatcher\b`,
-    String.raw`\bCRBrowserContext\b`,
-    // Node crash format markers.
-    String.raw`^\s*throw\s+er\b`,
-    String.raw`(Unhandled|Emitted) '\w+' event`,
-    String.raw`^\s*errno:\s*-?\d+`,
-    String.raw`^\s*syscall:\s*['"]`,
-    String.raw`^Node\.js v\d`,
-    // Lone caret pointer + lone brace-dump open/close lines.
-    String.raw`^\s*\^\s*$`,
-    String.raw`^\s*[{}],?\s*$`,
-  ].join("|"),
-);
-
-// Strip ANSI color escape sequences before testing against NOISY_LINE_RE
-// (Node's Playwright driver emits SGR codes like \x1b[90m...\x1b[39m, so
-// `^\s*errno:` won't match a line that's actually `\x1b[90m errno: \x1b[39m`
-// without the strip first). Stripping also yields cleaner LogPanel display.
-const ANSI_RE = /\x1b\[[0-9;]*m/g;
+// Download-stream "this line is a success" markers (green in the LogPanel).
+// Passed to the shared classifyLogLevel; searcher.js supplies its own set.
+const DOWNLOAD_SUCCESS_RE = /Done\.|saved →|✓|Completed|recovered/i;
 
 /**
  * Builds an array of CLI arguments from the UI's args object.
@@ -113,6 +67,11 @@ function buildCliArgs(args) {
     imageConcurrency: "--image-concurrency",
     imagePrefetchDepth: "--image-prefetch-depth",
     imagePrefetchParallel: "--image-prefetch-parallel",
+    // CPU-pool budget (Settings → Resource Limits → Max CPU usage). main.js
+    // resolves settings.cpuLimit → args.maxCpuPercent and sets it ONLY when
+    // < 100, so default (Unlimited) spawns never carry the flag. Python side:
+    // aio-dl.py:_cpu_pool_budget scales the modernize/webp/encode/decode pools.
+    maxCpuPercent: "--max-cpu-percent",
     // Back-compat: kept alongside imageConcurrency so saved settings dicts
     // that still carry mangafireImageConcurrency (pre-2026-05-13) keep
     // working. aio-dl.py installs a deprecation shim that routes
@@ -121,12 +80,6 @@ function buildCliArgs(args) {
     // injects one key from settings.defaults (it migrated to
     // imageConcurrency at the same time).
     mangafireImageConcurrency: "--mangafire-image-concurrency",
-    // MangaFire VRF capture flags (--mangafire-vrf-prefetch-depth and
-    // --mangafire-vrf-parallel) intentionally NOT in flagMap. They were
-    // removed from the Settings UI on 2026-05-13 — argparse defaults
-    // are good for most users; advanced users pass them on the CLI
-    // directly. Keeping them out of flagMap means useDownloader.js
-    // can't accidentally emit them when settings dicts are spread.
     missedRetries: "--missed-retries",
     missedLog: "--missed-log",
     jobStallTimeout: "--job-stall-timeout",
@@ -168,17 +121,6 @@ function buildCliArgs(args) {
     // a separate translation step. aio-dl.py:3589 defines --seeded-only;
     // it's read inside find_alternatives_for_direct_url at line 4432.
     seededOnly: "--seeded-only",
-    // Skip the multi-source image-quality probe phase entirely. Ranking
-    // falls back to sites/quality_seed.json priors only. Designed for
-    // the Library tab's UpdatesCenter downloads where the delta is
-    // typically a few chapters and the probe (30-60+ s per series on
-    // MangaFire-class handlers) dominates the actual download. Injected
-    // by LibraryTab.jsx's buildDownloadArgsForRow when
-    // settings.updateChecksUseSeededRating is on (default). Python
-    // side: aio-dl.py near --enable-ml-rating defines the flag; read
-    // in aio_search_cli.find_alternatives_for_direct_url which passes
-    // img_quality_cache=None into search_all when set.
-    seededRatingOnly: "--seeded-rating-only",
     // multiSourceLazy is deliberately NOT here — it's default-ON whenever
     // multi-source is on (absent-means-on), which boolMap's `=== true`
     // test can't express. See the dedicated chokepoint below the loops.
@@ -513,58 +455,12 @@ function parseProgressLine(line) {
     progress.batchTotal = parseInt(batchMatch[2], 10);
   }
 
-  // ── VRF phase ──
-  if (/(?:VRF|vrf).*(?:captur|generat|ensur|browser|playwright)/i.test(line)) {
-    progress.phase = "vrf";
-  }
-
   // ── Errors ──
   if (/\[!\]|Error:|Traceback|FAILED/i.test(line)) {
     progress.hasError = true;
   }
 
   return progress;
-}
-
-/**
- * Determines the "level" of a log line for color-coding in the UI.
- *   - "error"   → red text
- *   - "warning" → yellow text
- *   - "success" → green text
- *   - "info"    → default text
- *   - "verbose" → dimmed/gray text
- *
- * The error patterns are deliberately STRICT to avoid coloring informational
- * retry-style messages red. The previous rule `/error:|FAILED/i` matched the
- * substring "failed" anywhere (case-insensitive) which painted hundreds of
- * benign lines red — e.g., "First variant failed, trying 9 more" or
- * "[Fallback] X.jpg: first URL failed, trying...". Both are normal retry
- * paths, not errors.
- *
- * The canonical error marker in aio-dl.py is `[!]` prefix (13 occurrences
- * across the codebase). Python tracebacks start with "Traceback ". Python
- * exception chains print as "ExceptionName: message" at line start.
- */
-function classifyLogLevel(line) {
-  const trimmed = line.trim();
-  // [!] is the codebase convention for genuine errors (anchored to the
-  // start of the trimmed line so it doesn't fire on "[!?] not really").
-  if (/^\[!\]/.test(trimmed)) return "error";
-  // Python crash header — always indicates an unhandled exception above.
-  if (/^Traceback /.test(trimmed)) return "error";
-  // Python exception line: "ImportError: foo", "ValueError: bar", or just
-  // "Error: bar". Non-greedy \w*? lets the leading prefix vary while
-  // requiring "Error:" as the trailing token.
-  if (/^\w*?Error:/.test(trimmed)) return "error";
-  // Uppercase FAILED as a word boundary — matches CI-style "X tests FAILED"
-  // but NOT "First variant failed" (lowercase). aio-dl.py doesn't emit
-  // FAILED uppercase currently; this is forward-compat for tooling that does.
-  if (/\bFAILED\b/.test(line)) return "error";
-
-  if (/Warning:|warning:|⚠/i.test(line)) return "warning";
-  if (/Done\.|saved →|✓|Completed|recovered/i.test(line)) return "success";
-  if (/^\s{2,}/.test(line)) return "verbose"; // Indented lines are usually verbose detail
-  return "info";
 }
 
 class Downloader {
@@ -605,9 +501,11 @@ class Downloader {
     let prefetchedTempPath = null;
     let downloadArgs = args;
     if (args && args.prefetchedAlts) {
+      // Strip prefetchedAlts once; on success re-add it as the temp-file path.
+      const { prefetchedAlts, ...rest } = args;
+      downloadArgs = rest;
       try {
-        prefetchedTempPath = this._writePrefetchedAlts(downloadId, args.prefetchedAlts);
-        const { prefetchedAlts, ...rest } = args;
+        prefetchedTempPath = this._writePrefetchedAlts(downloadId, prefetchedAlts);
         downloadArgs = { ...rest, multiSourcePrefetched: prefetchedTempPath };
       } catch (err) {
         this._onLog(
@@ -615,8 +513,7 @@ class Downloader {
           `[!] Failed to write prefetched alts: ${err.message}; falling back to search`,
           "warning",
         );
-        const { prefetchedAlts, ...rest } = args;
-        downloadArgs = rest;
+        // downloadArgs already = rest (prefetchedAlts stripped) — run search path.
       }
     }
 
@@ -672,7 +569,7 @@ class Downloader {
    *   overrides whatever format was used in the original download.
    * @param {string} epubLayout - EPUB layout (vertical/page), only used when format is epub.
    */
-  resume({ pythonCmd, scriptPath, workingDir, url, tmpDir, format, epubLayout }) {
+  resume({ pythonCmd, scriptPath, workingDir, url, tmpDir, format, epubLayout, resourceFlags }) {
     const downloadId = `dl_${this._nextId++}_${Date.now()}`;
 
     // If no format specified, read the original from disk. Try run_meta.json
@@ -705,6 +602,16 @@ class Downloader {
     // Add EPUB layout if format is epub
     if (format === "epub" && epubLayout) {
       cliArgs.push("--epub-layout", epubLayout);
+    }
+
+    // Resource-limit throttle (Settings → Resource Limits). resourceFlags is
+    // resolved from the CURRENT settings by main.js (resumeThrottleFlags) — NOT
+    // restored from run_params.json — so a resume in a different environment
+    // (slower link, busy machine) honors the user's current limit. These are
+    // explicit resume-CLI dests, so aio-dl.py's --restore-parameters keeps them
+    // over the saved values (grep _user_set_dests) and none are resume-gating.
+    if (Array.isArray(resourceFlags) && resourceFlags.length) {
+      cliArgs.push(...resourceFlags);
     }
 
     cliArgs.push("--verbose", url);
@@ -763,6 +670,39 @@ class Downloader {
     let stdoutBuffer = "";
     let stderrBuffer = "";
 
+    // Per-line pipeline shared by the stdout + stderr STREAM handlers: skip
+    // empty, strip ANSI (fast-pathed for the no-escape majority), drop
+    // Playwright-teardown noise, classify severity, forward to the LogPanel.
+    // Returns the cleaned line when emitted, or null when skipped — the stdout
+    // handler runs progress parsing only on survivors. NOTE: the tail-flush in
+    // the close handler is deliberately NOT routed through here — it suppresses
+    // whitespace/ANSI-only tails via a post-strip `.trim()` guard, whereas the
+    // stream keeps the historical `!rawLine`-only skip (a spaces-only line
+    // still emits as verbose). Unifying the two would change that edge.
+    const emit = (rawLine) => {
+      if (!rawLine) return null;
+      const line = stripAnsi(rawLine);
+      if (NOISY_LINE_RE.test(line)) return null;
+      this._onLog(downloadId, line, classifyLogLevel(line, DOWNLOAD_SUCCESS_RE));
+      return line;
+    };
+
+    // Best-effort delete of the prefetched-alts temp file (Fix B). aio-dl.py
+    // reads it once during multi-source setup, so it's safe to remove once
+    // the child settles — from BOTH the close handler (normal exit) and the
+    // error handler (spawn failed before close would fire, else the file
+    // leaks). No-op when this run had no prefetched payload.
+    // _writePrefetchedAlts created it under ~/.aio-dl/cache.
+    const finalize = () => {
+      if (meta.prefetchedTempPath) {
+        try {
+          fs.unlinkSync(meta.prefetchedTempPath);
+        } catch {
+          // File may have been removed externally or never created
+        }
+      }
+    };
+
     // Read stdout line by line
     proc.stdout.on("data", (chunk) => {
       stdoutBuffer += chunk.toString("utf8");
@@ -772,16 +712,8 @@ class Downloader {
       stdoutBuffer = lines.pop() || "";
 
       for (const rawLine of lines) {
-        if (!rawLine) continue;
-        // Strip ANSI escapes once and reuse for both the noise filter and
-        // the LogPanel render — keeps user-visible logs free of `[90m...`
-        // garbage from the Node-side Playwright driver. Fast-path the
-        // common case (most lines have no ANSI) by skipping the regex
-        // scan entirely when the literal escape byte isn't present.
-        const line = rawLine.includes("\x1b") ? rawLine.replace(ANSI_RE, "") : rawLine;
-        if (NOISY_LINE_RE.test(line)) continue;
-        const level = classifyLogLevel(line);
-        this._onLog(downloadId, line, level);
+        const line = emit(rawLine);
+        if (line === null) continue;
 
         // Try to extract progress information from this line
         const progressUpdate = parseProgressLine(line);
@@ -836,11 +768,7 @@ class Downloader {
       stderrBuffer = lines.pop() || "";
 
       for (const rawLine of lines) {
-        if (!rawLine) continue;
-        const line = rawLine.includes("\x1b") ? rawLine.replace(ANSI_RE, "") : rawLine;
-        if (NOISY_LINE_RE.test(line)) continue;
-        const level = classifyLogLevel(line);
-        this._onLog(downloadId, line, level);
+        emit(rawLine);
       }
     });
 
@@ -850,30 +778,23 @@ class Downloader {
       // here too — a Playwright EPIPE arriving on the trailing line without
       // a terminating newline would otherwise slip past the streaming filter).
       // ANSI-strip first for the same reason the streaming handlers do.
-      // Tail bytes are short (single trailing line, if any), so the includes
-      // fast-path is mostly cosmetic here but stays consistent with above.
-      const tailStdout = stdoutBuffer.includes("\x1b") ? stdoutBuffer.replace(ANSI_RE, "") : stdoutBuffer;
-      const tailStderr = stderrBuffer.includes("\x1b") ? stderrBuffer.replace(ANSI_RE, "") : stderrBuffer;
+      // Tail bytes are short (single trailing line, if any). This stays inline
+      // rather than reusing emit() because the tail suppresses whitespace/
+      // ANSI-only content via the post-strip `.trim()` guard (emit only skips
+      // a falsy raw line) — see the emit() note above.
+      const tailStdout = stripAnsi(stdoutBuffer);
+      const tailStderr = stripAnsi(stderrBuffer);
       if (tailStdout.trim() && !NOISY_LINE_RE.test(tailStdout)) {
-        this._onLog(downloadId, tailStdout, classifyLogLevel(tailStdout));
+        this._onLog(downloadId, tailStdout, classifyLogLevel(tailStdout, DOWNLOAD_SUCCESS_RE));
       }
       if (tailStderr.trim() && !NOISY_LINE_RE.test(tailStderr)) {
         // Same classification as the streaming stderr handler above —
         // a trailing line without a final newline shouldn't auto-error.
-        this._onLog(downloadId, tailStderr, classifyLogLevel(tailStderr));
+        this._onLog(downloadId, tailStderr, classifyLogLevel(tailStderr, DOWNLOAD_SUCCESS_RE));
       }
 
-      // Fix B: clean up the prefetched-alts temp file. aio-dl.py reads it
-      // once during multi-source setup, so it's safe to delete on close.
-      // Best-effort — losing one stale file isn't worth crashing the spawn
-      // tracker over. _writePrefetchedAlts created it under ~/.aio-dl/cache.
-      if (meta.prefetchedTempPath) {
-        try {
-          fs.unlinkSync(meta.prefetchedTempPath);
-        } catch {
-          // File may have been removed externally or never created
-        }
-      }
+      // Clean up the prefetched-alts temp file (best-effort; see finalize).
+      finalize();
 
       this._processes.delete(downloadId);
 
@@ -893,11 +814,7 @@ class Downloader {
       this._onLog(downloadId, `Process error: ${err.message}`, "error");
       // Same cleanup as the close handler — spawn errored before close
       // would fire, so the temp file would otherwise leak.
-      if (meta.prefetchedTempPath) {
-        try {
-          fs.unlinkSync(meta.prefetchedTempPath);
-        } catch {}
-      }
+      finalize();
       this._processes.delete(downloadId);
       this._onComplete(downloadId, {
         exitCode: -1,

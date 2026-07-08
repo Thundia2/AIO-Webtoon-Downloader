@@ -1,6 +1,6 @@
 {
   "name": "aio-downloader-ui",
-  "version": "1.7.2",
+  "version": "2.0.0",
   "description": "Desktop UI for AIO Manga/Webtoon Downloader",
   "homepage": "https://github.com/zzyil/AIO-Webtoon-Downloader",
   "main": "electron/main.js",
@@ -59,8 +59,7 @@
     },
     "mac": {
       "target": [
-        { "target": "dmg", "arch": ["x64", "arm64"] },
-        { "target": "zip", "arch": ["x64", "arm64"] }
+        { "target": "dmg", "arch": ["x64", "arm64"] }
       ],
       "category": "public.app-category.utilities",
       "identity": null,

@@ -102,10 +102,12 @@ jobs:
           # only — blockmaps are auto-update bookkeeping we don't ship.
           # The Linux job emits BOTH .AppImage and .deb (added 2026-05-13
           # alongside AppImage — see UI-source/package.json:build.linux.target).
+          # macOS ships the .dmg only — the redundant zipped-.app target was
+          # dropped from UI-source/package.json:build.mac.target (no
+          # auto-updater consumes the .zip here, so it was pure release noise).
           path: |
             UI-source/release/*.exe
             UI-source/release/*.dmg
-            UI-source/release/*.zip
             UI-source/release/*.AppImage
             UI-source/release/*.deb
           if-no-files-found: ignore

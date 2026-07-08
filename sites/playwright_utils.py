@@ -1,8 +1,9 @@
 import time
 # Drop-in import of Patchright (Playwright fork with CDP-leak patches). Same
-# API; the swap is transparent to call sites in this file. See
-# mangafire_vrf_simple.py for the rationale on keeping PLAYWRIGHT_AVAILABLE as
-# the public flag name.
+# API; the swap is transparent to call sites in this file. The public flag
+# stays named PLAYWRIGHT_AVAILABLE (not PATCHRIGHT_*) because callers
+# (aio_search_cli.py, sites/comix.py) grep that name — renaming would cascade
+# through them without functional benefit.
 try:
     from patchright.sync_api import sync_playwright
     PLAYWRIGHT_AVAILABLE = True

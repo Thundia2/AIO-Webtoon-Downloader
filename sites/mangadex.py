@@ -235,25 +235,28 @@ class MangaDexSiteHandler(BaseSiteHandler):
         resp = make_request(url if not params else (url, params), scraper)
         return resp.json()
 
+    @staticmethod
+    def _pick_localized(block: Dict, langs=("en", "ja", "jp", "ko")) -> Optional[str]:
+        """First present language from a MangaDex {lang: value} dict, else any
+        value, else None. Shared by _title/_description_from_attributes."""
+        if not isinstance(block, dict):
+            return None
+        for key in langs:
+            if block.get(key):
+                return block[key]
+        if block:
+            return next(iter(block.values()))
+        return None
+
     def _title_from_attributes(self, attributes: Dict) -> str:
-        title = attributes.get("title") or {}
-        if isinstance(title, dict):
-            for key in ("en", "ja", "jp", "ko"):
-                if key in title and title[key]:
-                    return title[key]
-            if title:
-                return next(iter(title.values()))
-        return attributes.get("altTitles", [{}])[0].get("en") or "Unknown Manga"
+        return (
+            self._pick_localized(attributes.get("title") or {})
+            or attributes.get("altTitles", [{}])[0].get("en")
+            or "Unknown Manga"
+        )
 
     def _description_from_attributes(self, attributes: Dict) -> Optional[str]:
-        description = attributes.get("description") or {}
-        if isinstance(description, dict):
-            for key in ("en", "ja", "jp", "ko"):
-                if description.get(key):
-                    return description[key]
-            if description:
-                return next(iter(description.values()))
-        return None
+        return self._pick_localized(attributes.get("description") or {})
 
     def _cover_url(self, manga_id: str, relationships: Iterable[Dict]) -> Optional[str]:
         """Return the cover URL, preferring the MangaDex-hosted 512px thumbnail
@@ -759,9 +762,18 @@ class MangaDexSiteHandler(BaseSiteHandler):
                 else:
                     path_seg = "data-saver"
                     names = saver_filenames
+                # HA-1: `pending` indices come from the INITIAL n_pages, but a
+                # node-swap / data-saver rebind (see the `names`/`file_hash`
+                # reassignments below) can return a SHORTER filename list. A bare
+                # `names[idx]` would then raise IndexError and escape the
+                # IncompleteChapterError contract as an unclassified crash. Only
+                # build URLs for indices the current `names` list can actually
+                # address; out-of-range pages simply stay in `pending` and are
+                # surfaced by the post-loop `if pending: raise IncompleteChapterError`.
                 url_by_idx: Dict[int, str] = {
                     idx: f"{base_url}/{path_seg}/{file_hash}/{names[idx]}"
                     for idx in pending
+                    if idx < len(names)
                 }
 
                 # Submit + wait on this batch. Pool worker cap caps in-flight

@@ -251,7 +251,13 @@ class KappabeastSiteHandler(BaseSiteHandler):
             for item in items:
                 num = item.get("number")
                 title = item.get("title")
-                
+
+                # Skip entries with no chapter number instead of emitting a
+                # literal "None" chap (str(None)) and a bogus /chapter/None URL
+                # that silently fails to download. Review finding HB-2.
+                if num is None:
+                    continue
+
                 # Check for early access or paid restrictions (if any)
                 # Usually Kappabeast chapters are all free or unlocked via standard API.
                 chapters.append({

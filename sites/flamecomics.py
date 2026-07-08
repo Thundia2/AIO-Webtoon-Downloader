@@ -250,6 +250,11 @@ class FlameComicsSiteHandler(BaseSiteHandler):
             # name = "Chapter {chapter} - {title}"
             # token = chapter.token
             
+            # HB-3: a missing "chapter" value would make str(None) == "None",
+            # producing a chapter numbered literally "None" that can't be
+            # downloaded. Skip the entry entirely rather than emit a junk chapter.
+            if chap.get("chapter") is None:
+                continue
             chap_num = str(chap.get("chapter"))
             title = chap.get("title") or ""
             token = chap.get("token")
@@ -341,30 +346,24 @@ class FlameComicsSiteHandler(BaseSiteHandler):
         if not isinstance(series_list, list):
             return []
 
-        ql = clean.lower()
-        query_tokens = set(t for t in ql.split() if t)
-
-        scored: List[tuple] = []
-        for entry in series_list:
-            if not isinstance(entry, dict):
-                continue
-            title = (entry.get("title") or "").strip()
-            if not title:
-                continue
-            tl = title.lower()
-            if ql in tl:
-                relevance = 1.0
-            elif query_tokens and all(tok in tl for tok in query_tokens):
-                relevance = 0.7
-            else:
-                continue
-            scored.append((relevance, entry))
-
-        scored.sort(key=lambda x: -x[0])
+        # Rank via the shared client-side filter (grep _rank_client_filter_hits).
+        # Non-dict / empty-title entries are dropped before scoring; the
+        # series_id-missing skip stays in the emit loop so raw_score positions
+        # match the pre-refactor code exactly.
+        def _candidates():
+            for entry in series_list:
+                if not isinstance(entry, dict):
+                    continue
+                title = (entry.get("title") or "").strip()
+                if not title:
+                    continue
+                yield title, entry
 
         cdn_base = "https://cdn.flamecomics.xyz/uploads/images/series"
         hits: List[SearchHit] = []
-        for idx, (relevance, entry) in enumerate(scored[:limit]):
+        for raw_score, entry in self._rank_client_filter_hits(
+            clean, _candidates(), limit=limit
+        ):
             sid = entry.get("series_id")
             if sid is None:
                 continue
@@ -373,13 +372,11 @@ class FlameComicsSiteHandler(BaseSiteHandler):
             year = entry.get("year")
             if not isinstance(year, int):
                 year = None
-            url_full = f"https://flamecomics.xyz/series/{sid}"
-            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
             hits.append(
                 SearchHit(
                     site=self.name,
                     title=entry.get("title") or "",
-                    url=url_full,
+                    url=f"https://flamecomics.xyz/series/{sid}",
                     cover=cover,
                     alt_titles=[],
                     year=year,

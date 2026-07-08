@@ -43,7 +43,7 @@ import textwrap
 import xml.sax.saxutils
 import zipfile
 import zlib
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, unquote_to_bytes
 
 from aio_config import (
@@ -55,7 +55,7 @@ from aio_config import (
     write_hid_marker,
 )
 from sites import get_handler_by_name, get_handler_for_url
-from sites.chapter_merger import group_chapters_for_download
+from sites.chapter_merger import group_chapters_for_download, _extract_chapter_num
 from sites.base import SiteComicContext, IncompleteChapterError
 from sites._image_io import (
     sniff_image_extension as _sniff_image_extension,
@@ -144,8 +144,8 @@ class ChapterGhostError(Exception):
 
     Why a distinct exception (not just another ChapterSkippedError reason):
     a ghost signature on the primary means the chapter is structurally absent
-    there — VRF token rotated to a different URL space, soft-launched
-    placeholder, CDN URL signed for a chapter that was unpublished, etc. No
+    there — a soft-launched placeholder, a CDN URL signed for a chapter
+    that was unpublished, etc. No
     amount of inline retry will help, because the response template that
     every page returns won't change after a 30s/60s sleep (mangafire's
     5051-byte CF 'access denied' is the canonical case — see the 2026-05-27
@@ -186,18 +186,89 @@ class ChapterGhostError(Exception):
         )
 
 
+class ChapterPermanentSkipError(Exception):
+    """Raised by _process_chapter_strict for a chapter that failed with a
+    DETERMINISTIC per-chapter gate no retry or alternate source can clear —
+    currently a mature/age/login interstitial (reason 'mature_login_required',
+    grep _PERMANENT_SKIP_REASONS). The main loop treats this as skip-and-
+    continue: record missed + move on, WITHOUT the ghost path's consecutive-
+    host-block escalation (a mature series legitimately has many consecutive
+    gated episodes, so counting them toward a host-level abort would be wrong).
+
+    Why distinct from ChapterGhostError: ghost means "this chapter looks
+    structurally absent / the host is misbehaving" and escalates to a run abort
+    after GHOST_ABORT_THRESHOLD in a row; a login gate is a per-episode content
+    restriction, not a host fault. Why distinct from ChapterAbortedError: the
+    OLD flow inline-retried 'mature_login_required' to exhaustion and then
+    ABORTED the whole run on a single login-gated tapas BGM episode (the aux
+    veto — grep _chapter_carries_aux — also blocked alt-rescue), losing every
+    later good chapter over one age-gated one. Cross-file: sites/tapas.py raises
+    IncompleteChapterError(reason='mature_login_required') from
+    get_chapter_images when a logged-out mature interstitial replaces the
+    panels; the conversion to this class happens in _process_chapter_strict.
+    """
+    def __init__(self, chap, reason: str = "", host: str = "", pages_total: int = 0):
+        self.chap = chap
+        self.reason = reason
+        self.host = host
+        self.pages_total = pages_total
+        super().__init__(
+            f"chapter {chap} permanent-skip: reason={reason} "
+            f"host={host or '-'} pages={pages_total}"
+        )
+
+
+# Deterministic per-chapter failure reasons that no inline retry can clear —
+# routed to ChapterPermanentSkipError (skip + continue) by
+# _process_chapter_strict instead of the inline-retry→abort path, AFTER the
+# multi-source alt-rescue loop has been tried (a permanent reason on the
+# PRIMARY can still be delivered by an alternative site — so these are "primary
+# can't, and no alt did either" by the time they convert). A set so handlers
+# can add their own login/paywall gate reasons; producers today (sites/tapas.py):
+#   - "mature_login_required": logged-out mature interstitial replaced the panels.
+#   - "locked": premium/wait-to-unlock episode emitted as a placeholder
+#     (get_chapter_images short-circuits it) so --multi-source can fill it; when
+#     no alt has it, this clean-skips instead of aborting the whole run.
+_PERMANENT_SKIP_REASONS = frozenset({"mature_login_required", "locked"})
+
+
 # -----------------------------------------------------------
 # Cross-process folder allocation (avoid mixing same-title series)
 # -----------------------------------------------------------
 class _AIOFileLock:
-    """A tiny cross-platform exclusive file lock."""
+    """A tiny cross-platform exclusive file lock.
+
+    RACE-1: a single instance (the _COORD._net_lock / _cpu_lock / _state_lock
+    singletons) is entered by MULTIPLE THREADS. With only one self._fd, two
+    concurrent __enter__s clobbered it — the first thread's __exit__ then closed
+    the SECOND thread's fd (EBADF, swallowed → it ran UNLOCKED) while the first
+    thread's real OS lock leaked for the process lifetime (+10s msvcrt spins per
+    later acquire on Windows; POSIX siblings block forever). Serialize entry/exit
+    with a threading.Lock so exactly one thread owns self._fd at a time. This is
+    correct: it's an EXCLUSIVE lock, so same-process threads must be mutually
+    exclusive too, not just cross-process — the file lock still provides the
+    cross-process half. Non-reentrant: no coordinator method nests the same lock
+    (verified — net_phase/cpu_phase/state ops each take one lock, sequentially).
+    Only exercised under --jobs>1 (grep AIO_COORD_ENABLED / _COORD).
+    """
     def __init__(self, path: str):
         self.path = path
         self._fd = -1
+        self._tlock = threading.Lock()
 
     def __enter__(self):
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._tlock.acquire()
         try:
+            # makedirs is INSIDE the try (RACE-1 follow-up): if it raised after
+            # the _tlock.acquire() above, __enter__ would propagate WITHOUT
+            # Python ever calling __exit__ (it doesn't, when __enter__ raises) →
+            # the mutex leaks and every later acquire on this singleton
+            # deadlocks. Folding it into the best-effort block degrades a
+            # transient FS error (unmount / ACL flip / path-is-now-a-file under
+            # --jobs>1) to "proceed without the OS lock" — the threading.Lock is
+            # still held for intra-process exclusion — exactly like an os.open
+            # failure below.
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT)
             if os.name == "nt":
                 import msvcrt
@@ -210,7 +281,8 @@ class _AIOFileLock:
                 import fcntl
                 fcntl.flock(self._fd, fcntl.LOCK_EX)
         except Exception:
-            # Best effort — close fd and proceed without lock.
+            # Best effort — close fd and proceed without the OS lock (the
+            # threading.Lock is still held, so intra-process exclusion holds).
             if self._fd >= 0:
                 try:
                     os.close(self._fd)
@@ -220,23 +292,27 @@ class _AIOFileLock:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self._fd < 0:
-            return
+        # ALWAYS release the threading.Lock, even on the best-effort no-fd path,
+        # or a failed os.open would leak the mutex and hang every later acquire.
         try:
-            if os.name == "nt":
-                import msvcrt
-                os.lseek(self._fd, 0, os.SEEK_SET)
-                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-        except Exception:
-            pass
-        try:
-            os.close(self._fd)
-        except Exception:
-            pass
-        self._fd = -1
+            if self._fd >= 0:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        os.lseek(self._fd, 0, os.SEEK_SET)
+                        msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(self._fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    os.close(self._fd)
+                except Exception:
+                    pass
+                self._fd = -1
+        finally:
+            self._tlock.release()
 
 
 
@@ -735,6 +811,43 @@ def _parse_chapter_spec_number(value: str) -> Optional[float]:
         return None
 
 
+def _chap_as_float(chap) -> Optional[float]:
+    """Tolerant chapter-number parse for the post-bucketing filter/sort sites.
+
+    Returns the label as a float, or None for a non-numeric label. The chapter-
+    bucketing step (grep chapters_by_num) already normalizes float/"Oneshot"
+    labels to a numeric STRING and drops raw non-numeric ones, so in the normal
+    flow every downstream ch["chap"] parses — but the collapse-splits relabel
+    (sites/chapter_merger.py group.label, which can be "?" or "" for an
+    empty/None chap) can reintroduce a non-numeric label. The --no-partials /
+    --chapters filters and the .aio_series.json sort used a bare
+    float(c["chap"]) that crashed the whole run on that edge; this keeps them
+    defensive. C1 review finding.
+    """
+    try:
+        f = float(chap)
+    except (TypeError, ValueError):
+        return None
+    # Reject non-finite: float("inf") / "nan" / "1e400" all parse but aren't
+    # valid chapter numbers — inf/nan would crash int(cf) in _is_numeric_partial
+    # and poison the (is-None, value) sort keys. Residual follow-up.
+    return f if math.isfinite(f) else None
+
+
+def _chap_label_str(chap) -> str:
+    """Canonical chapter-label string matching --list-chapters' normalization.
+
+    --list-chapters emits f"{num:g}" for numeric labels (grep deduped_pool), so
+    the .aio_series.json chapters_downloaded set MUST use the same form or the
+    UI's update-check diff (main.js Set difference of raw strings) never matches
+    a float-emitting handler's chapters (mangathemesia family: 4.0 vs 4) and the
+    series sticks at "+N new" forever, re-downloading everything on each update.
+    Non-numeric labels fall back to str(). XF-1 review finding.
+    """
+    f = _chap_as_float(chap)
+    return str(chap) if f is None else f"{f:g}"
+
+
 def is_chapter_wanted(chapter_num_float: float, range_spec: str) -> bool:
     """
     Checks if a chapter number falls within a comma-separated range spec.
@@ -836,6 +949,27 @@ _HOST_CAP_LOCK = threading.Lock()
 # return early so the chapter aborts within seconds of the deadline.
 # None outside the chapter loop (e.g. during cover download).
 _CHAPTER_CANCEL: Optional[threading.Event] = None
+
+
+# RACE-2: the LEGACY (non-fast-download) image-prefetch path downloads the NEXT
+# chapters' pages via dl_image on a background ThreadPool. dl_image /
+# _try_download_url poll the FOREGROUND chapter's watchdog (_chapter_cancelled)
+# and per-host poison tally (_host_fail_count) — so a foreground chapter's
+# deadline/poison would abort the unrelated background prefetch of chapter N+k,
+# which then wipes its tdir and the foreground re-downloads it (the exact waste
+# the prefetch exists to avoid). And the prefetch's own failures fed the
+# foreground poison/ghost accumulators via _record_failure. This thread-local
+# marks a thread as a background-prefetch worker; _chapter_cancelled returns
+# False, _host_fail_count returns 0, and _record_failure routes to backoff-ONLY
+# for such threads — matching the fast path's already-decoupled behavior (grep
+# _prefetch_backoff_feedback). dl_image propagates the flag into its parallel
+# variant sub-threads (grep _bg_prefetch). The fast path never set this (it
+# doesn't call these foreground helpers at all).
+_PREFETCH_TLS = threading.local()
+
+
+def _in_background_prefetch() -> bool:
+    return getattr(_PREFETCH_TLS, "active", False)
 
 
 def _record_rate_limit(host: str, delay: float) -> None:
@@ -1050,6 +1184,20 @@ def _record_failure(
     4xx failures contribute to ghost detection if they came with a
     body (the host-fail count guard stays gated on non-permanent only).
     """
+    # RACE-2: a background image-prefetch worker (grep _in_background_prefetch)
+    # runs concurrently with some OTHER foreground chapter's window. Its failures
+    # must NOT pollute that chapter's poison tally or ghost-signature accumulator
+    # — feed ONLY the per-host backoff cap, exactly like the fast path's
+    # _prefetch_backoff_feedback (4xx skipped: prefetch has no ghost detector
+    # downstream, so a placeholder chapter of uniform 403s must not throttle the
+    # run's CDN trust).
+    if _in_background_prefetch():
+        if status is not None and 400 <= int(status) < 500:
+            return
+        if host and cls != "permanent":
+            _record_host_failure_for_backoff(host, cls)
+        return
+
     # Signature recording happens BEFORE the cls=="permanent" gate so that
     # uniform 4xx ghost responses (e.g. true 403 placeholder pages whose
     # body lacks rate-limit keywords) still feed the detector. Without
@@ -1184,6 +1332,10 @@ def _is_ghost_chapter_signature(
 
 def _host_fail_count(host: str) -> int:
     """Distinct URLs that have fully failed against this host this chapter."""
+    # RACE-2: a background prefetch worker must not fast-fail on the FOREGROUND
+    # chapter's poison tally — 0 keeps it downloading the next chapters.
+    if _in_background_prefetch():
+        return 0
     if not host:
         return 0
     with _HOST_FAIL_LOCK:
@@ -1358,7 +1510,15 @@ def _reset_host_concurrency_caps() -> None:
 def _chapter_cancelled() -> bool:
     """True if the current chapter's watchdog has fired or _CHAPTER_CANCEL was
     set explicitly. Returns False outside a chapter (cover download etc.)."""
-    return _CHAPTER_CANCEL is not None and _CHAPTER_CANCEL.is_set()
+    # RACE-2: background prefetch workers download the NEXT chapters and must not
+    # honor the FOREGROUND chapter's watchdog/cancel.
+    if _in_background_prefetch():
+        return False
+    # Capture the global once: the main loop flips _CHAPTER_CANCEL to None between
+    # chapters, so reading it twice ("is not None" then ".is_set()") could hit a
+    # None on the second read and AttributeError in a worker thread. S5-6.
+    evt = _CHAPTER_CANCEL
+    return evt is not None and evt.is_set()
 
 
 # Image format sniffing + atomic-rename helpers live in sites/_image_io.py
@@ -1554,6 +1714,11 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
 
     os.makedirs(folder, exist_ok=True)
 
+    # RACE-2: capture prefetch mode once so the parallel variant sub-threads
+    # spawned below inherit it (thread-locals don't cross threads); grep
+    # _in_background_prefetch / _bg_prefetch.
+    _bg = _in_background_prefetch()
+
     # Phase A (2026-05-07): callers pass `name` like "5_0001.jpg" by historic
     # convention, but the actual bytes may be webp/png/avif. Strip the
     # extension to get the base, write to a `.pending_<base>` tempfile in the
@@ -1563,7 +1728,17 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
     base, _orig_ext = os.path.splitext(name)
     if not base:
         base = name
-    pending_pth = os.path.join(folder, f".pending_{base}")
+    # S5-2 (write race): a background-prefetch download uses a DISTINCT pending
+    # name so it can't collide with the foreground writing the SAME page into
+    # the same tdir after it adopts this chapter (grep _image_prefetch_is_abandoned
+    # / _bg above). finalize_pending_image renames by the explicit `base`, NOT
+    # the pending basename, so the final page name is identical either way; the
+    # two writers' atomic os.replace to that shared final name is last-writer-
+    # wins (both fetched the same URL -> same bytes). Leftover .pending_* dotfiles
+    # are excluded from the CBZ build (grep "not fn.startswith").
+    pending_pth = os.path.join(
+        folder, f".pending_{base}" + (".bgprefetch" if _bg else "")
+    )
 
     if url.startswith("data:"):
         try:
@@ -1752,6 +1927,10 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
 
     def try_variant(attempt_url, thread_id):
         """Helper function for parallel execution - each thread uses its own temp file"""
+        # RACE-2: this runs in a fresh variant sub-thread; carry the prefetch
+        # flag over so _chapter_cancelled()/_host_fail_count() below (and inside
+        # _try_download_url) stay decoupled from the foreground chapter.
+        _PREFETCH_TLS.active = _bg
         # Fast-fail: skip this variant if the chapter is already being aborted
         # or the target host is poisoned. _try_download_url itself also checks
         # this, but bailing out before tempfile creation saves needless I/O.
@@ -2445,12 +2624,17 @@ def _wrap_text_line(
             lines.append(current)
             current = ""
 
-        for segment in _split_long_word(word, font, max_width):
-            if _measure_text(font, segment) <= max_width and not current:
-                current = segment
-            else:
-                lines.append(segment)
-                current = ""
+        # Emit every full segment as its own line; carry only the LAST segment
+        # as `current` so the next word can join the trailing partial. The old
+        # `and not current` gate held the first segment then flushed ALTERNATING
+        # segments, dropping every other one — halving CJK / long-word text that
+        # has no spaces to break on (a 6-segment word became 3 lines). Review
+        # finding S1-1.
+        segments = _split_long_word(word, font, max_width)
+        for segment in segments[:-1]:
+            lines.append(segment)
+        if segments:
+            current = segments[-1]
 
     if current:
         lines.append(current)
@@ -2493,6 +2677,32 @@ def combine_images(images: List[Image.Image], width: int) -> Image.Image:
         combined_img.paste(img, (0, y_offset))
         y_offset += img.height
     return combined_img
+
+
+# ── CPU-pool budget (Settings → Resource Limits → Max CPU usage) ──────────
+# _CPU_POOL_PERCENT scales the logical-core budget the CPU-BOUND image pools
+# may use. Set from --max-cpu-percent (env AIO_MAX_CPU_PERCENT) in
+# _apply_runtime_tunables; re-seeded on --restore-parameters. 100 = the prior
+# default (os.cpu_count()), so a default run is byte-for-byte unchanged.
+#
+# Consumed by the THREE CPU-bound pool sites — grep _cpu_pool_budget:
+#   process_chapter_images (PDF/img decode), save_final_images (final encode),
+#   _run_recompress_pool (modernize + webp recompress). Each does
+#   ``workers = cpu//2`` and (recompress) ``enc_threads = cpu//workers``, so
+#   scaling the budget scales workers AND per-encode threads together — total
+#   threads track the budget (reducing only workers would keep total flat).
+# NOT applied to the network pools (prefetch / foreground download) — those are
+# throttled via --image-concurrency / --image-workers / --image-prefetch-*.
+# UI: electron/main.js resolves Settings.cpuLimit → --max-cpu-percent (grep
+# cpuPercentForLevel in UI-source/electron/resource-limits.js).
+_CPU_POOL_PERCENT = 100
+
+
+def _cpu_pool_budget() -> int:
+    """Effective logical-core budget for the CPU-bound image pools, scaled by
+    --max-cpu-percent. Returns os.cpu_count() at 100% (the unchanged default)."""
+    cpu = os.cpu_count() or 4
+    return max(1, round(cpu * globals().get("_CPU_POOL_PERCENT", 100) / 100.0))
 
 
 def process_chapter_images(
@@ -2586,7 +2796,8 @@ def process_chapter_images(
                 log_debug(f"    (END) Finalizing last buffered page in memory.")
 
     if len(input_paths) > 1:
-        cpu = os.cpu_count() or 4
+        # CPU budget, scaled by --max-cpu-percent (grep _cpu_pool_budget)
+        cpu = _cpu_pool_budget()
         workers = max(1, min(cpu // 2 or 1, len(input_paths)))
         # `pool.map` returns a lazy iterator that yields results in submission
         # order. Workers run concurrently up to `workers`; consumed results
@@ -2875,7 +3086,8 @@ def save_final_images(
         # up idle workers for short page lists. The same cap works for
         # both WebP-lossless and JPEG paths since memory is dominated
         # by the decoded RGB buffer, not the encoder state.
-        cpu = os.cpu_count() or 4
+        # CPU budget, scaled by --max-cpu-percent (grep _cpu_pool_budget)
+        cpu = _cpu_pool_budget()
         half_cores = max(1, cpu // 2)
         workers = max(1, min(half_cores, len(plan)))
         # Thread-name prefix reflects the dominant format in the plan so log
@@ -2896,6 +3108,85 @@ def save_final_images(
             output_paths[idx] = dst
 
     return output_paths  # type: ignore[return-value]
+
+
+# -----------------------------------------------------------
+# Shared page-recompress concurrency driver
+# -----------------------------------------------------------
+def _run_recompress_pool(
+    raw_paths: List[str],
+    convert_one: Callable[
+        [Tuple[int, str], int], Tuple[int, str, Optional[Exception]]
+    ],
+    *,
+    guard: str,
+    thread_prefix: str,
+    label: str,
+    mop_up: Optional[
+        Callable[[List[Tuple[int, str]], List[Optional[str]], int, int], None]
+    ] = None,
+) -> List[str]:
+    """Shared dispatch skeleton for the two in-place page-recompress passes
+    (recompress_chapter_images_to_webp + recompress_chapter_images_modern),
+    which carried a byte-identical worker-pool loop.
+
+    Owns everything both twins shared: the cpu//2 worker count, the per-encode
+    thread budget (``enc_threads = cpu//workers`` — the anti-oversubscription
+    cap; webp ignores it, modern hands it to libjxl/libavif), the
+    serial-vs-ThreadPoolExecutor branch, the every-8-pages ``_hb`` heartbeat, and
+    the ``[p for p in out if p is not None]`` return. ``convert_one`` takes
+    ``(enumerate-entry, enc_threads)`` and returns ``(idx, dst, err)``: ``err`` is
+    ``None`` for webp (no encode-failure path) and carries the exception for
+    modern's mop-up. When ``mop_up`` is provided it runs INSIDE ``_cpu_guard``
+    (modern's serial retry must stay CPU-guarded — a real cross-process guard
+    when _COORD is set) with ``(failed, out, enc_threads, cpu)``; it mutates
+    ``out`` in place. grep _run_recompress_pool for the two callers.
+
+    workers uses ``max(1, min(cpu//2, len))`` — proven identical to webp's older
+    ``max(1, min(max(1, cpu//2), len))`` for every cpu>=1, and raw_paths is
+    always non-empty here (both callers early-return on the empty list).
+    """
+    # CPU budget, scaled by --max-cpu-percent (grep _cpu_pool_budget)
+    cpu = _cpu_pool_budget()
+    workers = max(1, min(cpu // 2, len(raw_paths)))
+    enc_threads = max(1, cpu // workers)
+
+    out: List[Optional[str]] = [None] * len(raw_paths)
+    failed: List[Tuple[int, str]] = []  # (idx, src) whose encode raised
+    with _cpu_guard(guard):
+        if workers == 1 or len(raw_paths) == 1:
+            for entry in enumerate(raw_paths):
+                idx, dst, err = convert_one(entry, enc_threads)
+                out[idx] = dst
+                if err is not None:
+                    failed.append((idx, raw_paths[idx]))
+                if idx % 8 == 0:
+                    _hb("cpu", f"{label} {idx+1}/{len(raw_paths)}")
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix=thread_prefix
+            ) as pool:
+                # pool.map preserves submission order; consumed iteratively so
+                # memory stays bounded. Native encoders (libwebp/libjxl/libavif)
+                # release the GIL during the heavy encode, so workers translate
+                # to speedup; a GIL-holding build just serializes (correct, only
+                # slower). _hb every 8 keeps the per-chapter watchdog satisfied.
+                for idx, dst, err in pool.map(
+                    lambda e: convert_one(e, enc_threads),
+                    list(enumerate(raw_paths)),
+                ):
+                    out[idx] = dst
+                    if err is not None:
+                        failed.append((idx, raw_paths[idx]))
+                    if idx % 8 == 0:
+                        _hb("cpu", f"{label} {idx+1}/{len(raw_paths)}")
+
+        if mop_up is not None and failed:
+            mop_up(failed, out, enc_threads, cpu)
+
+    # No None entries possible on the webp path (every convert returns a str);
+    # modern's mop-up also fills every slot. The filter/cast keeps mypy quiet.
+    return [p for p in out if p is not None]
 
 
 # -----------------------------------------------------------
@@ -3025,35 +3316,16 @@ def recompress_chapter_images_to_webp(
             )
         return idx, dst
 
-    cpu = os.cpu_count() or 4
-    half_cores = max(1, cpu // 2)
-    workers = max(1, min(half_cores, len(raw_paths)))
-
-    out: List[Optional[str]] = [None] * len(raw_paths)
-    with _cpu_guard("recompress_webp"):
-        if workers == 1 or len(raw_paths) == 1:
-            for entry in enumerate(raw_paths):
-                idx, dst = _convert_one(entry)
-                out[idx] = dst
-                if idx % 8 == 0:
-                    _hb("cpu", f"recompress {idx+1}/{len(raw_paths)}")
-        else:
-            with ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="webp-recompress"
-            ) as pool:
-                # pool.map preserves submission order; consumed iteratively
-                # so memory stays bounded. _hb every 8 keeps the per-chapter
-                # watchdog satisfied on long chapters (60+ pages).
-                for idx, dst in pool.map(
-                    _convert_one, list(enumerate(raw_paths))
-                ):
-                    out[idx] = dst
-                    if idx % 8 == 0:
-                        _hb("cpu", f"recompress {idx+1}/{len(raw_paths)}")
-
-    # No None entries possible by construction (every _convert_one returns
-    # idx, str); the cast keeps mypy quiet.
-    return [p for p in out if p is not None]
+    # Shared concurrency driver (grep _run_recompress_pool). webp has no
+    # encode-failure retry path, so the adapter tags every result err=None (the
+    # mop-up never fires) and ignores the enc_threads budget.
+    return _run_recompress_pool(
+        raw_paths,
+        lambda entry, _enc_threads: (*_convert_one(entry), None),
+        guard="recompress_webp",
+        thread_prefix="webp-recompress",
+        label="recompress",
+    )
 
 
 # -----------------------------------------------------------
@@ -3449,81 +3721,58 @@ def recompress_chapter_images_modern(
             pass
         return idx, src, None
 
-    # Encoder-thread budget — the fix for the intermittent modernize failure
-    # "... Generic Error. Please build `libjxl` from source ...". pillow_jxl's
-    # Encoder AND Pillow's native AVIF encoder each default to an ALL-CORES
-    # internal thread pool (num_threads=-1 / max_threads=cpu). Nested under this
-    # `workers`-thread page pool that compounds to workers*cpu threads (e.g.
-    # 6*12=72 on a 12-core box), and the oversubscription intermittently trips
-    # libjxl's parallel runner into a bare JXL_ENC_ERROR on very large pages
-    # under real-world load — reproduced on ~62 MP progressive JPEGs while the
-    # background image-prefetch chain ran (bench: 3/42 byte-identical pages
-    # failed intermittently; all pass single-threaded). Sizing each encode at
-    # cpu//workers keeps every core busy with NO oversubscription. Thread count
-    # NEVER changes the output bytes (sha-identical + reconstruction bit-exact
-    # across 1/2/4/-1), so it is invisible to the CBZ and to resume gating.
-    cpu = os.cpu_count() or 4
-    workers = max(1, min(cpu // 2, len(raw_paths)))
-    enc_threads = max(1, cpu // workers)
+    # Serial mop-up for pages whose parallel encode raised (almost always a
+    # transient libjxl JXL_ENC_ERROR under pool oversubscription — grep
+    # enc_threads): retry each single-file with the FULL core count (no sibling
+    # encoders competing — the low-contention condition that never failed in
+    # testing), twice with a short backoff before conceding, so a transient
+    # failure becomes "page transcoded a beat later" instead of "silently left
+    # un-modernized". One bad page never aborts the chapter. _run_recompress_pool
+    # invokes this INSIDE _cpu_guard (before releasing it); it mutates `out`.
+    def _mop_up(
+        failed: List[Tuple[int, str]],
+        out: List[Optional[str]],
+        _enc_threads: int,
+        cpu: int,
+    ) -> None:
+        log_verbose(
+            f"  [modernize] Retrying {len(failed)} page(s) that failed "
+            f"under load (serial)..."
+        )
+        for idx, src in failed:
+            dst = src
+            err: Optional[Exception] = None
+            for _attempt in range(2):
+                _hb("cpu", f"modernize retry {os.path.basename(src)}")
+                _, dst, err = _convert_one((idx, src), cpu)
+                if err is None:
+                    break
+                time.sleep(0.3 * (_attempt + 1))
+            out[idx] = dst
+            if err is not None:
+                log_verbose(
+                    f"  Warning: modernize transcode failed for "
+                    f"{os.path.basename(src)}: {err}. Keeping original."
+                )
 
-    out: List[Optional[str]] = [None] * len(raw_paths)
-    failed: List[Tuple[int, str]] = []  # (idx, src) whose encode raised
-    with _cpu_guard("recompress_modern"):
-        if workers == 1 or len(raw_paths) == 1:
-            for entry in enumerate(raw_paths):
-                idx, dst, err = _convert_one(entry, enc_threads)
-                out[idx] = dst
-                if err is not None:
-                    failed.append((idx, raw_paths[idx]))
-                if idx % 8 == 0:
-                    _hb("cpu", f"modernize {idx+1}/{len(raw_paths)}")
-        else:
-            with ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="modern-recompress"
-            ) as pool:
-                # JXL/AVIF native encoders generally release the GIL during the
-                # heavy encode (like libwebp/libjpeg), so workers translate to
-                # speedup; if a given pillow_jxl build holds the GIL the pool
-                # just serializes (correct, only slower). Part B uses processes.
-                for idx, dst, err in pool.map(
-                    lambda e: _convert_one(e, enc_threads),
-                    list(enumerate(raw_paths)),
-                ):
-                    out[idx] = dst
-                    if err is not None:
-                        failed.append((idx, raw_paths[idx]))
-                    if idx % 8 == 0:
-                        _hb("cpu", f"modernize {idx+1}/{len(raw_paths)}")
-
-        # Serial mop-up: a page whose encode raised almost always succeeds when
-        # retried single-file — no sibling encoders competing for cores/memory
-        # is exactly the low-contention condition that never failed in testing.
-        # Give the lone encode the full core count (nothing else runs now) and
-        # retry twice with a short backoff before conceding. This turns the
-        # transient libjxl failure from "page silently left un-modernized" into
-        # "page transcoded a beat later".
-        if failed:
-            log_verbose(
-                f"  [modernize] Retrying {len(failed)} page(s) that failed "
-                f"under load (serial)..."
-            )
-            for idx, src in failed:
-                dst = src
-                err: Optional[Exception] = None
-                for _attempt in range(2):
-                    _hb("cpu", f"modernize retry {os.path.basename(src)}")
-                    _, dst, err = _convert_one((idx, src), cpu)
-                    if err is None:
-                        break
-                    time.sleep(0.3 * (_attempt + 1))
-                out[idx] = dst
-                if err is not None:
-                    log_verbose(
-                        f"  Warning: modernize transcode failed for "
-                        f"{os.path.basename(src)}: {err}. Keeping original."
-                    )
-
-    return [p for p in out if p is not None]
+    # Shared concurrency driver (grep _run_recompress_pool) owns the cpu//2
+    # worker count + the enc_threads=cpu//workers anti-oversubscription cap — the
+    # fix for the intermittent libjxl "Generic Error" / JXL_ENC_ERROR: pillow_jxl
+    # AND native AVIF each default to an all-cores internal pool; nested under a
+    # `workers`-thread page pool they compound to workers*cpu threads (e.g.
+    # 6*12=72 on a 12-core box) and trip libjxl's runner on ~62 MP pages under
+    # load. Thread count NEVER changes output bytes (sha-identical + recon
+    # bit-exact across 1/2/4/-1), so it's invisible to the CBZ and resume gating.
+    # _convert_one already matches the driver's (entry, enc_threads) ->
+    # (idx, dst, err) contract.
+    return _run_recompress_pool(
+        raw_paths,
+        _convert_one,
+        guard="recompress_modern",
+        thread_prefix="modern-recompress",
+        label="modernize",
+        mop_up=_mop_up,
+    )
 
 
 # -----------------------------------------------------------
@@ -4480,7 +4729,11 @@ def build_epub(
     os.makedirs(os.path.join(temp_dir, "META-INF"), exist_ok=True)
 
     # --- 1. mimetype file ---
-    with open(os.path.join(temp_dir, "mimetype"), "w") as f:
+    # encoding="utf-8" on every EPUB text write below: the default open() uses
+    # the platform locale codepage (cp1254 on this Turkish-locale machine), so a
+    # non-ASCII chapter title / description / body raised UnicodeEncodeError (or
+    # silently mojibake'd) against the UTF-8 the XHTML/OPF declare. S2-5 finding.
+    with open(os.path.join(temp_dir, "mimetype"), "w", encoding="utf-8") as f:
         f.write("application/epub+zip")
 
     # --- 2. container.xml ---
@@ -4490,7 +4743,7 @@ def build_epub(
         <rootfile full-path="EPUB/content.opf" media-type="application/oebps-package+xml"/>
     </rootfiles>
 </container>'''
-    with open(os.path.join(temp_dir, "META-INF", "container.xml"), "w") as f:
+    with open(os.path.join(temp_dir, "META-INF", "container.xml"), "w", encoding="utf-8") as f:
         f.write(container_xml)
 
     # --- 3. content.opf (Package Document) ---
@@ -4517,7 +4770,7 @@ def build_epub(
 body, html { padding: 0; margin: 0; height: 100%; width: 100%; text-align: center; }
 svg, img { max-width: 100vw; max-height: 100vh; object-fit: contain; display: block; margin: auto; }'''
     style_path = os.path.join(epub_dir, "style.css")
-    with open(style_path, "w") as f:
+    with open(style_path, "w", encoding="utf-8") as f:
         f.write(style_content)
     manifest_items.append('<item id="css" href="style.css" media-type="text/css"/>')
 
@@ -4537,7 +4790,7 @@ p {
 }
 '''
     text_style_path = os.path.join(epub_dir, "text.css")
-    with open(text_style_path, "w") as f:
+    with open(text_style_path, "w", encoding="utf-8") as f:
         f.write(text_style_content)
     manifest_items.append('<item id="text_css" href="text.css" media-type="text/css"/>')
 
@@ -4577,7 +4830,7 @@ a { text-decoration: none; color: #005a9c; }
 a:hover, a:active { text-decoration: underline; }
 '''
     nav_style_path = os.path.join(epub_dir, "nav_style.css")
-    with open(nav_style_path, "w") as f:
+    with open(nav_style_path, "w", encoding="utf-8") as f:
         f.write(nav_style_content)
     manifest_items.append(
         '<item id="nav_css" href="nav_style.css" media-type="text/css"/>'
@@ -4606,7 +4859,7 @@ a:hover, a:active { text-decoration: underline; }
     <img src="images/cover.jpg" alt="Cover"/>
 </body>
 </html>'''
-            with open(os.path.join(epub_dir, "cover.xhtml"), "w") as f:
+            with open(os.path.join(epub_dir, "cover.xhtml"), "w", encoding="utf-8") as f:
                 f.write(cover_html_content)
             manifest_items.append(
                 '<item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>'
@@ -4644,7 +4897,7 @@ a:hover, a:active { text-decoration: underline; }
     <img src="images/{img_filename}" alt="Page {page_index + 1}"/>
 </body>
 </html>'''
-            with open(os.path.join(epub_dir, page_filename), "w") as f:
+            with open(os.path.join(epub_dir, page_filename), "w", encoding="utf-8") as f:
                 f.write(page_html_content)
             manifest_items.append(
                 f'<item id="page_{page_index}" href="{page_filename}" media-type="application/xhtml+xml"/>'
@@ -4693,7 +4946,7 @@ a:hover, a:active { text-decoration: underline; }
     </nav>
 </body>
 </html>'''
-        with open(os.path.join(epub_dir, "nav.xhtml"), "w") as f:
+        with open(os.path.join(epub_dir, "nav.xhtml"), "w", encoding="utf-8") as f:
             f.write(nav_content)
         manifest_items.append(
             '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>'
@@ -4782,7 +5035,7 @@ a:hover, a:active { text-decoration: underline; }
         {spine_xml}
     </spine>
 </package>'''
-    with open(os.path.join(epub_dir, "content.opf"), "w") as f:
+    with open(os.path.join(epub_dir, "content.opf"), "w", encoding="utf-8") as f:
         f.write(package_document)
 
     # --- Create the EPUB file (zip archive) ---
@@ -5157,7 +5410,15 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
         # harness building a Namespace by hand). Argparse default-paths
         # always populate the string/int form.
         "metadata_source": str(getattr(args, "metadata_source", "none") or "none"),
-        "metadata_tag_min_rank": int(getattr(args, "metadata_tag_min_rank", 50) or 50),
+        # `is not None` (not `or 50`) — 0 is a documented-legal min-rank (keep
+        # all tags) that `or` would silently clobber to 50, so --update-all
+        # children would then filter every rank-0 tag. Mirrors the
+        # modernize_distance guard below. S2-3 review finding.
+        "metadata_tag_min_rank": int(
+            getattr(args, "metadata_tag_min_rank", 50)
+            if getattr(args, "metadata_tag_min_rank", 50) is not None
+            else 50
+        ),
         "metadata_refresh": bool(getattr(args, "metadata_refresh", False)),
         # Content-aware JXL/AVIF transcode (--modernize family). Persisted so
         # --update-all child runs keep transcoding newly downloaded chapters;
@@ -5193,6 +5454,40 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
             if getattr(args, "modernize_avif_speed", 6) is not None
             else 6
         ),
+        # Chapter-SET / output-LAYOUT flags that were silently dropped from the
+        # replay before (grep _append_saved_update_options for the matching
+        # branches). Without these, --update-all children diverged from the
+        # original download:
+        #   collapse_splits — re-downloads previously-collapsed .1/.2 fragments
+        #     as perpetual "new" chapters (changes the chapter set). S4-2.
+        #   komikku — loses per-chapter ComicInfo + cover.jpg/details.json layout
+        #     (the child re-coerces format/keep/no-final itself). S2-2/S4-3.
+        #   webtoon_recompress[_quality/_method] — new LINE Webtoon chapters ship
+        #     as full-size PNG instead of the chosen WebP. S2-2.
+        #   no_sidecar_assets — the user's opt-out wasn't honored on updates.
+        # method default 4 uses `is not None` (0 is a valid libwebp method);
+        # quality min is 1 so plain `or` would be safe but is kept symmetric.
+        "collapse_splits": bool(getattr(args, "collapse_splits", False)),
+        "komikku": bool(getattr(args, "komikku", False)),
+        "webtoon_recompress": bool(getattr(args, "webtoon_recompress", False)),
+        "webtoon_recompress_quality": int(
+            getattr(args, "webtoon_recompress_quality", 85)
+            if getattr(args, "webtoon_recompress_quality", 85) is not None
+            else 85
+        ),
+        "webtoon_recompress_method": int(
+            getattr(args, "webtoon_recompress_method", 4)
+            if getattr(args, "webtoon_recompress_method", 4) is not None
+            else 4
+        ),
+        "no_sidecar_assets": bool(getattr(args, "no_sidecar_assets", False)),
+        # Persist the "user explicitly typed --quality <100" sentinel so replay
+        # only re-emits --quality when the ORIGINAL run set it. Emitting the
+        # default --quality 85 on replay flips the child's _user_set_quality True
+        # → disables the CBZ byte-passthrough fast-path → silent lossy q85
+        # re-encode of update chapters. S4-1. (The child recomputes this from its
+        # own argv at args._user_set_quality; grep that name.)
+        "_user_set_quality": bool(getattr(args, "_user_set_quality", False)),
     }
     if getattr(args, "format", None) == "epub":
         data["epub_layout"] = getattr(args, "epub_layout", "vertical")
@@ -5265,7 +5560,14 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
     if params.get("aspect_ratio") and not _replay_modernize:
         child_cmd.extend(["--aspect-ratio", str(params["aspect_ratio"])])
     if not params.get("no_processing"):
-        if not _replay_modernize:
+        # Only replay --quality when the ORIGINAL run had the user explicitly set
+        # it (_user_set_quality). Emitting the default --quality 85 flips the
+        # child's _user_set_quality sentinel True → disables the CBZ byte-
+        # passthrough fast-path → silent lossy q85 re-encode of update chapters
+        # while the rest of the byte-preserved library stays lossless. Old
+        # download_params.json lacking the key → get() falsy → skipped (byte-
+        # preserve), the safe default. S4-1 review finding.
+        if params.get("_user_set_quality") and not _replay_modernize:
             child_cmd.extend(["--quality", str(params.get("quality", 85))])
         child_cmd.extend(["--scaling", str(params.get("scaling", 100))])
     if params.get("cookies"):
@@ -5288,9 +5590,30 @@ def _append_saved_update_options(child_cmd: List[str], params: Dict[str, Any]) -
         ("no_cleanup", "--no-cleanup"),
         ("verbose", "--verbose"),
         ("debug", "--debug"),
+        # Chapter-set / layout flags now persisted by _save_download_params.
+        # collapse_splits changes the chapter SET (drops fragments) — replaying
+        # it stops --update-all re-downloading collapsed .1/.2 as "new" (S4-2);
+        # komikku re-coerces format/keep/no-final in the child so the flag alone
+        # restores the per-chapter layout (S2-2/S4-3); no_sidecar_assets honors
+        # the user's opt-out on updates.
+        ("collapse_splits", "--collapse-splits"),
+        ("komikku", "--komikku"),
+        ("no_sidecar_assets", "--no-sidecar-assets"),
     ):
         if params.get(key):
             child_cmd.append(flag)
+    # LINE Webtoon WebP recompression + its quality/method knobs (store_true +
+    # two ints). Emit non-default sub-values only, mirroring the modernize block
+    # below. Without this, newly downloaded webtoon chapters ship as full-size
+    # PNG instead of the chosen WebP. S2-2 review finding.
+    if params.get("webtoon_recompress"):
+        child_cmd.append("--webtoon-recompress")
+        wq = params.get("webtoon_recompress_quality")
+        if isinstance(wq, int) and wq != 85:
+            child_cmd.extend(["--webtoon-recompress-quality", str(wq)])
+        wm = params.get("webtoon_recompress_method")
+        if isinstance(wm, int) and wm != 4:
+            child_cmd.extend(["--webtoon-recompress-method", str(wm)])
     # External metadata enrichment (--metadata-source family). Saved by
     # _save_download_params; absence in older download_params.json files
     # silently degrades to the default-off behavior (the get returns None
@@ -5404,6 +5727,148 @@ def gating_hash(params):
     return hashlib.sha256(blob).hexdigest()
 
 
+# ── Multi-source resume cache (run_params.json `multi_source_cache` key) ──
+# The direct-URL --multi-source discovery (aio_search_cli.find_alternatives_
+# for_direct_url) costs ~30-80s: a cross-site title search + a chapter-list
+# fetch per candidate + alignment. On resume that whole probe re-runs even
+# though the discovered *sources* (which sites carry this series) essentially
+# never change between an interrupted run and its resume minutes/hours later.
+# We persist the resolved (site, url) alternatives + a timestamp into
+# run_params.json under a TOP-LEVEL `multi_source_cache` key (NOT inside
+# `params`, so it never enters gating_hash) and, on resume, feed them through
+# aio_search_cli.build_alternatives_from_payload — the same code the UI's
+# --multi-source-prefetched file uses. That skips the search but still
+# re-fetches chapter lists + re-aligns (cheap, and keeps the alt chapter data
+# fresh). A TTL bounds staleness so a long-idle tmp re-probes.
+#
+# Two write triggers (run_params.json is written ONCE, and discovery is eager
+# OR lazy): the eager path runs before the tmp dir exists, so its payload
+# rides `_ms_resume_cache_payload` into main()'s run_params write block; the
+# lazy path fires mid-run after that block, so it read-modify-writes the file
+# via _persist_multi_source_cache. The chapter loop is sequential on the main
+# thread (grep `for ch_idx, ch in enumerate(chapters)`), so that write is
+# race-free. Cross-file: consumed in _discover_multi_source_alternatives.
+_MULTI_SOURCE_CACHE_TTL_SECONDS = 72 * 3600  # 72h; override via AIO_MULTISOURCE_CACHE_TTL_HOURS
+
+
+def _multi_source_cache_ttl_seconds() -> float:
+    """Resolve the multi-source resume-cache TTL in seconds.
+
+    Default 72h. Env override AIO_MULTISOURCE_CACHE_TTL_HOURS (float hours);
+    <= 0 disables the cache entirely (every resume re-probes). A malformed
+    env value falls back to the default.
+    """
+    raw = os.environ.get("AIO_MULTISOURCE_CACHE_TTL_HOURS")
+    if raw is None or not str(raw).strip():
+        return float(_MULTI_SOURCE_CACHE_TTL_SECONDS)
+    try:
+        return float(raw) * 3600.0
+    except (TypeError, ValueError):
+        return float(_MULTI_SOURCE_CACHE_TTL_SECONDS)
+
+
+def _read_multi_source_resume_cache(params_path: str) -> Optional[Dict[str, Any]]:
+    """Return the cached multi-source payload from run_params.json if present
+    and younger than the TTL, else None.
+
+    The returned dict has the --multi-source-prefetched payload shape
+    ({"title", "year"?, "alternatives": [{"site","url",...}, ...]}) plus a
+    "saved_at" epoch float, so it can be handed straight to
+    aio_search_cli.build_alternatives_from_payload. Best-effort: a missing
+    file / malformed JSON / stale-or-future timestamp / empty alt list all
+    yield None so the caller falls back to a fresh cross-site search.
+    """
+    ttl = _multi_source_cache_ttl_seconds()
+    if ttl <= 0:
+        return None
+    try:
+        if not params_path or not os.path.exists(params_path):
+            return None
+        with open(params_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    cache = data.get("multi_source_cache")
+    if not isinstance(cache, dict):
+        return None
+    alts = cache.get("alternatives")
+    if not isinstance(alts, list) or not alts:
+        return None
+    saved_at = cache.get("saved_at")
+    if not isinstance(saved_at, (int, float)) or isinstance(saved_at, bool):
+        return None
+    age = time.time() - float(saved_at)
+    # age < 0 → clock moved backwards / future-dated cache; re-probe rather
+    # than trust it. age > ttl → stale.
+    if age < 0 or age > ttl:
+        return None
+    return cache
+
+
+def _persist_multi_source_cache(params_path: str, cache_payload: Optional[Dict[str, Any]]) -> None:
+    """Read-modify-write the `multi_source_cache` top-level key into an
+    EXISTING run_params.json.
+
+    Used by the lazy-discovery path, which fires AFTER main()'s one-shot
+    run_params write block — so the cache must be merged into the file that
+    already holds {gating_hash, params}. Deliberately a NO-OP when the file
+    doesn't exist yet: the eager path hasn't created the tmp dir at discovery
+    time, and that case rides `_ms_resume_cache_payload` into the write block
+    instead — creating a params-less run_params.json here would break the
+    resume-compat check. Best-effort; never raises.
+    """
+    if not cache_payload or not cache_payload.get("alternatives"):
+        return
+    if not params_path or not os.path.exists(params_path):
+        return
+    try:
+        with open(params_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        data["multi_source_cache"] = cache_payload
+        with open(params_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+    except (OSError, ValueError):
+        pass
+
+
+def _build_multi_source_cache_payload(ms_result, title, saved_at, year=None):
+    """Assemble the persistable `multi_source_cache` dict from a discovery
+    result's `resolved_sources` (grep that key in aio_search_cli.py).
+
+    Returns None when there are no usable (site, url) sources — nothing worth
+    caching, so the caller leaves run_params.json untouched.
+    """
+    sources = (ms_result or {}).get("resolved_sources") or []
+    clean: List[Dict[str, Any]] = []
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        site = (s.get("site") or "").strip()
+        url = (s.get("url") or "").strip()
+        if not site or not url:
+            continue
+        entry: Dict[str, Any] = {"site": site, "url": url}
+        if s.get("title"):
+            entry["title"] = s["title"]
+        if s.get("cover"):
+            entry["cover"] = s["cover"]
+        clean.append(entry)
+    if not clean:
+        return None
+    payload: Dict[str, Any] = {
+        "saved_at": float(saved_at),
+        "title": title or "",
+        "alternatives": clean,
+    }
+    if year:
+        payload["year"] = year
+    return payload
+
+
 def _validate_resume_categories(parser):
     """Startup sanity check: dests in the category sets must exist
     in the parser, and the two sets must not overlap.
@@ -5451,8 +5916,8 @@ def _apply_runtime_tunables(args):
         after JSON values have been setattr'd onto args)
 
     Globals here are read at runtime by make_request, dl_image,
-    _process_chapter (watchdog), _process_chapter_strict (inline retry),
-    and _vrf_prefetch_worker_loop (batch sizing). Without the second
+    _process_chapter (watchdog), and _process_chapter_strict (inline
+    retry). Without the second
     call after restore, these caches still hold the argparse defaults
     from the resume invocation's CLI (which only re-passes
     --restore-parameters --format … --verbose <url>) — so the user's
@@ -5473,17 +5938,27 @@ def _apply_runtime_tunables(args):
     globals()["_CHAPTER_HOST_POISON"] = int(getattr(args, "chapter_host_poison_threshold", 5))
     globals()["_INLINE_CHAPTER_RETRIES"] = int(getattr(args, "inline_chapter_retries", 2))
     globals()["_INLINE_CHAPTER_BACKOFF"] = float(getattr(args, "inline_chapter_backoff", 30.0))
-    _vrf_async_batch_state["parallel_count"] = max(
-        1, int(getattr(args, "mangafire_vrf_parallel", 1) or 1)
-    )
     # --no-fast-download: force-disable curl_cffi fast path globally. Read
     # by both the main-path SUPPORTS_FAST_DOWNLOAD gate AND the prefetch
     # worker's SUPPORTS_FAST_DOWNLOAD gate. Module-global so the prefetch
     # worker (which doesn't have args in scope as a closure capture) can
     # read it without parameter threading.
     globals()["_NO_FAST_DOWNLOAD"] = bool(getattr(args, "no_fast_download", False))
+    # --max-cpu-percent: scale the CPU-bound image-pool budget (grep
+    # _cpu_pool_budget). Clamped [1,100]. Module-global so the three pool sites
+    # read it without threading args through. Re-applied on --restore-parameters
+    # so a resumed run honors the CURRENT --max-cpu-percent — the resume CLI
+    # passes it explicitly (downloader.js resume()), and the restore loop keeps
+    # explicit CLI dests. NOT in _RESUME_GATING_DESTS (speed knob, never changes
+    # decoded pixels — mirrors modernize_effort).
+    _cpu_pct = getattr(args, "max_cpu_percent", 100)
+    # `is not None` (not `or`) so an explicit 0 clamps DOWN to the floor of 1
+    # rather than being read as falsy and reset to 100 (full).
+    globals()["_CPU_POOL_PERCENT"] = max(
+        1, min(100, int(_cpu_pct if _cpu_pct is not None else 100))
+    )
     # --image-prefetch-parallel: how many concurrent image-prefetch worker
-    # threads. Same module-global pattern as _vrf_async_batch_state since
+    # threads. Same module-global pattern as _CPU_POOL_PERCENT above, since
     # the workers are spawned by _ensure_image_prefetch_workers without
     # args in scope. Re-applied on --restore-parameters via the second
     # call to _apply_runtime_tunables.
@@ -5595,184 +6070,11 @@ def _validate_build_final_cli(p: argparse.ArgumentParser, argv: List[str]) -> No
 
 
 
-# -----------------------------------------------------------
-# VRF prefetch – overlap next-N-chapter VRF capture with
-#                current-chapter image downloads.
-#
-# How it works:
-#   - After get_chapter_images(ch_N) returns the image URLs,
-#     _start_vrf_prefetch_chain() pushes the next `depth` upcoming
-#     chapters onto _vrf_prefetch_queue.
-#   - A single long-lived daemon worker drains the queue, calling
-#     vrf_gen.ensure_vrf() for each. Tokens land in the shared
-#     _vrf_cache; later foreground calls hit cache instantly.
-#   - With depth=4 (the new default), by the time the main loop
-#     reaches chapter N+1, VRFs for N+2..N+4 are already captured
-#     or in flight, fully hiding VRF cost behind image download.
-#
-# Pre-2026-05-09: depth was effectively 1 (single thread, single
-# chapter ahead). Bumped to 4 + queue worker so capture starts
-# earlier; this matters most for runs where image download time
-# is short relative to VRF capture time (i.e. small chapters).
-#
-# Why this is safe with --jobs:
-#   --jobs spawns separate subprocesses, each with their own
-#   Playwright browser and VRF generator. This prefetch only
-#   touches the current process's VRF generator.
-# -----------------------------------------------------------
+# Shared stdlib queue for the inter-chapter image-download prefetch pool
+# below. (The MangaFire VRF-prefetch machinery that used to live here was
+# removed with the 2026 MangaFire REST-API rewrite — chapter payloads are
+# plain JSON now, no token capture; see sites/mangafire.py.)
 import queue as _stdlib_queue
-
-_vrf_prefetch_queue: "_stdlib_queue.Queue[Optional[Tuple[str, str, str]]]" = _stdlib_queue.Queue()
-_vrf_prefetch_worker: Optional[threading.Thread] = None
-# Tracks paths already submitted (or completed) so we don't enqueue the
-# same chapter VRF capture twice when overlapping prefetch windows include
-# it. Cleared at process exit; growth is bounded by the chapter count.
-_vrf_prefetch_seen: set = set()
-_vrf_prefetch_lock = threading.Lock()
-# Opt-in async batch capture instance, lazily created on first parallel
-# prefetch with --mangafire-vrf-parallel > 1. None when sequential mode.
-_vrf_async_batch_state: Dict[str, Any] = {"capturer": None, "parallel_count": 1}
-
-
-def _vrf_prefetch_worker_loop() -> None:
-    """Drain _vrf_prefetch_queue serially. Sequential mode uses sync
-    ensure_vrf (proven, ~1.5-2s/chapter). Parallel mode (parallel_count>1)
-    batches up to N items and submits to AsyncBatchVRFCapture for
-    concurrent multi-page capture. Both flow tokens into the shared
-    _vrf_cache, so subsequent ensure_vrf calls hit cache instantly."""
-    try:
-        from sites.mangafire_vrf_simple import get_vrf_generator
-    except Exception:
-        return  # No VRF backend; idle worker.
-
-    parallel_count = max(1, int(_vrf_async_batch_state.get("parallel_count", 1) or 1))
-
-    while True:
-        item = _vrf_prefetch_queue.get()
-        if item is None:  # Shutdown sentinel
-            return
-
-        # Drain up to parallel_count-1 additional items so we batch when
-        # parallel mode is active. In sequential mode batch_items has 1.
-        batch_items = [item]
-        if parallel_count > 1:
-            try:
-                while len(batch_items) < parallel_count:
-                    batch_items.append(_vrf_prefetch_queue.get_nowait())
-            except _stdlib_queue.Empty:
-                pass
-
-        if parallel_count > 1 and len(batch_items) > 1:
-            # Async batch path. Lazy-import to avoid loading async machinery
-            # for users who never opt in.
-            capturer = _vrf_async_batch_state.get("capturer")
-            if capturer is None:
-                try:
-                    from sites.mangafire_vrf_async_batch import AsyncBatchVRFCapture
-                    capturer = AsyncBatchVRFCapture()
-                    _vrf_async_batch_state["capturer"] = capturer
-                except Exception as exc:
-                    log_verbose(
-                        f"  [VRF Prefetch] AsyncBatch init failed; falling back "
-                        f"to sequential for this batch: {exc}"
-                    )
-                    capturer = None
-            if capturer is not None:
-                try:
-                    capturer.submit_batch(
-                        [(cid, curl) for (cid, curl, _label) in batch_items],
-                        parallel=parallel_count,
-                    )
-                    log_verbose(
-                        f"  [VRF Prefetch] async-batch captured "
-                        f"{len(batch_items)} VRFs (parallel={parallel_count})"
-                    )
-                    for _, _, label in batch_items:
-                        log_verbose(f"  [VRF Prefetch] (async) chapter {label} ready")
-                    [_vrf_prefetch_queue.task_done() for _ in batch_items]
-                    continue
-                except Exception as exc:
-                    # Async batch failed — fall through to sequential.
-                    log_verbose(
-                        f"  [VRF Prefetch] async-batch failed ({exc}); "
-                        "retrying sequentially"
-                    )
-
-        # Sequential path (default, also fallback when async fails).
-        for chapter_id, chapter_url, chap_label in batch_items:
-            ajax_path = f"/ajax/read/chapter/{chapter_id}"
-            try:
-                vrf_gen = get_vrf_generator()
-                vrf_gen.ensure_vrf(ajax_path, page_url=chapter_url, init_url=chapter_url)
-                log_verbose(f"  [VRF Prefetch] Cached VRF for chapter {chap_label}")
-            except Exception as exc:
-                # Not a problem — the foreground path will capture it.
-                log_verbose(
-                    f"  [VRF Prefetch] Failed for chapter {chap_label} "
-                    f"(will retry normally): {exc}"
-                )
-            finally:
-                _vrf_prefetch_queue.task_done()
-
-
-def _ensure_vrf_prefetch_worker() -> None:
-    """Lazy-start the worker on first chain push. Daemon thread, exits
-    automatically on process shutdown."""
-    global _vrf_prefetch_worker
-    with _vrf_prefetch_lock:
-        if _vrf_prefetch_worker is not None and _vrf_prefetch_worker.is_alive():
-            return
-        _vrf_prefetch_worker = threading.Thread(
-            target=_vrf_prefetch_worker_loop,
-            daemon=True,
-            name="VRF-Prefetch-Queue",
-        )
-        _vrf_prefetch_worker.start()
-
-
-def _start_vrf_prefetch_chain(
-    upcoming: List[Dict[str, Any]], handler, depth: int
-) -> None:
-    """Push the next `depth` chapters' VRF capture jobs onto the prefetch
-    queue. No-op for non-MangaFire handlers, missing chapter URLs, or
-    already-queued chapters. depth=0 disables prefetch entirely.
-
-    Replaces the pre-2026-05-09 _start_vrf_prefetch (single chapter
-    ahead). The queue worker drains in order; parallel mode (controlled
-    via _vrf_async_batch_state['parallel_count']) batches into multi-
-    page async capture inside the worker.
-    """
-    if depth <= 0 or not upcoming:
-        return
-    if getattr(handler, "name", "") != "mangafire":
-        return
-
-    pushed = 0
-    with _vrf_prefetch_lock:
-        for ch in upcoming[:depth]:
-            chapter_id = ch.get("hid")
-            chapter_url = ch.get("url")
-            if not chapter_id or not chapter_url:
-                continue
-            ajax_path = f"/ajax/read/chapter/{chapter_id}"
-            if ajax_path in _vrf_prefetch_seen:
-                continue
-            _vrf_prefetch_seen.add(ajax_path)
-            chap_label = str(ch.get("chap", "?"))
-            _vrf_prefetch_queue.put((chapter_id, chapter_url, chap_label))
-            pushed += 1
-
-    if pushed:
-        _ensure_vrf_prefetch_worker()
-
-
-# Backward-compat shim: existing call sites elsewhere may still reference
-# _start_vrf_prefetch (single chapter). Kept as a thin wrapper. Remove
-# once all call sites migrate to _start_vrf_prefetch_chain.
-def _start_vrf_prefetch(next_chapter: Optional[Dict], handler) -> None:
-    if next_chapter is None:
-        return
-    _start_vrf_prefetch_chain([next_chapter], handler, depth=1)
 
 
 # -----------------------------------------------------------
@@ -5793,7 +6095,7 @@ def _start_vrf_prefetch(next_chapter: Optional[Dict], handler) -> None:
 #     prefetched file instead of re-fetching.
 #   - Phase 1 (handler.get_chapter_images) still runs in main on every
 #     chapter — needed for media_entries (text_blocks etc.). For mangafire
-#     this is ~0.5-1s with the cached VRF; cheap enough that we don't try
+#     this is a single cheap JSON GET now; cheap enough that we don't try
 #     to share metadata via sidecar JSON between threads.
 #
 # Gated by --prefetch-image-workers (default -1 → match --image-workers).
@@ -5802,7 +6104,7 @@ def _start_vrf_prefetch(next_chapter: Optional[Dict], handler) -> None:
 # positive number to keep prefetch on but with a lighter footprint.
 #
 # Phase B (2026-05-13): replaced single-in-flight thread with a
-# queue+worker-pool pattern mirroring _vrf_prefetch_*. Multiple chapters
+# queue+worker-pool pattern. Multiple chapters
 # can now download in parallel (controlled by --image-prefetch-parallel),
 # and the queue depth (--image-prefetch-depth) lets us push ahead
 # multiple chapters at the chain-fire site. Preserves the filesystem-
@@ -5833,9 +6135,30 @@ _image_prefetch_queue: "_stdlib_queue.Queue[Optional[_ImgPrefetchJob]]" = (
 _image_prefetch_workers: List[threading.Thread] = []
 _image_prefetch_seen: set = set()                       # dedupe: chap_label
 _image_prefetch_done: Dict[str, threading.Event] = {}   # chap_label -> Event
+# S5-2: chap_labels whose consume-wait TIMED OUT while the worker was still
+# running. The foreground then downloads into the same ch_{chap} tdir, so the
+# still-running worker must NOT wipe it (partial-fail rm_tree) or write its late
+# success marker. Set under _image_prefetch_lock by _consume_image_prefetch on
+# timeout; the worker checks + discards it right before its finalize.
+_image_prefetch_abandoned: set = set()                  # chap_label
 _image_prefetch_lock = threading.Lock()                 # guards _seen/_done/_workers
 # Set by _apply_runtime_tunables from --image-prefetch-parallel (default 2).
 _image_prefetch_parallel: int = 2
+
+
+def _image_prefetch_is_abandoned(chap_label: str) -> bool:
+    """True once _consume_image_prefetch handed this chapter's tdir to the
+    foreground (300s consume timeout). The prefetch worker polls this DURING
+    Phase 2 so it stops writing into the tdir the foreground now downloads
+    into — otherwise both write the same per-page .pending_<base> tempfile
+    (base.py's fast path AND dl_image's legacy path share that name, keyed on
+    (folder, base), NOT per-thread), tearing the tempfile and racing the
+    atomic rename. Distinct from _chapter_cancelled: that's the FOREGROUND
+    chapter's watchdog, which RACE-2 keeps prefetch decoupled from; THIS is a
+    per-chapter hand-off signal prefetch DOES honor. Peek only — the finalize
+    block still does the discard under the lock. S5-2 write-race follow-up."""
+    with _image_prefetch_lock:
+        return chap_label in _image_prefetch_abandoned
 
 
 def _image_prefetch_worker_loop() -> None:
@@ -5860,6 +6183,34 @@ def _image_prefetch_worker_loop() -> None:
             if evt is not None:
                 evt.set()
             _image_prefetch_queue.task_done()
+
+
+def _binary_image_page_name(entry: Dict[str, Any], blob, chap_label, page_counter: int) -> str:
+    """On-disk filename for a binary_image page: '<chap_label>_<counter:04d><ext>'.
+
+    ext = explicit entry['extension'] -> a suffix on entry['name'] -> magic-sniff
+    (blob[:32] + content_type). The chap_label prefix + CONTINUOUS page_counter
+    (never the handler's per-chapter 'name') is REQUIRED: a per-chapter name like
+    MangaDex's "0001.png" collides when --collapse-splits concatenates parts into
+    one tdir — part 2 overwrites part 1, dropping pages, and under --modernize the
+    transcode pool races the shared path (winner deletes the source, the dup
+    slot's cleanup deletes the winner's .jxl) -> CBZ FileNotFoundError. Shared by
+    _process_chapter_impl (foreground) and _run_image_prefetch_job (prefetch) so
+    the naming can't drift between the two — the exact bug that forced editing
+    both twins (grep bench/collapseSplitsModernize.md). CL-4.
+    """
+    explicit_ext = entry.get("extension")
+    custom_name = entry.get("name")
+    if explicit_ext:
+        ext = explicit_ext if explicit_ext.startswith(".") else "." + explicit_ext
+    elif custom_name and os.path.splitext(custom_name)[1]:
+        ext = os.path.splitext(custom_name)[1]
+    else:
+        ext = _sniff_image_extension(
+            blob[:32] if isinstance(blob, (bytes, bytearray)) else b"",
+            entry.get("content_type"),
+        )
+    return f"{chap_label}_{page_counter:04d}{ext}"
 
 
 def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
@@ -5909,6 +6260,22 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
 
         os.makedirs(target_tdir, exist_ok=True)
 
+        # S5-2 (write race): if get_chapter_images (Phase 1, network-bound) ran
+        # long enough that the foreground's consume timed out and ADOPTED this
+        # tdir, write NOTHING into it — the foreground owns it now and is
+        # downloading the same pages. Discard the flag and bail before any
+        # classification / binary-blob write. (Phase-2 downloads are gated
+        # per-page below too: is_cancelled on the fast path, _bg_prefetch on the
+        # legacy path — this covers a slow Phase-1 that finished after adoption.)
+        if _image_prefetch_is_abandoned(chap_label):
+            with _image_prefetch_lock:
+                _image_prefetch_abandoned.discard(chap_label)
+            log_verbose(
+                f"  [Img Prefetch] Ch {chap_label} abandoned during fetch — "
+                f"foreground owns the tdir; not writing"
+            )
+            return
+
         # ── Classify entries (mirrors main's Phase 1 logic) ──
         download_tasks: List[Tuple[int, str, str, str]] = []
         page_counter = 1
@@ -5923,29 +6290,11 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                     blob = entry.get("data")
                     if not blob:
                         continue
-                    explicit_ext = entry.get("extension")
-                    custom_name = entry.get("name")
-                    if explicit_ext:
-                        ext = (
-                            explicit_ext
-                            if explicit_ext.startswith(".")
-                            else "." + explicit_ext
-                        )
-                    elif custom_name and os.path.splitext(custom_name)[1]:
-                        ext = os.path.splitext(custom_name)[1]
-                    else:
-                        ext = _sniff_image_extension(
-                            blob[:32]
-                            if isinstance(blob, (bytes, bytearray))
-                            else b"",
-                            entry.get("content_type"),
-                        )
-                    # Unique per-page name (continuous page_counter), never the
-                    # handler's bare `name` — a per-chapter name like MangaDex's
-                    # "0001.png" collides when --collapse-splits merges parts
-                    # into one tdir. Full rationale at the foreground twin (grep
-                    # collapseSplitsModernize.md / _merged_parts).
-                    filename = f"{chap_label}_{page_counter:04d}{ext}"
+                    # CL-4: shared with the foreground twin so the collapse-safe
+                    # naming can't drift (grep _binary_image_page_name).
+                    filename = _binary_image_page_name(
+                        entry, blob, chap_label, page_counter
+                    )
                     pth = os.path.join(target_tdir, filename)
                     try:
                         with open(pth, "wb") as fh:
@@ -5969,6 +6318,11 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
             _write_prefetched_marker(target_tdir)
             return
 
+        # Blame-host for the Phase-D per-host concurrency cap. download_tasks is
+        # non-empty here (guarded above), so the first task's netloc stands in
+        # for the chapter's CDN in both the fast and ThreadPool paths below.
+        prefetch_host = urlparse(download_tasks[0][1]).netloc
+
         # ── Phase 2: parallel download ──
         # curl_cffi async path runs concurrently inside this daemon
         # thread (asyncio.run() spins up its own event loop here).
@@ -5983,10 +6337,7 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
             # Phase D: apply per-host concurrency cap on prefetch too —
             # if the foreground path dialed concurrency down for this
             # CDN, prefetch should respect the same limit.
-            fast_conc = _effective_concurrency(
-                urlparse(download_tasks[0][1]).netloc if download_tasks else "",
-                fast_conc,
-            )
+            fast_conc = _effective_concurrency(prefetch_host, fast_conc)
             fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
             # Backoff feedback (2026-07-03): prefetch hard-failures dial down
             # the shared per-host concurrency cap. Before this, the prefetch
@@ -6020,6 +6371,19 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                 concurrency=fast_conc,
                 timeout=fast_timeout,
                 record_host_failure=_prefetch_backoff_feedback,
+                # S5-2 (write race): bail per-page once the foreground adopts
+                # this tdir (consume timeout) so we stop writing the shared
+                # .pending_<base> tempfiles it is now writing too. This is the
+                # PREFETCH's own hand-off signal, NOT the foreground chapter's
+                # watchdog — RACE-2 keeps us decoupled from _chapter_cancelled,
+                # but we DO honor being adopted. fast_download_images re-checks
+                # is_cancelled before each attempt and after the semaphore.
+                is_cancelled=lambda: _image_prefetch_is_abandoned(chap_label),
+                # S5-2 (write race): distinct pending-file name so an in-flight
+                # prefetch page write (one that started before is_cancelled
+                # fired) can't collide with the foreground's write of the same
+                # page into the adopted tdir (grep .bgprefetch / pending_suffix).
+                pending_suffix=".bgprefetch",
                 # Forward cookies (e.g. age-gate cookies for LineWebtoon)
                 # so prefetch can fetch the same content the foreground
                 # path would. Base impl filters to host-relevant cookies.
@@ -6029,15 +6393,35 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
         else:
             workers = max(1, min(image_workers, len(download_tasks)))
             # Phase D: cap prefetch ThreadPool concurrency too.
-            workers = max(1, _effective_concurrency(
-                urlparse(download_tasks[0][1]).netloc if download_tasks else "",
-                workers,
-            ))
+            workers = max(1, _effective_concurrency(prefetch_host, workers))
+            # RACE-2: mark each pool thread as a background prefetch worker so
+            # dl_image / _try_download_url don't honor the FOREGROUND chapter's
+            # watchdog + poison tally (which would abort this prefetch of a LATER
+            # chapter and wipe its tdir). The flag rides a thread-local (grep
+            # _in_background_prefetch); dl_image propagates it into its variant
+            # sub-threads. Reset per task; the pool's threads die with the block.
+            def _bg_prefetch(url, folder, name):
+                # S5-2 (write race): once the foreground adopts this tdir
+                # (consume timeout), stop scheduling new page writes into it —
+                # it downloads the same pages now and shares dl_image's
+                # per-(folder,base) .pending_ tempfile, so concurrent writes
+                # tear the tempfile / race the rename. Not-yet-started tasks
+                # short-circuit here; the ≤workers already inside dl_image
+                # finish their current page (bounded). Counts as failed, but the
+                # finalize block checks _abandoned FIRST and leaves the dir to
+                # the foreground (no rm_tree, no marker).
+                if _image_prefetch_is_abandoned(chap_label):
+                    return False
+                _PREFETCH_TLS.active = True
+                try:
+                    return dl_image(url, folder, name, scraper, True)
+                finally:
+                    _PREFETCH_TLS.active = False
             with ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix=f"img-prefetch-{chap_label}"
             ) as pool:
                 futures = [
-                    pool.submit(dl_image, url, folder, name, scraper, True)
+                    pool.submit(_bg_prefetch, url, folder, name)
                     for _, url, folder, name in download_tasks
                 ]
                 for fut in as_completed(futures):
@@ -6047,7 +6431,20 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                     except Exception:
                         failed += 1
 
-        if failed == 0:
+        # S5-2: if the foreground gave up waiting (consume timed out) it has
+        # ADOPTED this tdir and is downloading into it now. Neither write our
+        # marker nor wipe the dir — a late rm_tree here deletes the foreground's
+        # in-progress pages mid-build (the unordinaryLogs.md 90-300s consume
+        # waits made this reachable). Leave ch_{chap} entirely to the foreground.
+        with _image_prefetch_lock:
+            _abandoned = chap_label in _image_prefetch_abandoned
+            _image_prefetch_abandoned.discard(chap_label)
+        if _abandoned:
+            log_verbose(
+                f"  [Img Prefetch] Ch {chap_label} abandoned (foreground took "
+                f"over its tdir after consume timeout) — leaving it untouched"
+            )
+        elif failed == 0:
             _write_prefetched_marker(target_tdir)
             log_verbose(
                 f"  [Img Prefetch] Ch {chap_label} ready ({len(download_tasks)} imgs)"
@@ -6069,7 +6466,7 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
 
 def _ensure_image_prefetch_workers() -> None:
     """Lazy-spawn up to _image_prefetch_parallel daemon worker threads.
-    Mirrors _ensure_vrf_prefetch_worker but with N workers instead of 1.
+    N daemon workers total.
     Called from _start_image_prefetch on first enqueue; idempotent on
     subsequent calls (re-checks alive count and tops up if any died)."""
     with _image_prefetch_lock:
@@ -6163,8 +6560,7 @@ def _start_image_prefetch_chain(
     no_processing: bool,
 ) -> None:
     """Push the next `depth` chapters' image-prefetch jobs onto the queue.
-    No-op when depth <= 0 (user opted out). Mirror of
-    _start_vrf_prefetch_chain for the image-download side.
+    No-op when depth <= 0 (user opted out).
 
     Skips chapters whose tdir already has a success marker (processed-
     complete or download-complete depending on --no-processing) — same
@@ -6229,7 +6625,19 @@ def _consume_image_prefetch(chap_label: str) -> None:
         # pushes us beyond this, foreground download falls through and
         # main re-does the work — same recovery semantics as a single-
         # thread prefetch hanging.
-        evt.wait(timeout=300.0)
+        finished = evt.wait(timeout=300.0)
+        if not finished:
+            # S5-2: we're giving up the wait but the worker is STILL running.
+            # The foreground is about to download into the SAME ch_{chap} tdir,
+            # so flag the chapter abandoned — the worker's late finalize then
+            # skips both its rm_tree (which would delete our in-progress pages)
+            # and its success marker. Grep _image_prefetch_abandoned.
+            with _image_prefetch_lock:
+                _image_prefetch_abandoned.add(chap_label)
+            log_verbose(
+                f"  Image prefetch of Ch {chap_label} exceeded 300s; foreground "
+                f"taking over its tdir."
+            )
     with _image_prefetch_lock:
         # Clean up per-chap state. Keep _image_prefetch_seen entry so a
         # second enqueue for the same chapter (e.g. inline retry) is
@@ -6261,6 +6669,37 @@ def _serialize_anilist_tag(t: Any) -> Dict[str, Any]:
         "rank": int(getattr(t, "rank", 0) or 0),
         "is_media_spoiler": bool(getattr(t, "is_media_spoiler", False)),
         "is_general_spoiler": bool(getattr(t, "is_general_spoiler", False)),
+    }
+
+
+def _anilist_meta_fields(comic_data: Dict[str, Any]) -> Dict[str, Any]:
+    """The seven AniList enrichment fields shared VERBATIM by the two
+    .aio_series.json writers (live-download near 'series_meta =' and
+    --refresh-library-metadata's 'meta[...]' block) AND — as its leading
+    block — the details.json reader extras (_build_aio_reader_extras).
+
+    Returns them in canonical order (id, mal_id, country_of_origin,
+    media_format, synonyms, tags, spoiler_tags) so every on-disk artifact
+    stays key-order-identical. Tags run through the module-level
+    _serialize_anilist_tag (AnilistTag dataclass -> plain dict; the dataclass
+    itself doesn't survive json.dump); every value reads comic_data.get(...) so
+    an unenriched series emits null/[] on a stable schema. Cross-file: three
+    consumers, grep _anilist_meta_fields.
+    """
+    return {
+        "anilist_id": comic_data.get("anilist_id"),
+        "mal_id": comic_data.get("mal_id"),
+        "country_of_origin": comic_data.get("country_of_origin"),
+        "media_format": comic_data.get("media_format"),
+        "anilist_synonyms": list(comic_data.get("anilist_synonyms") or []),
+        "anilist_tags": [
+            _serialize_anilist_tag(t)
+            for t in (comic_data.get("anilist_tags") or [])
+        ],
+        "anilist_spoiler_tags": [
+            _serialize_anilist_tag(t)
+            for t in (comic_data.get("anilist_spoiler_tags") or [])
+        ],
     }
 
 
@@ -6308,19 +6747,9 @@ def _build_aio_reader_extras(
     'new_details.update').
     """
     return {
-        "anilist_id": comic_data.get("anilist_id"),
-        "mal_id": comic_data.get("mal_id"),
-        "country_of_origin": comic_data.get("country_of_origin"),
-        "media_format": comic_data.get("media_format"),
-        "anilist_synonyms": list(comic_data.get("anilist_synonyms") or []),
-        "anilist_tags": [
-            _serialize_anilist_tag(t)
-            for t in (comic_data.get("anilist_tags") or [])
-        ],
-        "anilist_spoiler_tags": [
-            _serialize_anilist_tag(t)
-            for t in (comic_data.get("anilist_spoiler_tags") or [])
-        ],
+        # Seven AniList fields (canonical order) shared with both
+        # .aio_series.json writers; grep _anilist_meta_fields.
+        **_anilist_meta_fields(comic_data),
         "source_site": source_site or "",
         "source_url": source_url or "",
         "language": language or "",
@@ -6664,18 +7093,40 @@ def _refresh_library_metadata(args) -> int:
 
         if not comic_data.get("anilist_id"):
             best = comic_data.pop("_anilist_best_score", 0.0) or 0.0
-            print(
-                f"  [-] {title}: no confident AniList match "
-                f"(best {best:.0f}) — left unchanged"
-            )
+            if comic_data.pop("_anilist_gate_rejected", False):
+                # LINE Webtoon corroboration gate: author disagreed + synonym-only
+                # hit. NOTE this path does NOT rewrite the existing files, so a
+                # previously-poisoned series stays poisoned on disk — the gate only
+                # stops re-applying. Full repair = re-download the series (metadata
+                # is re-fetched from the site; the .aio_series.json writer nulls the
+                # anilist fields via _anilist_meta_fields).
+                print(
+                    f"  [-] {title}: AniList match rejected — site author "
+                    f"disagrees and title {best:.0f} was a synonym-only hit "
+                    f"— left unchanged"
+                )
+            else:
+                print(
+                    f"  [-] {title}: no confident AniList match "
+                    f"(best {best:.0f}) — left unchanged"
+                )
             skipped.append(title)
             continue
 
         # Rewrite Komikku details.json (preserve extra keys + existing artist).
         new_details = dict(existing_details)
         new_details["title"] = title
-        new_details["author"] = ", ".join(comic_data.get("authors") or [])
-        new_details.setdefault("artist", existing_details.get("artist", ""))
+        # Author/artist: prefer the (possibly AniList-overwritten) comic_data
+        # values — AniList now populates staff on a confident match ("always
+        # wins", grep _staff_names_by_role in external_metadata.py). Fall back to
+        # the previously-recorded value when this match carried no staff
+        # (comic_data keeps the seeded credit then — see the always-wins guard in
+        # _apply_anilist_match), so a blank-source refresh never wipes a good
+        # author/artist. Finding S3-1.
+        new_authors = ", ".join(comic_data.get("authors") or [])
+        new_details["author"] = new_authors or existing_details.get("author", "")
+        new_artists = ", ".join(comic_data.get("artists") or [])
+        new_details["artist"] = new_artists or existing_details.get("artist", "")
         new_details["description"] = (
             comic_data.get("desc") or existing_details.get("description", "")
         )
@@ -6704,6 +7155,13 @@ def _refresh_library_metadata(args) -> int:
 
         # Rewrite .aio_series.json enrichment fields (preserve the rest).
         meta["genres"] = list(comic_data.get("genres") or [])
+        # authors: AniList overwrites these on a confident match ("always wins",
+        # grep _staff_names_by_role). comic_data["authors"] is AniList's staff, or
+        # the seeded meta value when the match carried no staff — never blank, so
+        # the unconditional assign is safe and keeps the live-download writer's
+        # behavior (aio-dl.py:12375). (.aio_series.json has no "artists" key by
+        # schema; the artist credit lives in details.json + ComicInfo only.)
+        meta["authors"] = list(comic_data.get("authors") or [])
         if comic_data.get("status"):
             meta["status"] = comic_data["status"]
         # Repoint the cover URL to AniList's when enrichment supplied one so
@@ -6712,19 +7170,11 @@ def _refresh_library_metadata(args) -> int:
         # URL after enrich, or the unchanged site cover when AniList had none
         # — safe to assign unconditionally.
         meta["cover"] = comic_data.get("cover")
-        meta["anilist_id"] = comic_data.get("anilist_id")
-        meta["mal_id"] = comic_data.get("mal_id")
-        meta["country_of_origin"] = comic_data.get("country_of_origin")
-        meta["media_format"] = comic_data.get("media_format")
-        meta["anilist_synonyms"] = list(comic_data.get("anilist_synonyms") or [])
-        meta["anilist_tags"] = [
-            _serialize_anilist_tag(t)
-            for t in (comic_data.get("anilist_tags") or [])
-        ]
-        meta["anilist_spoiler_tags"] = [
-            _serialize_anilist_tag(t)
-            for t in (comic_data.get("anilist_spoiler_tags") or [])
-        ]
+        # Same seven AniList fields the live-download .aio_series.json writer
+        # emits; .update overwrites the loaded meta's existing keys in place
+        # (order preserved), matching the prior sequential assignments byte-for-
+        # byte. grep _anilist_meta_fields.
+        meta.update(_anilist_meta_fields(comic_data))
         try:
             with open(
                 os.path.join(folder, SERIES_META_FILE), "w", encoding="utf-8"
@@ -6915,6 +7365,24 @@ def main():
              "impersonation issues. Equivalent to setting "
              "SUPPORTS_FAST_DOWNLOAD=False per-handler, but global.",
     )
+    # ── CPU budget (2026-07-05: Settings → Resource Limits → Max CPU usage) ──
+    # Scales the CPU-BOUND image pools only (grep _cpu_pool_budget). Speed knob,
+    # NOT image-affecting → deliberately NOT in _RESUME_GATING_DESTS (mirrors
+    # modernize_effort). Resume passes the CURRENT value explicitly so it wins
+    # over the persisted one (see downloader.js resume()).
+    p.add_argument(
+        "--max-cpu-percent",
+        type=int,
+        default=int(os.getenv("AIO_MAX_CPU_PERCENT", "100")),
+        help="Cap CPU-bound image processing (modernize/webp transcode, final "
+             "encode, PDF/image decode) to roughly this percentage of logical "
+             "cores (1-100; default 100 = prior behaviour). Lower values run "
+             "fewer parallel page-encode workers AND fewer threads per encoder, "
+             "so the whole pipeline stays under the budget — useful to keep the "
+             "machine responsive during a download. Does NOT affect network "
+             "concurrency (see --image-concurrency et al.). Clamped to [1,100]. "
+             "Env: AIO_MAX_CPU_PERCENT.",
+    )
 
     # Deprecated 2026-05-13 — superseded by --image-concurrency (generalized
     # from MangaFire-only). Still accepted for back-compat; routed onto
@@ -6926,32 +7394,6 @@ def main():
         type=int,
         default=None,
         help=argparse.SUPPRESS,
-    )
-
-    # MangaFire-specific VRF capture knobs (2026-05-09). VRF is MangaFire's
-    # proprietary token-capture problem; no other handler has it. Kept under
-    # the --mangafire- namespace because the flags don't apply to anyone else.
-    p.add_argument(
-        "--mangafire-vrf-prefetch-depth",
-        type=int,
-        default=4,
-        help="How many chapters ahead to keep VRF prefetch queued for MangaFire "
-             "(default 4). Sequential capture (~1.5-2s/chapter) but starts "
-             "earlier so VRF capture overlaps fully with image download — by "
-             "the time chapter N+1 begins, VRFs for N+2..N+4 are already "
-             "cached or in flight. 0 disables prefetch entirely.",
-    )
-    p.add_argument(
-        "--mangafire-vrf-parallel",
-        type=int,
-        default=1,
-        help="Opt-in: capture N MangaFire chapter VRFs concurrently via "
-             "Patchright async (default 1 = sequential, current behavior). "
-             "4 is bench-confirmed working with single-IP storage_state and "
-             "5.2x speedup over sequential, but can trigger CF rate-limiting "
-             "on some sessions. Recommended only for large downloads (50+ "
-             "chapters) on a stable IP; falls back to sequential transparently "
-             "on detected throttle (homepage redirect).",
     )
 
     p.add_argument(
@@ -6997,11 +7439,10 @@ def main():
         type=float,
         default=20.0,
         help="Per-site search timeout in seconds (default: 20.0). Sized for "
-             "MangaFire's Playwright bridge: ~3s browser warmup + ~3-4s page "
-             "navigation with networkidle + up to 12s capture_search retry "
-             "loop. Pure-HTTP handlers complete in <2s. Slow sites self-select "
-             "out and the probe-failure cache suppresses them for 1h after "
-             "2 timeouts.",
+             "the slower Playwright-driven handlers (e.g. comix) that need "
+             "browser warmup + page navigation. Pure-HTTP handlers (incl. "
+             "MangaFire) complete in <2s. Slow sites self-select out and the "
+             "probe-failure cache suppresses them for 1h after 2 timeouts.",
     )
     p.add_argument(
         "--search-min-match",
@@ -7071,28 +7512,6 @@ def main():
              "hosts with a degraded WMI service, hanging --search forever. "
              "Honors AIO_ENABLE_ML_RATING=1 env var so power users can "
              "set the preference once.",
-    )
-    p.add_argument(
-        "--seeded-rating-only",
-        action="store_true",
-        help="Skip the image-quality probe phase entirely when --multi-source "
-             "is set on a direct URL. The orchestrator ranks alternatives "
-             "purely from sites/quality_seed.json's curated per-site priors "
-             "(0.0-1.0 quality numbers per host). Trades ~5-10%% ranking "
-             "accuracy for a ~30-60+ second savings per series (probe phase "
-             "downloads sample images from each alt candidate and runs T1 "
-             "pixel-level scoring; with --enable-ml-rating it adds T2/T3 "
-             "model inference on top of that, multiplying the savings). "
-             "Designed for the Library tab's update-check downloads, where "
-             "the delta is typically 1-5 new chapters and the probe cost "
-             "dominates the actual download time. Cross-file: read in "
-             "aio_search_cli.find_alternatives_for_direct_url; when True, "
-             "passes img_quality_cache=None to sites.search_orchestrator."
-             "search_all so the probe phase at the `if img_cache is not "
-             "None and candidates:` gate is skipped. The _quality_for "
-             "comparator falls back to seed_quality cleanly. Has no effect "
-             "without --multi-source or in --multi-source-prefetched mode "
-             "(the prefetched path never runs the probe).",
     )
     # --- External metadata enrichment (opt-in, single-source AniList) ---
     # When enabled, queries https://graphql.anilist.co for ranked
@@ -7206,9 +7625,9 @@ def main():
              "until a chapter download actually fails, instead of running "
              "it upfront before the first chapter. The upfront discovery "
              "(title search across handlers + chapter-list fetch per "
-             "candidate + alignment) costs ~30-80+ s even with "
-             "--seeded-rating-only — longer than a typical 1-5 chapter "
-             "update download takes end to end. With this flag the run "
+             "candidate + alignment) costs ~30-80+ s — longer than a "
+             "typical 1-5 chapter update download takes end to end. With "
+             "this flag the run "
              "starts downloading immediately; the first chapter that "
              "raises a strict-mode failure pays the discovery cost once, "
              "and every later chapter (including the end-of-run missed "
@@ -7749,6 +8168,22 @@ def main():
 
         failed = []
         up_to_date = []
+
+        def _classify_update_result(title: str, returncode: int, stdout: str, stderr: str) -> None:
+            # Mirror the child's stdout/stderr, then bucket the run: rc 0 -> updated
+            # (implicit), rc != 0 with a "nothing new" marker -> up-to-date, else
+            # failed. Shared by the parallel + serial loops so the up-to-date
+            # heuristic can't drift between them.
+            sys.stdout.write(stdout)
+            sys.stderr.write(stderr)
+            if returncode != 0:
+                combined = stdout + stderr
+                if "No chapters selected" in combined or "Filtered list down to 0 chapters" in combined:
+                    up_to_date.append(title)
+                    print("  Already up to date.")
+                else:
+                    failed.append(title)
+
         jobs = max(1, int(getattr(args, "jobs", 1) or 1))
         if jobs > 1:
             print(f"[*] Running updates with up to {jobs} worker(s)...")
@@ -7762,30 +8197,14 @@ def main():
                     print(f"\n{'=' * 60}")
                     print(f"Updating: {title}")
                     print(f"{'=' * 60}")
-                    sys.stdout.write(stdout)
-                    sys.stderr.write(stderr)
-                    combined = stdout + stderr
-                    if returncode != 0:
-                        if "No chapters selected" in combined or "Filtered list down to 0 chapters" in combined:
-                            up_to_date.append(title)
-                            print("  Already up to date.")
-                        else:
-                            failed.append(title)
+                    _classify_update_result(title, returncode, stdout, stderr)
         else:
             for title, cmd in child_procs:
                 print(f"\n{'=' * 60}")
                 print(f"Updating: {title}")
                 print(f"{'=' * 60}")
                 _, returncode, stdout, stderr = _run_saved_update(title, cmd)
-                sys.stdout.write(stdout)
-                sys.stderr.write(stderr)
-                combined = stdout + stderr
-                if returncode != 0:
-                    if "No chapters selected" in combined or "Filtered list down to 0 chapters" in combined:
-                        up_to_date.append(title)
-                        print("  Already up to date.")
-                    else:
-                        failed.append(title)
+                _classify_update_result(title, returncode, stdout, stderr)
         print(f"\n{'=' * 60}")
         updated = len(child_procs) - len(failed) - len(up_to_date)
         print(f"Update complete: {updated} updated, {len(up_to_date)} up-to-date, {len(failed)} failed")
@@ -8108,6 +8527,14 @@ def main():
     # prefetched JSON, direct-URL discovery). None = no peer signal; the
     # group helper falls through to original in-source-only heuristics.
     _multi_source_consensus_set: Optional[Set[float]] = None
+
+    # Persistable multi-source resume cache (run_params.json `multi_source_cache`).
+    # Set by _discover_multi_source_alternatives on a successful discovery. The
+    # run_params write block folds it into the freshly-written file (EAGER path —
+    # the tmp dir doesn't exist yet at discovery time), while the LAZY path writes
+    # it directly via _persist_multi_source_cache. grep this name + the module
+    # helpers _read/_persist/_build_multi_source_cache*.
+    _ms_resume_cache_payload: Optional[Dict[str, Any]] = None
 
     if getattr(args, "search", None):
         from aio_search_cli import run_search_mode, take_latest_multi_source_state
@@ -8480,7 +8907,7 @@ def main():
             # any flag the user didn't pass on the resume CLI; now that
             # the JSON values have been setattr'd onto args, re-snapshot
             # so runtime-cached tunables (_HTTP_TIMEOUT, _CHAPTER_DEADLINE,
-            # _vrf_async_batch_state, etc.) honor the user's original
+            # _CPU_POOL_PERCENT, etc.) honor the user's original
             # choices instead of the argparse defaults.
             _apply_runtime_tunables(args)
 
@@ -8672,17 +9099,53 @@ def main():
         for a direct-URL --multi-source run. Never raises: any discovery
         failure degrades to standard single-source behavior."""
         nonlocal _multi_source_alternatives, _multi_source_consensus_set
-        # Fix B (2026-05-07): when the UI passes --multi-source-prefetched, use
-        # the JSON-listed alts instead of running cross-site search again. The
-        # search-tab download path writes this file just before spawning aio-dl
-        # so we skip the redundant ~80s search. Falls back to search if the
-        # file is missing or malformed (defensive — doesn't fail the download).
+        nonlocal _ms_resume_cache_payload
+        # Source of alternatives, in priority order:
+        #   1. UI-supplied --multi-source-prefetched file (authoritative for
+        #      THIS spawn; the search-tab writes it just before launch, saving
+        #      the redundant ~80s search).
+        #   2. Resume cache persisted by a PRIOR run of this series into
+        #      run_params.json (< TTL old) — reused via the SAME payload path
+        #      as the prefetched file, skipping the ~30-80s cross-site search
+        #      but still re-fetching chapter lists so the alt data stays fresh.
+        #   3. Fresh cross-site search (find_alternatives_for_direct_url).
+        # Anything discovered fresh (2/3) is re-persisted so the NEXT resume is
+        # cheap. grep _read/_persist/_build_multi_source_cache*.
         prefetched_path = getattr(args, "multi_source_prefetched", None)
+        _run_params_path = os.path.join(main_tmp_dir, "run_params.json")
+        cache_from_disk = (
+            None if prefetched_path
+            else _read_multi_source_resume_cache(_run_params_path)
+        )
+        _cache_hit = False
         try:
             if prefetched_path:
                 from aio_search_cli import build_alternatives_from_prefetched
                 _ms_result = build_alternatives_from_prefetched(
                     prefetched_path=prefetched_path,
+                    primary_handler=handler,
+                    primary_context=context,
+                    primary_chapters=pool,
+                    args=args,
+                    make_request=make_request,
+                    on_status=lambda m: print(m, file=sys.stderr),
+                )
+            elif cache_from_disk is not None:
+                from aio_search_cli import build_alternatives_from_payload
+                _cache_hit = True
+                _age_h = max(
+                    0.0,
+                    (time.time() - float(cache_from_disk.get("saved_at", 0))) / 3600.0,
+                )
+                print(
+                    f"[*] Multi-source: reusing "
+                    f"{len(cache_from_disk.get('alternatives') or [])} cached "
+                    f"alternative source(s) from run_params.json "
+                    f"(discovered {_age_h:.1f}h ago); skipping cross-site search",
+                    file=sys.stderr,
+                )
+                _ms_result = build_alternatives_from_payload(
+                    cache_from_disk,
                     primary_handler=handler,
                     primary_context=context,
                     primary_chapters=pool,
@@ -8722,6 +9185,30 @@ def main():
                     f"alternative sources ({n_alts} total fallback paths)",
                     file=sys.stderr,
                 )
+                # Persist the discovered sources so a future resume of this
+                # series skips the search. On a cache HIT the payload is already
+                # on disk and unchanged — just retain it for the write block /
+                # post-wipe rewrite (keeps the original saved_at, so the TTL
+                # counts from first discovery, not from each resume). On a fresh
+                # search or prefetched-file run, build a fresh payload
+                # (saved_at=now) and BOTH stash it (eager path: run_params write
+                # block folds it in) AND write it now (lazy path: that block has
+                # already run). grep _persist_multi_source_cache.
+                if _cache_hit:
+                    _ms_resume_cache_payload = cache_from_disk
+                else:
+                    _cache_year = None
+                    try:
+                        if comic_data.get("year"):
+                            _cache_year = int(comic_data["year"])
+                    except (TypeError, ValueError, AttributeError):
+                        _cache_year = None
+                    _new_cache = _build_multi_source_cache_payload(
+                        _ms_result, title, time.time(), year=_cache_year,
+                    )
+                    if _new_cache:
+                        _ms_resume_cache_payload = _new_cache
+                        _persist_multi_source_cache(_run_params_path, _new_cache)
         except Exception as exc:
             # Don't let alternatives discovery block the main download. If it
             # fails, the user gets standard single-source behavior.
@@ -8760,7 +9247,7 @@ def main():
 
     # ── --list-chapters: print metadata + chapter list as JSON, then exit ──
     # Used by the UI to check for new chapters without downloading anything.
-    # Only needs the page HTML + chapter list API call — no image VRF, no downloads.
+    # Only needs series metadata + the chapter list — no image fetching, no downloads.
     # IMPORTANT: This runs BEFORE allocate_series_output_dir so it doesn't
     # create empty folders in manga/ just for checking.
     #
@@ -8782,7 +9269,24 @@ def main():
         # the optional collapse pass see the same canonical keys.
         seen_nums = set()
         deduped_pool: List[Dict[str, Any]] = []
+        # Premium/locked placeholders (tapas.get_chapters emits them for
+        # WAIT_OR_MUST_PAY episodes) are surfaced SEPARATELY as locked_chapters
+        # so the UI can badge them + nudge multi-source — but they are NEVER
+        # folded into `chapters`, which drives the UI's "+N new" update diff.
+        # They don't download without --multi-source (and even with it, only if
+        # an alt carries them), so counting them there would show a perpetual
+        # "+N new". Cross-file: consumed by UI-source (grep locked_chapters).
+        locked_labels: List[str] = []
         for ch in pool:
+            if ch.get("_locked"):
+                lk = ch.get("chap")
+                if isinstance(lk, (int, float)):
+                    lk = f"{lk:g}"
+                elif lk is not None:
+                    lk = str(lk)
+                if lk is not None and _chap_as_float(lk) is not None:
+                    locked_labels.append(lk)
+                continue
             num = ch.get("chap")
             if num is None:
                 continue
@@ -8790,6 +9294,26 @@ def main():
                 num = f"{num:g}"
             else:
                 num = str(num)
+            # Mirror the download path's "Oneshot"→"1" remap (grep
+            # chapters_by_num, ~line 9237) so --list-chapters and the
+            # .aio_series.json writer agree on the label. manganato's
+            # _chapter_number returns the raw title as its no-numeric-token
+            # fallback, so a chapter literally titled "Oneshot" would otherwise
+            # LIST as "Oneshot" but RECORD as "1" → the UI update-check shows it
+            # as a perpetual "+1 new". Must run BEFORE the seen_nums dedup so a
+            # real Ch.1 + a "Oneshot" collapse to one "1" (as the download path
+            # buckets them). XF-1 follow-up.
+            if num.lower() in ("oneshot", "one-shot"):
+                num = "1"
+            # Mirror the download path's numeric gate: bucketing (grep
+            # chapters_by_num) does float(num_str) and DROPS non-numeric labels,
+            # so best_chapters — everything the download actually fetches — is
+            # numeric-only. --list-chapters must drop them too, else the UI
+            # update-check surfaces a "Special"/"Extra"/"Omake" that never
+            # downloads as a perpetual "+N new". Extends the Oneshot fix above to
+            # ALL non-numeric labels. Residual follow-up.
+            if _chap_as_float(num) is None:
+                continue
             if num in seen_nums:
                 continue
             seen_nums.add(num)
@@ -8822,6 +9346,8 @@ def main():
         except (ValueError, TypeError):
             pass
 
+        locked_chapters = sorted(set(locked_labels), key=lambda x: float(x))
+
         result = {
             "hid": hid,
             "title": title,
@@ -8833,10 +9359,36 @@ def main():
             "genres": comic_data.get("genres", []),
             "total": len(unique_chapters),
             "chapters": unique_chapters,
+            # Premium/locked placeholders surfaced for the UI (badge + multi-source
+            # nudge). Empty for every non-tapas site today. NOT part of `total`
+            # or the "+N new" diff — see the locked_labels comment above.
+            "locked_chapters": locked_chapters,
             "collapse_applied": collapse_splits_enabled,
         }
         print(json.dumps(result))
         sys.exit(0)
+
+    # Download path only (--list-chapters exited above): drop premium/locked
+    # placeholders unless --multi-source can fill them. tapas.get_chapters emits
+    # WAIT_OR_MUST_PAY episodes as bare `_locked` placeholders so the multi-
+    # source alt-rescue can fetch them from another site; with multi-source OFF
+    # there is no rescue path, so each would only attempt → short-circuit
+    # ("locked") → clean-skip, and be re-attempted every run. Dropping them here
+    # restores the clean single-source behavior (matches the pre-feature "N
+    # locked skipped" outcome). Kept when multi-source is on so the alignment
+    # includes their chapter numbers and _process_chapter_strict can rescue
+    # them (grep aux_veto / _PERMANENT_SKIP_REASONS). Non-tapas pools have no
+    # `_locked` entries, so this is a no-op there.
+    if not getattr(args, "multi_source", False):
+        _locked_dropped = sum(1 for c in pool if c.get("_locked"))
+        if _locked_dropped:
+            pool = [c for c in pool if not c.get("_locked")]
+            print(
+                f"[i] {_locked_dropped} premium/locked chapter(s) skipped — "
+                f"they need a site login we don't have. Enable --multi-source "
+                f"to fetch them from an alternative site.",
+                file=sys.stderr,
+            )
 
     # Output goes into a per-title folder under ./manga (title, with hid only on collision)
     # Capture the user-facing ROOT before mutating args.output_dir / args.epub_dir to the
@@ -8912,12 +9464,24 @@ def main():
                 )
             else:
                 best_score = comic_data.pop("_anilist_best_score", 0.0) or 0.0
-                log_verbose(
-                    f"  AniList enrichment: no confident match for "
-                    f"'{comic_data.get('title', '?')}' "
-                    f"(best rapidfuzz score {best_score:.1f} < 75 "
-                    f"threshold) — continuing with site-only metadata"
-                )
+                if comic_data.pop("_anilist_gate_rejected", False):
+                    # LINE Webtoon corroboration gate rejected a title-plausible
+                    # candidate (author disagreed AND it was a synonym-only hit —
+                    # the unOrdinary poison class). best_score is ABOVE 75 here.
+                    log_verbose(
+                        f"  AniList enrichment: rejected best candidate for "
+                        f"'{comic_data.get('title', '?')}' (title score "
+                        f"{best_score:.1f} cleared 75 but the site author "
+                        f"disagreed and the match was synonym-only) — "
+                        f"continuing with site-only metadata"
+                    )
+                else:
+                    log_verbose(
+                        f"  AniList enrichment: no confident match for "
+                        f"'{comic_data.get('title', '?')}' "
+                        f"(best rapidfuzz score {best_score:.1f} < 75 "
+                        f"threshold) — continuing with site-only metadata"
+                    )
         except Exception as exc:
             log_verbose(
                 f"  AniList enrichment failed (continuing with "
@@ -8954,7 +9518,14 @@ def main():
             float(num_str)
             if num_str not in chapters_by_num:
                 chapters_by_num[num_str] = []
-            chapters_by_num[num_str].append(ch)
+            # Propagate the normalized label back onto the dict (was: append the
+            # raw `ch`). Bucketing keys on num_str — "Oneshot"→"1", float 4.0→"4"
+            # (:g above), numeric 0→"0" — but ch["chap"] kept the RAW value, so
+            # the downstream float(c["chap"]) filters (--no-partials / --chapters)
+            # crashed on "Oneshot" and the .aio_series.json writer recorded "4.0"
+            # where --list-chapters emits "4" (perpetual "+N new"). Rewriting the
+            # dict here fixes all three at the single chokepoint. C1 review finding.
+            chapters_by_num[num_str].append({**ch, "chap": num_str})
         except (ValueError, TypeError):
             log_verbose(f"  Skipping chapter with invalid number: {num_str}")
             continue
@@ -9012,6 +9583,33 @@ def main():
         collapse_splits=collapse_splits_enabled,
         consensus_set=_multi_source_consensus_set,
     )
+    # Skip-set for the UI update-check (Option 2, 2026-07-07). A consensus-armed
+    # collapse DROPS source-only fragment-shaped decimals (mangafire's duplicate
+    # 52.1 next to 52, this series' lone .3 == its integer counterpart) via Rule
+    # 2/3b/6. But the Library update-check spawns `--list-chapters` with NO peer
+    # data — discovery is skipped there (grep the list_chapters gate above
+    # _discover_multi_source_alternatives), so its consensus-free collapse KEEPS
+    # those labels, and the main.js diff (siteChapters − chapters_downloaded)
+    # flags them as a perpetual "+N new" that a "Download Missing" click then
+    # refetches as duplicates. Record exactly the labels THIS run dropped-under-
+    # consensus so the UI can subtract them. free_labels ⊇ consensus_labels
+    # always (consensus only ever removes more), so the difference is precisely
+    # the consensus-gated drops — Rule 3a/5 sequential-split merges collapse
+    # identically with or without consensus and never appear here. Empty unless
+    # collapse is ON and consensus actually fired (single-source / lazy runs
+    # contribute nothing; the UNION at the .aio_series.json write below preserves
+    # an earlier eager run's set). Cross-file: UI-source/electron/main.js:
+    # _checkSeriesUpdates (grep chapters_skipped_fragments).
+    _skipped_fragment_labels: Set[str] = set()
+    if collapse_splits_enabled and _multi_source_consensus_set:
+        _consensus_labels = {g.label for g in groups}
+        _free_labels = {
+            g.label
+            for g in group_chapters_for_download(
+                chapters, collapse_splits=True, consensus_set=None,
+            )
+        }
+        _skipped_fragment_labels = _free_labels - _consensus_labels
     grouped_chapters: List[Dict[str, Any]] = []
     for group in groups:
         if len(group.parts) == 1:
@@ -9042,11 +9640,13 @@ def main():
 
     if args.no_partials:
         original_count = len(chapters)
-        chapters = [
-            c
-            for c in chapters
-            if float(c["chap"]) == int(float(c["chap"]))
-        ]
+        # Guard float(c["chap"]) against a non-numeric group.label (collapse-
+        # splits can relabel to "?"/"" — grep _chap_as_float). A non-numeric
+        # label isn't a numeric ".5" partial, so keep it rather than crash.
+        def _is_numeric_partial(c) -> bool:
+            cf = _chap_as_float(c.get("chap"))
+            return cf is not None and cf != int(cf)
+        chapters = [c for c in chapters if not _is_numeric_partial(c)]
         log_verbose(
             f"  --no-partials: Filtered out {original_count - len(chapters)} partial chapters."
         )
@@ -9070,11 +9670,13 @@ def main():
             pass
 
         if not is_negative_index:
-            chapters = [
-                c
-                for c in chapters
-                if is_chapter_wanted(float(c["chap"]), args.chapters)
-            ]
+            # Guard float(c["chap"]) against a non-numeric group.label (grep
+            # _chap_as_float): a numbered range can't match a non-numeric label,
+            # so drop it rather than crash the run.
+            def _wanted(c) -> bool:
+                cf = _chap_as_float(c.get("chap"))
+                return cf is not None and is_chapter_wanted(cf, args.chapters)
+            chapters = [c for c in chapters if _wanted(c)]
             log_verbose(
                 f"  --chapters '{args.chapters}': Filtered list down to {len(chapters)} chapters."
             )
@@ -9149,11 +9751,18 @@ def main():
         # Wrapped schema. Legacy flat-dict format is detected on read above;
         # any tmp folder created from this point forward uses the wrapped
         # {"gating_hash", "params"} structure.
+        _run_params_obj: Dict[str, Any] = {
+            "gating_hash": current_hash, "params": current_params,
+        }
+        # Fold in the multi-source resume cache discovered earlier this run.
+        # EAGER discovery ran before this tmp dir existed, so
+        # _persist_multi_source_cache no-op'd and its payload waited here; the
+        # LAZY path writes the file itself later (grep _ms_resume_cache_payload).
+        # Top-level key, NOT in `params`, so gating_hash is unaffected.
+        if _ms_resume_cache_payload:
+            _run_params_obj["multi_source_cache"] = _ms_resume_cache_payload
         with open(params_path, "w") as f:
-            json.dump(
-                {"gating_hash": current_hash, "params": current_params},
-                f, indent=4,
-            )
+            json.dump(_run_params_obj, f, indent=4)
 
     # Save UI metadata (URL, format, title) separately from processing params.
     # This file is read by the Electron UI to auto-fill the URL when resuming,
@@ -9308,14 +9917,33 @@ def main():
         try:
             os.makedirs(os.path.dirname(missed_log_path) or '.', exist_ok=True)
             with open(missed_log_path, 'w', encoding='utf-8') as f:
-                json.dump(entries, f, ensure_ascii=False, indent=2)
+                # default=str is a belt-and-suspenders: _record_missed already
+                # strips the non-serializable _aux* keys (grep _strip_aux_for_log),
+                # but any future non-JSON value must NOT silently blow away the
+                # whole missed log via the except:pass below. S5-1 review finding.
+                json.dump(entries, f, ensure_ascii=False, indent=2, default=str)
         except Exception:
             pass
+
+    def _strip_aux_for_log(d: Dict[str, Any]) -> Dict[str, Any]:
+        # AssetSpec instances (_aux_assets) and raw audio bytes (_aux_members)
+        # aren't JSON-serializable, and _aux_members can be MB of audio — storing
+        # them in the missed log made json.dump raise TypeError, swallowed by
+        # _save_missed's except:pass, so the WHOLE run's missed_chapters.json went
+        # missing/stale (the end-of-run copy then shipped nothing). Drop every
+        # _aux* key; recurse into _merged_parts which carry their own. S5-1.
+        out = {k: v for k, v in d.items() if not k.startswith('_aux')}
+        parts = out.get('_merged_parts')
+        if isinstance(parts, list):
+            out['_merged_parts'] = [
+                _strip_aux_for_log(p) if isinstance(p, dict) else p for p in parts
+            ]
+        return out
 
     def _record_missed(ch: Dict[str, Any], grp_name: str, reason: str, err: str, *, insert_list_index: int, insert_chapter_index: int, insert_marker_index: int, insert_page_index: int, host: str = "", pages_ok: int = 0, pages_total: int = 0) -> None:
         entry = {
             'key': _chapter_key(ch),
-            'ch': ch,
+            'ch': _strip_aux_for_log(ch),
             'chap': ch.get('chap'),
             'url': ch.get('url'),
             'group': grp_name,
@@ -9530,7 +10158,7 @@ def main():
                     rm_tree(tdir)
 
             print(f"\nChapter {n} ({grp_name or 'No Group'})")
-            _t0_vrf = time.monotonic()
+            _t0_imageurls = time.monotonic()
             # Phase 8 (2026-05-08): split-cluster collapse — when this chapter
             # was synthesized by group_chapters_for_download from multiple
             # parts (rule 5: X.1/X.2/X.3/X.4 with no integer X), `_merged_parts`
@@ -9637,19 +10265,8 @@ def main():
                         pages_ok=0,
                         pages_total=0,
                     ) from exc
-            _timing["vrf"] += time.monotonic() - _t0_vrf
+            _timing["imageurls"] += time.monotonic() - _t0_imageurls
 
-            # --- VRF pipelining: enqueue the next `depth` chapters' VRF
-            #     captures while this chapter's images download. The queue
-            #     worker drains them serially (or batches into async multi-
-            #     page if --mangafire-vrf-parallel > 1). With depth=4 and a
-            #     ~6s image download, all 4 fit into the overlap window so
-            #     subsequent chapters' VRFs are cached before they're needed.
-            depth = max(0, int(getattr(args, "mangafire_vrf_prefetch_depth", 4) or 0))
-            if upcoming_chapters:
-                _start_vrf_prefetch_chain(upcoming_chapters, handler, depth=depth)
-            elif next_chapter is not None:
-                _start_vrf_prefetch_chain([next_chapter], handler, depth=depth)
             raw_image_paths: List[str] = []
             text_blocks: List[Dict[str, Any]] = []
             page_counter = 1
@@ -9688,37 +10305,14 @@ def main():
                         blob = entry.get("data")
                         if not blob:
                             continue
-                        # Phase A (2026-05-07): if the handler provided an
-                        # explicit extension, trust it; else honor a suffix on
-                        # the handler's `name` hint; else sniff blob magic + the
-                        # optional content-type hint (falling back to .jpg).
-                        # Same logic as dl_image so binary_image entries don't
-                        # bypass the CBZ byte-preservation guarantee.
-                        explicit_ext = entry.get("extension")
-                        custom_name = entry.get("name")
-                        if explicit_ext:
-                            ext = explicit_ext if explicit_ext.startswith(".") else "." + explicit_ext
-                        elif custom_name and os.path.splitext(custom_name)[1]:
-                            ext = os.path.splitext(custom_name)[1]
-                        else:
-                            ext = _sniff_image_extension(
-                                blob[:32] if isinstance(blob, (bytes, bytearray)) else b"",
-                                entry.get("content_type"),
-                            )
-                        # On-disk page name is ALWAYS the continuous
-                        # page_counter, never the handler's bare `name`: a
-                        # per-chapter name (MangaDex "0001.png", no chapter
-                        # prefix) collides when --collapse-splits concatenates
-                        # parts into one tdir — part 2's "0001.png" overwrites
-                        # part 1's, so immediate_images collects duplicate paths.
-                        # That drops part-1 pages, and under --modernize races the
-                        # transcode pool on the shared path (winner deletes the
-                        # source, the dup slot's except-cleanup deletes the
-                        # winner's .jxl) → CBZ FileNotFoundError, chapter missed.
-                        # The archive never shows this name (build_cbz renumbers
-                        # by arcname). Mirrored in _run_image_prefetch_job; see
-                        # bench/collapseSplitsModernize.md.
-                        filename = f"{n}_{page_counter:04d}{ext}"
+                        # CL-4: ext-determination + collapse-safe naming now live
+                        # in the shared _binary_image_page_name so this and the
+                        # prefetch twin (_run_image_prefetch_job) can't drift —
+                        # the per-chapter-name collision they both guard against
+                        # (MangaDex "0001.png" overwriting across merged parts,
+                        # racing the modernize pool → CBZ FileNotFoundError) is
+                        # documented in the helper. bench/collapseSplitsModernize.md.
+                        filename = _binary_image_page_name(entry, blob, n, page_counter)
                         pth = os.path.join(tdir, filename)
                         with open(pth, "wb") as fh:
                             fh.write(blob)
@@ -10007,16 +10601,14 @@ def main():
                 # ChapterGhostError it raises.
                 primary_only_for_ghost: Optional[bool] = None
                 if _multi_source_alternatives:
-                    try:
-                        chap_str = str(ch.get("chap") or "").strip()
-                        m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
-                        if m:
-                            chap_float = float(m.group(1))
-                            primary_only_for_ghost = (
-                                not _multi_source_alternatives.get(chap_float)
-                            )
-                    except (TypeError, ValueError):
-                        primary_only_for_ghost = None
+                    # CL-1: use the canonical extractor the aligner keyed the
+                    # alternatives_by_chap_num dict with (grep _extract_chapter_num)
+                    # so the float lookup can't drift from an inline regex reimpl.
+                    _cf = _extract_chapter_num(ch.get("chap"))
+                    if _cf is not None:
+                        primary_only_for_ghost = (
+                            not _multi_source_alternatives.get(_cf)
+                        )
                 if _is_ghost_chapter_signature(
                     pages_ok=pages_ok,
                     pages_total=pages_total,
@@ -10230,8 +10822,8 @@ def main():
                 and not force_redownload
                 and not is_alt_source
             ):
-                # Prefer the windowed upcoming_chapters list (same shape
-                # passed to the VRF chain), falling back to [next_chapter]
+                # Prefer the windowed upcoming_chapters list, falling
+                # back to [next_chapter]
                 # when the chapter loop didn't propagate a window.
                 chain_upcoming: List[Dict[str, Any]] = (
                     list(upcoming_chapters)
@@ -11033,14 +11625,11 @@ def main():
         # mirrors chapter_merger._extract_chapter_num.
         alts: List[Dict[str, Any]] = []
         if not aux_veto:
-            try:
-                chap_str = str(ch.get("chap") or "").strip()
-                m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
-                if m:
-                    chap_float = float(m.group(1))
-                    alts = list(_multi_source_alternatives.get(chap_float, []))
-            except (TypeError, ValueError):
-                alts = []
+            # CL-1: canonical extractor (matches the aligner's dict keys) — grep
+            # _extract_chapter_num.
+            _cf = _extract_chapter_num(ch.get("chap"))
+            if _cf is not None:
+                alts = list(_multi_source_alternatives.get(_cf, []))
 
         if alts:
             print(
@@ -11079,23 +11668,30 @@ def main():
                     # Alt rescue succeeded. Record the rescue in the
                     # cross-chapter tally so the timing summary can
                     # surface multi-source value. Also print an explicit
-                    # "rescued" line when the primary failure was the
-                    # ghost-signature shape (the canonical case the user
-                    # said "multi-source exists exactly for this" about).
-                    # For other reasons (host_poison / time_budget /
-                    # incomplete) the existing "[Multi-source] -> X"
-                    # line + the per-chapter "CBZ saved" already make
-                    # the rescue obvious; we only need the extra line for
-                    # ghost because the in-chapter log claimed "every
-                    # failure had identical signature" and we want to
-                    # close the loop visually.
+                    # "filled/rescued" line for the two reasons where the
+                    # in-chapter log didn't already make the rescue obvious:
+                    #   - locked: a premium tapas placeholder the primary can
+                    #     NEVER serve — this fill IS the feature the user asked
+                    #     for ("paid chapter → next highest rated site"), so
+                    #     name it plainly.
+                    #   - ghost: the in-chapter log claimed "every failure had
+                    #     identical signature"; close the loop visually.
+                    # For other reasons (host_poison / time_budget / incomplete)
+                    # the existing "[Multi-source] -> X" line + the per-chapter
+                    # "CBZ saved" already make the rescue obvious.
                     multi_source_rescues.append({
                         "chap": n_for_log,
                         "alt_site": alt_handler.name,
                         "primary_site": primary_state[0].name,
                         "primary_reason": primary_err.reason,
                     })
-                    if primary_err.reason == "ghost_chapter":
+                    if primary_err.reason == "locked":
+                        print(
+                            f"    [Multi-source] ✓ Chapter {n_for_log} "
+                            f"(premium/locked on {primary_state[0].name}) "
+                            f"filled from {alt_handler.name}"
+                        )
+                    elif primary_err.reason == "ghost_chapter":
                         print(
                             f"    [Multi-source] ✓ Chapter {n_for_log} rescued "
                             f"from {primary_state[0].name} ({primary_err.reason}) "
@@ -11130,21 +11726,34 @@ def main():
         if primary_err.reason == "ghost_chapter":
             primary_only_for_ghost: Optional[bool] = None
             if _multi_source_alternatives:
-                try:
-                    chap_str = str(ch.get("chap") or "").strip()
-                    m = re.search(r"(\d+(?:\.\d+)?)", chap_str)
-                    if m:
-                        chap_float = float(m.group(1))
-                        primary_only_for_ghost = (
-                            not _multi_source_alternatives.get(chap_float)
-                        )
-                except (TypeError, ValueError):
-                    primary_only_for_ghost = None
+                # CL-1: canonical extractor (matches the aligner's dict keys) —
+                # grep _extract_chapter_num.
+                _cf = _extract_chapter_num(ch.get("chap"))
+                if _cf is not None:
+                    primary_only_for_ghost = (
+                        not _multi_source_alternatives.get(_cf)
+                    )
             raise ChapterGhostError(
                 chap=n_for_log,
                 host=primary_err.host,
                 pages_total=primary_err.pages_total,
                 primary_only=primary_only_for_ghost,
+            ) from primary_err
+
+        # Deterministic per-chapter gate (mature/age/login interstitial): no
+        # inline retry or alt source clears it, and for an aux chapter the veto
+        # above already skipped alt-rescue — so the OLD path exhausted retries
+        # and then ABORTED the whole run on a single login-gated tapas BGM
+        # episode. Skip + continue instead (the main loop records it missed),
+        # WITHOUT the ghost path's consecutive-host-block escalation (a mature
+        # series legitimately has many consecutive gated episodes). Grep
+        # _PERMANENT_SKIP_REASONS / ChapterPermanentSkipError.
+        if primary_err.reason in _PERMANENT_SKIP_REASONS:
+            raise ChapterPermanentSkipError(
+                chap=n_for_log,
+                reason=primary_err.reason,
+                host=primary_err.host,
+                pages_total=primary_err.pages_total,
             ) from primary_err
 
         # Other reasons (incomplete / time_budget / host_poison): fall back
@@ -11179,7 +11788,7 @@ def main():
 
 
     # --- Timing accumulators (monotonic clock – essentially zero overhead) ---
-    _timing = {"vrf": 0.0, "download": 0.0, "processing": 0.0}
+    _timing = {"imageurls": 0.0, "download": 0.0, "processing": 0.0}
     _timing_total_start = time.monotonic()
     # Running counter for EPUB page indices – avoids re-scanning
     # the ever-growing current_book_content list every chapter.
@@ -11243,10 +11852,10 @@ def main():
         insert_chapter_index = len(current_book_chapters)
         insert_marker_index = len(current_epub_markers)
         insert_page_index = _running_page_count if args.format == 'epub' else 0
-        # Look ahead so _process_chapter_impl can prefetch upcoming chapters'
-        # VRFs (chain depth from --mangafire-vrf-prefetch-depth, default 4)
-        # while downloading images for this one. next_ch retained for the
-        # inter-chapter image prefetch (Phase G7) which is single-chapter.
+        # Look ahead so _process_chapter_impl can image-prefetch upcoming
+        # chapters while downloading images for this one. next_ch retained
+        # for the inter-chapter image prefetch (Phase G7) which is
+        # single-chapter.
         next_ch = chapters[ch_idx + 1] if ch_idx + 1 < len(chapters) else None
         # Slice depth+a-bit so the chain push has enough lookahead even if
         # depth is bumped at runtime via env (we don't have a depth-aware
@@ -11366,6 +11975,38 @@ def main():
                 host=cge.host,
                 pages_ok=0,
                 pages_total=cge.pages_total,
+            )
+            continue
+        except ChapterPermanentSkipError as cpse:
+            # Deterministic per-chapter gate — record missed and continue, with
+            # NO consecutive-host-block escalation (unlike the ghost soft-skip
+            # above). See ChapterPermanentSkipError + _PERMANENT_SKIP_REASONS;
+            # producers are sites/tapas.py's mature_login_required and "locked".
+            # By the time we're here the alt-rescue loop already ran and failed
+            # (or multi-source was off), so a "locked" chapter means no alt site
+            # could supply it either. Fixes the old abort-on-one-gated-episode.
+            if cpse.reason == "locked":
+                _gate_note = (
+                    "premium/locked episode — no alternative source could "
+                    "supply it (enable/broaden --multi-source to fill it)"
+                )
+            else:
+                _gate_note = "content is gated (needs a site login we don't have)"
+            print(
+                f"\n[!] Chapter {cpse.chap}: {cpse.reason} on "
+                f"{cpse.host or '?'} — {_gate_note}. Recorded as missed; the "
+                f"run continues."
+            )
+            _record_missed(
+                ch, grp_name, cpse.reason,
+                "deterministic per-chapter gate; no retry/alt source can clear it",
+                insert_list_index=insert_list_index,
+                insert_chapter_index=insert_chapter_index,
+                insert_marker_index=insert_marker_index,
+                insert_page_index=insert_page_index,
+                host=cpse.host,
+                pages_ok=0,
+                pages_total=cpse.pages_total,
             )
             continue
         except ChapterAbortedError as cae:
@@ -11670,9 +12311,21 @@ def main():
         # Figure out which chapters were actually downloaded successfully.
         # Start with all chapters we attempted, then subtract any that are
         # still in the missed list after retries.
-        downloaded_nums = set(str(ch["chap"]) for ch in chapters)
-        still_missed_nums = set(str(e["chap"]) for e in missed_entries) if missed_entries else set()
-        actually_downloaded = sorted(downloaded_nums - still_missed_nums, key=lambda x: float(x))
+        # Normalize labels to --list-chapters' f"{num:g}" form (grep
+        # _chap_label_str) so the UI's update-check diff matches — a float-
+        # emitting handler otherwise records "4.0" here vs "4" from
+        # --list-chapters and the series sticks at "+N new". Safe sort key so a
+        # stray non-numeric label can't crash the whole .aio_series.json write
+        # (it lives in a log-only except → silent metadata loss). XF-1/PYP-2.
+        downloaded_nums = set(_chap_label_str(ch["chap"]) for ch in chapters)
+        still_missed_nums = (
+            set(_chap_label_str(e["chap"]) for e in missed_entries)
+            if missed_entries else set()
+        )
+        actually_downloaded = sorted(
+            downloaded_nums - still_missed_nums,
+            key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
+        )
 
         # If a previous .aio_series.json exists (from an earlier download),
         # merge the chapter lists so partial/split downloads accumulate.
@@ -11684,28 +12337,43 @@ def main():
             except Exception:
                 pass
 
-        prev_downloaded = set(existing_meta.get("chapters_downloaded", []))
+        # Re-normalize any legacy "4.0"-style entries from an older writer so a
+        # once-polluted file self-heals to "4" on this write (else the union
+        # keeps BOTH "4.0" and "4"). Safe sort key (grep _chap_as_float).
+        prev_downloaded = set(
+            _chap_label_str(x) for x in existing_meta.get("chapters_downloaded", [])
+        )
         merged_downloaded = sorted(
             prev_downloaded | set(actually_downloaded),
-            key=lambda x: float(x),
+            key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
         )
 
-        # Serialize AniList tags as dicts (the AnilistTag dataclass
-        # doesn't survive json.dump). Empty lists when enrichment was
-        # off or no confident match — keeps the schema uniform so the
-        # library UI / user's reader can rely on the field always
-        # existing. Cross-file: sites/external_metadata.py:AnilistTag
-        # is the source; aio-dl.py:_load_cached_anilist_id reads
-        # "anilist_id" back on subsequent runs.
-        def _tag_to_dict(t: Any) -> Dict[str, Any]:
-            return {
-                "name": getattr(t, "name", ""),
-                "category": getattr(t, "category", ""),
-                "rank": int(getattr(t, "rank", 0) or 0),
-                "is_media_spoiler": bool(getattr(t, "is_media_spoiler", False)),
-                "is_general_spoiler": bool(getattr(t, "is_general_spoiler", False)),
-            }
+        # Fragment labels this (or a prior eager) run dropped under multi-source
+        # consensus — the UI update-check subtracts these so duplicate .1-.4
+        # fragments don't show as a perpetual "+N new" (see _skipped_fragment_labels
+        # at the group_chapters_for_download site). UNION with any prior set so a
+        # later lazy "Download Missing" run (no consensus → empty THIS run) can't
+        # wipe an eager run's set; MINUS merged_downloaded so a force-downloaded
+        # fragment counts as present rather than skipped (the two on-disk sets stay
+        # disjoint). Same normalized :g labels as chapters_downloaded so the main.js
+        # Set difference matches. grep chapters_skipped_fragments.
+        prev_skipped = set(
+            _chap_label_str(x)
+            for x in existing_meta.get("chapters_skipped_fragments", [])
+        )
+        merged_skipped = sorted(
+            (prev_skipped | {_chap_label_str(x) for x in _skipped_fragment_labels})
+            - set(merged_downloaded),
+            key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
+        )
 
+        # Serialize AniList tags via the module-level _serialize_anilist_tag —
+        # the same serializer the refresh writer + _build_aio_reader_extras use,
+        # so the on-disk schema stays identical across all three writers (the
+        # AnilistTag dataclass itself doesn't survive json.dump). Empty lists
+        # when enrichment was off / no confident match keep the field always
+        # present. Cross-file: sites/external_metadata.py:AnilistTag is the
+        # source; aio-dl.py:_load_cached_anilist_id reads "anilist_id" back on resume.
         series_meta = {
             "url": args.comic_url,
             "hid": hid,
@@ -11719,6 +12387,10 @@ def main():
             "cover": comic_data.get("cover"),
             "genres": comic_data.get("genres", []),
             "chapters_downloaded": merged_downloaded,
+            # Consensus-dropped duplicate fragments; subtracted by the UI
+            # update-check (main.js:_checkSeriesUpdates). Empty for single-source
+            # / lazy / collapse-off series. grep chapters_skipped_fragments.
+            "chapters_skipped_fragments": merged_skipped,
             "total_available_at_download": len(pool),
             "last_downloaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             # --- AniList enrichment fields (--metadata-source=anilist) ---
@@ -11726,17 +12398,10 @@ def main():
             # null/empty when no match or feature disabled. The cached
             # IDs let resume + --update-all runs short-circuit the
             # fuzzy title-match step. See sites/external_metadata.py.
-            "anilist_id": comic_data.get("anilist_id"),
-            "mal_id": comic_data.get("mal_id"),
-            "country_of_origin": comic_data.get("country_of_origin"),
-            "media_format": comic_data.get("media_format"),
-            "anilist_synonyms": list(comic_data.get("anilist_synonyms") or []),
-            "anilist_tags": [
-                _tag_to_dict(t) for t in (comic_data.get("anilist_tags") or [])
-            ],
-            "anilist_spoiler_tags": [
-                _tag_to_dict(t) for t in (comic_data.get("anilist_spoiler_tags") or [])
-            ],
+            # Same seven fields as the refresh writer + _build_aio_reader_extras
+            # (grep _anilist_meta_fields), appended in canonical order so the
+            # on-disk key sequence is unchanged.
+            **_anilist_meta_fields(comic_data),
         }
 
         with open(series_meta_path, "w", encoding="utf-8") as f:
@@ -11761,9 +12426,9 @@ def main():
             return f"{int(m)}m {sec:.1f}s"
         return f"{s:.1f}s"
 
-    _timing_other = max(0.0, _timing_total - _timing["vrf"] - _timing["download"] - _timing["processing"])
+    _timing_other = max(0.0, _timing_total - _timing["imageurls"] - _timing["download"] - _timing["processing"])
     print(f"\n--- Timing Summary ---")
-    print(f"  VRF / image URLs : {_fmt_time(_timing['vrf'])}")
+    print(f"  Image URL fetch  : {_fmt_time(_timing['imageurls'])}")
     print(f"  Image download   : {_fmt_time(_timing['download'])}")
     print(f"  Processing       : {_fmt_time(_timing['processing'])}")
     print(f"  Other (overhead) : {_fmt_time(_timing_other)}")

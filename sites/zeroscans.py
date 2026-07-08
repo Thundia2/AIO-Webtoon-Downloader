@@ -419,45 +419,32 @@ class ZeroScansSiteHandler(BaseSiteHandler):
         # by _api_request's success path; fall back to default for safety.
         active_domain = self._active_domain or self._default_domain()
 
-        ql = clean.lower()
-        # Score by token overlap so multi-word queries match meaningfully.
-        # We let the orchestrator's rapidfuzz reweight against title/alt_titles
-        # — our raw_score is just a stable per-site relevance hint.
-        query_tokens = set(t for t in ql.split() if t)
-
-        scored: List[tuple] = []
-        for c in all_comics:
-            name = (c.get("name") or "").strip()
-            if not name:
-                continue
-            nl = name.lower()
-            # Substring or token-overlap match. Conservative: require either
-            # the full query as a substring OR every query token to appear.
-            if ql in nl:
-                relevance = 1.0
-            elif query_tokens and all(tok in nl for tok in query_tokens):
-                relevance = 0.7
-            else:
-                continue
-            scored.append((relevance, c))
-
-        scored.sort(key=lambda x: -x[0])
+        # Rank via the shared client-side filter (grep _rank_client_filter_hits).
+        # Score by token overlap so multi-word queries match meaningfully; the
+        # orchestrator's rapidfuzz reweights against title/alt_titles later — our
+        # raw_score is just a stable per-site relevance hint. Empty-name entries
+        # drop before scoring; the slug-missing skip stays in the emit loop so
+        # raw_score positions are unchanged.
+        def _candidates():
+            for c in all_comics:
+                name = (c.get("name") or "").strip()
+                if not name:
+                    continue
+                yield name, c
 
         hits: List[SearchHit] = []
-        for idx, (relevance, c) in enumerate(scored[:limit]):
+        for raw_score, c in self._rank_client_filter_hits(
+            clean, _candidates(), limit=limit
+        ):
             slug = c.get("slug")
             if not slug:
                 continue
             cover_v = (c.get("cover") or {}).get("vertical")
-            url = f"https://{active_domain}/comics/{slug}"
-            # Position-based raw_score, scaled by relevance so substring
-            # matches outrank token-overlap ones.
-            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
             hits.append(
                 SearchHit(
                     site=self.name,
                     title=c.get("name") or slug,
-                    url=url,
+                    url=f"https://{active_domain}/comics/{slug}",
                     cover=cover_v,
                     alt_titles=[],
                     year=None,

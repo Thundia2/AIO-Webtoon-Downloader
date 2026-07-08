@@ -4,7 +4,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
-from bs4 import BeautifulSoup, FeatureNotFound
+from bs4 import BeautifulSoup
 
 from .base import BaseSiteHandler, SearchHit, SiteComicContext
 
@@ -21,21 +21,7 @@ class AsmotoonSiteHandler(BaseSiteHandler):
     _BASE_URL = "https://asmotoon.com"
     _CDN_URL = "https://cdn.meowing.org/uploads/"
 
-    def __init__(self) -> None:
-        super().__init__()
-        try:
-            import lxml  # type: ignore  # noqa: F401
-
-            self._parser = "lxml"
-        except Exception:
-            self._parser = "html.parser"
-
     # ----------------------------------------------------------------- helpers
-    def _make_soup(self, html: str) -> BeautifulSoup:
-        try:
-            return BeautifulSoup(html, self._parser)
-        except FeatureNotFound:
-            return BeautifulSoup(html, "html.parser")
 
     def _normalize_url(self, url: str) -> str:
         if not url.lower().startswith("http"):
@@ -60,17 +46,6 @@ class AsmotoonSiteHandler(BaseSiteHandler):
             return parts[1].rstrip("/")
         return None
 
-    def _meta(self, soup: BeautifulSoup, name: Optional[str] = None, property_name: Optional[str] = None) -> Optional[str]:
-        if name:
-            tag = soup.find("meta", attrs={"name": name})
-            if tag and tag.get("content"):
-                return tag["content"].strip()
-        if property_name:
-            tag = soup.find("meta", attrs={"property": property_name})
-            if tag and tag.get("content"):
-                return tag["content"].strip()
-        return None
-
     def _extract_series_title(self, soup: BeautifulSoup) -> Optional[str]:
         chapter_header = soup.select_one("#chapter_header a[href*='/series/']")
         if chapter_header and chapter_header.get_text(strip=True):
@@ -88,7 +63,7 @@ class AsmotoonSiteHandler(BaseSiteHandler):
         return None
 
     def _extract_keywords(self, soup: BeautifulSoup) -> List[str]:
-        keywords = self._meta(soup, "keywords")
+        keywords = self._meta_content(soup, "keywords")
         if not keywords:
             return []
         values = [kw.strip() for kw in keywords.split(",")]
@@ -138,12 +113,7 @@ class AsmotoonSiteHandler(BaseSiteHandler):
         return results
 
     def _parse_chapter_number(self, text: str) -> Optional[str]:
-        if not text:
-            return None
-        match = re.search(r"(\d+(?:\.\d+)?)", text.replace(",", "."))
-        if match:
-            return match.group(1)
-        return None
+        return self._chapter_number_from_text(text, decimal_comma=True)
 
     def _chapter_sort_key(self, chapter: Dict) -> Tuple[float, str]:
         chap = chapter.get("chap")
@@ -190,8 +160,8 @@ class AsmotoonSiteHandler(BaseSiteHandler):
             raise RuntimeError("Unable to determine series identifier.")
 
         title = self._extract_series_title(soup) or series_slug
-        desc = self._meta(soup, "description")
-        cover = self._meta(soup, property_name="og:image")
+        desc = self._meta_content(soup, "description")
+        cover = self._meta_content(soup, property_name="og:image")
         keywords = self._extract_keywords(soup)
 
         comic: Dict[str, object] = {
@@ -315,31 +285,21 @@ class AsmotoonSiteHandler(BaseSiteHandler):
             if href_norm not in seen:
                 seen[href_norm] = (title, cover)
 
-        ql = clean.lower()
-        query_tokens = set(t for t in ql.split() if t)
-
-        scored: List = []
-        for href, (title, cover) in seen.items():
-            tl = title.lower()
-            if ql in tl:
-                relevance = 1.0
-            elif query_tokens and all(tok in tl for tok in query_tokens):
-                relevance = 0.7
-            else:
-                continue
-            scored.append((relevance, title, href, cover))
-
-        scored.sort(key=lambda x: -x[0])
-
+        # Rank via the shared client-side catalog filter (grep
+        # _rank_client_filter_hits); the payload carries title+href+cover so
+        # the emit loop can build the per-hit URL and SearchHit.
+        candidates = (
+            (title, (title, href, cover)) for href, (title, cover) in seen.items()
+        )
         hits: List[SearchHit] = []
-        for idx, (relevance, title, href, cover) in enumerate(scored[:limit]):
-            url_full = urljoin(self._BASE_URL, href + "/")
-            raw_score = max(0.05, relevance * (1.0 - (idx / max(1, len(scored)))))
+        for raw_score, (title, href, cover) in self._rank_client_filter_hits(
+            clean, candidates, limit=limit
+        ):
             hits.append(
                 SearchHit(
                     site=self.name,
                     title=title,
-                    url=url_full,
+                    url=urljoin(self._BASE_URL, href + "/"),
                     cover=cover,
                     alt_titles=[],
                     year=None,

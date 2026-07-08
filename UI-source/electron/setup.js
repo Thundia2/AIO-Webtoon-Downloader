@@ -109,7 +109,7 @@ function getPythonAsset() {
 //     sync_playwright` fails if greenlet (C ext) didn't install. This is
 //     EXACTLY the failure mode in early sandbox tests — pip says ok,
 //     setup says ok, then runtime crashes with "Playwright is required"
-//     (msg comes from sites/mangafire_vrf_simple.py's PLAYWRIGHT_AVAILABLE
+//     (msg comes from sites/playwright_utils.py's PLAYWRIGHT_AVAILABLE
 //     check, even though we're now importing from patchright — the
 //     constant name was kept for back-compat, see comment in that file).
 //   - `import cryptography` succeeds, but `from cryptography.hazmat.primitives
@@ -911,8 +911,9 @@ class PythonSetup {
     //   - Antivirus quarantining the chromium binary
     //   - Wrong PLAYWRIGHT_BROWSERS_PATH (typo, etc.)
     // Without this check, the user only finds out something is wrong on
-    // their first MangaFire search/download — which is exactly the failure
-    // mode we're trying to eliminate.
+    // their first Playwright-driven site's search/download (comix,
+    // violetscans, etc.) — which is exactly the failure mode we're
+    // trying to eliminate.
     //
     // Headless launch + immediate close takes ~2-3s on a normal machine.
     this._onLog("Verifying Chromium launches…");

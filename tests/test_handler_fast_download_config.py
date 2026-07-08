@@ -77,9 +77,9 @@ def test_mangafire_referer_set_to_homepage():
 
 
 def test_mangafire_user_agent_pinned_to_chrome_122():
-    """Pinned to match the Patchright session UA so cf_clearance cookie's
-    UA fingerprint stays consistent if CF starts cookie-validating image
-    hits. Magic string check — value matters for cookie-validation parity."""
+    """A current desktop Chrome UA is sent with the curl_cffi image
+    downloads. Magic string check — the handler pins a stable, realistic
+    desktop UA for the CDN image hits."""
     ua = MangaFireSiteHandler.FAST_DL_USER_AGENT
     assert ua is not None
     assert "Chrome/122.0.0.0" in ua

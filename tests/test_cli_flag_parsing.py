@@ -152,18 +152,15 @@ def test_mangafire_image_concurrency_emits_deprecation_warning():
 
 
 # ────────────────────────────────────────────────────────────────────────
-# MangaFire-namespaced VRF flags are kept (they're not generic)
+# MangaFire VRF flags were removed with the 2026 REST-API rewrite
 # ────────────────────────────────────────────────────────────────────────
 
-def test_mangafire_vrf_prefetch_depth_flag_still_present():
-    """VRF is MangaFire-specific; this flag stays namespaced."""
+def test_mangafire_vrf_flags_removed():
+    """The old Patchright VRF capture is gone; both --mangafire-vrf-* flags
+    must no longer appear in --help (MangaFire is a plain JSON API now)."""
     proc = _run_aio_dl("--help")
-    assert "--mangafire-vrf-prefetch-depth" in proc.stdout
-
-
-def test_mangafire_vrf_parallel_flag_still_present():
-    proc = _run_aio_dl("--help")
-    assert "--mangafire-vrf-parallel" in proc.stdout
+    assert "--mangafire-vrf-prefetch-depth" not in proc.stdout
+    assert "--mangafire-vrf-parallel" not in proc.stdout
 
 
 # ────────────────────────────────────────────────────────────────────────

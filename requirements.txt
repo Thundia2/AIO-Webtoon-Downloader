@@ -11,7 +11,7 @@ fastapi>=0.100.0
 uvicorn[standard]>=0.20.0
 impit
 zendriver
-patchright>=1.40.0  # Drop-in Playwright fork with CDP-leak patches (Cloudflare-stealthier). Drives sites/mangafire_vrf_simple.py and sites/playwright_utils.py.
+patchright>=1.40.0  # Drop-in Playwright fork with CDP-leak patches (Cloudflare-stealthier). Drives sites/playwright_utils.py + sites/comix.py and other Playwright-driven handlers.
 rapidfuzz  # Cross-site search title matching (sites/search_orchestrator.py)
 curl_cffi>=0.7.0  # MangaFire fast image-download path (HTTP/2 + Chrome120 TLS fingerprint, async). See sites/mangafire.py:fast_download_images.
 # Phase H (2026-05-16) — pyvips powers the lossy-WebP save fast path in

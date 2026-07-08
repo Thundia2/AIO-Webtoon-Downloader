@@ -128,9 +128,16 @@ export default function App() {
               )}
 
               {/* Red dot on logs tab when there's a recent error */}
+              {/* UIR-2: skip trailing 'divider' entries (a completion divider is
+                  appended after the final error line, which would otherwise
+                  suppress the dot exactly on a failed run). */}
               {tab.id === "logs" &&
-                (dl.logs || []).length > 0 &&
-                (dl.logs || [])[dl.logs.length - 1]?.level === "error" &&
+                (() => {
+                  const logs = dl.logs || [];
+                  let i = logs.length - 1;
+                  while (i >= 0 && logs[i]?.level === "divider") i--;
+                  return i >= 0 && logs[i]?.level === "error";
+                })() &&
                 activeTab !== "logs" && (
                   <div className="absolute top-1 right-1 w-2 h-2 rounded-full bg-red-500" />
                 )}
