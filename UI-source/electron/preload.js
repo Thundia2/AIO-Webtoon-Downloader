@@ -124,6 +124,23 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener("update-check-progress", handler);
   },
 
+  // ── App self-update (opt-in) ──
+  // NOT the manga-chapter checkForUpdates family above — these drive the
+  // app's own silent update flow (electron/updater.js): background check,
+  // maturity-delay gate, silent download, install on exit. Status object
+  // shape lives on updater.js's `status` (state: unsupported|disabled|
+  // idle|checking|deferred|downloading|downloaded|up-to-date|no-feed|
+  // error + currentVersion/eligibleAt etc.).
+  // SettingsTab fetches a snapshot on mount, then subscribes for pushes.
+  getAppUpdateStatus: () => ipcRenderer.invoke("app-update:get-status"),
+  checkAppUpdateNow: () => ipcRenderer.invoke("app-update:check-now"),
+  applyAppUpdateNow: () => ipcRenderer.invoke("app-update:apply-now"),
+  onAppUpdateStatus: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on("app-update-status", handler);
+    return () => ipcRenderer.removeListener("app-update-status", handler);
+  },
+
   // ── Setup (first-run Python environment installation) ──
   // These are used by setup.html during the first-launch wizard,
   // and by the "Reinstall Python" button in SettingsTab.

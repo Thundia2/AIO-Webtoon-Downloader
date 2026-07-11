@@ -168,6 +168,20 @@ const DEFAULT_SETTINGS = {
   scriptPath: DEV_DEFAULTS.scriptPath,
   workingDir: DEV_DEFAULTS.workingDir,
   verboseAlways: true,
+  // App self-update opt-in (grep appAutoUpdate — consumed by
+  // electron/updater.js via main.js's save-settings live-sync). OFF by
+  // default, deliberately: when on, the app downloads new releases in the
+  // background and installs them silently on exit, so it needs explicit
+  // buy-in. Top-level (not defaults.*) — an app preference, not a
+  // per-download flag. NOT related to the Library chapter update checks.
+  appAutoUpdate: false,
+  // Update maturity delay: only install a release once it's this many
+  // days old, so a bad release can be pulled or superseded before it
+  // reaches installs. 0 = update as soon as a release is published.
+  // Clock = the feed's releaseDate (stamped when CI built the release).
+  // Clamped [0, 60] in electron/updater.js (_clampDelayDays — keep the
+  // IntInput bounds below in sync with MAX_DELAY_DAYS there).
+  appUpdateDelayDays: 5,
   // Global chapter-collapse toggle. Affects:
   //   - Search-display "X main / Y entries" diagnostic counts.
   //   - Actual download behavior — split clusters (e.g. 1.1/1.2/1.3/1.4)
@@ -644,6 +658,27 @@ export default function SettingsTab({ settings, onSave }) {
     return () => { cancelled = true; };
   }, []);
 
+  // App self-update status (electron/updater.js). Snapshot on mount via
+  // app-update:get-status, then live pushes from the app-update-status
+  // channel. null until the snapshot resolves (renderAppUpdates hides the
+  // status/version rows meanwhile) and stays null in browser dev mode.
+  // SettingsTab unmounts on tab switch — the mount snapshot makes dropping
+  // and re-creating the subscription safe.
+  const [updStatus, setUpdStatus] = useState(null);
+  useEffect(() => {
+    const api = typeof window !== "undefined" && window.electronAPI;
+    if (!api || typeof api.getAppUpdateStatus !== "function") return;
+    let cancelled = false;
+    api.getAppUpdateStatus()
+      .then((s) => { if (!cancelled && s) setUpdStatus(s); })
+      .catch(() => {});
+    const unsub = api.onAppUpdateStatus?.((s) => setUpdStatus(s));
+    return () => {
+      cancelled = true;
+      if (unsub) unsub();
+    };
+  }, []);
+
   // Load settings when they arrive from Electron
   useEffect(() => {
     if (settings) {
@@ -986,6 +1021,185 @@ export default function SettingsTab({ settings, onSave }) {
       </div>
     </>
   );
+
+  // ── General › App Updates ──
+  // App SELF-update (not Library chapter checks). Deliberately the ONLY
+  // update UI in the app — no banners, no dialogs anywhere else; install
+  // happens silently on exit (user decision, 2026-07-12). The toggle
+  // persists settings.appAutoUpdate; main.js's save-settings handler
+  // live-syncs electron/updater.js (enable arms a check immediately,
+  // disable also cancels install-on-quit for an already-downloaded
+  // update). Status states + shape: updater.js's `status` object.
+  const renderAppUpdates = () => {
+    const st = updStatus; // null pre-snapshot / in browser dev mode
+    const supported = !!st?.supported;
+    const busy = st?.state === "checking" || st?.state === "downloading";
+
+    let statusNode = null;
+    if (st) {
+      switch (st.state) {
+        case "downloaded":
+          statusNode = (
+            <Badge variant="success" className="text-[10px]">
+              v{st.latestVersion} ready — installs when you exit
+            </Badge>
+          );
+          break;
+        case "downloading":
+          statusNode = <>Downloading v{st.latestVersion} · {st.percent ?? 0}%</>;
+          break;
+        case "deferred":
+          // Maturity delay: the release exists but is younger than the
+          // configured wait — updater.js re-evaluates on every re-check.
+          statusNode = (
+            <>
+              v{st.latestVersion} available — updates{" "}
+              {st.eligibleAt
+                ? `after ${new Date(st.eligibleAt).toLocaleDateString()}`
+                : "soon"}
+            </>
+          );
+          break;
+        case "checking":
+          statusNode = <>Checking for updates…</>;
+          break;
+        case "up-to-date":
+          statusNode = <>Up to date</>;
+          break;
+        case "no-feed":
+          // Benign: the newest published release predates the updater and
+          // has no latest.yml (updater.js maps the 404 codes here).
+          statusNode = <>No update feed published yet</>;
+          break;
+        case "error":
+          statusNode = (
+            <span className="text-red-500 dark:text-red-400">
+              Update check failed: {st.error}
+            </span>
+          );
+          break;
+        case "idle":
+          statusNode = <>Waiting for the first background check</>;
+          break;
+        case "disabled":
+          statusNode = <>Automatic updates are off</>;
+          break;
+        default:
+          statusNode = null; // unsupported → reason rendered under the toggle
+      }
+    }
+
+    return (
+      <>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex-1">
+            <Label className="text-xs cursor-pointer">
+              Automatically install app updates
+            </Label>
+            <p className="text-[10px] text-muted-foreground mt-0.5">
+              Checks GitHub Releases in the background after launch,
+              downloads new versions silently, and applies them on the next
+              app exit — never interrupts, never prompts. Updates come from
+              the repo that built this install.
+            </p>
+            {st && !supported && (
+              <p className="text-[10px] text-yellow-500 dark:text-yellow-400 mt-1 leading-snug">
+                Not available for this install: {st.reason}
+              </p>
+            )}
+          </div>
+          <Switch
+            checked={local.appAutoUpdate === true}
+            onCheckedChange={(v) => set("appAutoUpdate", v)}
+          />
+        </div>
+
+        {/* Maturity delay — nested under the opt-in. A release only
+            downloads once it's this many days old (clock = the feed's
+            releaseDate, stamped when CI built it), so a bad release can
+            be pulled/superseded before it reaches installs. Lowering it
+            to 0 + Save is the "update me now" escape hatch — main.js's
+            save-settings sync re-evaluates a deferred release live. */}
+        {local.appAutoUpdate === true && (
+          <div className="flex items-start justify-between gap-3 mt-3 animate-slide-up">
+            <div className="flex-1">
+              <Label className="text-xs cursor-pointer">
+                Wait after a release before updating
+              </Label>
+              <p className="text-[10px] text-muted-foreground mt-0.5">
+                Safety buffer: a fresh release is only installed once it's
+                this many days old, so a bad build can be pulled or fixed
+                before it reaches you. <span className="font-mono">0</span>{" "}
+                = update as soon as a release is published.
+              </p>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              {/* Bounds mirror _clampDelayDays in electron/updater.js. */}
+              <IntInput
+                value={local.appUpdateDelayDays ?? 5}
+                onChange={(v) => set("appUpdateDelayDays", v)}
+                min={0}
+                max={60}
+                fallback={5}
+                className="w-20 shrink-0 font-mono tabular-nums"
+              />
+              <span className="text-[10px] text-muted-foreground">days</span>
+            </div>
+          </div>
+        )}
+
+        {st && (
+          <div className="flex items-center justify-between gap-3 mt-3 pt-3 border-t border-border/50">
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="text-xs font-medium">Current version</span>
+              <Badge variant="secondary" className="font-mono tabular-nums">
+                v{st.currentVersion || "?"}
+              </Badge>
+            </div>
+            <div className="text-[10px] text-muted-foreground text-right min-w-0">
+              {statusNode}
+            </div>
+          </div>
+        )}
+
+        {st && supported && (
+          <div className="flex items-center gap-2 mt-3">
+            {/* Gated on the SAVED enabled state (st.enabled), not the local
+                draft — main.js's checkNow refuses while the saved pref is
+                off, and nothing in this tab applies until Save anyway. Also
+                disabled once an update is downloaded: updater.js skips
+                re-checks in that state (the next action is the restart
+                button), so the click would silently no-op. */}
+            <Button
+              variant="outline"
+              size="sm"
+              className="text-xs gap-1.5"
+              disabled={!st.enabled || busy || st.state === "downloaded"}
+              title={!st.enabled ? "Turn on automatic updates and save first" : undefined}
+              onClick={() => window.electronAPI?.checkAppUpdateNow?.()}
+            >
+              <RefreshCw className={cn("w-3 h-3", busy && "animate-spin")} />
+              Check now
+            </Button>
+            {st.state === "downloaded" && (
+              <>
+                <Button
+                  size="sm"
+                  className="text-xs"
+                  onClick={() => window.electronAPI?.applyAppUpdateNow?.()}
+                >
+                  Restart &amp; update now
+                </Button>
+                <span className="text-[10px] text-muted-foreground">
+                  Any running downloads stop and become resumable.
+                </span>
+              </>
+            )}
+          </div>
+        )}
+      </>
+    );
+  };
 
   // ── Output › Format & Quality (+ CBZ preserve-originals) ──
   const renderFormat = () => (
@@ -2295,6 +2509,7 @@ export default function SettingsTab({ settings, onSave }) {
   const SECTIONS = [
     { group: "general",     title: "Paths & Python",                render: renderPaths },
     { group: "general",     title: "Logging",                       render: renderLogging },
+    { group: "general",     title: "App Updates",                   render: renderAppUpdates },
     { group: "output",      title: "Format & Quality",              render: renderFormat },
     { group: "output",      title: "Komikku Output",                render: renderKomikku },
     { group: "output",      title: "Chapter Behavior",              render: renderChapters },

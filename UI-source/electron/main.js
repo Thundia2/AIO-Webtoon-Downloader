@@ -34,6 +34,10 @@ const {
 const { HistoryManager } = require("./history");
 const { PythonSetup, isSetupComplete, deleteEnv, PYTHON_VERSION } = require("./setup");
 const { scanLibrary, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, getChaptersOnDevice, getImageChaptersOnDevice } = require("./library");
+// App self-update (opt-in, settings.appAutoUpdate) — cheap require; the
+// heavy electron-updater load is deferred inside updater.js. NOT the manga
+// chapter update-check family below (check-for-updates etc.).
+const appUpdater = require("./updater");
 
 // ── DEV MODE DEFAULTS ──
 // When running from source (npm run electron:dev), the app uses
@@ -623,6 +627,16 @@ function setupIPC() {
   // even if main.js / the renderer ever regresses.
   ipcMain.handle("save-settings", async (_event, newSettings) => {
     history.saveSettings(newSettings);
+    // Live-sync the app self-updater with the (post-merge) saved prefs:
+    // enabling arms a check immediately, disabling also flips
+    // autoInstallOnAppQuit off so a downloaded update won't install on
+    // quit after an opt-out, and a maturity-delay change re-evaluates a
+    // deferred release. See electron/updater.js:applySettings.
+    const merged = history.getSettings();
+    appUpdater.applySettings({
+      enabled: merged.appAutoUpdate === true,
+      delayDays: merged.appUpdateDelayDays,
+    });
     return { ok: true };
   });
 
@@ -1410,9 +1424,42 @@ function setupIPC() {
     // Delete the entire Python environment
     deleteEnv(pythonEnvDir);
 
+    // app.exit() skips before-quit/will-quit but still emits 'quit' —
+    // which is where electron-updater's install-on-quit hook lives. A
+    // pending downloaded update would silently install WHILE the
+    // relaunched app starts (and the installer kills it). Suppress it;
+    // the update applies on the next normal exit instead.
+    appUpdater.suppressInstallOnQuit();
+
     // Restart the app — on next launch, setup will re-run
     app.relaunch();
     app.exit(0);
+  });
+
+  // ── App self-update (opt-in; electron/updater.js) ──
+  // Colon-namespaced like search:/metadata: to keep visual distance from
+  // the kebab-case manga "check-for-updates" family above. get-status
+  // returns the full status snapshot (SettingsTab fetches it on mount,
+  // then live-updates from the "app-update-status" push channel).
+  ipcMain.handle("app-update:get-status", async () => {
+    return appUpdater.getStatus();
+  });
+
+  ipcMain.handle("app-update:check-now", async () => {
+    return appUpdater.checkNow();
+  });
+
+  // Same pre-quit cleanup window-all-closed does: kill running Python
+  // children first so they can't outlive Electron and hold tmp_<hid>/
+  // locks; the cancelled runs surface in the resume bar on relaunch.
+  // Guard BEFORE cancelAll — a spurious invoke with no downloaded update
+  // must not kill active downloads for nothing.
+  ipcMain.handle("app-update:apply-now", async () => {
+    if (appUpdater.getStatus().state !== "downloaded") {
+      return { ok: false, reason: "No downloaded update to apply." };
+    }
+    if (downloader) await downloader.cancelAll();
+    return appUpdater.applyNow();
   });
 }
 
@@ -1476,6 +1523,18 @@ app.whenReady().then(async () => {
   ensurePythonSrcInPth();
   initDownloader();
   createWindow();
+
+  // App self-update — armed only when the user opted in (Settings →
+  // General → App Updates) AND this install supports it (packaged
+  // Windows NSIS / Linux AppImage). First check runs ~30s post-launch;
+  // the require("electron-updater") itself is deferred until then, so
+  // startup cost is zero either way. See electron/updater.js.
+  const updaterSettings = history.getSettings();
+  appUpdater.initAppUpdater({
+    enabled: updaterSettings.appAutoUpdate === true,
+    delayDays: updaterSettings.appUpdateDelayDays,
+    onStatus: (s) => sendToUI("app-update-status", s),
+  });
 });
 
 app.on("window-all-closed", async () => {
