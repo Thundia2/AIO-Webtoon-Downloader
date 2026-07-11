@@ -355,6 +355,8 @@ Electron tabs:
 
 Installer builds use `npm run dist:win`, `npm run dist:mac`, or `npm run dist:linux`, and output to `UI-source/release/`.
 
+**Automatic updates (opt-in).** Installed builds can keep themselves up to date: enable **Settings → General → App Updates**. When on, the app checks the GitHub Releases of the repo that built your installer in the background after launch, downloads new versions silently, and applies them on the next app exit — no prompts, no interruptions, ever. As a safety buffer, a fresh release is only installed once it's a configurable number of days old (default 5, settable to 0 for immediate updates), so a bad release can be pulled or fixed before it reaches you. Off by default. Available for the Windows installer and the Linux AppImage (the unsigned macOS build and the `.deb` can't self-update — grab new versions from Releases).
+
 ---
 
 ## ⚙️ Options

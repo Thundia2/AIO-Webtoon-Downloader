@@ -28,6 +28,16 @@
 #     script's location, but we set AIO_SOURCE_DIR explicitly anyway —
 #     the env var is the documented contract and it survives any future
 #     refactor of the script's path resolution.
+#   - AUTO-UPDATE (opt-in, UI-source/electron/updater.js): installed apps
+#     poll this repo's *published* releases via electron-updater. Two build
+#     steps below feed that: the version stamp (tag → package.json version,
+#     so the repo never has to bump its checked-in version) and the publish
+#     stamp (feed = whichever repo ran this workflow). Publishing the draft
+#     is the go-live act — drafts are invisible to installed apps. Release
+#     tags MUST be plain semver (vX.Y.Z) or the version stamp skips and the
+#     release never serves as an update; always tag current HEAD (GitHub's
+#     /releases/latest sorts by the tagged commit's created_at, not by
+#     publish time).
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Release
@@ -80,6 +90,44 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      # The repo convention keeps package.json's version static across
+      # releases — the release tag is the version of record. Stamp it into
+      # package.json before electron-builder runs so BOTH app.getVersion()
+      # (baked into the installed app) and latest.yml (the update feed's
+      # channel file) carry the tag's version. electron-updater then
+      # compares those two stamped values — "newest published release vs
+      # the release this install came from" — with no repo bumps ever.
+      # Non-semver tags (e.g. a 4-component v0.0.5.1) skip the stamp with
+      # a warning: the build still ships, but installed apps will never
+      # see it as an update. npm version's own strict semver validation
+      # backstops the regex. Cross-file: UI-source/electron/updater.js.
+      - name: Stamp app version from release tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            npm version "$VER" --no-git-tag-version --allow-same-version --ignore-scripts
+            echo "Stamped app version ${VER} (from tag ${GITHUB_REF_NAME})"
+          else
+            echo "::warning::Tag '${GITHUB_REF_NAME}' is not plain semver (vX.Y.Z[-pre]) — keeping package.json version $(node -p "require('./package.json').version"). Auto-update clients will not see this release."
+          fi
+
+      # Point the embedded update feed (resources/app-update.yml) at the
+      # repo that is building the installer, so fork-built installers poll
+      # the fork's releases and upstream-built ones poll upstream — no
+      # cross-repo coupling. Unconditional (unlike the version stamp):
+      # workflow_dispatch draft builds must also poll their own repo, not
+      # the static default in package.json's build.publish (which only
+      # covers local `npm run dist:*` builds).
+      - name: Point update feed at this repo
+        shell: bash
+        run: |
+          npm pkg set build.publish.provider=github \
+            build.publish.owner="${GITHUB_REPOSITORY%%/*}" \
+            build.publish.repo="${GITHUB_REPOSITORY##*/}"
+          echo "Update feed: github.com/${GITHUB_REPOSITORY}"
+
       - name: Build installer
         env:
           AIO_SOURCE_DIR: ${{ github.workspace }}
@@ -97,19 +145,24 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.os }}-build
-          # electron-builder writes per-format artifacts plus blockmap and
-          # latest*.yml metadata. We capture the user-facing installers
-          # only — blockmaps are auto-update bookkeeping we don't ship.
-          # The Linux job emits BOTH .AppImage and .deb (added 2026-05-13
-          # alongside AppImage — see UI-source/package.json:build.linux.target).
+          # Installers PLUS the auto-update metadata (reversal of the old
+          # "installers only" policy, 2026-07-12): latest*.yml is the
+          # channel file installed apps poll to learn the newest version
+          # (latest.yml from the Windows job, latest-linux.yml from the
+          # AppImage build; macOS emits none — dmg-only + unsigned means
+          # no mac auto-update), and *.blockmap enables differential
+          # downloads so future updates fetch only changed blocks. Both
+          # MUST ride the release or updater clients 404. The Linux job
+          # emits BOTH .AppImage and .deb (only the AppImage auto-updates).
           # macOS ships the .dmg only — the redundant zipped-.app target was
-          # dropped from UI-source/package.json:build.mac.target (no
-          # auto-updater consumes the .zip here, so it was pure release noise).
+          # dropped from UI-source/package.json:build.mac.target.
           path: |
             UI-source/release/*.exe
             UI-source/release/*.dmg
             UI-source/release/*.AppImage
             UI-source/release/*.deb
+            UI-source/release/latest*.yml
+            UI-source/release/*.blockmap
           if-no-files-found: ignore
           retention-days: 14
 

@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from typing import Dict, List, Optional, Any, Tuple
-from urllib.parse import parse_qsl, quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -57,16 +57,17 @@ class ComixSiteHandler(BaseSiteHandler):
     # Opt out of the orchestrator's image-quality probe entirely. Two
     # facts make probing comix uneconomic at search time:
     #   1. comix's chapter list AND every chapter page require the
-    #      single-threaded Patchright bridge (encrypted /chapters API +
-    #      JS-decrypted canvas-rendered pages). The probe phase runs
-    #      up to 6 sources in parallel — they all serialize on the
-    #      bridge worker thread, so adding comix to the probe set
-    #      uniformly trips the orchestrator's 240 s probe-phase
-    #      deadline before any comix candidate completes.
-    #   2. Canvas-captured pages come back as synthetic `comix-page://`
-    #      URLs. sites/base.py:_fetch_probe_item_bytes uses
-    #      scraper.get(url) which doesn't know that scheme, so even
-    #      when the probe DOES finish it scores 0.0 on every chapter.
+    #      single-threaded Patchright bridge (the /chapters + /chapters/{id}
+    #      APIs are signed + encrypted, and the page <img> URLs are only
+    #      set by in-page JS on scroll — see get_chapter_images). The probe
+    #      phase runs up to 6 sources in parallel — they all serialize on
+    #      the bridge worker thread, so adding comix to the probe set
+    #      uniformly trips the orchestrator's 240 s probe-phase deadline
+    #      before any comix candidate completes.
+    #   2. Any legacy tile-scrambled pages come back as synthetic
+    #      `comix-page://` URLs. sites/base.py:_fetch_probe_item_bytes uses
+    #      scraper.get(url) which doesn't know that scheme, so those chapters
+    #      score 0.0 even when the probe DOES finish.
     # Resolution: the comix seed in sites/quality_seed.json is
     # calibrated offline (run comix_seed_calibration.py — drives the
     # full T1+T2 ML pipeline against one good + one bad title; the
@@ -98,36 +99,21 @@ class ComixSiteHandler(BaseSiteHandler):
     # fetch is queued.
     SKIP_MULTI_SOURCE = True
 
-    # comix.to API endpoints are token-gated with per-URL HMAC signatures
-    # (`_=<sig>` param) we can't reproduce in Python. The only tractable
-    # path is letting Patchright navigate the page and either capturing the
-    # outgoing request URL (for listing — replayed with cloudscraper) or
-    # reading the response body (for chapter detail — we steal the JSON
-    # directly).
-    #
     # Patchright's sync API requires that every call run on the same thread
     # that started the browser, AND that thread must own an asyncio loop.
-    # Probe-phase workers (sites/search_orchestrator.py:4346-4354) and
-    # aio-dl.py's image-prefetch threads can't satisfy either. So we route
-    # all Patchright work through _COMIX_BROWSER_BRIDGE (defined at the
-    # bottom of this file), which serializes calls onto a single dedicated
-    # worker thread, one process-wide. Block-on-future semantics make the
-    # bridge fully synchronous from any caller's perspective.
-    #
-    # Cross-file: identical idiom to sites/mangafire_vrf_simple.py:_VRFBridge.
-    #
-    # Token cache memoizes successful list-API sig captures by title-url
-    # across the bridge's lifetime AND across multiple handler instances.
-    # Tokens are URL-bound (not session-bound) so one capture per title
-    # covers paginated chapter-list fetches.
-    _ChaptersTokenCache: Dict[str, str] = {}
+    # Probe-phase workers (sites/search_orchestrator.py) and aio-dl.py's
+    # image-prefetch threads can't satisfy either. So all Patchright work
+    # (the chapter-list + chapter-image DOM scrapes — the site is a signed +
+    # encrypted SPA, see fetch_comic_context) routes through
+    # _COMIX_BROWSER_BRIDGE (bottom of this file), which serializes calls onto
+    # a single dedicated worker thread, one process-wide. Block-on-future
+    # semantics make the bridge fully synchronous from any caller's
+    # perspective. Cross-file idiom: sites/mangadex.py:_report_worker.
 
     def __init__(self):
-        # BaseSiteHandler has no __init__; super().__init__() falls through
-        # to object.__init__ (no-args). We override here only to attach the
-        # per-instance lazy CF session — the class-level _ChaptersTokenCache
-        # stays shared across instances on purpose (sig tokens are URL-bound,
-        # not session-bound, so cross-instance reuse is correct).
+        # BaseSiteHandler has no __init__; super().__init__() falls through to
+        # object.__init__ (no-args). We override only to attach the per-instance
+        # lazy CF session + the chapter-image memo cache below.
         super().__init__()
         # Lazy-init zendriver CF session. Built on first 403/503 in
         # _cf_aware_request when is_cf_challenge confirms the body is a CF
@@ -136,16 +122,6 @@ class ComixSiteHandler(BaseSiteHandler):
         # chapter-detail steal) don't need this — the browser handles CF
         # natively via its own cookie store.
         self._cf_session = None
-        # Latched once we confirm comix is serving encrypted chapter-API
-        # responses (the steady-state behaviour as of 2026-05-26 — every
-        # /api/v1/chapters/{id} call returns {"e": "<base64>"} that the
-        # in-page JS decrypts client-side, but Python can't). Set in
-        # get_chapter_images the first time we see the shape; on every
-        # subsequent chapter we skip the API call entirely and go straight
-        # to the browser DOM scrape. Eliminates ~5 lines of noise per
-        # chapter (the "data.keys()=['e']" warning + 300-char snippet + the
-        # "falling back to DOM-scrape-for-images" follow-up).
-        self._chapter_api_known_encrypted = False
         # Memoize get_chapter_images results so the prefetch worker and
         # the main download flow don't both run the ~20s canvas scrape
         # per chapter. Both threads share THIS handler instance (the
@@ -243,134 +219,74 @@ class ComixSiteHandler(BaseSiteHandler):
                 pass
         return response
 
-    def _get_api_token(self, url: str) -> Optional[str]:
-        """Return the `_=<sig>&time=<ts>` query string for the chapter
-        listing API (`/api/v1/manga/{hid}/chapters`).
+    def _extract_initial_data_manga(self, soup) -> Optional[Dict]:
+        """Return the full manga-detail dict from the title page's SSR
+        React-Query hydration blob, or None.
 
-        Cached per (title url) on the class; first miss drives the bridge,
-        which navigates Patchright to the title URL and intercepts the
-        outgoing /chapters?_=… request. Returns the bare query string
-        (no leading `?`) or None on failure.
+        2026-07-11: comix.to is now an SPA that gates every /api/v1/* endpoint
+        behind a per-request signature AND encrypts the response body
+        ({"e":"<blob>"}, decrypted only in-JS), so the old cloudscraper API
+        calls return 403 "Missing token." The title-page HTML, however, still
+        ships a plaintext <script id="initial-data" type="application/json">
+        React-Query hydration blob in the RAW server response. Its
+        ["manga","detail",<hid|id>] query value IS the detail object we want:
+        title / altTitles / authors / artists / genres / poster / synopsis /
+        year / status / latestChapter / url. Plain HTTP, no browser, no
+        decryption — this is the replacement for /api/v1/manga/{hid}.
 
-        Cross-file: actual Patchright work lives in
-        `_ComixBrowserSession.get_api_token` at the bottom of this file.
+        Match the query key on the ["manga","detail" prefix (parsed as JSON)
+        so it works whether comix keys it by hid string ("6e6jz") or numeric
+        id (49660), and ignore the sibling ["manga","recommended"/"groups"]
+        queries. Some React-Query dumps wrap the payload under a "data" key;
+        handle both. Returns a shallow copy so callers can mutate freely.
         """
-        cached = ComixSiteHandler._ChaptersTokenCache.get(url)
-        if cached:
-            return cached
-        token_query = _COMIX_BROWSER_BRIDGE.get_api_token(url)
-        if token_query:
-            ComixSiteHandler._ChaptersTokenCache[url] = token_query
-        return token_query
-
-    def _fetch_chapter_api_via_browser(self, chapter_url: str, chap_id) -> Optional[Dict]:
-        """Steal the chapter-detail API response body via Patchright.
-
-        Returns the parsed `/api/v1/chapters/{chap_id}` response dict (with
-        `result.pages`) or None on failure.
-
-        Cross-file: actual Patchright work lives in
-        `_ComixBrowserSession.fetch_chapter_api` at the bottom of this file.
-        """
-        return _COMIX_BROWSER_BRIDGE.fetch_chapter_api(chapter_url, chap_id)
-
-    def _extract_next_data(self, html: str) -> List[Any]:
-        """Extracts data pushed to self.__next_f."""
-        data = []
-        
-        # Robust parsing instead of regex
-        search_str = 'self.__next_f.push(['
-        start_idx = 0
-        
-        while True:
-            idx = html.find(search_str, start_idx)
-            if idx == -1:
-                break
-            
-            # Start parsing from after 'self.__next_f.push(['
-            content_start = idx + len(search_str)
-            current_idx = content_start
-            
-            balance = 1 # We are inside the first [
-            in_string = False
-            escape = False
-            
-            while current_idx < len(html):
-                char = html[current_idx]
-                
-                if in_string:
-                    if escape:
-                        escape = False
-                    elif char == '\\':
-                        escape = True
-                    elif char == '"':
-                        in_string = False
-                else:
-                    if char == '"':
-                        in_string = True
-                    elif char == '[':
-                        balance += 1
-                    elif char == ']':
-                        balance -= 1
-                        if balance == 0:
-                            break
-                
-                current_idx += 1
-            
-            if balance == 0:
-                # We found the matching closing bracket
-                arg_content = html[content_start:current_idx]
-                
-                # Try to parse as JSON list
+        try:
+            tag = soup.find("script", id="initial-data")
+            raw = (tag.string or tag.get_text()) if tag else None
+            data = json.loads(raw) if raw else None
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        queries = data.get("queries")
+        if isinstance(queries, dict):
+            for key, value in queries.items():
+                if not isinstance(key, str):
+                    continue
                 try:
-                    # Wrap in brackets to make it a valid JSON list
-                    json_str = f"[{arg_content}]"
-                    args = json.loads(json_str)
-                    
-                    if len(args) >= 2:
-                        data_str = args[1]
-                        if isinstance(data_str, str):
-                            # Parse the inner string
-                            if data_str.startswith('c:'):
-                                inner_json = data_str[2:]
-                                try:
-                                    data.append(json.loads(inner_json))
-                                except json.JSONDecodeError:
-                                    pass
-                            elif data_str.startswith('0:'):
-                                inner_json = data_str[2:]
-                                try:
-                                    data.append(json.loads(inner_json))
-                                except json.JSONDecodeError:
-                                    pass
-                            else:
-                                # Try parsing directly if it looks like JSON
-                                try:
-                                    data.append(json.loads(data_str))
-                                except json.JSONDecodeError:
-                                    pass
-                except (json.JSONDecodeError, Exception):
-                    pass
-            
-            start_idx = idx + 1
-
-        return data
-
-    def _find_key_recursive(self, obj: Any, key: str) -> Any:
-        """Recursively searches for a key in a nested dictionary/list."""
-        if isinstance(obj, dict):
-            if key in obj:
-                return obj[key]
-            for v in obj.values():
-                res = self._find_key_recursive(v, key)
-                if res is not None:
-                    return res
-        elif isinstance(obj, list):
-            for item in obj:
-                res = self._find_key_recursive(item, key)
-                if res is not None:
-                    return res
+                    parsed_key = json.loads(key)
+                except Exception:
+                    continue
+                if not (
+                    isinstance(parsed_key, list)
+                    and len(parsed_key) >= 2
+                    and parsed_key[0] == "manga"
+                    and parsed_key[1] == "detail"
+                ):
+                    continue
+                if isinstance(value, dict):
+                    if value.get("title"):
+                        return dict(value)
+                    inner = value.get("data")
+                    if isinstance(inner, dict) and inner.get("title"):
+                        return dict(inner)
+        # Alt shape: a top-level "manga" object carrying real fields (vs the
+        # {hid,id}-only stub the current markup uses).
+        manga = data.get("manga")
+        if isinstance(manga, dict) and manga.get("title"):
+            return dict(manga)
         return None
+
+    def _extract_sync_data(self, soup) -> Optional[Dict]:
+        """Return the small <script id="syncData"> JSON (mal-sync integration
+        data: {name, manga_id, manga_url, ...}) or None. Present on every
+        title page; a cheap title/hid source when #initial-data is absent."""
+        try:
+            tag = soup.find("script", id="syncData")
+            raw = (tag.string or tag.get_text()) if tag else None
+            return json.loads(raw) if raw else None
+        except Exception:
+            return None
 
     def _normalize_named_list(self, value: Any) -> List[str]:
         """Converts mixed list/dict/string inputs into a clean list of names."""
@@ -407,45 +323,27 @@ class ComixSiteHandler(BaseSiteHandler):
             else:
                 hash_id = slug_part
         
-        manga_data = None
-        
-        # Try to fetch from API endpoint if we have hash_id
-        if hash_id:
-            try:
-                # 2026-05-13: comix.to disabled /api/v2/manga/{hid} (returns
-                # 404 with HTML body > 100 bytes, slipping past the warning
-                # path in make_request). v1 is the documented public API per
-                # their JS bundle's axios baseURL. Keep v2 as a fallback in
-                # case they re-enable.
-                api_url = f"https://comix.to/api/v1/manga/{hash_id}"
-                api_response = self._cf_aware_request(api_url, scraper, make_request)
-                if api_response.status_code == 404:
-                    api_url = f"https://comix.to/api/v2/manga/{hash_id}"
-                    api_response = self._cf_aware_request(api_url, scraper, make_request)
-                api_data = api_response.json()
+        # Primary source (2026-07-11): the full manga detail lives plaintext in
+        # the title page's <script id="initial-data"> SSR blob — see
+        # _extract_initial_data_manga. This replaces the now-dead
+        # /api/v1/manga/{hid} API call (403 "Missing token." + encrypted body).
+        # The og:image / meta-description / list-normalization steps below run
+        # regardless of which branch populated manga_data.
+        manga_data = self._extract_initial_data_manga(soup)
 
-                # v1 returns status="ok"; v2 returned status=200. Accept both.
-                if api_data.get("status") in (200, "ok") and api_data.get("result"):
-                    manga_data = api_data["result"]
-                    # Ensure hid is set
-                    if "hid" not in manga_data:
-                        manga_data["hid"] = manga_data.get("hash_id", hash_id)
-            except Exception:
-                # API failed, fall back to HTML extraction
-                pass
-        
-        # Fallback: Extract Next.js data from HTML
+        # Fallback 1: the small #syncData mal-sync blob ({name, manga_id}).
         if not manga_data:
-            next_data = self._extract_next_data(html)
-            
-            for item in next_data:
-                found = self._find_key_recursive(item, "manga")
-                if found:
-                    manga_data = found
-                    break
-        
+            sync = self._extract_sync_data(soup)
+            if sync and sync.get("name"):
+                _sync_hid = sync.get("manga_id") or hash_id
+                manga_data = {
+                    "hid": _sync_hid,
+                    "hash_id": _sync_hid,
+                    "title": sync.get("name"),
+                }
+
+        # Fallback 2: a raw "manga_id"/"hash_id"/"title" triple in the HTML.
         if not manga_data:
-            # Fallback: try to find it in the raw HTML
             match = re.search(r'"manga_id":(\d+)', html)
             if match:
                 hash_match = re.search(r'"hash_id":"([^"]+)"', html)
@@ -458,18 +356,23 @@ class ComixSiteHandler(BaseSiteHandler):
                         "hid": hash_match.group(1),
                     }
 
-        if not manga_data:
-             # Last resort: extract basic info from URL
-             if hash_id:
-                 title = slug_part.split('-', 1)[1].replace('-', ' ').title() if '-' in slug_part else slug_part
-                 manga_data = {
-                     "hash_id": hash_id,
-                     "title": title,
-                     "hid": hash_id,
-                 }
+        # Last resort: derive a title from the URL slug (hash_id is only set
+        # when slug_part parsed, so slug_part is defined here).
+        if not manga_data and hash_id:
+            title = slug_part.split('-', 1)[1].replace('-', ' ').title() if '-' in slug_part else slug_part
+            manga_data = {
+                "hash_id": hash_id,
+                "title": title,
+                "hid": hash_id,
+            }
 
         if not manga_data:
             raise RuntimeError("Could not find manga data in page.")
+
+        # AniList enrichment reads comic_data["title"]; some callers key on
+        # "name". Set both from whichever branch won (asura precedent, CLAUDE.md).
+        if manga_data.get("title") and not manga_data.get("name"):
+            manga_data["name"] = manga_data["title"]
 
         # Ensure hid is present
         if "hid" not in manga_data:
@@ -507,13 +410,12 @@ class ComixSiteHandler(BaseSiteHandler):
             if desc_meta and desc_meta.get("content"):
                 manga_data["desc"] = desc_meta["content"].strip()
 
-        # comix.to API returns relative paths (e.g. "/title/pvry-one-piece")
-        # in manga_data["url"]. _get_api_token → page.goto in get_chapters
-        # requires an absolute URL or Patchright raises "Cannot navigate to
-        # invalid URL", which short-circuits the token capture and causes the
-        # downstream /chapters API to 403. Normalize here so every caller of
-        # context.comic["url"] sees a usable absolute URL. Fall back to the
-        # caller-supplied url only when the API didn't populate the field.
+        # The #initial-data detail's `url` is a relative path (e.g.
+        # "/title/6e6jz-the-beginning-after-the-end"). get_chapters →
+        # fetch_chapters_via_dom → page.goto needs an absolute URL or Patchright
+        # raises "Cannot navigate to invalid URL". Normalize here so every caller
+        # of context.comic["url"] sees a usable absolute URL. Fall back to the
+        # caller-supplied url only when the detail didn't populate the field.
         api_url_value = manga_data.get("url")
         if isinstance(api_url_value, str) and api_url_value.startswith("/"):
             manga_data["url"] = "https://comix.to" + api_url_value
@@ -551,77 +453,6 @@ class ComixSiteHandler(BaseSiteHandler):
             soup=soup
         )
 
-    def _fetch_chapters_api_items(
-        self, hash_id: str, title_url: str, scraper, make_request
-    ) -> List[Dict]:
-        """Paginate the /api/v1/manga/{hid}/chapters endpoint and return the
-        flat list of raw API items. Empty list signals "API didn't yield" —
-        the caller should fall back to the DOM scrape.
-
-        2026-05-24 reality: comix.to now returns encrypted blobs
-        (`{"e": "<base64-ish>"}`) on this endpoint; the page's bundle
-        decrypts client-side. The `status` field is absent in that shape,
-        so the `status not in (200, "ok")` guard breaks the loop on the
-        first encrypted page and we return []. Kept as a fast path in
-        case comix reverts — a single rejected page is cheap, and a real
-        plain-JSON response avoids the much-slower DOM scrape entirely.
-        """
-        captured_qs = self._get_api_token(title_url) or ""
-        sig = ""
-        if captured_qs:
-            for k, v in parse_qsl(captured_qs):
-                if k == "_":
-                    sig = v
-                    break
-
-        items_all: List[Dict] = []
-        page = 1
-        # Server caps at limit=100 (limit=200 → 422 Unprocessable Entity);
-        # 100 covers a 67-item title in one page and most series in 1-3
-        # pages. limit is NOT part of the signature so we can pick any
-        # accepted value without re-capturing the token.
-        limit = 100
-
-        while True:
-            # 2026-05-13: v2 chapters endpoint 404s; v1 serves but requires
-            # the captured token. Keep v2 as 404 fallback for forward-compat.
-            api_url = (
-                f"https://comix.to/api/v1/manga/{hash_id}/chapters"
-                f"?order[number]=desc&limit={limit}&page={page}"
-            )
-            if sig:
-                api_url += f"&_={sig}"
-            response = self._cf_aware_request(api_url, scraper, make_request)
-            if response.status_code == 404:
-                api_url = (
-                    f"https://comix.to/api/v2/manga/{hash_id}/chapters"
-                    f"?order[number]=desc&limit={limit}&page={page}"
-                )
-                if sig:
-                    api_url += f"&_={sig}"
-                response = self._cf_aware_request(api_url, scraper, make_request)
-            try:
-                data = response.json()
-            except json.JSONDecodeError:
-                break
-
-            # v1 status="ok"; v2 status=200. Accept both. Encrypted-blob
-            # responses (`{"e": "..."}`) have neither, so this break
-            # naturally short-circuits and we fall through to the DOM path.
-            if data.get("status") not in (200, "ok"):
-                break
-
-            items = data.get("result", {}).get("items", [])
-            if not items:
-                break
-
-            items_all.extend(items)
-            if len(items) < limit:
-                break
-            page += 1
-
-        return items_all
-
     def get_chapters(
         self, context: SiteComicContext, scraper, language: str, make_request
     ) -> List[Dict]:
@@ -629,29 +460,25 @@ class ComixSiteHandler(BaseSiteHandler):
         if not hash_id:
              raise RuntimeError("Missing manga identifier (hash_id).")
 
-        # Title URL feeds both the sig-capture path and the DOM-scrape
-        # fallback. fetch_comic_context absolutizes this on the comic dict;
-        # the hash_id-only fallback exists for callers that constructed a
-        # context manually without a URL.
+        # Title URL feeds the DOM scrape. fetch_comic_context absolutizes this
+        # on the comic dict; the hash_id-only fallback exists for callers that
+        # constructed a context manually without a URL.
         title_url = context.comic.get("url") or f"https://comix.to/title/{hash_id}"
 
-        # Try the API path first (fast path, ~1-3 paginated calls + sig
-        # capture). Returns [] when comix.to encrypts the response, which
-        # is the steady-state behaviour as of 2026-05-24. The DOM scrape
-        # picks up from there — it's ~10x slower but works because the
-        # browser decrypts in-page before rendering.
-        raw_items = self._fetch_chapters_api_items(hash_id, title_url, scraper, make_request)
-        if not raw_items:
-            # Don't be silent here — the DOM scrape can take 30-90s on a
-            # large series, so the user should know why this step suddenly
-            # got slow. stderr (via the _stderr_print shim) keeps stdout
-            # clean for JSON consumers.
-            print(
-                "[*] Comix: API returned 0 chapters (likely encrypted response); "
-                "falling back to DOM scrape via persistent browser.",
-                flush=True,
-            )
-            raw_items = _COMIX_BROWSER_BRIDGE.fetch_chapters_via_dom(title_url) or []
+        # 2026-07-11: /api/v1/manga/{hid}/chapters is signed + encrypted
+        # ({"e":...}) and 403s "Missing token." to cloudscraper, so the chapter
+        # list is only obtainable from the rendered DOM. The persistent
+        # Patchright browser paginates the title page via ?page=N (hard 20/page;
+        # ?limit= is ignored and there's no infinite scroll), which can take
+        # 30-90s on a large multi-group series. stderr (via the _stderr_print
+        # shim) keeps stdout clean for JSON consumers.
+        # Cross-file: _ComixBrowserSession.fetch_chapters_via_dom.
+        print(
+            "[*] Comix: fetching chapter list via persistent-browser DOM scrape "
+            "(the JSON API is encrypted/token-gated).",
+            flush=True,
+        )
+        raw_items = _COMIX_BROWSER_BRIDGE.fetch_chapters_via_dom(title_url) or []
 
         chapters: List[Dict] = []
         for item in raw_items:
@@ -806,183 +633,50 @@ class ComixSiteHandler(BaseSiteHandler):
 
     def get_chapter_images(self, chapter: Dict, scraper, make_request) -> List[str]:
         url = chapter.get("url")
-        chap_id = chapter.get("id")
-        images: List[str] = []
 
-        # Memoization fast path. The prefetch worker and the main
-        # download flow share this handler instance and BOTH call
-        # into get_chapter_images for every chapter — the comment
-        # in aio-dl.py around _ImgPrefetchJob explicitly chose not
-        # to share media_entries via sidecar JSON because for
-        # mangafire the redo is ~0.5-1 s. For comix the redo is a
-        # ~20 s canvas scrape AND it serializes through the bridge's
-        # single daemon worker behind any pending prefetches, so
-        # main was waiting several chapters' worth of scrape time
-        # for a result it could have served from memory. Cache hit
-        # → return immediately, no API call, no DOM scrape, no
-        # bridge enqueue. See __init__ for the cache + TTL setup.
+        # Memoization fast path. The prefetch worker and the main download flow
+        # share this handler instance and BOTH call in for every chapter; the
+        # DOM scrape is ~seconds AND serializes through the bridge's single
+        # daemon worker behind any pending prefetches, so main was waiting
+        # several chapters' scrape time for a result it could serve from memory.
+        # Cache hit → return immediately, no browser enqueue. See __init__.
         if url:
             cached = self._get_cached_chapter_images(url)
             if cached is not None:
                 return cached
 
-        # 2026-05-13: chapter HTML is now a ~6.7KB SPA shell with no embedded
-        # images — JS calls /api/v1/chapters/{id}?_=<sig> client-side, where
-        # `_=` is a per-URL HMAC we can't reproduce in Python. Patchright
-        # navigates to the chapter URL and we steal the response body the
-        # browser already received. Persistent browser (see _ensure_browser)
-        # amortizes startup cost across chapters in the same download.
-        #
-        # 2026-05-26: also gated by `_chapter_api_known_encrypted`. Comix
-        # encrypted the response shape sometime after 2026-05-13 — every
-        # call now returns {"e": "<base64>"} that only the in-page JS can
-        # decrypt. Once we confirm that on the FIRST chapter, every later
-        # chapter skips the API path entirely and goes straight to the
-        # canvas/DOM scrape below. Without this latch, every chapter ate a
-        # ~1s API call + spammed ~5 lines of "encrypted" warnings.
-        if chap_id and url and not self._chapter_api_known_encrypted:
-            data = self._fetch_chapter_api_via_browser(url, chap_id)
-            if data:
-                # 2026-05-13 v1 chapter-detail shape:
-                #   result.pages = {"baseUrl": "<cdn-path-with-trailing-slash>",
-                #                   "items": [{"url": "01.webp", "width": ..., "height": ...}, ...]}
-                # Full image URL = baseUrl + items[i].url. Items typically all
-                # webp; the baseUrl host rotates per chapter (anti-hotlink).
-                result = data.get("result") or {}
-                pages_obj = result.get("pages") or {}
-                base_url = pages_obj.get("baseUrl") or ""
-                items = pages_obj.get("items") or []
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    rel = item.get("url")
-                    if not isinstance(rel, str) or not rel:
-                        continue
-                    images.append(rel if rel.startswith("http") else (base_url + rel))
-                # API returned data but no image URLs. Two paths:
-                #   (a) Encrypted shape ({"e": "<blob>"}) — latch the flag
-                #       so every subsequent chapter skips the API call
-                #       outright. Print ONE clean line, no base64 snippet.
-                #   (b) Anything else — keep the diagnostic but drop the
-                #       300-char data snippet (just noise; the key list is
-                #       enough to debug a future schema change).
-                if not images:
-                    try:
-                        keys = list(data.keys())
-                        if keys == ["e"]:
-                            self._chapter_api_known_encrypted = True
-                            print(
-                                "[*] Comix: chapter API is serving "
-                                "encrypted responses; switching to "
-                                "browser DOM scrape for the rest of "
-                                "this run.",
-                                flush=True,
-                            )
-                        else:
-                            print(
-                                f"[!] Comix: chapter API returned data "
-                                f"for chap_id={chap_id} but no image "
-                                f"URLs parsed. data.keys()={keys[:8]}",
-                                flush=True,
-                            )
-                    except Exception:
-                        pass
-
-        if images:
-            if url:
-                self._cache_chapter_images(url, images)
-            return images
-
-        # ──────────────────────────────────────────────────────────────
-        # 2026-05-26: DOM-scrape-for-images fallback. The chapter API now
-        # returns the same encrypted shape that the listing API does
-        # (`{"e": "<base64>"}`); the bridge captures the response but the
-        # parse loop above can't extract image URLs from an opaque blob.
-        # The in-page JS DOES decrypt it client-side and renders <img>
-        # tags, so navigate the chapter via the bridge (which has CF
-        # cookies + matching UA from _sync_cf_cookies) and scrape the
-        # rendered DOM. Same strategy as fetch_chapters_via_dom for the
-        # listing; pre-empts the HTML scrape below because chapter HTML
-        # is a SPA shell with no embedded image URLs anyway.
-        # Cross-file: _ComixBrowserSession.fetch_chapter_images_via_dom.
-        # ──────────────────────────────────────────────────────────────
-        if chap_id and url:
-            # Silent fallback once the encrypted flag is latched — every
-            # chapter takes this path, so the "falling back" line would
-            # just be 72 lines of noise. Only print when something
-            # unexpected drove us here (API errored without latching the
-            # flag, or an unrecognized non-encrypted schema shape).
-            if not self._chapter_api_known_encrypted:
-                print(
-                    f"[*] Comix: falling back to DOM-scrape-for-images "
-                    f"(chap_id={chap_id})...",
-                    flush=True,
-                )
-            images = _COMIX_BROWSER_BRIDGE.fetch_chapter_images_via_dom(url) or []
-            if images:
-                self._cache_chapter_images(url, images)
-                return images
-
-        # ----- HTML-scrape fallback (kept for forward-compat if comix re-enables SSR) -----
         if not url:
-            raise RuntimeError("Comix chapter is missing both id and url; cannot fetch images.")
-        response = self._cf_aware_request(url, scraper, make_request)
-        html = response.text
+            raise RuntimeError("Comix chapter is missing a url; cannot fetch images.")
 
-        next_data = self._extract_next_data(html)
-
-        for item in next_data:
-            # Look for "images" key which is a list of strings
-            imgs = self._find_key_recursive(item, "images")
-            if imgs and isinstance(imgs, list) and len(imgs) > 0 and isinstance(imgs[0], str):
-                images = imgs
-                break
-
-        if not images:
-             # Fallback: regex for "images":["url1", "url2"]
-             match = re.search(r'"images":\[(.*?)\]', html)
-             if match:
-                 img_list_str = match.group(1)
-                 # Extract URLs
-                 images = re.findall(r'"(https?://[^"]+)"', img_list_str)
-
-        if not images:
-             # Fallback for escaped JSON (inside Next.js data string)
-             # Matches \"images\":[\"url1\", \"url2\"]
-             match = re.search(r'\\"images\\":\[(.*?)\]', html)
-             if match:
-                 img_list_str = match.group(1)
-                 # Extract URLs (unescaped)
-                 # The URLs will be like \"https://...\"
-                 # We need to capture the URL inside the escaped quotes
-                 # The regex r'\\"(https?://[^"]+)\\"' might fail if there are escaped chars inside the URL, but usually not.
-                 # Safer: unescape the whole string first
-                 try:
-                     # Add brackets to make it a valid JSON list string: ["url1", "url2"]
-                     # But img_list_str is like \"url1\",\"url2\"
-                     # So we wrap it in brackets and unescape quotes? No.
-                     # img_list_str is literally: \"https://...\",\"https://...\"
-                     # We can just replace \" with " and then parse as JSON list
-                     unescaped = "[" + img_list_str.replace('\\"', '"') + "]"
-                     images = json.loads(unescaped)
-                 except Exception:
-                     # Regex fallback for escaped
-                     images = re.findall(r'\\"(https?://[^"]+)\\"', img_list_str)
-
-        if not images:
-            raise RuntimeError("Could not find images in chapter page.")
-
-        if url:
+        # 2026-07-11: the chapter page is an SPA that fetches a signed +
+        # encrypted /api/v1/chapters/{id} ({"e":...}) and decrypts it in-JS to
+        # render one lazy-loaded <img> per page. Those pages are now plain,
+        # directly-fetchable webp CDN URLs — comix dropped the old server-side
+        # tile-scramble, so there is no <canvas> anymore (verified 2026-07-11:
+        # no x-scramble-* headers, no CSS transform, fetchable with no referer).
+        # Python can neither sign nor decrypt the API, so drive the persistent
+        # browser to render the chapter and scrape the page URLs from the DOM.
+        # The bridge's page.on("response") listener also caches each <img>'s
+        # bytes as they load, so aio-dl.py:dl_image usually serves straight from
+        # memory instead of re-fetching. Returns [] on a render miss (the
+        # caller's completeness gate then retries on the primary — comix is
+        # SKIP_MULTI_SOURCE, so there is no alt-source rescue).
+        # Cross-file: _ComixBrowserSession.fetch_chapter_images_via_dom.
+        images = _COMIX_BROWSER_BRIDGE.fetch_chapter_images_via_dom(url) or []
+        if images:
             self._cache_chapter_images(url, images)
         return images
 
     # ----------------------------------------------------------------- search
-    # Comix uses /api/v1/manga?keyword=<query>. The /api/v1/search endpoint
-    # in their JS bundle config IS a thing but returns 404 for unauth GETs;
-    # /api/v1/manga is the public list endpoint with a 'keyword' filter that
-    # behaves as substring/relevance match. (axios baseURL=/api/v1; bundle
-    # exposes a top-level routes.search="/search" but that's a UI route, not
-    # an API one.) The list endpoint is the supported public search path.
+    # 2026-07-11: /api/v1/manga?keyword= is token-gated now — it returns
+    # 403 {"message":"Missing token."} to anything cloudscraper can send (the
+    # signature is computed in-page per URL). Keyword search can no longer work
+    # from Python, so this degrades to [] on any failure, which just drops comix
+    # out of a TITLE search. The usable path is URL-seed input: paste a comix.to
+    # /title/ URL into --search and aio_search_cli.py:_try_extract_seed_hit
+    # resolves it via fetch_comic_context (SSR #initial-data, no browser). A
+    # browser-driven keyword search was considered and deferred (fragile; comix
+    # is already SKIP_MULTI_SOURCE + SKIP_QUALITY_PROBE, i.e. de-prioritized).
     def search(
         self,
         query: str,
@@ -1000,10 +694,12 @@ class ComixSiteHandler(BaseSiteHandler):
             f"?keyword={quote_plus(clean)}"
             f"&limit={int(limit)}"
         )
-        response = make_request(url, scraper)
+        # Any error (403 token-gate, network, non-JSON) → no comix results,
+        # never an exception that would break the cross-site orchestrator.
         try:
+            response = make_request(url, scraper)
             data = response.json()
-        except (ValueError, json.JSONDecodeError):
+        except Exception:
             return []
         if not isinstance(data, dict) or data.get("status") != "ok":
             return []
@@ -1164,26 +860,20 @@ class _ComixBrowserSession:
             self._cleanup()
             return False
 
-        # Session-level <img> byte capture. This is the single most
-        # important wire in the comix chapter pipeline once the API
-        # is encrypted — without it the 70-80 plain (non-scrambled)
-        # pages per chapter come back as real CDN URLs and dl_image
-        # re-fetches them later via HTTP, by which time the signed
-        # token has expired or the CDN is rate-limiting from the
-        # parallel canvas-scrape traffic. Empirically this is what
-        # was causing the [Backoff]/[Fallback]/[Error: Skipping]
-        # cascades and the 30s long-retries per chapter. Stashing
-        # the bytes here at the moment the browser pulls them lets
-        # dl_image short-circuit straight to disk on lookup.
+        # Session-level <img> byte capture. This is the single most important
+        # wire in the comix chapter pipeline: the ~70-80 pages per chapter load
+        # as <img> off the CDN, and without capturing the bytes here dl_image
+        # would re-fetch each URL over HTTP later — by which time the CDN may be
+        # rate-limiting from the parallel scrape traffic. Empirically that was
+        # the cause of the [Backoff]/[Fallback]/[Error: Skipping] cascades and
+        # the 30s long-retries per chapter. Stashing the bytes at the moment the
+        # browser pulls them lets dl_image short-circuit straight to disk.
         #
-        # Filter on request.resource_type == "image": only true
-        # <img>-tag fetches qualify. JS-driven fetch()/XHR calls
-        # (which carry the SCRAMBLED canvas-source webps we'd need
-        # the in-page Mr unscramble to use) are resource_type
-        # "fetch"/"xhr" and get skipped — caching them would just
-        # waste the 256MB cap. Cross-file: sites/image_cache.py
-        # owns the cache + eviction; aio-dl.py:dl_image reads from
-        # it at the top of dl_image before any HTTP work.
+        # Filter on request.resource_type == "image": only true <img>-tag
+        # fetches qualify. JS-driven fetch()/XHR calls are resource_type
+        # "fetch"/"xhr" and get skipped — caching them would just waste the
+        # 256MB cap. Cross-file: sites/image_cache.py owns the cache + eviction;
+        # aio-dl.py:dl_image reads from it at the top before any HTTP work.
         try:
             from . import image_cache as _image_cache_module
         except Exception:
@@ -1329,90 +1019,6 @@ class _ComixBrowserSession:
                 f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
-
-    def get_api_token(self, url: str) -> Optional[str]:
-        if not self._start():
-            return None
-        self._sync_cf_cookies()
-        page = self._page
-        token_query: Optional[str] = None
-
-        def handle_req(request):
-            nonlocal token_query
-            if token_query:
-                return
-            u = request.url
-            # Title page only fires the /chapters listing call (not /chapters/{id}).
-            if "/chapters?" in u and "_=" in u:
-                parts = u.split("?", 1)
-                if len(parts) > 1:
-                    token_query = parts[1]
-
-        page.on("request", handle_req)
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            # Poll up to ~5s for the listing XHR to fire.
-            for _ in range(50):
-                if token_query:
-                    break
-                page.wait_for_timeout(100)
-        except Exception as e:
-            print(f"[!] Comix token capture navigation failed: {e}")
-            try:
-                page.remove_listener("request", handle_req)
-            except Exception:
-                pass
-            return None
-        try:
-            page.remove_listener("request", handle_req)
-        except Exception:
-            pass
-        return token_query
-
-    def fetch_chapter_api(self, chapter_url: str, chap_id) -> Optional[Dict]:
-        if not self._start():
-            return None
-        self._sync_cf_cookies()
-        page = self._page
-        captured: Dict[str, Optional[Dict]] = {"data": None}
-        target_path = f"/api/v1/chapters/{chap_id}"
-        seen_responses: List[str] = []
-
-        def handle_response(response):
-            if captured["data"] is not None:
-                return
-            try:
-                u = response.url
-                if "/api/v1/" in u:
-                    seen_responses.append(f"{response.status} {u[:120]}")
-                if target_path in u and response.status == 200:
-                    captured["data"] = response.json()
-            except Exception:
-                pass
-
-        page.on("response", handle_response)
-        try:
-            page.goto(chapter_url, wait_until="domcontentloaded", timeout=30000)
-            # Poll up to ~10s for the chapter-detail XHR to land. SPA loads
-            # the viewer JS first, then fires the API call ~1-2s later.
-            for _ in range(100):
-                if captured["data"]:
-                    break
-                page.wait_for_timeout(100)
-        except Exception as e:
-            print(f"[!] Comix chapter browser fetch failed for {chap_id}: {type(e).__name__}: {e}", flush=True)
-        finally:
-            try:
-                page.remove_listener("response", handle_response)
-            except Exception:
-                pass
-
-        if not captured["data"]:
-            # Diagnostic: surface what API responses we DID see so the user
-            # can tell if the site changed structure vs. our listener missed.
-            tail = seen_responses[-6:] if seen_responses else ["(none)"]
-            print(f"[!] Comix: no chapter-API response captured for {chap_id}. Seen API responses (tail): {tail}", flush=True)
-        return captured["data"]
 
     def fetch_chapters_via_dom(
         self,
@@ -1703,53 +1309,42 @@ class _ComixBrowserSession:
         chapter_url: str,
         time_budget_s: float = 300.0,
     ) -> list:
-        """Capture chapter pages by reading the rendered canvas/img
-        elements one at a time. Each scrambled page is unscrambled by
-        comix's own JS (function `Mr` exported from secure-tfmtlr-*.js)
-        when the page's parent .rpage-page enters the viewport; we
-        read the resulting canvas pixels via canvas.toDataURL.
+        """Capture chapter pages by scrolling each .rpage-page into view and
+        reading the rendered element one at a time.
 
-        Why this and not a URL-list approach: comix scrambles chapter
-        images server-side. Every webp response from the CDN ships
-        with `x-scramble-seed: <int>` and `x-scramble-grid: <NxN>`
-        response headers, and the in-page JS decodes the webp, splits
-        it into an N×N tile grid, applies a seeded Fisher-Yates
-        permutation, and redraws the unscrambled image onto a
-        <canvas>. We can't replicate that algorithm in Python because
-        the JS function `Mr` lives inside a VM-obfuscated bundle
-        (`secure-tfmtlr-DRWN4DsO.js`, opcode 243 inside `vmm_bab755`).
-        Reverse-engineering the VM is deep work; reading the canvas
-        pixels after the browser unscrambles is one page.evaluate.
+        Why the browser at all: the chapter page is an SPA whose page list
+        comes from a signed + encrypted /api/v1/chapters/{id} ({"e":...})
+        response that only the in-page JS can decrypt — Python can neither sign
+        nor decrypt it — and the <img> src is lazy-set per page as it nears the
+        viewport (not in #initial-data or any data-* attribute). So we let the
+        browser render and scrape the DOM.
+
+        Two page shapes, checked in order (see the per-page poll below):
+          - <img> (the NORMAL path as of 2026-07-11): comix dropped the old
+            server-side tile-scramble, so pages are plain, directly-fetchable
+            webp CDN URLs. Use img.src verbatim; aio-dl.py:dl_image fetches it
+            (and the session-level page.on("response") listener already cached
+            its bytes as it loaded, so that's usually a memory hit).
+          - <canvas> (LEGACY fallback): kept in case comix re-enables the tile
+            scramble it used through mid-2026 (webp shipped with x-scramble-seed
+            / x-scramble-grid headers, unscrambled in-JS onto a canvas). Read
+            the pixels via canvas.toDataURL and stash the bytes in image_cache
+            under a synthetic comix-page://<chap_id>/<NNNN>.webp key so dl_image
+            serves them without any HTTP fetch (the real /si/ URL would return
+            the scrambled bytes). Costs nothing when no canvas is present.
 
         Flow:
           1. Pre-flight: visit comix.to once to set localStorage
-             `reader.default.preload = 'all'` so the reader eagerly
-             renders every page's canvas, not just the visible ones.
-          2. Navigate to the chapter URL. Wait for the React app to
-             mount and the chapter API response to populate the DOM
-             with one .rpage-page <div> per page (which is how we
-             know the total page count).
-          3. For each page index 1..N:
-               a. scrollIntoView the .rpage-page[data-page=N] element
-                  (triggers IntersectionObserver → Mr fires).
-               b. Poll for the canvas or img child to be fully
-                  rendered (canvas.width > 0 and parent is not
-                  .is-loading). 10 s max per page.
-               c. If <canvas>: read pixels via canvas.toDataURL,
-                  stash bytes in image_cache under a synthetic URL
-                  key (comix-page://<chap_id>/<NNNN>.webp), append
-                  the key to the return list. dl_image's cache
-                  check (see aio-dl.py:dl_image) finds the bytes and
-                  bypasses any HTTP fetch.
-               d. If <img>: use the real img.src as the URL.
-                  Plain (non-scrambled) pages — cloudscraper can
-                  fetch these the normal way.
+             `reader.default.preload = 'all'` so the reader renders eagerly.
+          2. Navigate to the chapter URL; wait for the React app to mount and
+             populate one .rpage-page <div> per page (= the page count).
+          3. For each page 1..N: scrollIntoView (triggers the lazy load), poll
+             up to 10 s for a rendered <img>/<canvas>, collect the URL/key.
 
-        Cross-file: called from sites/comix.py:ComixSiteHandler
-        .get_chapter_images via _COMIX_BROWSER_BRIDGE
-        .fetch_chapter_images_via_dom. image_cache populated here is
-        read by aio-dl.py:dl_image. Runs on the comix-pw daemon worker
-        per the bridge's same-thread Patchright contract.
+        Cross-file: called from ComixSiteHandler.get_chapter_images via
+        _COMIX_BROWSER_BRIDGE.fetch_chapter_images_via_dom; image_cache
+        populated here is read by aio-dl.py:dl_image. Runs on the comix-pw
+        daemon worker per the bridge's same-thread Patchright contract.
         """
         if not self._start():
             return []
@@ -1850,8 +1445,8 @@ class _ComixBrowserSession:
 
         print(
             f"[*] Comix: chapter has {page_count} pages; capturing "
-            f"each via Patchright (canvas pixels for scrambled pages, "
-            f"<img> src for plain pages).",
+            f"each via Patchright (<img> src, or canvas pixels if a page "
+            f"is tile-scrambled).",
             flush=True,
         )
 
@@ -2167,12 +1762,6 @@ class _ComixBrowserBridge:
     block-comment near _COMIX_REQUEST_QUEUE for rationale).
     """
 
-    def get_api_token(self, url: str) -> Optional[str]:
-        return _comix_call("get_api_token", url)
-
-    def fetch_chapter_api(self, chapter_url: str, chap_id) -> Optional[Dict]:
-        return _comix_call("fetch_chapter_api", chapter_url, chap_id)
-
     def fetch_chapters_via_dom(
         self,
         title_url: str,
@@ -2200,24 +1789,21 @@ class _ComixBrowserBridge:
         chapter_url: str,
         time_budget_s: float = 300.0,
     ) -> List[str]:
-        """Bridge facade for chapter-page canvas capture.
+        """Bridge facade for chapter-page image capture.
 
-        Used as the fallback when `/api/v1/chapters/{id}` returns an
-        encrypted blob (`{"e": "..."}`) we can't decrypt in Python.
-        The in-page JS decrypts the blob, unscrambles each page via
-        the closure-scoped `Mr` function (canvas tile permutation
-        seeded by `x-scramble-seed` response header), and renders to
-        a <canvas>. We read those canvas pixels out via Patchright.
+        The chapter page's `/api/v1/chapters/{id}` response is signed +
+        encrypted (`{"e": "..."}`) and Python can't reproduce/decrypt it, so
+        drive the browser to render the chapter and scrape the page URLs. Pages
+        are plain <img> webp CDN URLs now (comix dropped the tile-scramble); a
+        legacy <canvas> branch remains as a fallback — see
+        _ComixBrowserSession.fetch_chapter_images_via_dom for the details.
 
-        Default 300 s budget covers ~126-page chapters; a typical
-        chapter takes ~1-2 s per page (scroll + render wait). Bump
-        this for chapters that exceed the budget. Inner deadline +
-        30 s outer cap matches fetch_chapters_via_dom.
-
-        Cross-file: see _ComixBrowserSession.fetch_chapter_images_via_dom
-        for the actual implementation. Populates sites/image_cache.py
-        with unscrambled bytes; aio-dl.py:dl_image reads from there
-        via synthetic `comix-page://<chap_id>/<NNNN>.webp` URL keys.
+        Default 300 s budget covers ~126-page chapters; a typical chapter takes
+        ~1-2 s per page (scroll + render wait). Bump this for chapters that
+        exceed the budget. Inner deadline + 30 s outer cap matches
+        fetch_chapters_via_dom. Populates sites/image_cache.py with page bytes;
+        aio-dl.py:dl_image reads real CDN URLs from there, and canvas-captured
+        pages via synthetic `comix-page://<chap_id>/<NNNN>.webp` keys.
         """
         return _comix_call(
             "fetch_chapter_images_via_dom",
