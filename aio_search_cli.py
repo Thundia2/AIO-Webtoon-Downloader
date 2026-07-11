@@ -69,20 +69,35 @@ from sites.search_orchestrator import (
 )
 
 
+# Host suffix → handler name for URL-mode --search. The conceptual boundary is
+# "sites whose keyword search is unreliable or dead," so pasting a series URL is
+# the only reliable way to force the site into cross-site comparison:
+#   - mangafire: typeahead is intermittent.
+#   - comix: the keyword API is signed + encrypted (403 "Missing token."), so
+#     ComixSiteHandler.search() returns []; a /title/ URL resolves via the SSR
+#     #initial-data blob (plain HTTP, no browser). See sites/comix.py.
+# Add a host here (and, if its get_chapters is expensive, a count branch below)
+# to extend the feature.
+_URL_SEED_HOSTS = {
+    "mangafire.to": "mangafire",
+    "comix.to": "comix",
+}
+
+
 def _try_extract_seed_hit(query: str) -> Optional[SearchHit]:
-    """If `query` is a URL we can scrape into a SearchHit, return it.
+    """If `query` is a URL for a URL-seedable site, scrape it into a SearchHit.
 
-    Currently MangaFire-only: the user's "URL-mode --search" sidequest exists
-    because MangaFire's typeahead is unreliable and they need a way to GUARANTEE
-    MangaFire participates in cross-site comparison. Other sites' search is
-    reliable enough that URL-mode adds no value there.
+    The "URL-mode --search" feature (originally MangaFire-only) exists for sites
+    whose keyword search can't be relied on: paste a series URL and that site is
+    GUARANTEED to participate in cross-site comparison. Supported hosts live in
+    _URL_SEED_HOSTS; other sites' search is reliable enough that URL-mode adds
+    no value there.
 
-    Returns None if `query` isn't a URL or isn't a MangaFire URL — caller
-    proceeds with normal title-based search using `query` as-is.
-
-    Raises SystemExit if the URL appears to be MangaFire but the page can't
-    be scraped (bad slug, network error, etc.) — the user expected a usable
-    seed and we can't deliver, so fail loudly rather than silently swallow.
+    Returns None if `query` isn't a URL — the caller proceeds with normal
+    title-based search using `query` as-is. Raises SystemExit if the URL is a
+    seedable host that can't be resolved (bad slug, network error), OR is a URL
+    for an unsupported host — the user passed a URL expecting a seed, so fail
+    loudly rather than silently treat the raw URL as a search string.
     """
     if not query:
         return None
@@ -94,20 +109,28 @@ def _try_extract_seed_hit(query: str) -> Optional[SearchHit]:
     except Exception:
         return None
     host = (parsed.netloc or "").lower()
-    if not host.endswith("mangafire.to"):
+    site = next(
+        (
+            name
+            for suffix, name in _URL_SEED_HOSTS.items()
+            if host == suffix or host.endswith("." + suffix)
+        ),
+        None,
+    )
+    if site is None:
+        supported = ", ".join(sorted(_URL_SEED_HOSTS))
         sys.exit(
-            f"--search received a URL but it's not from MangaFire: {host}\n"
-            "URL-mode --search is currently MangaFire-only (the typeahead's "
-            "intermittency is what motivated this feature). For other sites, "
-            "search by title."
+            f"--search received a URL but URL-mode is only supported for: "
+            f"{supported} (those sites' keyword search is unreliable/dead). "
+            f"Got host: {host!r}. For other sites, search by title."
         )
-    # MangaFire URL → resolve via the handler's REST API. Since the 2026
-    # MangaFire relaunch this is a plain JSON GET (no browser/VRF) — see
-    # sites/mangafire.py. fetch_comic_context extracts the hid from either the
-    # new /title/{hid}-{slug} or the old /manga/{slug}.{hid} URL shape.
-    handler = get_handler_by_name("mangafire")
+    # Resolve the URL via the handler's fetch_comic_context. Both supported
+    # handlers extract the id from the URL themselves (mangafire: new/old shape;
+    # comix: slug hid) and populate the comic dict — mangafire via a plain JSON
+    # GET, comix via the SSR #initial-data blob. No browser in either path.
+    handler = get_handler_by_name(site)
     if handler is None:
-        sys.exit("MangaFire handler unavailable")
+        sys.exit(f"{site} handler unavailable")
     session = requests.Session()
     try:
         handler.configure_session(session, None)
@@ -120,34 +143,55 @@ def _try_extract_seed_hit(query: str) -> Optional[SearchHit]:
     try:
         ctx = handler.fetch_comic_context(q, session, _mk)
     except Exception as exc:
-        sys.exit(f"Failed to resolve MangaFire URL: {exc}")
+        sys.exit(f"Failed to resolve {site} URL: {exc}")
     comic = ctx.comic or {}
     title = ctx.title or comic.get("title")
     if not title or title == "Unknown Title":
-        sys.exit(f"MangaFire URL didn't yield a title: {q}")
-    # Accurate chapter count — one (or few) cheap JSON GET(s). Feeds the
-    # orchestrator's DMCA/count heuristics; non-fatal if it fails.
-    count: Optional[int] = None
-    try:
-        chaps = handler.get_chapters(ctx, session, "en", _mk)
-        count = len(chaps) if chaps else None
-    except Exception:
-        count = None
+        sys.exit(f"{site} URL didn't yield a title: {q}")
+
+    # Chapter count is per-site. MangaFire's get_chapters is a cheap REST call,
+    # so verify the actual fetchable count (feeds the orchestrator's DMCA/count
+    # heuristics). comix's get_chapters is a slow browser DOM scrape — DON'T run
+    # it just to seed a search; use the #initial-data `latestChapter` hint
+    # instead (a metadata claim, not verified → chapter_count_hint only,
+    # actual=None), so resolving a comix URL stays a single cheap HTTP GET.
+    count_hint: Optional[int] = None
+    actual: Optional[int] = None
+    if site == "mangafire":
+        try:
+            chaps = handler.get_chapters(ctx, session, "en", _mk)
+            count_hint = actual = len(chaps) if chaps else None
+        except Exception:
+            count_hint = actual = None
+    else:
+        for _key in ("latestChapter", "finalChapter"):
+            _val = comic.get(_key)
+            if _val in (None, "", 0, "0"):
+                continue
+            try:
+                count_hint = int(float(_val))
+                break
+            except (TypeError, ValueError):
+                continue
+
+    # comix omits is_official (defer to the handler, matching its own search()
+    # hits); MangaFire is a non-publisher aggregator → False.
+    is_official = False if site == "mangafire" else None
     return SearchHit(
-        site="mangafire",
+        site=site,
         title=title,
         url=comic.get("url") or q,
         cover=comic.get("cover"),
         alt_titles=comic.get("alt_names") or [],
         year=comic.get("year"),
         language=None,
-        chapter_count_hint=count,
-        actual_chapter_count=count,
+        chapter_count_hint=count_hint,
+        actual_chapter_count=actual,
         dmca_likely=False,
         # 1.0 because the title came directly from the URL's series page —
         # the user's intent is unambiguous, so seed it as a perfect match.
         raw_score=1.0,
-        is_official=False,
+        is_official=is_official,
     )
 
 
@@ -379,16 +423,16 @@ def run_search_mode(
     from sites.search_orchestrator import set_ml_rating_enabled
     set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
 
-    # URL-mode: if the user supplied a MangaFire URL instead of a title text,
-    # resolve the series via MangaFire's REST API and turn it into a seed hit.
-    # The orchestrator then runs the normal cross-site search using the
-    # resolved title, with MangaFire's data already guaranteed to be present.
+    # URL-mode: if the user supplied a series URL instead of title text (a
+    # MangaFire or comix /title/ URL — see _URL_SEED_HOSTS), resolve it into a
+    # seed hit. The orchestrator then runs the normal cross-site search using
+    # the resolved title, with that site's data already guaranteed to be present.
     seed_hits: list = []
     seed = _try_extract_seed_hit(query)
     if seed is not None:
         seed_hits.append(seed)
         # Use the scraped title as the effective query for other sites — the
-        # original URL is meaningless to non-MangaFire handlers.
+        # original URL is meaningless to the other handlers.
         query = seed.title
 
     language = getattr(args, "search_language", None) or getattr(args, "language", "en") or "en"
