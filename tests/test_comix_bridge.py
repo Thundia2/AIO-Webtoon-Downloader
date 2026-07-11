@@ -15,15 +15,20 @@ on `_comix_call` (the previous `fut.result()` had none, deadlocking
 every other bridge caller behind a single hung op). The bridge's
 public API (`_COMIX_BROWSER_BRIDGE`) is unchanged across both rewrites.
 
+2026-07-11: comix.to relaunched as a fully signed + encrypted SPA, so the old
+token-capture (`get_api_token`) and encrypted-response-steal (`fetch_chapter_api`)
+methods were deleted from both the handler and the bridge — the only live
+Patchright work now is the chapter-list and chapter-image DOM scrapes
+(`fetch_chapters_via_dom` / `fetch_chapter_images_via_dom`). See sites/comix.py.
+
 These tests verify the bridge's contract:
   - Module-level singletons exist (request queue, worker-started flag,
     bridge, ensure-worker helper).
-  - The handler's _get_api_token / _fetch_chapter_api_via_browser methods
-    delegate through the bridge with no main-thread restriction.
-  - A worker-thread call doesn't raise `RuntimeError: no running event loop`.
+  - A worker-thread call (fetch_chapters_via_dom — the live chapter-list path)
+    doesn't raise `RuntimeError: no running event loop`.
 
-The tests stub the bridge methods (no real Patchright launch) so they run
-without network or browser dependencies. A separate live-integration check
+The tests stub the bridge/session methods (no real Patchright launch) so they
+run without network or browser dependencies. A separate live-integration check
 is documented in the plan file's Verification section but not run here.
 
 Cross-file:
@@ -71,59 +76,26 @@ def test_handler_no_longer_needs_main_thread_prefetch():
     assert getattr(comix.ComixSiteHandler, "NEEDS_MAIN_THREAD_PREFETCH", False) is False
 
 
-def test_handler_delegates_get_api_token_to_bridge():
-    """ComixSiteHandler._get_api_token should route through the bridge
-    when the per-handler memo is cold. Caches the result on hit so
-    subsequent calls don't re-pay the bridge round-trip."""
-    handler = comix.ComixSiteHandler()
-    # Drop any pre-existing memo for our test URL (cache lives on the class).
-    comix.ComixSiteHandler._ChaptersTokenCache.pop("https://test.example/title/xyz", None)
-    with patch.object(
-        comix._COMIX_BROWSER_BRIDGE, "get_api_token", return_value="_=DEADBEEF&time=1"
-    ) as bridge_mock:
-        out = handler._get_api_token("https://test.example/title/xyz")
-        assert out == "_=DEADBEEF&time=1"
-        bridge_mock.assert_called_once_with("https://test.example/title/xyz")
-        # Second call serves from the class-level memo, no bridge hit.
-        out2 = handler._get_api_token("https://test.example/title/xyz")
-        assert out2 == "_=DEADBEEF&time=1"
-        assert bridge_mock.call_count == 1
-
-
-def test_handler_delegates_fetch_chapter_api_to_bridge():
-    """ComixSiteHandler._fetch_chapter_api_via_browser is a thin pass-through
-    to the bridge — no caching, no main-thread guard."""
-    handler = comix.ComixSiteHandler()
-    fake_payload = {"result": {"pages": {"baseUrl": "https://cdn/", "items": []}}}
-    with patch.object(
-        comix._COMIX_BROWSER_BRIDGE, "fetch_chapter_api", return_value=fake_payload
-    ) as bridge_mock:
-        out = handler._fetch_chapter_api_via_browser(
-            "https://test.example/title/abc/123-chapter-1", 123,
-        )
-        assert out is fake_payload
-        bridge_mock.assert_called_once_with(
-            "https://test.example/title/abc/123-chapter-1", 123,
-        )
-
-
 def test_bridge_callable_from_worker_thread_without_event_loop():
     """The primary regression guard: pre-v7, calling the Patchright surface
     from a worker thread raised `RuntimeError: no running event loop`.
-    Post-v7, the bridge serializes the work onto its dedicated executor
-    thread so the caller's thread context is irrelevant.
+    Post-v7, the bridge serializes the work onto its dedicated worker thread
+    so the caller's thread context is irrelevant.
 
-    Stubs the underlying session methods so this test runs without an
-    actual browser launch."""
+    Exercised via fetch_chapters_via_dom — the live chapter-list path since the
+    2026-07-11 signed+encrypted SPA relaunch (token capture / API steal were
+    deleted). Stubs the underlying session method so this runs without an actual
+    browser launch."""
     captured: dict = {"exc": None, "result": "<unset>"}
+    fake_chapters = [{"id": 1, "number": 1, "url": "https://x/1", "language": None}]
 
-    # Patch the session method that runs on the executor thread.
+    # Patch the session method that runs on the bridge's worker thread.
     with patch.object(
-        comix._ComixBrowserSession, "get_api_token", return_value="_=mock&time=1"
+        comix._ComixBrowserSession, "fetch_chapters_via_dom", return_value=fake_chapters
     ):
         def worker():
             try:
-                captured["result"] = comix._COMIX_BROWSER_BRIDGE.get_api_token(
+                captured["result"] = comix._COMIX_BROWSER_BRIDGE.fetch_chapters_via_dom(
                     "https://test.example/title/wt"
                 )
             except Exception as e:
@@ -135,9 +107,9 @@ def test_bridge_callable_from_worker_thread_without_event_loop():
 
     assert captured["exc"] is None, (
         f"bridge call from worker thread raised {captured['exc']!r}; "
-        f"expected the executor to absorb the asyncio-loop constraint"
+        f"expected the worker thread to absorb the asyncio-loop constraint"
     )
-    assert captured["result"] == "_=mock&time=1"
+    assert captured["result"] == fake_chapters
 
 
 def test_bridge_close_is_noop_safe():
