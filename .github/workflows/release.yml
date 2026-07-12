@@ -5,8 +5,8 @@
 #   - push of any tag matching v*  (cuts a draft GitHub Release)
 #   - manual workflow_dispatch     (also cuts a draft release — tag is
 #                                   either provided via the `tag_name`
-#                                   input or auto-derived from
-#                                   UI-source/package.json + timestamp)
+#                                   input or auto-derived from the
+#                                   commit's date-version + timestamp)
 #
 # Jobs:
 #   build   — matrix over windows-latest / macos-latest / ubuntu-latest.
@@ -30,14 +30,16 @@
 #     refactor of the script's path resolution.
 #   - AUTO-UPDATE (opt-in, UI-source/electron/updater.js): installed apps
 #     poll this repo's *published* releases via electron-updater. Two build
-#     steps below feed that: the version stamp (tag → package.json version,
-#     so the repo never has to bump its checked-in version) and the publish
-#     stamp (feed = whichever repo ran this workflow). Publishing the draft
-#     is the go-live act — drafts are invisible to installed apps. Release
-#     tags MUST be plain semver (vX.Y.Z) or the version stamp skips and the
-#     release never serves as an update; always tag current HEAD (GitHub's
-#     /releases/latest sorts by the tagged commit's created_at, not by
-#     publish time).
+#     steps below feed that: the version stamp (a DATE-BASED version derived
+#     from the release commit by UI-source/scripts/ci-date-version.js — the
+#     repo never bumps its checked-in version, and tag names are pure
+#     labels: any naming works) and the publish stamp (feed = whichever
+#     repo ran this workflow). Publishing the draft is the go-live act —
+#     drafts are invisible to installed apps. Publish promptly (the
+#     updater's maturity delay counts from BUILD time) and release from
+#     the newest commit: versions grow with committer time, clients never
+#     downgrade, and GitHub's /releases/latest sorts by the tagged
+#     commit's created_at, not by publish time.
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Release
@@ -46,15 +48,16 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
-    # Manual runs cut a draft release too — handy for shipping a build
-    # without pushing a real vX.Y.Z tag yet. Either supply the tag name
-    # explicitly, or leave it blank and the release job will synthesize
-    # `v<package.json.version>-draft-<UTC timestamp>` so multiple manual
-    # runs never collide. The tag is only materialized on the commit
-    # when the maintainer clicks "Publish" on the draft.
+    # Manual runs cut a draft release too — and since the app version is
+    # date-derived from the commit (not from any tag), a manual draft is
+    # every bit as updatable as a tag-push one once published. Either
+    # supply the tag name explicitly, or leave it blank and the release
+    # job will synthesize `v<date-version>-draft-<UTC timestamp>` so
+    # multiple manual runs never collide. The tag is only materialized
+    # on the commit when the maintainer clicks "Publish" on the draft.
     inputs:
       tag_name:
-        description: 'Tag for the draft release (e.g. v1.7.3). Leave empty to auto-generate from UI-source/package.json version + UTC timestamp.'
+        description: 'Tag for the draft release. Any name works — tags are labels; the app version is date-derived from the commit. Leave empty to auto-generate.'
         required: false
         type: string
         default: ''
@@ -91,32 +94,32 @@ jobs:
         run: npm ci
 
       # The repo convention keeps package.json's version static across
-      # releases — the release tag is the version of record. Stamp it into
-      # package.json before electron-builder runs so BOTH app.getVersion()
-      # (baked into the installed app) and latest.yml (the update feed's
-      # channel file) carry the tag's version. electron-updater then
+      # releases — the version of record is DATE-BASED, derived from the
+      # release commit's committer timestamp by scripts/ci-date-version.js
+      # (YYYY.MDD.HMM UTC; see that file for the full rationale). Stamp it
+      # into package.json before electron-builder runs so BOTH
+      # app.getVersion() (baked into the installed app) and latest.yml
+      # (the update feed's channel file) carry it. electron-updater then
       # compares those two stamped values — "newest published release vs
-      # the release this install came from" — with no repo bumps ever.
-      # Non-semver tags (e.g. a 4-component v0.0.5.1) skip the stamp with
-      # a warning: the build still ships, but installed apps will never
-      # see it as an update. npm version's own strict semver validation
-      # backstops the regex. Cross-file: UI-source/electron/updater.js.
-      - name: Stamp app version from release tag
-        if: github.ref_type == 'tag'
+      # the release this install came from" — with no repo bumps ever and
+      # no dependency on how the release is tagged (tag names here have
+      # always been variable — v0.0.5.1, v.0.0.5.2 — and are now pure
+      # labels). Unconditional: every run of this workflow is a release
+      # build, including workflow_dispatch drafts, which the old
+      # tag-derived stamp used to skip, shipping dead 2.0.0 feeds. npm
+      # version's strict semver validation backstops the script's own
+      # tripwire. Cross-file: UI-source/electron/updater.js.
+      - name: Stamp date-based app version
         shell: bash
         run: |
-          VER="${GITHUB_REF_NAME#v}"
-          if [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            npm version "$VER" --no-git-tag-version --allow-same-version --ignore-scripts
-            echo "Stamped app version ${VER} (from tag ${GITHUB_REF_NAME})"
-          else
-            echo "::warning::Tag '${GITHUB_REF_NAME}' is not plain semver (vX.Y.Z[-pre]) — keeping package.json version $(node -p "require('./package.json').version"). Auto-update clients will not see this release."
-          fi
+          VER=$(node scripts/ci-date-version.js)
+          npm version "$VER" --no-git-tag-version --allow-same-version --ignore-scripts
+          echo "Stamped app version ${VER} (from commit $(git log -1 --format='%h, committed %cI'))"
 
       # Point the embedded update feed (resources/app-update.yml) at the
       # repo that is building the installer, so fork-built installers poll
       # the fork's releases and upstream-built ones poll upstream — no
-      # cross-repo coupling. Unconditional (unlike the version stamp):
+      # cross-repo coupling. Unconditional, like the version stamp:
       # workflow_dispatch draft builds must also poll their own repo, not
       # the static default in package.json's build.publish (which only
       # covers local `npm run dist:*` builds).
@@ -175,10 +178,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout is needed by "Determine release tag" below so it can read
-      # UI-source/package.json on manual runs without an explicit tag input.
-      # Cheap (shallow clone, no LFS) and a no-op on tag-push runs that
-      # already have the tag in github.ref.
+      # Checkout is needed by "Determine release tag" below so it can run
+      # UI-source/scripts/ci-date-version.js on manual runs without an
+      # explicit tag input. Cheap (shallow clone, no LFS) and a no-op on
+      # tag-push runs that already have the tag in github.ref.
       - uses: actions/checkout@v6
 
       # download-artifact@v8 errors on hash mismatch by default (was warning
@@ -190,13 +193,15 @@ jobs:
         with:
           path: artifacts
 
-      # Tag-push runs: re-use the pushed ref (refs/tags/vX.Y.Z → vX.Y.Z).
+      # Tag-push runs: re-use the pushed ref (refs/tags/<name> → <name>).
       # Manual runs: prefer the user-supplied input; otherwise synthesize
-      # v<package.json.version>-draft-<UTC timestamp> so repeat manual
-      # runs each get a unique draft. softprops/action-gh-release only
-      # materializes the tag on the run's commit when the maintainer
-      # publishes the draft via the UI, so the synthesized name is safe
-      # to throw away if the draft is discarded.
+      # v<date-version>-draft-<UTC timestamp> — the same ci-date-version.js
+      # output the build jobs stamped into the installers, so the draft's
+      # name says what's inside — and repeat manual runs each get a unique
+      # draft. softprops/action-gh-release only materializes the tag on
+      # the run's commit when the maintainer publishes the draft via the
+      # UI, so the synthesized name is safe to throw away if the draft is
+      # discarded.
       - name: Determine release tag
         id: tag
         shell: bash
@@ -206,7 +211,7 @@ jobs:
             if [ -n "$INPUT_TAG" ]; then
               TAG="$INPUT_TAG"
             else
-              VERSION=$(node -p "require('./UI-source/package.json').version")
+              VERSION=$(node UI-source/scripts/ci-date-version.js)
               STAMP=$(date -u +%Y%m%d-%H%M%S)
               TAG="v${VERSION}-draft-${STAMP}"
             fi

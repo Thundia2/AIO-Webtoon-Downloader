@@ -16,11 +16,11 @@
 // off; update-available decides eligible-vs-deferred), not the
 // install — a bad build never even lands on disk. The clock is the
 // feed's releaseDate, which electron-builder stamps at BUILD time:
-// for the canonical tag-push flow that's minutes before the draft
-// exists, but a draft left unpublished for days eats into the
-// window — publish drafts promptly. allowDowngrade stays false, so
-// a pulled release that makes an OLDER version "latest" can never
-// downgrade anyone regardless of this delay.
+// for the normal build→draft→publish flow that's minutes before
+// the draft exists, but a draft left unpublished for days eats
+// into the window — publish drafts promptly. allowDowngrade stays
+// false, so a pulled release that makes an OLDER version "latest"
+// can never downgrade anyone regardless of this delay.
 //
 // Consumed by main.js only (grep initAppUpdater). Renderer
 // surface: push channel "app-update-status" + invoke handlers
@@ -30,12 +30,19 @@
 // default; main.js's save-settings handler calls applySettings).
 //
 // Cross-file couplings:
-//   - .github/workflows/release.yml — "Stamp app version from
-//     release tag" writes the tag's version into package.json at
-//     build time (the repo's checked-in version never bumps), and
-//     "Point update feed at this repo" targets app-update.yml at
-//     whichever repo ran the build. Both are load-bearing: the
-//     semver comparison below is stamped-version vs stamped-version.
+//   - .github/workflows/release.yml — "Stamp date-based app
+//     version" writes a version derived from the release commit's
+//     committer timestamp (UI-source/scripts/ci-date-version.js,
+//     YYYY.MDD.HMM UTC) into package.json at build time. The
+//     repo's checked-in version never bumps, and release TAG
+//     NAMES are pure labels — the GitHub provider only uses the
+//     tag as a download-path segment, never parses it (verified:
+//     with allowPrerelease=false, GitHubProvider.getLatestTagName
+//     returns /releases/latest's tag_name verbatim), so any tag
+//     naming works. "Point update feed at this repo" targets
+//     app-update.yml at whichever repo ran the build. Both steps
+//     are load-bearing: the semver comparison below is
+//     stamped-version vs stamped-version.
 //   - UI-source/package.json — build.publish (static default for
 //     local builds), nsis.artifactName / appImage.artifactName
 //     (space-free names; GitHub renames spaces in release assets
@@ -95,7 +102,7 @@ const status = {
   reason: null,          // human-readable why-not when !supported
   enabled: false,
   state: "disabled",
-  currentVersion: "",    // app.getVersion() — the CI-stamped tag version
+  currentVersion: "",    // app.getVersion() — CI-stamped date version (2.0.0 on local/dev builds)
   latestVersion: null,   // set while deferred / downloading / downloaded
   percent: null,         // 0-100 while downloading
   eligibleAt: null,      // ISO timestamp when a deferred release matures
