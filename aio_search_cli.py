@@ -470,9 +470,9 @@ def run_search_mode(
         # candidate. Quality skip is reserved for direct-URL
         # --multi-source (find_alternatives_for_direct_url below),
         # where the primary is already committed and probing it is
-        # waste. SKIP_QUALITY_PROBE class-attr handlers (currently
-        # comix) opt out unconditionally via search_orchestrator's
-        # per-source loop — no plumbing needed here.
+        # waste. The SKIP_QUALITY_PROBE class-attr opt-out is honored
+        # unconditionally in search_orchestrator's per-source loop (a
+        # generic hook — no handler sets it today) — no plumbing here.
         on_status=_status,
         seeded_only=bool(getattr(args, "seeded_only", False)),
     )
@@ -759,17 +759,17 @@ def _filter_and_rank_alt_sources(sources, *, primary_host: str = "", quality_min
         if primary_host and urlparse(s.url).netloc.lower() == primary_host:
             continue
         # Handlers that opt out of multi-source merging entirely via the
-        # SKIP_MULTI_SOURCE class attribute (currently only comix — see
-        # sites/comix.py for the why). These are sites whose chapter-list
-        # fetch is wildly more expensive than other handlers in absolute
-        # wall-clock terms (comix runs a ~25 s bridge-DOM-scrape per
-        # candidate through a single-threaded Patchright worker), so
-        # adding them to the alternatives pool delays --multi-source
-        # alignment for the user's primary download without buying real
-        # fallback coverage — the primary site almost always has the
-        # same chapters. Treat the flag as equivalent to primary_host
-        # exclusion: drop before the quality_min check so they never
-        # reach _fetch_chapters_for_winner.
+        # SKIP_MULTI_SOURCE class attribute. This is a generic opt-out hook
+        # for a site whose chapter-list fetch is wildly more expensive than
+        # other handlers in absolute wall-clock terms (e.g. a single-threaded
+        # browser bridge), where adding it to the alternatives pool would
+        # delay --multi-source alignment for the user's primary download
+        # without buying real fallback coverage. NO handler sets it today —
+        # comix used to, but it's now a full multi-source participant (see
+        # sites/comix.py). Kept because the trade-off it guards is real and a
+        # future handler may need it. Treat the flag as equivalent to
+        # primary_host exclusion: drop before the quality_min check so a
+        # flagged site never reaches _fetch_chapters_for_winner.
         handler = get_handler_by_name(s.site)
         if handler is not None and getattr(handler, "SKIP_MULTI_SOURCE", False):
             continue
@@ -1169,17 +1169,17 @@ def build_alternatives_from_payload(
     from sites.search_orchestrator import SeriesCandidate, SourceEntry
 
     # SKIP_MULTI_SOURCE filter: mirrors _filter_and_rank_alt_sources's check
-    # (see ~line 647). Required at THIS entry point too because the prefetched
+    # (see ~line 761). Required at THIS entry point too because the prefetched
     # JSON path bypasses _filter_and_rank_alt_sources entirely — that filter
     # only runs on the direct-URL multi-source path
-    # (find_alternatives_for_direct_url, above). Without this hook, comix gets
-    # queued for a chapter-list fetch despite SKIP_MULTI_SOURCE=True and the
-    # user pays a ~25 s Patchright bridge scrape per multi-source download
-    # AND a ~5-minute canvas scrape per chapter when comix is hit as a
-    # fallback alt — see sites/comix.py:99 for the why-not-multi-source
-    # rationale.
-    # Cross-file: SKIP_MULTI_SOURCE is set in sites/comix.py (the only handler
-    # using it today). _filter_and_rank_alt_sources in this file does the same
+    # (find_alternatives_for_direct_url, above). The flag is a generic opt-out
+    # for a handler whose chapter-list + per-chapter image fetch is far more
+    # expensive than its peers; a flagged site would otherwise be queued for a
+    # chapter-list fetch here and dragged into per-chapter fallback. NO handler
+    # sets it today (comix used to, but it's now a full multi-source
+    # participant — see sites/comix.py); kept so both entry points stay
+    # consistent if a future handler needs it.
+    # Cross-file: _filter_and_rank_alt_sources in this file does the same
     # check; both filters must agree for SKIP_MULTI_SOURCE to be honored
     # consistently across the direct-URL and prefetched-JSON paths.
     alt_sources = []

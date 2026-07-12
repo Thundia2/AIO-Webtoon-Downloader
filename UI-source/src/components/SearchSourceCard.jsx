@@ -37,21 +37,14 @@ function qualityTier(score) {
 // Add/remove entries here when handlers break / get fixed. Each value
 // is the tooltip text the user sees on hover.
 //
-// Entries:
-//   - comix (added 2026-05-27): the canvas-scrape fallback for
-//     unscrambled chapter images can't render all pages within the 300s
-//     per-chapter time budget. Chapter downloads time out at single-
-//     digit page counts (e.g. 3/193 pages in the 2026-05-27 Shangri-La
-//     Frontier run). The Patchright bridge is single-threaded so
-//     increasing parallelism doesn't help. See sites/comix.py for the
-//     in-progress work and the PR-31 context doc's "fix comix" pointer.
-const BROKEN_HANDLERS = {
-  comix: (
-    "Currently broken: canvas-scrape can't capture all pages within the "
-    + "per-chapter time budget. Downloads typically time out at a small "
-    + "number of pages. You can still try, but expect failure."
-  ),
-};
+// Entries: none currently. comix was flagged here (2026-05-27) while its
+// chapter images came off a single-threaded canvas scrape that timed out
+// mid-chapter; that warning was retired with comix's 2026-07-11 rewrite to
+// plain directly-fetchable webp <img> pages plus its 2026-07-12 promotion to
+// a first-class search / --multi-source / quality-probed source. The empty
+// map keeps the render affordance (the icon just renders for nothing) ready
+// for the next handler that breaks.
+const BROKEN_HANDLERS = {};
 
 export default function SearchSourceCard({
   source,           // SourceEntry from JSON (site, url, cover, scores, etc.)
