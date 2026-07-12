@@ -80,6 +80,25 @@ class ComixSiteHandler(BaseSiteHandler):
     # prefetched-alts path) getattr hooks still exist as generic opt-outs;
     # comix just no longer sets them.
 
+    # Fan-out scheduling (2026-07-12): comix's search() is the only
+    # browser-driven one — cold Patchright launch + typeahead render, 28s
+    # inner budget — so the orchestrator enqueues it FIRST (slow-first
+    # stable sort) to overlap the cheap HTTP handlers instead of adding its
+    # full duration in a late wave. Grep SEARCH_COST_HINT in sites/base.py
+    # (contract) + search_orchestrator.py (the sort).
+    SEARCH_COST_HINT = "slow"
+
+    # The probe override below IGNORES the orchestrator's max_samples clamp
+    # (it hard-caps to ONE chapter regardless), so its result is always this
+    # probe's full form. The orchestrator's clamped-probe cache (2026-07-12)
+    # keys off this flag: comix results are written UNCLAMPED (full 30-day
+    # TTL, servable in both top-candidate and non-top roles) — which is what
+    # retires the old behavior of re-running the 15-70s browser probe on
+    # EVERY search whenever comix wasn't the top candidate. Grep
+    # PROBE_SAMPLES_FIXED in search_orchestrator.py (_desired_max_samples
+    # serve rule + _probe_one write rule).
+    PROBE_SAMPLES_FIXED = True
+
     # Patchright's sync API requires that every call run on the same thread
     # that started the browser, AND that thread must own an asyncio loop.
     # Probe-phase workers (sites/search_orchestrator.py) and aio-dl.py's
@@ -783,6 +802,7 @@ class ComixSiteHandler(BaseSiteHandler):
     def _probe_chapter_aggregate(
         self, hit: SearchHit, scraper, make_request,
         max_samples: Optional[int] = None,
+        fetch_memo=None,
     ) -> Optional[tuple]:
         """comix override: probe a SINGLE chapter (chapter 1 by preference),
         rendering only the first _COMIX_PROBE_PAGE_CAP pages and scoring the
@@ -806,19 +826,24 @@ class ComixSiteHandler(BaseSiteHandler):
 
         if not hit or not hit.url:
             return None
+        # Context + FULL chapter-list scrape — comix lists newest-first, so
+        # chapter 1 is the OLDEST entry and only found by paginating the whole
+        # list. ~5-50 s for normal series; a pathological 1000+ chapter series
+        # may approach the probe deadline and degrade to seed (accepted — rare,
+        # and the seed is a calibrated prior). Routed through the per-run
+        # FetchMemo when provided (sites/fetch_memo.py, 2026-07-12): T3 and the
+        # winner chapter fetch then reuse THIS scrape instead of re-paying the
+        # browser cost — for comix that reuse is worth 5-50s per later phase.
         try:
-            context = self.fetch_comic_context(hit.url, scraper, make_request)
-        except Exception:
-            return None
-        if context is None:
-            return None
-        # Full chapter-list scrape — comix lists newest-first, so chapter 1 is
-        # the OLDEST entry and only found by paginating the whole list. ~5-50 s
-        # for normal series; a pathological 1000+ chapter series may approach
-        # the probe deadline and degrade to seed (accepted — rare, and the seed
-        # is a calibrated prior).
-        try:
-            chapters = self.get_chapters(context, scraper, "en", make_request)
+            if fetch_memo is not None:
+                chapters = fetch_memo.get_chapters(
+                    self, hit.url, "en", scraper, make_request,
+                )
+            else:
+                context = self.fetch_comic_context(hit.url, scraper, make_request)
+                if context is None:
+                    return None
+                chapters = self.get_chapters(context, scraper, "en", make_request)
         except Exception:
             return None
         if not chapters:

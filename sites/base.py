@@ -4,6 +4,7 @@ import datetime as dt
 import os
 import re
 import statistics
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
@@ -220,6 +221,17 @@ class BaseSiteHandler:
     # No handler sets this today (MangaFire's 2026 REST-API rewrite dropped
     # its VRF cost); browser-based handlers can opt in.
     EXPENSIVE_PROBE: bool = False
+
+    # Relative cost class of this handler's search() for the search
+    # orchestrator's fan-out scheduler. "slow" handlers are enqueued FIRST
+    # (stable slow-first sort) so a multi-second search overlaps the cheap
+    # HTTP handlers instead of starting in a late wave and adding its full
+    # duration to the fan-out phase. comix (browser-driven typeahead: cold
+    # Patchright launch + 28s inner budget) is the only "slow" today.
+    # Values: "normal" | "slow". Cross-file consumer:
+    # sites/search_orchestrator.py:search_all sorts `eligible` on this
+    # before enqueue — grep SEARCH_COST_HINT.
+    SEARCH_COST_HINT: str = "normal"
 
     # When True, the search orchestrator treats this handler as the canonical
     # source for any series it returns — winning the per-candidate tiebreaker
@@ -1162,9 +1174,29 @@ class BaseSiteHandler:
     # when a CDN is poisoned (cdn_reliability == 0).
     THROTTLE_TAIL_PAGES = 3
 
+    # Per-SOURCE wall-clock budget for one _probe_chapter_aggregate call
+    # (2026-07-12). Found live on the Frieren benchmark: a host whose chapter
+    # pages TIME OUT (rather than fail fast) costs ~40-55s per sampled
+    # chapter under the search request shim (2 attempts × 20s + a 15s page
+    # fetch), so a full 8-chapter breadth probe needs >240s — it held the
+    # orchestrator's ENTIRE probe phase to its PROBE_PHASE_DEADLINE_S on
+    # every single search, and because the abandoned worker died with the
+    # process, its result NEVER cached, so the 240s was re-paid every run
+    # (mangakatana was the live culprit; the pre-2026-07-12 pipeline had the
+    # same flaw, just masked by everything else being slow too). When the
+    # budget expires mid-sampling, the REMAINING chapters count as failures
+    # (0.0 — the same "honest broken-CDN" contract failed fetches already
+    # use: a site that can't serve chapter pages promptly IS degraded) and
+    # the partial aggregate returns + caches, so the cost is paid once per
+    # TTL instead of once per search. 120s = half the phase deadline; a
+    # healthy source's 8 samples finish in well under 30s. Not applied to
+    # comix's override (its own browser time budgets bound it).
+    PROBE_SOURCE_BUDGET_S = 120.0
+
     def _probe_chapter_aggregate(
         self, hit: "SearchHit", scraper, make_request,
         max_samples: "Optional[int]" = None,
+        fetch_memo=None,
     ) -> "Optional[tuple]":
         """Breadth-sampled chapter probe — fetches 1 page from each of 8
         chapters spread across the series, plus a throttle-probe tail.
@@ -1210,16 +1242,33 @@ class BaseSiteHandler:
 
         if not hit or not hit.url:
             return None
-        try:
-            context = self.fetch_comic_context(hit.url, scraper, make_request)
-        except Exception:
-            return None
-        if context is None:
-            return None
-        try:
-            chapters = self.get_chapters(context, scraper, "en", make_request)
-        except Exception:
-            return None
+        # Context + chapter list, optionally through the per-run FetchMemo
+        # (sites/fetch_memo.py, 2026-07-12). The probe is the FIRST of up to
+        # three phases (probe → T3 pairwise → winner chapter fetch) that all
+        # need this source's context + chapter list; routing through the
+        # memo lets the later phases reuse this fetch instead of re-hitting
+        # the site. Failure semantics identical to the direct path: any
+        # exception or empty list → None (orchestrator falls back to the
+        # cover probe), and the memo stores nothing on failure (no negative
+        # caching — the winner fetch retries with its own policy).
+        if fetch_memo is not None:
+            try:
+                chapters = fetch_memo.get_chapters(
+                    self, hit.url, "en", scraper, make_request,
+                )
+            except Exception:
+                return None
+        else:
+            try:
+                context = self.fetch_comic_context(hit.url, scraper, make_request)
+            except Exception:
+                return None
+            if context is None:
+                return None
+            try:
+                chapters = self.get_chapters(context, scraper, "en", make_request)
+            except Exception:
+                return None
         if not chapters:
             return None
 
@@ -1253,7 +1302,21 @@ class BaseSiteHandler:
         per_chapter_image_lists: List[Optional[List]] = []  # for throttle tail
         per_chapter_picked_page_idx: List[Optional[int]] = []
         per_chapter_blobs: List[Optional[bytes]] = []  # v5.1: kept for re-score pass
+        # Per-source budget (see PROBE_SOURCE_BUDGET_S): once exceeded, the
+        # remaining chapters are recorded as failures instead of fetched, so
+        # a timing-out host produces a bounded, cacheable partial aggregate
+        # instead of holding the orchestrator's probe phase to its deadline
+        # on every search.
+        probe_deadline = time.monotonic() + self.PROBE_SOURCE_BUDGET_S
+        budget_exhausted = False
         for abs_idx, chapter in chapter_picks:
+            if time.monotonic() > probe_deadline:
+                budget_exhausted = True
+                per_chapter_scores.append(0.0)
+                per_chapter_image_lists.append(None)
+                per_chapter_picked_page_idx.append(None)
+                per_chapter_blobs.append(None)
+                continue
             try:
                 image_items = self.get_chapter_images(chapter, scraper, make_request)
             except Exception:
@@ -1378,6 +1441,7 @@ class BaseSiteHandler:
                 "samples_attempted": len(chapter_picks),
                 "samples_succeeded": 0,
                 "cdn_reliability": 0.0,
+                "probe_budget_exhausted": budget_exhausted,
             }
 
         # Hybrid median/mean aggregation across chapters (was: across pages
@@ -1411,7 +1475,13 @@ class BaseSiteHandler:
         cdn_reliability: Optional[float] = None
         tail_attempted = 0
         tail_succeeded = 0
-        if per_chapter_scores and max_samples is None:
+        # Tail also respects the per-source budget: its 3 sequential fetches
+        # cost up to ~45s against a timing-out host, and a budget-exhausted
+        # breadth pass already established the degradation signal.
+        if (
+            per_chapter_scores and max_samples is None
+            and time.monotonic() <= probe_deadline
+        ):
             best_chapter_local_idx = max(
                 range(len(per_chapter_scores)),
                 key=lambda i: per_chapter_scores[i],
@@ -1535,6 +1605,11 @@ class BaseSiteHandler:
             # short-circuit at sites/rizzcomic.py. None when the tail
             # couldn't run (e.g. only 1 chapter probed total).
             "cdn_reliability": cdn_reliability,
+            # True when PROBE_SOURCE_BUDGET_S expired mid-sampling and the
+            # remaining chapters were recorded as failures — the score is a
+            # bounded partial aggregate of a timing-out host. Cache-audit /
+            # UI-tooltip diagnostic; not read by ranking.
+            "probe_budget_exhausted": budget_exhausted,
             # Provenance for debugging / cache audit. The picked chapter
             # indices let calibration replay deterministically what was
             # measured.

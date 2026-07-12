@@ -46,6 +46,31 @@ function qualityTier(score) {
 // for the next handler that breaks.
 const BROKEN_HANDLERS = {};
 
+// Where this source's displayed rating came from. The orchestrator emits
+// `quality_basis` per source (search_orchestrator.py:_quality_basis —
+// "chapter_probe" | "cover" | "seed"); anything that ISN'T a real
+// chapter-page measurement gets a red AlertTriangle next to the site name
+// (user request 2026-07-12, same affordance BROKEN_HANDLERS uses). That
+// covers: seed-prior-only ratings (unprobed candidates under the top-2
+// probe scope, late-merged fan-out stragglers, cache misses) and
+// cover-image fallbacks / all-samples-failed probes. The fallback inference
+// below handles JSON from an older spawn that predates the field: null
+// score means the UI is showing seed_quality; metadata without a successful
+// sample means cover/failed-probe.
+function qualityBasis(source) {
+  if (source.quality_basis) return source.quality_basis;
+  if (source.img_quality_score == null) return "seed";
+  const m = source.img_quality_metadata;
+  if (m && (m.samples_succeeded ?? 0) > 0) return "chapter_probe";
+  return "cover";
+}
+
+const QUALITY_BASIS_WARNINGS = {
+  seed: "Rating is the per-site prior — no chapter pages were measured for this source in this search.",
+  cover:
+    "Rating was not measured from chapter pages — it comes from the cover image only, or every sampled page failed to fetch.",
+};
+
 export default function SearchSourceCard({
   source,           // SourceEntry from JSON (site, url, cover, scores, etc.)
   officialPublisher, // string | null — non-null if any chapter via this site is is_official=true
@@ -69,6 +94,9 @@ export default function SearchSourceCard({
 
   const final = source.img_quality_score != null ? source.img_quality_score : source.seed_quality;
   const tier = qualityTier(final);
+  // Red-triangle warning when the displayed rating isn't grounded in real
+  // chapter pages. null for "chapter_probe" (no icon).
+  const basisWarning = QUALITY_BASIS_WARNINGS[qualityBasis(source)] || null;
   // Phase H aggregate metadata from sites/base.py:_probe_chapter_aggregate.
   // null when un-measured (cache miss + probe failed). Drives the format chip
   // beside the site name, the bpp/B&W/outlier breakdown in the quality-bar
@@ -198,6 +226,25 @@ export default function SearchSourceCard({
               <AlertTriangle
                 className="w-3 h-3 text-red-500"
                 aria-label={`${source.site} is currently broken: ${BROKEN_HANDLERS[source.site]}`}
+              />
+            </span>
+          )}
+          {/* Quality-basis danger icon (2026-07-12): red AlertTriangle when
+              the displayed rating is seed-prior-only or a cover fallback —
+              i.e. NOT measured from real chapter pages. Same affordance as
+              the BROKEN_HANDLERS icon above (and distinct from the yellow
+              outlier triangle on the score row, which means "measured but
+              suspect"). Data contract + derivation:
+              search_orchestrator.py:_quality_basis; helper qualityBasis at
+              the top of this file handles pre-field JSON. */}
+          {basisWarning && (
+            <span
+              className="shrink-0 inline-flex items-center"
+              title={basisWarning}
+            >
+              <AlertTriangle
+                className="w-3 h-3 text-red-500"
+                aria-label={`${source.site} rating basis warning: ${basisWarning}`}
               />
             </span>
           )}

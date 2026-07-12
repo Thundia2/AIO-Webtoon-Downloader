@@ -26,6 +26,21 @@ from ._publishers import lookup_publisher
 _logger = logging.getLogger(__name__)
 
 
+# Cap on the per-hit DMCA-detection probes appended to search() results
+# (2026-07-12). Each probe is one extra sequential /chapter?limit=1 API call
+# (~50-200ms healthy, seconds under load); at the previous "every hit" scope
+# a 20-hit search added up to 20 serialized calls (~1-4s+) to the fan-out
+# phase for hits nobody ranks. Head hits dominate per_site_best after the
+# orchestrator's title-match scoring for real queries, so probing only the
+# first N keeps the DMCA signal where it matters. Recall trade-off
+# (accepted): tail hits keep actual_chapter_count=None, so the orchestrator's
+# cross-site count check simply can't flag THEM as dmca_likely/count_outlier
+# — they fall back to hint-only data, same as sites that never expose actual
+# counts. Sequential on purpose: the scraper session isn't thread-safe and
+# the MangaDex API's politeness expectations argue against a burst here.
+_DMCA_PROBE_MAX_HITS = 5
+
+
 # Module-level fire-and-forget /api/report POSTs to the MD@H operator
 # network. Without batching, the prior code spawned one daemon thread per
 # page per node-attempt; a 200-page chapter through 4 swaps would spawn
@@ -1061,11 +1076,13 @@ class MangaDexSiteHandler(BaseSiteHandler):
         #
         # Costs ~1 extra HTTP call per hit (~50-200ms each). Wrapped in
         # best-effort try/except — a failed probe just leaves the field None.
+        # Capped to the first _DMCA_PROBE_MAX_HITS hits (see the constant's
+        # comment for the wall-clock rationale + recall trade-off).
         languages: List[str] = []
         if language and language.lower() != "all":
             languages = [l.strip() for l in language.split(",") if l.strip()]
 
-        for hit in hits:
+        for hit in hits[:_DMCA_PROBE_MAX_HITS]:
             manga_id = hit.url.rsplit("/", 1)[-1]
             try:
                 params = [("manga", manga_id), ("limit", "1")]

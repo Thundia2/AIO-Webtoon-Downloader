@@ -60,6 +60,7 @@ from urllib.parse import urlparse
 from sites import get_handler_by_name
 from sites.base import SearchHit
 from sites.chapter_merger import _classify_main_chapters, align_chapter_lists
+from sites.fetch_memo import FetchMemo
 from sites.search_orchestrator import (
     DEFAULT_MIN_MATCH,
     DEFAULT_PER_SITE_TIMEOUT_S,
@@ -84,7 +85,7 @@ _URL_SEED_HOSTS = {
 }
 
 
-def _try_extract_seed_hit(query: str) -> Optional[SearchHit]:
+def _try_extract_seed_hit(query: str, fetch_memo=None) -> Optional[SearchHit]:
     """If `query` is a URL for a URL-seedable site, scrape it into a SearchHit.
 
     The "URL-mode --search" feature (originally MangaFire-only) exists for sites
@@ -92,6 +93,14 @@ def _try_extract_seed_hit(query: str) -> Optional[SearchHit]:
     GUARANTEED to participate in cross-site comparison. Supported hosts live in
     _URL_SEED_HOSTS; other sites' search is reliable enough that URL-mode adds
     no value there.
+
+    ``fetch_memo`` (sites/fetch_memo.py, 2026-07-12): when provided, the
+    context (and, for mangafire, the chapter list) this resolution already
+    fetched is pre-registered so the probe / T3 / winner-fetch phases reuse
+    it instead of re-fetching. The seed's bare requests.Session is
+    deliberately NOT registered as the memo scraper — it was configured with
+    args=None and would drift from the args-configured scrapers the other
+    phases build.
 
     Returns None if `query` isn't a URL — the caller proceeds with normal
     title-based search using `query` as-is. Raises SystemExit if the URL is a
@@ -157,10 +166,12 @@ def _try_extract_seed_hit(query: str) -> Optional[SearchHit]:
     # actual=None), so resolving a comix URL stays a single cheap HTTP GET.
     count_hint: Optional[int] = None
     actual: Optional[int] = None
+    seed_chapters: Optional[list] = None
     if site == "mangafire":
         try:
             chaps = handler.get_chapters(ctx, session, "en", _mk)
             count_hint = actual = len(chaps) if chaps else None
+            seed_chapters = chaps if chaps else None
         except Exception:
             count_hint = actual = None
     else:
@@ -173,6 +184,20 @@ def _try_extract_seed_hit(query: str) -> Optional[SearchHit]:
                 break
             except (TypeError, ValueError):
                 continue
+
+    # Pre-populate the per-run fetch memo with data this resolution already
+    # paid for. Keyed on the SAME url the SearchHit below carries
+    # (comic.get("url") or q) so probe/T3/winner lookups — which key on
+    # src.url == hit.url — hit it. Best-effort: memo failures must never
+    # break seed resolution.
+    if fetch_memo is not None:
+        seed_url = comic.get("url") or q
+        try:
+            fetch_memo.put_context(site, seed_url, ctx)
+            if seed_chapters:
+                fetch_memo.put_chapters(site, seed_url, "en", seed_chapters)
+        except Exception:
+            pass
 
     # comix omits is_official (defer to the handler, matching its own search()
     # hits); MangaFire is a non-publisher aggregator → False.
@@ -283,8 +308,9 @@ def _fetch_chapters_for_winner(
     args,
     make_request,
     *,
-    parallelism: int = 4,
+    parallelism: Optional[int] = None,
     on_status=None,
+    fetch_memo=None,
 ):
     """Fetch chapter lists for each source of the winner SeriesCandidate in parallel.
 
@@ -297,15 +323,40 @@ def _fetch_chapters_for_winner(
     The richer return shape (vs the original tuple) is needed for Phase 4b:
     aio-dl.py main() needs the live scraper/context per source to populate the
     per-chapter fallback dict consumed by _process_chapter_strict.
+
+    2026-07-12 perf changes:
+      - ``parallelism=None`` (the new default) resolves to min(n_sources, 8)
+        — was a hardcoded 4. Each source is ONE distinct host doing 1-2
+        requests, so the wider burst is politeness-safe; at 4, ten alt
+        sources took 3 sequential waves.
+      - The list fetches use an internal bounded-retry shim (2 attempts ×
+        30s, same _search_make_request_factory the search probes use)
+        instead of the caller-supplied make_request — aio-dl.py's default
+        retries 6× with 45s-capped backoff, so ONE dead alt could stall
+        this phase for minutes. The passed ``make_request`` stays in the
+        signature: public callers (aio-dl.py via find_alternatives /
+        build_alternatives_*) still pass it, and the per-chapter DOWNLOAD
+        path keeps using aio-dl's own make_request — only the list fetch
+        here is bounded. Accepted trade-off: a transient-5xx alt that 6
+        retries would have rescued contributes no fallback for this run.
+      - ``fetch_memo`` (sites/fetch_memo.py): context + chapters + scraper
+        come from the per-run memo when provided — for sources the probe
+        phase already touched this is zero-network (the 2nd-3rd fetch of
+        identical data before this change).
     """
     if on_status:
         on_status(f"[*] Fetching chapter lists from {len(candidate.sources)} sources...")
+    _fetch_started = time.monotonic()
 
     language = (
         getattr(args, "language", None)
         or getattr(args, "search_language", None)
         or "en"
     )
+
+    # Bounded-retry shim for the list fetches (see docstring). make_request
+    # (the 6-retry one) is intentionally NOT used below.
+    winner_mr = _search_make_request_factory(timeout=30.0, attempts=2)
 
     def _fetch_one(source) -> dict:
         handler = get_handler_by_name(source.site)
@@ -314,13 +365,28 @@ def _fetch_chapters_for_winner(
                 "site": source.site, "url": source.url,
                 "chapters": [], "scraper": None, "handler": None, "context": None,
             }
-        scraper = _build_scraper(args)
+
+        def _build_configured() -> Any:
+            s = _build_scraper(args)
+            try:
+                handler.configure_session(s, args)
+            except Exception:
+                pass
+            return s
+
+        if fetch_memo is not None:
+            # Reuse the probe phase's scraper for this (site, url) — CF
+            # clearance and cookies included; fresh build only on miss.
+            scraper = fetch_memo.get_scraper(
+                source.site, source.url, _build_configured,
+            )
+        else:
+            scraper = _build_configured()
         try:
-            handler.configure_session(scraper, args)
-        except Exception:
-            pass
-        try:
-            ctx = handler.fetch_comic_context(source.url, scraper, make_request)
+            if fetch_memo is not None:
+                ctx = fetch_memo.get_context(handler, source.url, scraper, winner_mr)
+            else:
+                ctx = handler.fetch_comic_context(source.url, scraper, winner_mr)
         except Exception as exc:
             if on_status:
                 on_status(f"  {source.site}: fetch_comic_context failed ({type(exc).__name__})")
@@ -329,7 +395,12 @@ def _fetch_chapters_for_winner(
                 "chapters": [], "scraper": scraper, "handler": handler, "context": None,
             }
         try:
-            chapters = handler.get_chapters(ctx, scraper, language, make_request)
+            if fetch_memo is not None:
+                chapters = fetch_memo.get_chapters(
+                    handler, source.url, language, scraper, winner_mr,
+                )
+            else:
+                chapters = handler.get_chapters(ctx, scraper, language, winner_mr)
         except Exception as exc:
             if on_status:
                 on_status(f"  {source.site}: get_chapters failed ({type(exc).__name__})")
@@ -356,10 +427,23 @@ def _fetch_chapters_for_winner(
             "chapters": chapters, "scraper": scraper, "handler": handler, "context": ctx,
         }
 
+    # Per-source durations so the summary line can NAME what dominated the
+    # phase (e.g. a comix browser chapter scrape that had no memo entry).
+    fetch_times: list = []
+
+    def _timed_fetch(source) -> dict:
+        t0 = time.monotonic()
+        try:
+            return _fetch_one(source)
+        finally:
+            fetch_times.append((source.site, time.monotonic() - t0))
+
+    if parallelism is None:
+        parallelism = min(len(candidate.sources), 8)
     workers = max(1, min(parallelism, len(candidate.sources)))
     results: list = [None] * len(candidate.sources)
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ms-chap") as pool:
-        futures = {pool.submit(_fetch_one, src): idx for idx, src in enumerate(candidate.sources)}
+        futures = {pool.submit(_timed_fetch, src): idx for idx, src in enumerate(candidate.sources)}
         for fut in as_completed(futures):
             idx = futures[fut]
             try:
@@ -370,6 +454,17 @@ def _fetch_chapters_for_winner(
                     "site": src.site, "url": src.url, "chapters": [],
                     "scraper": None, "handler": None, "context": None,
                 }
+    if on_status:
+        ok = sum(1 for r in results if r and r.get("chapters"))
+        slowest = sorted(fetch_times, key=lambda kv: -kv[1])[:3]
+        slow_str = (
+            " (slowest: " + " · ".join(f"{n} {t:.1f}s" for n, t in slowest) + ")"
+            if slowest else ""
+        )
+        on_status(
+            f"[*] Chapter lists fetched: {ok}/{len(candidate.sources)} "
+            f"sources in {time.monotonic() - _fetch_started:.1f}s{slow_str}"
+        )
     return [r for r in results if r is not None]
 
 
@@ -423,12 +518,20 @@ def run_search_mode(
     from sites.search_orchestrator import set_ml_rating_enabled
     set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
 
+    # Per-run fetch memo (sites/fetch_memo.py, 2026-07-12): shared by the
+    # probe phase, T3 pairwise, and the winner chapter fetch so each
+    # (site, url)'s context + chapter list is fetched from the network at
+    # most once per run. In-process only — dies with this invocation.
+    fetch_memo = FetchMemo()
+
     # URL-mode: if the user supplied a series URL instead of title text (a
     # MangaFire or comix /title/ URL — see _URL_SEED_HOSTS), resolve it into a
     # seed hit. The orchestrator then runs the normal cross-site search using
     # the resolved title, with that site's data already guaranteed to be present.
+    # The seed resolution pre-populates the memo (context + mangafire chapter
+    # list) so the winner fetch gets the seed source for free.
     seed_hits: list = []
-    seed = _try_extract_seed_hit(query)
+    seed = _try_extract_seed_hit(query, fetch_memo=fetch_memo)
     if seed is not None:
         seed_hits.append(seed)
         # Use the scraped title as the effective query for other sites — the
@@ -475,6 +578,15 @@ def run_search_mode(
         # generic hook — no handler sets it today) — no plumbing here.
         on_status=_status,
         seeded_only=bool(getattr(args, "seeded_only", False)),
+        # Probe scope (2026-07-12, user decision): --auto-pick only ever
+        # reads candidates[0] → probing other candidates' sources is pure
+        # waste (1). UI searches (JSON output) probe the top TWO candidates
+        # ("titles can be slightly different" — keep the runner-up
+        # comparable); candidates #3+ fall back to seed and carry
+        # quality_basis="seed" so SearchSourceCard flags them. Candidate
+        # ORDER is unaffected (pure title-match).
+        probe_candidate_limit=(1 if auto_pick else 2),
+        fetch_memo=fetch_memo,
     )
 
     multi_source = bool(getattr(args, "multi_source", False))
@@ -507,8 +619,10 @@ def run_search_mode(
         )
         if winner.sources:
             source_records = _fetch_chapters_for_winner(
-                winner, args, make_request, on_status=_status
+                winner, args, make_request, on_status=_status,
+                fetch_memo=fetch_memo,
             )
+            _status(fetch_memo.stats_line())
             # Alignment input is the older tuple shape; project the richer
             # records down for align_chapter_lists.
             # collapse_splits flows from the --collapse-splits CLI flag
@@ -887,6 +1001,9 @@ def find_alternatives_for_direct_url(
     img_cache = ImageQualityCache()
     factory = _scraper_factory_for(args)
     search_mr = _search_make_request_factory(timeout=timeout, attempts=2)
+    # Per-run fetch memo (sites/fetch_memo.py): probe → winner-fetch reuse,
+    # same as run_search_mode. Scoped to this discovery call.
+    fetch_memo = FetchMemo()
 
     candidates = search_all(
         title,
@@ -911,6 +1028,12 @@ def find_alternatives_for_direct_url(
         ),
         on_status=on_status,
         seeded_only=bool(getattr(args, "seeded_only", False)),
+        # Only candidates[0] is consumed below — probing the sub-series
+        # candidates' sources would be pure waste on the download-start
+        # path (2026-07-12 perf change; ranking unaffected — candidate
+        # order is pure title-match).
+        probe_candidate_limit=1,
+        fetch_memo=fetch_memo,
     )
     if not candidates:
         if on_status:
@@ -953,8 +1076,11 @@ def find_alternatives_for_direct_url(
         sources=alt_sources,
     )
     source_records = _fetch_chapters_for_winner(
-        alt_candidate, args, make_request, on_status=on_status
+        alt_candidate, args, make_request, on_status=on_status,
+        fetch_memo=fetch_memo,
     )
+    if on_status:
+        on_status(fetch_memo.stats_line())
 
     # Step 5: align primary chapters with alt chapters. Primary is the anchor
     # (the user picked this URL, so its chapter set is canonical for the
@@ -1230,8 +1356,15 @@ def build_alternatives_from_payload(
         sources=alt_sources,
     )
 
+    # Per-run fetch memo: nothing repeats WITHIN this call (no probe phase
+    # on the prefetched/resume path — chapter lists are fetched exactly
+    # once), but it dedupes any (site, url) that appears twice in the
+    # payload and keeps this entry point on the same code path as the
+    # search-driven ones.
+    fetch_memo = FetchMemo()
     source_records = _fetch_chapters_for_winner(
-        alt_candidate, args, make_request, on_status=on_status
+        alt_candidate, args, make_request, on_status=on_status,
+        fetch_memo=fetch_memo,
     )
 
     # Same alignment + alts-dict construction as find_alternatives_for_direct_url

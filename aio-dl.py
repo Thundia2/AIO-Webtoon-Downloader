@@ -7454,10 +7454,13 @@ def main():
     p.add_argument(
         "--search-json",
         action="store_true",
-        help="Force JSON output for --search even when --auto-pick is set "
-             "(prints candidates to stdout, picks winner internally). Useful "
-             "for UI integrations that want to display the candidate list "
-             "while still proceeding with a download.",
+        help="Emit the --search candidate list as JSON on stdout. This is "
+             "already the default when --auto-pick is NOT set; the flag "
+             "exists so UI integrations can request JSON explicitly. NOTE: "
+             "combined with --auto-pick the JSON is suppressed (the run "
+             "proceeds straight to the picked download) — the UI never "
+             "combines the two. See aio_search_cli.run_search_mode's "
+             "json_output gate.",
     )
     p.add_argument(
         "--multi-source",
