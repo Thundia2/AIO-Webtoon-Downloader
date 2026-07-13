@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import queue
 import re
 import statistics
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -198,6 +200,54 @@ class AssetSpec:
     filename: Optional[str] = None
     mime: Optional[str] = None
     meta: Dict[str, Any] = field(default_factory=dict)
+
+
+# --- Search image-quality probe: breadth-sample concurrency -----------------
+# How many of a source's breadth-sample chapters BaseSiteHandler.
+# _probe_chapter_aggregate probes CONCURRENTLY. The breadth pass fetches 1 page
+# from each of up to 8 chapters; those fetches used to run SERIALLY, so an
+# HTML-scraped site whose page-image list lives in the chapter HTML (mangakatana:
+# every sample = a full Cloudflare-fronted origin GET) cost ~40s cold-cache for
+# a probe an actual chapter download does in ~4s. A small bounded daemon pool
+# collapses that to ceil(picks / N) waves.
+#
+# BYTE-IDENTICAL to serial: WHICH chapter+page each sample fetches is fixed
+# before any I/O by two pure pickers (_pick_representative_chapters /
+# _pick_random_middle_page_index) and the aggregation (median/mean, Counter
+# votes) is order-independent — concurrency only reorders the fetches. Default 4
+# keeps the per-host origin burst modest (get_chapter_images routes through
+# make_request -> _respect_rate_limit, which backs off on 429/503). Env override
+# tunes the fleet default without a release (mirrors search_orchestrator.
+# _FANOUT_MAX); a subclass sets PROBE_BREADTH_CONCURRENCY=1 to force serial
+# (e.g. a future browser handler avoiding concurrent tabs). comix is unaffected
+# (whole-method override). Grep target: PROBE_BREADTH_CONCURRENCY.
+_PROBE_BREADTH_CONCURRENCY = 4
+try:
+    _PROBE_BREADTH_CONCURRENCY = max(
+        1,
+        int(os.environ.get("AIO_PROBE_BREADTH_CONCURRENCY", "") or _PROBE_BREADTH_CONCURRENCY),
+    )
+except (TypeError, ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class _ProbeSample:
+    """One breadth-sample chapter's probe result, written by a worker into a
+    preallocated slot in _probe_chapter_aggregate's concurrent breadth pass.
+
+    ``metadata is not None`` is the SINGLE "full success" discriminator — it
+    drives the compacted ``per_chapter_metas`` rebuild. A FAILED sample carries
+    ``metadata=None`` but may still carry ``image_items`` / ``picked_page_idx`` /
+    ``blob`` (whatever it had computed before failing), exactly mirroring the
+    per-branch field population of the former serial loop so the re-score pass
+    and throttle tail see identical state.
+    """
+    score: float
+    metadata: Optional[Dict]
+    image_items: Optional[List]
+    picked_page_idx: Optional[int]
+    blob: Optional[bytes]
 
 
 class BaseSiteHandler:
@@ -1157,6 +1207,47 @@ class BaseSiteHandler:
                 return None
         return None
 
+    def _probe_one_pick(
+        self, abs_idx, chapter, hit, scraper, make_request, score_fn,
+    ) -> "_ProbeSample":
+        """Probe ONE breadth-sample chapter -> a _ProbeSample.
+
+        Extracted VERBATIM from _probe_chapter_aggregate's former serial loop
+        body so the serial and concurrent breadth paths share ONE implementation
+        (any divergence would break the byte-identity guarantee). The four
+        failure branches reproduce the exact field combinations the serial loop
+        wrote: a failure keeps whatever it had computed so far (image_items once
+        fetched, picked_page_idx once chosen, blob once downloaded) so the
+        re-score pass + throttle tail see the same state. ``metadata`` is
+        non-None ONLY on a fully scored page (the compacted-metas discriminator).
+
+        ``score_fn`` is passed in rather than importing _score_image_blob here so
+        this method stays clear of the search_orchestrator circular-import dance
+        the caller already does at its late-import site (grep _score_image_blob).
+        Must never raise: get_chapter_images failures are swallowed; the caller's
+        worker wraps this in a further guard for anything unforeseen.
+        """
+        try:
+            image_items = self.get_chapter_images(chapter, scraper, make_request)
+        except Exception:
+            image_items = None
+        if not image_items:
+            return _ProbeSample(0.0, None, None, None, None)
+        page_idx = self._pick_random_middle_page_index(
+            len(image_items), hit.url, abs_idx, chapter=chapter,
+        )
+        if page_idx is None:
+            return _ProbeSample(0.0, None, image_items, None, None)
+        blob = self._fetch_probe_item_bytes(image_items[page_idx], scraper)
+        if not blob:
+            return _ProbeSample(0.0, None, image_items, page_idx, None)
+        result = score_fn(blob)
+        if result is None:
+            # keep blob in case re-score works (mirrors the serial base path)
+            return _ProbeSample(0.0, None, image_items, page_idx, blob)
+        score, metadata = result
+        return _ProbeSample(score, metadata, image_items, page_idx, blob)
+
     # Throttle-probe tail constants. The throttle-probe tail re-fetches up to
     # N additional pages from the highest-scoring chapter to compute a
     # cdn_reliability ratio. This is the v5 mitigation for the lost throttle-
@@ -1192,6 +1283,13 @@ class BaseSiteHandler:
     # healthy source's 8 samples finish in well under 30s. Not applied to
     # comix's override (its own browser time budgets bound it).
     PROBE_SOURCE_BUDGET_S = 120.0
+
+    # Breadth-sample concurrency for _probe_chapter_aggregate (module default
+    # _PROBE_BREADTH_CONCURRENCY, env AIO_PROBE_BREADTH_CONCURRENCY). 1 = serial.
+    # A subclass whose per-chapter fetch must not run concurrently (e.g. a
+    # browser handler) overrides this to 1. See the module-level constant's
+    # comment for the full rationale + the byte-identity guarantee.
+    PROBE_BREADTH_CONCURRENCY: int = _PROBE_BREADTH_CONCURRENCY
 
     def _probe_chapter_aggregate(
         self, hit: "SearchHit", scraper, make_request,
@@ -1283,10 +1381,9 @@ class BaseSiteHandler:
         if not chapter_picks:
             return None
 
-        # Per-chapter sample loop. Each chapter contributes at most 1 page.
-        # Failures (get_chapter_images raised, empty image list, image fetch
-        # failed, unscoreable bytes) count as 0.0 — same "honest broken-CDN"
-        # contract as v4 but at chapter-granularity.
+        # Each chapter contributes at most 1 page; failures (get_chapter_images
+        # raised, empty image list, image fetch failed, unscoreable bytes) count
+        # as 0.0 — the "honest broken-CDN" contract, at chapter-granularity.
         #
         # v5.1: pass 1 scores with content_type="unknown" (== bw_manga
         # weights, the v5 default). We need the per-page metadata to
@@ -1297,65 +1394,99 @@ class BaseSiteHandler:
         # content_type (re-scoring with "unknown" would be a no-op). The
         # re-score path keeps the cached blob in `per_chapter_blobs` so
         # we don't re-fetch from the CDN.
+        # Breadth pass: probe each picked chapter's single sample page. Formerly
+        # a serial for-loop; now a bounded daemon pool (PROBE_BREADTH_CONCURRENCY)
+        # so an HTML site paying a full origin GET per sample isn't N-times
+        # serial. BYTE-IDENTICAL to serial: the (chapter, page) set is fixed
+        # before any I/O by the pure pickers above, and the aggregation below is
+        # order-independent. Each worker owns a distinct PREALLOCATED slot
+        # (list[i]=x is atomic under the GIL) so there are no append races; the
+        # sweep afterward rebuilds the four index-aligned lists + the compacted
+        # per_chapter_metas in slot (= pick) order, matching the old append
+        # semantics exactly.
+        #
+        # Per-source budget (see PROBE_SOURCE_BUDGET_S): probe_deadline gates
+        # BOTH task start (a worker that pulls a pick past the deadline records a
+        # failure without fetching — the concurrent analogue of the old
+        # per-iteration skip) AND the wall-clock join (a worker blocked in a hung
+        # GET can't stall the source past the budget). Any slot still None after
+        # the join is a miss (never pulled / gated / in-flight at timeout) and is
+        # swept to a 0.0 failure — the same "honest broken-CDN" contract. Daemon
+        # pattern mirrors the orchestrator's probe-phase pool (grep _worker_loop
+        # in search_orchestrator.py).
+        probe_deadline = time.monotonic() + self.PROBE_SOURCE_BUDGET_S
+        n_workers = max(
+            1, min(int(self.PROBE_BREADTH_CONCURRENCY or 1), len(chapter_picks))
+        )
+        sample_results: List[Optional[_ProbeSample]] = [None] * len(chapter_picks)
+
+        if n_workers <= 1:
+            # Serial path: a single pick (max_samples=1) or a subclass forcing
+            # concurrency 1. No thread/queue overhead; identical to the old loop.
+            for slot, (abs_idx, chapter) in enumerate(chapter_picks):
+                if time.monotonic() > probe_deadline:
+                    break  # remaining slots stay None -> swept to failures
+                sample_results[slot] = self._probe_one_pick(
+                    abs_idx, chapter, hit, scraper, make_request, _score_image_blob,
+                )
+        else:
+            work_q: "queue.Queue" = queue.Queue()
+            for slot, (abs_idx, chapter) in enumerate(chapter_picks):
+                work_q.put((slot, abs_idx, chapter))
+
+            def _breadth_worker() -> None:
+                while True:
+                    try:
+                        slot, abs_idx, chapter = work_q.get_nowait()
+                    except queue.Empty:
+                        return
+                    if time.monotonic() > probe_deadline:
+                        return  # task-start gate: don't begin a fetch past budget
+                    try:
+                        sample_results[slot] = self._probe_one_pick(
+                            abs_idx, chapter, hit, scraper, make_request,
+                            _score_image_blob,
+                        )
+                    except Exception:
+                        # Belt-and-suspenders: a worker must never propagate and
+                        # kill the pool (_probe_one_pick already swallows fetch
+                        # errors; this covers anything unforeseen).
+                        sample_results[slot] = _ProbeSample(0.0, None, None, None, None)
+
+            workers = [
+                threading.Thread(
+                    target=_breadth_worker, name="probe-breadth", daemon=True,
+                )
+                for _ in range(n_workers)
+            ]
+            for t in workers:
+                t.start()
+            for t in workers:
+                remaining = probe_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                t.join(timeout=remaining)
+
+        # Sweep in slot (= pick) order. A surviving None = a budget miss ->
+        # recorded as a 0.0 failure. Rebuild the four index-aligned lists (one
+        # entry per pick) + the compacted per_chapter_metas (successes only, in
+        # pick order) so every downstream consumer (re-score stitch, throttle
+        # tail, chapter_indices_sampled) is unchanged.
+        budget_exhausted = any(r is None for r in sample_results)
         per_chapter_scores: List[float] = []
         per_chapter_metas: List[Dict] = []
         per_chapter_image_lists: List[Optional[List]] = []  # for throttle tail
         per_chapter_picked_page_idx: List[Optional[int]] = []
         per_chapter_blobs: List[Optional[bytes]] = []  # v5.1: kept for re-score pass
-        # Per-source budget (see PROBE_SOURCE_BUDGET_S): once exceeded, the
-        # remaining chapters are recorded as failures instead of fetched, so
-        # a timing-out host produces a bounded, cacheable partial aggregate
-        # instead of holding the orchestrator's probe phase to its deadline
-        # on every search.
-        probe_deadline = time.monotonic() + self.PROBE_SOURCE_BUDGET_S
-        budget_exhausted = False
-        for abs_idx, chapter in chapter_picks:
-            if time.monotonic() > probe_deadline:
-                budget_exhausted = True
-                per_chapter_scores.append(0.0)
-                per_chapter_image_lists.append(None)
-                per_chapter_picked_page_idx.append(None)
-                per_chapter_blobs.append(None)
-                continue
-            try:
-                image_items = self.get_chapter_images(chapter, scraper, make_request)
-            except Exception:
-                image_items = None
-            if not image_items:
-                per_chapter_scores.append(0.0)
-                per_chapter_image_lists.append(None)
-                per_chapter_picked_page_idx.append(None)
-                per_chapter_blobs.append(None)
-                continue
-            page_idx = self._pick_random_middle_page_index(
-                len(image_items), hit.url, abs_idx, chapter=chapter,
-            )
-            if page_idx is None:
-                per_chapter_scores.append(0.0)
-                per_chapter_image_lists.append(image_items)
-                per_chapter_picked_page_idx.append(None)
-                per_chapter_blobs.append(None)
-                continue
-            blob = self._fetch_probe_item_bytes(image_items[page_idx], scraper)
-            if not blob:
-                per_chapter_scores.append(0.0)
-                per_chapter_image_lists.append(image_items)
-                per_chapter_picked_page_idx.append(page_idx)
-                per_chapter_blobs.append(None)
-                continue
-            result = _score_image_blob(blob)
-            if result is None:
-                per_chapter_scores.append(0.0)
-                per_chapter_image_lists.append(image_items)
-                per_chapter_picked_page_idx.append(page_idx)
-                per_chapter_blobs.append(blob)  # keep blob in case re-score works
-                continue
-            score, metadata = result
-            per_chapter_scores.append(score)
-            per_chapter_metas.append(metadata)
-            per_chapter_image_lists.append(image_items)
-            per_chapter_picked_page_idx.append(page_idx)
-            per_chapter_blobs.append(blob)
+        for r in sample_results:
+            if r is None:
+                r = _ProbeSample(0.0, None, None, None, None)
+            per_chapter_scores.append(r.score)
+            per_chapter_image_lists.append(r.image_items)
+            per_chapter_picked_page_idx.append(r.picked_page_idx)
+            per_chapter_blobs.append(r.blob)
+            if r.metadata is not None:
+                per_chapter_metas.append(r.metadata)
 
         # v5.1: classify series content_type from successful pages' metadata.
         # The classifier reads width / height / aspect / is_grayscale /
