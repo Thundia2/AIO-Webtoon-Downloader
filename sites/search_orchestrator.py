@@ -305,6 +305,85 @@ try:
 except (TypeError, ValueError):
     pass
 
+# --- Search-health "slow site" thresholds (2026-07-13) ------------------
+# A participating site whose fan-out search or image-quality probe exceeds
+# these is flagged "slow" in search_all's `diagnostics["site_health"]` payload,
+# which aio_search_cli surfaces in --search-json so the UI can recommend
+# disabling chronically slow/down sites (grep _classify_site_health /
+# SlowSitesCallout in UI-source). ABSOLUTE, not relative-to-phase: fan-out is
+# parallel (one site's share of wall-clock is meaningless) and the probe covers
+# only the top 1-2 candidates' cache-miss sources (each probe is ~100% of the
+# phase by construction). SLOW_FANOUT_S sits below the single-retry request
+# cost (search_timeout×2 → a retry-then-succeed site legitimately takes ~20s)
+# yet well above a healthy sub-3s search. SLOW_PROBE_S is DELIBERATELY not
+# applied to constitutionally-slow handlers (SEARCH_COST_HINT=="slow" /
+# EXPENSIVE_PROBE / OFFICIAL_PUBLISHER) whose deep browser/licensed probe is
+# slow by design — see _classify_site_health; without that gate comix's healthy
+# ~40-70s breadth probe would trip "slow" every run and get perpetually
+# recommended for disabling. Env-overridable, same pattern as the deadlines.
+SEARCH_SLOW_FANOUT_S = 10.0
+try:
+    SEARCH_SLOW_FANOUT_S = max(
+        0.0, float(os.environ.get("AIO_SEARCH_SLOW_FANOUT_S", "") or SEARCH_SLOW_FANOUT_S)
+    )
+except (TypeError, ValueError):
+    pass
+
+SEARCH_SLOW_PROBE_S = 30.0
+try:
+    SEARCH_SLOW_PROBE_S = max(
+        0.0, float(os.environ.get("AIO_SEARCH_SLOW_PROBE_S", "") or SEARCH_SLOW_PROBE_S)
+    )
+except (TypeError, ValueError):
+    pass
+
+# --- Search-health reachability probe (2026-07-13, fix 3) ---------------
+# _classify_site_health below answers "how did this site's SEARCH behave this
+# run" (raised? slow? never finished?) — NOT "is the site actually reachable".
+# Those diverge in exactly the ways users hit: a site whose SEARCH endpoint
+# times out ~40s then raises looks identical to a dead host (both 'down/error')
+# even though its DOWNLOAD path is fine, while a site that swallows its own
+# all-mirrors-dead failure to [] (grep zeroscans.search) or is merely slow in
+# the image probe looks 'slow' though it's unreachable. To split those,
+# _emit_site_health runs a bounded liveness GET against each FLAGGED (non-ok)
+# eligible site at return time and _refine_with_reachability rewrites the
+# verdict: reachable+errored -> a softer 'slow/search_error' (site up, its
+# search flaked — no longer the alarming 'down' that auto-recommends disabling
+# a download-healthy site), unreachable+anything -> 'down/unreachable' (the one
+# true dead bucket). This DELIBERATELY reverses the feature's original "zero
+# new network round-trips" constraint (plan
+# ~/.claude/plans/certain-sites-that-we-refactored-elephant.md) — that
+# constraint is precisely what made the labels mechanism-based-and-wrong.
+# BOUNDED so it can't re-inflate the wall time the 2026-07-12 perf rework won
+# back: fires ONLY when a site was already flagged (a healthy all-ok search
+# probes NOTHING → +0s), skips constitutionally-slow/official/expensive
+# handlers (comix — its scraper_factory would launch Patchright), runs parallel
+# daemon workers under a hard phase deadline, single-attempts each host with a
+# short timeout (NOT make_request's 6× retry chain). Kill-switch
+# AIO_SEARCH_REACHABILITY=0 restores the pure-mechanism classification.
+_REACHABILITY_ENABLED = (
+    os.environ.get("AIO_SEARCH_REACHABILITY", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+SEARCH_REACHABILITY_TIMEOUT_S = 5.0
+try:
+    SEARCH_REACHABILITY_TIMEOUT_S = max(
+        0.5,
+        float(os.environ.get("AIO_SEARCH_REACHABILITY_TIMEOUT_S", "") or SEARCH_REACHABILITY_TIMEOUT_S),
+    )
+except (TypeError, ValueError):
+    pass
+SEARCH_REACHABILITY_DEADLINE_S = 12.0
+try:
+    SEARCH_REACHABILITY_DEADLINE_S = max(
+        1.0,
+        float(os.environ.get("AIO_SEARCH_REACHABILITY_DEADLINE", "") or SEARCH_REACHABILITY_DEADLINE_S),
+    )
+except (TypeError, ValueError):
+    pass
+_REACHABILITY_MAX_URLS = 3     # candidate hosts probed per handler (cap the fan)
+_REACHABILITY_MAX_SITES = 16   # flagged sites probed per run (whole-connection-down backstop)
+
 
 # --- Data shapes --------------------------------------------------------
 @dataclass
@@ -5188,6 +5267,205 @@ def _desired_max_samples(
     return None
 
 
+# --- Search-health classification --------------------------------------
+def _classify_site_health(
+    fanout_s: Optional[float],
+    probe_s: Optional[float],
+    *,
+    errored: bool,
+    blocked: bool,
+    never_finished: bool,
+    stuck: bool,
+    constitutionally_slow: bool,
+) -> Tuple[str, Optional[str]]:
+    """Map a site's per-run search signals to a (status, reason) health verdict.
+
+    status is "down" | "slow" | "ok". Hard-down signals always win over slow.
+    `never_finished` = still pending at the fan-out soft barrier AND never
+    adopted late (search_all's return-time `late_pending`); `stuck` = still
+    in-flight when the probe phase abandoned at its deadline. `constitutionally_
+    slow` handlers (SEARCH_COST_HINT=="slow" / EXPENSIVE_PROBE / OFFICIAL_
+    PUBLISHER — comix's browser probe, official-publisher deep probes) are
+    EXEMPT from the slow_probe signal only (their deep probe is slow by design);
+    they still catch every hard-down signal. Pure function so
+    tools/_test_site_health.py can exercise the truth table offline.
+    """
+    if errored:
+        return "down", "error"
+    if blocked:
+        return "down", "blocked"
+    if never_finished:
+        return "down", "late_fanout"
+    if stuck:
+        return "down", "probe_stuck"
+    if fanout_s is not None and fanout_s >= SEARCH_SLOW_FANOUT_S:
+        return "slow", "slow_fanout"
+    if (
+        not constitutionally_slow
+        and probe_s is not None
+        and probe_s >= SEARCH_SLOW_PROBE_S
+    ):
+        return "slow", "slow_probe"
+    return "ok", None
+
+
+# --- Search-health reachability probe (2026-07-13, fix 3) ---------------
+def _reachability_urls(handler) -> List[str]:
+    """Base URLs to liveness-check for a handler, best-host first, deduped and
+    capped at _REACHABILITY_MAX_URLS. Prefers a failover handler's own
+    _candidate_domains() (so a moved-domain site like zeroscans → zscans.com is
+    checked at its CURRENT mirrors, not just domains[0]), then any explicit
+    base_url / _BASE_URL, then the universal `domains` tuple (apex form, www-
+    deduped). Cross-file: consumed only by _probe_site_reachable."""
+    urls: List[str] = []
+    seen: set = set()
+
+    def _add(u: Optional[str]) -> None:
+        if isinstance(u, str) and u:
+            key = u.rstrip("/").lower()
+            if key not in seen:
+                seen.add(key)
+                urls.append(u)
+
+    cand = getattr(handler, "_candidate_domains", None)
+    if callable(cand):
+        try:
+            for d in cand():
+                if d:
+                    _add(f"https://{d}/")
+        except Exception:
+            pass
+    for attr in ("base_url", "_BASE_URL"):
+        b = getattr(handler, attr, None)
+        if isinstance(b, str) and b:
+            _add(b if b.startswith("http") else f"https://{b}/")
+    for d in (getattr(handler, "domains", None) or ()):
+        if isinstance(d, str) and d:
+            apex = d[4:] if d.startswith("www.") else d
+            _add(f"https://{apex}/")
+    return urls[:_REACHABILITY_MAX_URLS]
+
+
+def _probe_site_reachable(handler, scraper_factory, *, timeout_s: float) -> Optional[bool]:
+    """One bounded liveness GET per candidate host. Returns:
+      True  — a host returned ANY HTTP status (even 4xx/5xx / a Cloudflare
+              challenge: the server ANSWERED, so the site is reachable and any
+              search-side failure is endpoint-specific, not a dead host).
+      False — every candidate failed at the socket layer (DNS / conn refused /
+              SSL / timeout) within the budget → genuinely unreachable.
+      None  — couldn't attempt (no domains, unusable scraper, kwarg-signature
+              mismatch) → caller keeps the mechanism verdict.
+    Single attempt per host with a short timeout — deliberately NOT make_request
+    (its 6× retry + backoff would re-eat ~40s and defeat a liveness check) and
+    NOT its cross-process cooldown machinery (a raw .get must not trip the
+    rate-limit coordinator). Handler-agnostic: uses the scraper's .get; a
+    browser/exotic scraper without a compatible .get yields None (callers
+    already skip constitutionally-slow/browser handlers — this is a backstop).
+    Module-level (not a closure) so tools/_test_site_health.py can monkeypatch
+    it for deterministic offline coverage."""
+    urls = _reachability_urls(handler)
+    if not urls:
+        return None
+    try:
+        scraper = scraper_factory(handler)
+    except Exception:
+        return None
+    getter = getattr(scraper, "get", None)
+    if not callable(getter):
+        return None
+    for url in urls:
+        try:
+            r = getter(url, timeout=timeout_s, allow_redirects=True)
+        except TypeError:
+            # scraper.get doesn't accept our kwargs — don't risk an unbounded
+            # bare call; report 'unknown' and keep the mechanism verdict.
+            return None
+        except Exception:
+            continue  # socket-layer failure on THIS host — try the next mirror
+        if getattr(r, "status_code", None) is not None:
+            return True
+    return False
+
+
+def _refine_with_reachability(
+    status: str, reason: Optional[str], reachable: Optional[bool]
+) -> Tuple[str, Optional[str]]:
+    """Second-stage correction of a mechanism verdict using an emit-time
+    liveness result. `reachable` is True / False / None (not probed → keep as
+    is). Pure function — offline truth-table in tools/_test_site_health.py.
+
+    - `blocked` is untouched: the ProbeFailureCache is the authority there and
+      the host was NOT re-probed.
+    - unreachable (False) → down/unreachable for every non-blocked reason. This
+      is the ONE true 'the site is dead' bucket (zeroscans' swallowed all-
+      mirrors failure; omegascans timing out).
+    - reachable (True) → the host is UP, so a search-side problem is never
+      'down': an errored search softens to slow/search_error (mangakatana — its
+      search flaked but downloads are fine), and any other hard-down verdict
+      (late_fanout / probe_stuck) softens to 'slow' keeping its reason. An
+      already-'slow' verdict is unchanged.
+    """
+    if reason == "blocked":
+        return status, reason
+    if reachable is False:
+        return "down", "unreachable"
+    if reachable is True:
+        if reason == "error":
+            return "slow", "search_error"
+        if status == "down":
+            return "slow", reason
+        return status, reason
+    return status, reason
+
+
+def _run_reachability_probe(
+    pending: List[dict], scraper_factory
+) -> Dict[str, Optional[bool]]:
+    """Liveness-probe a list of flagged-site pending dicts in parallel daemon
+    workers under a hard phase deadline. Returns {name -> True/False/None};
+    names unresolved when the deadline fires are omitted (the caller treats a
+    missing name as None → keeps the mechanism verdict). Mirrors the fan-out /
+    image-probe daemon+deadline pattern so a wedged host can't hang the run."""
+    results: Dict[str, Optional[bool]] = {}
+    rlock = threading.Lock()
+    rq: "queue.Queue" = queue.Queue()
+    for p in pending:
+        rq.put(p)
+
+    def _rworker() -> None:
+        while True:
+            try:
+                p = rq.get_nowait()
+            except queue.Empty:
+                return
+            verdict: Optional[bool] = None
+            try:
+                verdict = _probe_site_reachable(
+                    p["handler"], scraper_factory,
+                    timeout_s=SEARCH_REACHABILITY_TIMEOUT_S,
+                )
+            except Exception:
+                verdict = None
+            with rlock:
+                results[p["name"]] = verdict
+
+    n_workers = max(1, min(len(pending), _FANOUT_MAX))
+    threads = [
+        threading.Thread(target=_rworker, name="search-reach", daemon=True)
+        for _ in range(n_workers)
+    ]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + SEARCH_REACHABILITY_DEADLINE_S
+    for t in threads:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            break
+        t.join(timeout=rem)
+    with rlock:
+        return dict(results)
+
+
 # --- Public entrypoint --------------------------------------------------
 def search_all(
     query: str,
@@ -5207,6 +5485,8 @@ def search_all(
     seeded_only: bool = False,
     probe_candidate_limit: Optional[int] = None,
     fetch_memo=None,
+    exclude_sites: Optional[Set[str]] = None,
+    diagnostics: Optional[dict] = None,
 ) -> List[SeriesCandidate]:
     """Fan out search across all search-capable handlers, dedupe, rank.
 
@@ -5259,6 +5539,20 @@ def search_all(
         run's phases. The probe phase populates it (scrapers + contexts +
         chapter lists); T3 and the caller's winner chapter fetch then reuse
         those instead of re-fetching identical data a 2nd/3rd time.
+      exclude_sites: optional set of handler names (lowercase) to drop from the
+        fan-out + probe entirely — the user's disabled-sites list (--disable-
+        sites). Filtered in the eligibility loop before the blocked/seeded
+        checks. A URL seed_hit for an excluded site still rides (explicit user
+        intent overrides the block); excluded sites also get NO site_health
+        entry (below) so a disabled site isn't re-flagged as down.
+      diagnostics: optional mutable dict the caller passes to receive per-run
+        observability WITHOUT changing the return type (same collaborator
+        pattern as probe_failure_cache / img_quality_cache / fetch_memo). When
+        provided, search_all fills diagnostics["site_health"] (a list of
+        {site, display_name, host, status, reason, fanout_s, probe_s} for every
+        slow/down participating site), ["eligible_count"], and ["phase_times"].
+        Assembled at return under the fan-out/probe locks (stragglers may still
+        be mutating the timing containers). See _classify_site_health.
 
     Returns:
       List of SeriesCandidate, ranked best-first.
@@ -5273,6 +5567,23 @@ def search_all(
     _fanout_elapsed = 0.0
     _probe_elapsed = 0.0
     _t3_elapsed = 0.0
+
+    # Per-site timing + failure attribution for the search-health signal
+    # (2026-07-13). Populated by the fan-out and probe phases below (each under
+    # its own lock — fanout_lock / probe_track_lock) and snapshotted at return
+    # time to build diagnostics["site_health"]. HOISTED to function scope (out
+    # of the `if eligible:` fan-out block and the nested probe block) so the
+    # return-time assembly is valid even when a phase never runs — no eligible
+    # handlers, img_cache None, or zero cache-misses. errored_names is written
+    # by _run_one's except branches UNDER fanout_lock so the return snapshot
+    # can't tear; blocked_skipped is captured single-threaded in the
+    # eligibility loop.
+    fanout_times: Dict[str, float] = {}
+    probe_times: List[Tuple[str, float]] = []
+    probe_inflight: Dict[Tuple[str, str], float] = {}
+    probe_track_lock = threading.Lock()
+    errored_names: Set[str] = set()
+    blocked_skipped: List[Tuple[str, str, str]] = []  # (name, display_name, host)
 
     cache = probe_failure_cache  # may be None
     img_cache = img_quality_cache  # may be None — probe phase skipped if None
@@ -5325,8 +5636,17 @@ def search_all(
     # so the filter is consistent with how scoring would have treated them.
     eligible: List[BaseSiteHandler] = []
     skipped_unseeded = 0
+    disabled_skipped = 0
+    _exclude = {s.lower() for s in exclude_sites} if exclude_sites else set()
     for h in handlers:
         host = (h.domains[0] if getattr(h, "domains", None) else "") or ""
+        # User-disabled sites (--disable-sites) drop out FIRST — before the
+        # blocked/seeded checks — so the disable is authoritative. A matching
+        # URL-seed hit (if any) still rides in all_hits: an explicit URL
+        # overrides the block, same as the primary anchor in a download.
+        if _exclude and h.name.lower() in _exclude:
+            disabled_skipped += 1
+            continue
         if h.name in seeded_sites:
             # Skip silently — mangafire (or whichever site the URL maps to)
             # is already represented by a seed_hit that goes into
@@ -5344,6 +5664,9 @@ def search_all(
         if cache and host and cache.is_blocked(host):
             if on_status:
                 on_status(f"  skipping {h.name} ({host} suppressed)")
+            # Blocked = 2+ recent failures (down/unreachable). Surface it in the
+            # health signal even though it never enters `eligible`.
+            blocked_skipped.append((h.name, getattr(h, "display_name", h.name), host))
             continue
         if seeded_only and h.name.lower() not in seed:
             skipped_unseeded += 1
@@ -5354,6 +5677,8 @@ def search_all(
             f"  --seeded-only: skipped {skipped_unseeded} handler(s) not in "
             f"quality_seed.json"
         )
+    if disabled_skipped and on_status:
+        on_status(f"  --disable-sites: skipped {disabled_skipped} handler(s)")
 
     # Slow-first enqueue order (2026-07-12): handlers whose search() is
     # expensive (SEARCH_COST_HINT="slow" — comix's browser-driven typeahead
@@ -5393,6 +5718,11 @@ def search_all(
         try:
             scraper = scraper_factory(handler)
         except Exception:
+            # Attribute this run's failure to the site for the health signal —
+            # under fanout_lock so the return-time set(errored_names) snapshot
+            # can't tear against a straggler still erroring past the barrier.
+            with fanout_lock:
+                errored_names.add(handler.name)
             if cache and host:
                 cache.record_failure(host)
             return []
@@ -5402,12 +5732,26 @@ def search_all(
             )
             if not isinstance(hits, list):
                 hits = []
-            if cache and host:
-                # Empty results don't count as failures (the site is up but
-                # has no match for this query); only exceptions do.
+            if cache and host and hits:
+                # Record success ONLY on a NON-EMPTY result — that's the sole
+                # proof we actually reached AND parsed the site. An empty list
+                # is ambiguous: a genuine no-match, OR a handler that swallowed
+                # its own network failure to [] (grep zeroscans.search's all-
+                # mirrors-down path). The old UNCONDITIONAL record_success
+                # marked a fully-unreachable host 'healthy', hiding it from both
+                # the ProbeFailureCache block path AND the search-health signal
+                # (2026-07-13, fix 1). Empty now records NOTHING — neither
+                # success nor failure; the emit-time reachability probe
+                # (_probe_site_reachable) is what splits down-from-slow for a
+                # zero-hit site. Exceptions still record_failure below.
                 cache.record_success(host)
             return hits
         except Exception:
+            # Attribute this run's failure to the site for the health signal —
+            # under fanout_lock so the return-time set(errored_names) snapshot
+            # can't tear against a straggler still erroring past the barrier.
+            with fanout_lock:
+                errored_names.add(handler.name)
             if cache and host:
                 cache.record_failure(host)
             return []
@@ -5438,10 +5782,10 @@ def search_all(
         for h in eligible:
             fan_q.put(h)
 
-        # Per-site search durations for the "slowest" diagnostic line below —
-        # names the handlers that dominate the fan-out phase (the mangakatana
-        # class of problem is invisible without per-site attribution).
-        fanout_times: Dict[str, float] = {}
+        # fanout_times (per-site search durations for the "slowest" diagnostic
+        # line — the mangakatana class of problem is invisible without per-site
+        # attribution) is hoisted to function scope; populated here under
+        # fanout_lock so the return-time health assembly can snapshot it.
 
         def _fanout_worker() -> None:
             while True:
@@ -5488,11 +5832,165 @@ def search_all(
             )
     _fanout_elapsed = time.monotonic() - _fanout_started
 
+    # ---- Search-health snapshot (2026-07-13) ----
+    # Reuse the timing the phases ALREADY measured (zero added network work) to
+    # tell the caller which participating sites were slow or down. Defined here
+    # (after the fan-out barrier) and called before EVERY return path — the
+    # no-hits / no-match early returns below INCLUDED, because "every site is
+    # down → no hits → early return" is exactly when the signal matters most.
+    # Snapshots under the existing locks: daemon fan-out stragglers past the
+    # barrier and probe workers past the deadline can still be mutating these
+    # containers, so a bare read risks "dict/list changed size during iteration".
+    # `late_pending` holds sites still pending at the barrier; by the FINAL
+    # return the adoption block below has discarded any straggler that finished
+    # late (those keep a real fanout_times entry and classify "slow" instead),
+    # leaving only genuinely never-finished sites (down/late_fanout). Excluded
+    # (user-disabled) sites get no entry so a disabled site isn't re-flagged as
+    # down. Consumed by aio_search_cli's --search-json payload → the UI's
+    # SlowSitesCallout. Closure over the phase locals (read at call time).
+    def _emit_site_health() -> None:
+        if diagnostics is None:
+            return
+        with fanout_lock:
+            _ft = dict(fanout_times)
+            _errored = set(errored_names)
+            _never = set(late_pending)
+            _blocked = list(blocked_skipped)
+        with probe_track_lock:
+            _stuck = {site for (site, _u) in probe_inflight}
+            _probe_by_site: Dict[str, float] = {}
+            for _site, _secs in probe_times:
+                # A site can be probed once per source across the top 1-2
+                # candidates; keep its WORST single probe.
+                if _secs > _probe_by_site.get(_site, 0.0):
+                    _probe_by_site[_site] = _secs
+
+        # Stage 1 — mechanism verdict per eligible site (pure, no network). Each
+        # _pending entry carries what the reachability refinement + payload
+        # assembly below need. Blocked-skipped sites are appended afterward as
+        # down/blocked and are NOT reachability-probed (the cache is authority).
+        _pending: List[dict] = []
+        for h in eligible:
+            name = h.name
+            if _exclude and name.lower() in _exclude:
+                continue
+            host = (h.domains[0] if getattr(h, "domains", None) else "") or ""
+            fo = _ft.get(name)
+            pr = _probe_by_site.get(name)
+            constitutionally_slow = (
+                getattr(h, "SEARCH_COST_HINT", "normal") == "slow"
+                or getattr(h, "EXPENSIVE_PROBE", False)
+                or getattr(h, "OFFICIAL_PUBLISHER", False)
+            )
+            status, reason = _classify_site_health(
+                fo, pr,
+                errored=(name in _errored),
+                blocked=bool(cache and host and cache.is_blocked(host)),
+                never_finished=(name in _never),
+                stuck=(name in _stuck),
+                constitutionally_slow=constitutionally_slow,
+            )
+            _pending.append({
+                "handler": h, "name": name, "host": host,
+                "fo": fo, "pr": pr, "status": status, "reason": reason,
+                "constitutionally_slow": constitutionally_slow,
+            })
+
+        # Stage 2 — bounded emit-time reachability probe (2026-07-13, fix 3).
+        # ONLY sites already flagged non-ok are probed, and only plain-HTTP
+        # handlers: constitutionally-slow / official / expensive handlers are
+        # slow-or-special by design (probing comix's scraper_factory would
+        # launch Patchright), and a blocked-verdict eligible site (a host that
+        # crossed the cache threshold mid-run) is left to the cache. A healthy
+        # all-ok search reaches here with an empty _to_probe → zero added
+        # latency. See the reachability-constant header for the full rationale.
+        _reach: Dict[str, Optional[bool]] = {}
+        if _REACHABILITY_ENABLED:
+            _to_probe = [
+                p for p in _pending
+                if p["status"] != "ok"
+                and p["reason"] != "blocked"
+                and not p["constitutionally_slow"]
+            ][:_REACHABILITY_MAX_SITES]
+            if _to_probe:
+                _reach = _run_reachability_probe(_to_probe, scraper_factory)
+
+        # Stage 3 — refine each mechanism verdict with the liveness result, feed
+        # a confirmed-unreachable host into the cache, and assemble the payload.
+        _health: List[dict] = []
+        _unreachable_ct = 0
+        for p in _pending:
+            if p["status"] == "ok":
+                continue  # healthy → no entry (keep the payload tiny)
+            reachable = _reach.get(p["name"])
+            status, reason = _refine_with_reachability(p["status"], p["reason"], reachable)
+            if status == "ok":  # defensive — refine never returns ok, but guard
+                continue
+            # A newly-confirmed-unreachable site that did NOT already error this
+            # run (its _run_one never recorded a failure — a swallow-to-[]
+            # handler, or a slow-but-alive host that died before the emit probe)
+            # feeds the cache so a persistently-dead host trends toward a block +
+            # auto-skip on later runs. Errored sites already recorded in
+            # _run_one's except — don't double-count (that would block a host
+            # after a single run instead of the intended 2).
+            if reachable is False:
+                _unreachable_ct += 1
+                if p["reason"] != "error" and cache and p["host"]:
+                    try:
+                        cache.record_failure(p["host"])
+                    except Exception:
+                        pass
+            _health.append({
+                "site": p["name"],
+                "display_name": getattr(p["handler"], "display_name", p["name"]),
+                "host": p["host"],
+                "status": status,
+                "reason": reason,
+                "fanout_s": round(p["fo"], 1) if p["fo"] is not None else None,
+                "probe_s": round(p["pr"], 1) if p["pr"] is not None else None,
+            })
+        # ProbeFailureCache-blocked sites never entered `eligible` — surface
+        # them as down/blocked (unless the user already disabled them).
+        for name, display_name, host in _blocked:
+            if _exclude and name.lower() in _exclude:
+                continue
+            _health.append({
+                "site": name,
+                "display_name": display_name,
+                "host": host,
+                "status": "down",
+                "reason": "blocked",
+                "fanout_s": None,
+                "probe_s": None,
+            })
+        if on_status and _reach:
+            on_status(
+                f"[*] reachability: probed {len(_reach)} flagged site(s), "
+                f"{_unreachable_ct} unreachable"
+            )
+        diagnostics["site_health"] = _health
+        diagnostics["eligible_count"] = len(eligible)
+        # The names of the sites actually fanned out this run (disabled /
+        # seed-hit / blocked / unseeded sites never enter `eligible`). The UI
+        # folds site_health as STRIKES and uses this as the DECAY set: a site
+        # in tested_sites but absent from site_health came back healthy this
+        # run → decay its strike; a site in NEITHER wasn't measured → leave it
+        # untouched. Without this the UI can't tell "tested & ok" from "not
+        # tested", so recovered sites would never drop off the recommend list.
+        # Cross-file: useDownloader.js setSearchSiteHealth fold (grep tested_sites).
+        diagnostics["tested_sites"] = [h.name for h in eligible]
+        diagnostics["phase_times"] = {
+            "fanout": round(_fanout_elapsed, 1),
+            "probe": round(_probe_elapsed, 1),
+            "t3": round(_t3_elapsed, 1),
+        }
+
     if not all_hits:
         # Nothing matched by the barrier and no seeds. Stragglers (if any)
         # are abandoned here — an empty result at ~the barrier matches the
         # user's "stop waiting" semantics; a handler that alone needs >60s
         # for the only hits is the degenerate case we accept.
+        _emit_site_health()
         return []
 
     # Score every hit against the query.
@@ -5503,6 +6001,7 @@ def search_all(
             scored.append((score, hit))
 
     if not scored:
+        _emit_site_health()
         return []
 
     # Group by canonical title key. Within a candidate, multiple sources may
@@ -6026,14 +6525,14 @@ def search_all(
                 q.put(s)
             probe_workers = max(1, min(parallelism, len(cache_misses)))
 
-            # Per-source probe attribution: durations feed the "probe
-            # slowest" line below, and the in-flight map lets the deadline
-            # message NAME the source(s) still running — without it, "1/6
-            # workers still running" gave no clue that (live example)
-            # mangakatana was the one re-eating the deadline every search.
-            probe_track_lock = threading.Lock()
-            probe_inflight: Dict[Tuple[str, str], float] = {}
-            probe_times: List[Tuple[str, float]] = []
+            # Per-source probe attribution: durations feed the "probe slowest"
+            # line below, and the in-flight map lets the deadline message NAME
+            # the source(s) still running — without it, "1/6 workers still
+            # running" gave no clue that (live example) mangakatana was the one
+            # re-eating the deadline every search. probe_track_lock /
+            # probe_inflight / probe_times are hoisted to function scope
+            # (populated here) so the return-time health assembly can snapshot
+            # them under the lock.
 
             def _worker_loop() -> None:
                 while True:
@@ -6258,6 +6757,14 @@ def search_all(
             f"{_probe_elapsed:.1f}s · T3 {_t3_elapsed:.1f}s · total "
             f"{time.monotonic() - _phase_t0:.1f}s"
         )
+
+    # Emit the search-health snapshot on the success path too (defined after
+    # the fan-out barrier above; also called before the no-hits/no-match early
+    # returns). By this FINAL call the late-adoption block has run, so
+    # late_pending holds only never-finished sites and the probe phase's timing
+    # is included.
+    _emit_site_health()
+
     return candidates
 
 

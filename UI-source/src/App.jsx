@@ -32,6 +32,11 @@ const TABS = [
 export default function App() {
   const [activeTab, setActiveTab] = useState("new");
   const [downloadDraft, setDownloadDraft] = useState(null);
+  // When the SearchTab slow-sites callout's "Manage in Settings" link fires, we
+  // jump to the Settings tab AND preselect its Search category. Null the rest of
+  // the time so a manual Settings visit (via the rail) lands on the default pane
+  // — the rail button clears it below.
+  const [settingsCategory, setSettingsCategory] = useState(null);
 
   // Central hook that manages all download state and Electron IPC
   const dl = useDownloader();
@@ -102,7 +107,12 @@ export default function App() {
           return (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => {
+                // A manual Settings visit resets any callout-forced category so
+                // it opens on the default (General) pane, not Search.
+                if (tab.id === "settings") setSettingsCategory(null);
+                setActiveTab(tab.id);
+              }}
               title={tab.label}
               className={cn(
                 "relative flex flex-col items-center justify-center w-12 h-12 rounded-lg",
@@ -193,6 +203,11 @@ export default function App() {
               onSaveSettings={dl.saveSettings}
               resumable={dl.resumable}
               onResumeDownload={dl.resumeDownload}
+              searchSiteHealth={dl.searchSiteHealth}
+              onManageSources={() => {
+                setSettingsCategory("search");
+                setActiveTab("settings");
+              }}
               onStartDownload={(url, args) => {
                 // Fix A (2026-05-07): merge settings.defaults so search- and
                 // library-driven downloads inherit format / quality / scaling /
@@ -229,6 +244,8 @@ export default function App() {
             <SettingsTab
               settings={dl.settings}
               onSave={dl.saveSettings}
+              searchSiteHealth={dl.searchSiteHealth}
+              initialCategory={settingsCategory}
             />
           )}
         </div>

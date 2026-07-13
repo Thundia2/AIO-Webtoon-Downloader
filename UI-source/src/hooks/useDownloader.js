@@ -66,6 +66,13 @@ export function useDownloader() {
     // CDN is rate-limiting and the extra concurrent burst from N+1's
     // downloads compounds throttling. See aio-dl.py:_start_image_prefetch.
     prefetchImageWorkers: -1,
+    // Durable list of handler names the user disabled (Settings → Search →
+    // "Search Sources", or the SlowSitesCallout). Excluded from the search
+    // fan-out/probe AND from multi-source download alternatives. Injected into
+    // runSearch (→ --disable-sites) and queueDownload (→ --disable-sites) below.
+    // Placeholder here for the pre-load window; SettingsTab.DEFAULT_SETTINGS
+    // owns the canonical default and get-settings hydrates the saved value.
+    disabledSites: [],
   });
   const [queue, setQueue] = useState([]);
   const [currentDownloadId, setCurrentDownloadId] = useState(null);
@@ -85,6 +92,22 @@ export function useDownloader() {
   });
   const [searchLogs, setSearchLogs] = useState([]);
   const pendingSearchLogsRef = useRef([]);
+
+  // ── Rolling per-site search health (IN-MEMORY — deliberately NOT persisted) ──
+  // Keyed by handler name → { strikes, lastStatus, lastReason, lastFanoutS,
+  // lastProbeS, displayName, host, lastSeen }. Folded from each search's
+  // result.site_health (strikes) + result.tested_sites (decay) in runSearch.
+  // A merely-SLOW site needs 2+ searches to cross the recommend threshold (+1
+  // per slow run); a DOWN/unreachable site crosses in one (+2). Sites that come
+  // back healthy decay (−1) and drop off at 0; untested sites are left alone.
+  //
+  // WHY in-memory and not a persisted setting: writing it to `settings` every
+  // search would fire SettingsTab's hydration effect mid-edit and clobber the
+  // user's unsaved Settings draft (searches run 30–240 s — "start search, edit
+  // Settings, search finishes" is reachable). Resetting strikes on app restart
+  // is acceptable; only the disabledSites LIST is durable. The SearchTab callout
+  // and the Settings "Search Sources" section both read this snapshot.
+  const [searchSiteHealth, setSearchSiteHealth] = useState({});
 
   // ── Library state ──
   // Lifted from LibraryTab.jsx so the entries survive tab switches without
@@ -493,6 +516,16 @@ export function useDownloader() {
             && s?.metadataRefresh === true
           ? { metadataRefresh: true }
           : {}),
+        // User-disabled sites → --disable-sites on EVERY spawn (manual / search /
+        // library / queue). downloader.js:buildCliArgs emits the flag when the
+        // array is non-empty; aio-dl.py drops those sites as multi-source
+        // alternatives (and guard-filters the persisted alt cache). Injected
+        // here — the single chokepoint every download path routes through — so
+        // no callsite has to re-implement it. Skipped when empty so default
+        // spawns stay clean. Caller args still win via the trailing ...args.
+        ...(Array.isArray(s?.disabledSites) && s.disabledSites.length
+          ? { disabledSites: s.disabledSites }
+          : {}),
         ...args,
       };
 
@@ -664,6 +697,15 @@ export function useDownloader() {
     const s = settingsRef.current;
     const finalOpts = {
       collapseSplits: s?.collapseSplits === true,
+      // Durable disabled-sites list → --disable-sites (searcher.js). Injected
+      // from settings so every ordinary search honors the block. The callout's
+      // "Disable & re-search" overrides this via an explicit opts.disabledSites
+      // (opts spreads last, so it wins) to dodge the settingsRef update race —
+      // saveSettings updates React state async, but the re-search fires
+      // synchronously right after, so the ref may still hold the pre-disable list.
+      ...(Array.isArray(s?.disabledSites) && s.disabledSites.length
+        ? { disabledSites: s.disabledSites }
+        : {}),
       ...opts,
     };
 
@@ -691,6 +733,54 @@ export function useDownloader() {
         results: result,
         error: null,
       }));
+
+      // Fold this run's per-site health into the rolling in-memory map (see the
+      // searchSiteHealth declaration for the model + why it's not persisted).
+      //   site_health  → STRIKES (down +2, slow +1, capped 4)
+      //   tested_sites → the DECAY roster (tested-and-healthy this run → −1)
+      // A site in neither list wasn't measured this run, so it's left untouched.
+      const health = Array.isArray(result?.site_health) ? result.site_health : [];
+      const tested = Array.isArray(result?.tested_sites) ? result.tested_sites : [];
+      if (health.length || tested.length) {
+        setSearchSiteHealth((prev) => {
+          const next = { ...prev };
+          const seenNow = Date.now();
+          const flagged = new Set();
+          // 1) Strike the sites flagged slow/down this run.
+          for (const h of health) {
+            const key = h?.site;
+            if (!key) continue;
+            flagged.add(key);
+            const prevStrikes = next[key]?.strikes || 0;
+            const delta = h.status === "down" ? 2 : 1; // down clears the 2-strike bar alone
+            next[key] = {
+              strikes: Math.min(prevStrikes + delta, 4),
+              lastStatus: h.status || "slow",
+              lastReason: h.reason || null,
+              lastFanoutS: h.fanout_s ?? null,
+              lastProbeS: h.probe_s ?? null,
+              displayName: h.display_name || key,
+              host: h.host || null,
+              lastSeen: seenNow,
+            };
+          }
+          // 2) Decay sites that were tested this run but came back healthy
+          //    (present in tested_sites, absent from site_health). Fully-decayed
+          //    entries are deleted so the map stays bounded to live problems.
+          for (const site of tested) {
+            if (flagged.has(site)) continue;
+            const cur = next[site];
+            if (!cur) continue; // never flagged → nothing to decay
+            const strikes = Math.max((cur.strikes || 0) - 1, 0);
+            if (strikes === 0) {
+              delete next[site];
+            } else {
+              next[site] = { ...cur, strikes, lastStatus: "ok", lastReason: null, lastSeen: seenNow };
+            }
+          }
+          return next;
+        });
+      }
       return result;
     } catch (err) {
       setSearchState((prev) => ({
@@ -724,6 +814,7 @@ export function useDownloader() {
     currentDownloadId,
     searchState,
     searchLogs,
+    searchSiteHealth,
     libraryEntries,
     libraryLoading,
 

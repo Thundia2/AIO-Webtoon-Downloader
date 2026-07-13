@@ -85,6 +85,16 @@ _URL_SEED_HOSTS = {
 }
 
 
+def parse_disable_sites(args) -> set:
+    """Parse the --disable-sites comma list off `args` into a lowercased set of
+    handler names. The user's opted-out (unreachable/slow) sites; fed to
+    search_all(exclude_sites=) here and to aio-dl.py's multi-source alternatives
+    guard-filter. Tolerant of None / blanks / stray whitespace. Matched against
+    handler.name (the JSON 'site' field) everywhere."""
+    raw = getattr(args, "disable_sites", None) or ""
+    return {s.strip().lower() for s in raw.split(",") if s.strip()}
+
+
 def _try_extract_seed_hit(query: str, fetch_memo=None) -> Optional[SearchHit]:
     """If `query` is a URL for a URL-seedable site, scrape it into a SearchHit.
 
@@ -556,6 +566,10 @@ def run_search_mode(
     def _status(msg: str) -> None:
         print(msg, file=sys.stderr)
 
+    # Search-health sink (2026-07-13): search_all fills this with per-site
+    # slow/down verdicts + phase timings; surfaced in the JSON payload below so
+    # the UI can recommend disabling chronically slow/down sites.
+    diag: dict = {}
     candidates = search_all(
         query,
         factory,
@@ -587,6 +601,9 @@ def run_search_mode(
         # ORDER is unaffected (pure title-match).
         probe_candidate_limit=(1 if auto_pick else 2),
         fetch_memo=fetch_memo,
+        # Drop the user's disabled sites from the fan-out + probe entirely.
+        exclude_sites=parse_disable_sites(args),
+        diagnostics=diag,
     )
 
     multi_source = bool(getattr(args, "multi_source", False))
@@ -745,6 +762,19 @@ def run_search_mode(
             "language": language,
             "candidates": [c.to_json() for c in candidates],
         }
+        # Per-site slow/down verdicts (2026-07-13) — absent when every site was
+        # healthy, so the UI shows no callout. eligible_count lets the UI's
+        # "Disable & re-search" guard avoid emptying the roster.
+        if diag.get("site_health"):
+            payload["site_health"] = diag["site_health"]
+        if diag.get("eligible_count") is not None:
+            payload["eligible_count"] = diag["eligible_count"]
+        # tested_sites = the sites actually searched this run. The UI decays a
+        # tracked site's strike only when it was tested-and-healthy (in here,
+        # absent from site_health); an untested site is left alone. Emitted
+        # whenever the search fanned out at all (search_orchestrator.py).
+        if diag.get("tested_sites"):
+            payload["tested_sites"] = diag["tested_sites"]
         if winner_chapter_map is not None:
             payload["winner_chapter_map"] = winner_chapter_map
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -1034,6 +1064,10 @@ def find_alternatives_for_direct_url(
         # order is pure title-match).
         probe_candidate_limit=1,
         fetch_memo=fetch_memo,
+        # Don't fan out to the user's disabled sites when discovering
+        # alternatives; aio-dl.py also guard-filters the assembled dict to catch
+        # prefetched/cached alts that predate the disable.
+        exclude_sites=parse_disable_sites(args),
     )
     if not candidates:
         if on_status:

@@ -252,6 +252,20 @@ function buildCliArgs(args) {
     cliArgs.push("--collapse-splits");
   }
 
+  // User-disabled sites also drop out as MULTI-SOURCE download alternatives —
+  // not just from search (the user's "search + downloads" scope decision). Same
+  // chokepoint shape as collapseSplits above: comma-joined handler names →
+  // --disable-sites. useDownloader.queueDownload injects args.disabledSites from
+  // settings.disabledSites on EVERY spawn (manual / search / library / queue),
+  // so a disabled site is skipped by find_alternatives_for_direct_url and the
+  // guard-filter of _multi_source_alternatives in aio-dl.py (which also scrubs
+  // it from any prefetched/disk-cached alt list). Harmless no-op on
+  // single-source downloads — Python only consults the exclusion under
+  // --multi-source. Array+length guarded, mirroring searcher.js:buildSearchArgs.
+  if (Array.isArray(args.disabledSites) && args.disabledSites.length) {
+    cliArgs.push("--disable-sites", args.disabledSites.join(","));
+  }
+
   // LINE Webtoon recompression valued knobs (Phase 1, 2026-05-11). Only
   // emit when the master toggle is on AND the value differs from the
   // Python-side argparse default (85 for quality, 4 for method). Without

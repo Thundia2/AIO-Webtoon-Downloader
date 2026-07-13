@@ -29,6 +29,9 @@ import {
   Trash2,
   Download,
   SlidersHorizontal,
+  Gauge,
+  AlertTriangle,
+  ArrowRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LANGUAGES } from "@/lib/constants";
@@ -90,6 +93,63 @@ const DOWNLOAD_FORMATS = [
   { value: "none", label: "None" },
 ];
 
+// ── Slow/down-site recommendation (2026-07-13) ──
+// A tracked site is recommended for disabling once it has ≥2 strikes (a merely
+// slow site, seen slow in 2+ searches) OR was down/unreachable in the last run
+// (down = +2 strikes in one go — see useDownloader.setSearchSiteHealth). Mirror
+// of the ProbeFailureCache threshold: don't nag on a one-off blip.
+const RECOMMEND_STRIKE_THRESHOLD = 2;
+// Empty-roster guard: block "Disable & re-search" if it would leave fewer than
+// this many searchable sites, so a user can't accidentally disable everything.
+const MIN_REMAINING_ROSTER = 3;
+// Visual full-scale for the per-row latency bar (NOT correctness — just where
+// the bar reads as "maxed"). Tuned to the Python soft deadlines so a fan-out
+// near the 60 s barrier fills the bar. Cross-file: search_orchestrator.py
+// _FANOUT_DEADLINE_S (60) and BaseSiteHandler.PROBE_SOURCE_BUDGET_S (120).
+const FANOUT_BUDGET_S = 60;
+const PROBE_BUDGET_S = 120;
+
+// Map one rolling-health entry to its callout row presentation: a status label,
+// a human latency/reason detail, and the latency-bar fill %. A `down` site maxes
+// the bar in red (worse than any slow site); a `slow` site fills proportionally
+// to whichever phase dragged. Kept module-level (pure) so it's not rebuilt per render.
+//
+// Reason vocabulary since the 2026-07-13 reachability refinement (Python side:
+// search_orchestrator.py _refine_with_reachability): `unreachable` is the one
+// true DOWN bucket (the emit-time liveness GET couldn't reach any host);
+// `search_error` is a SLOW verdict — the host is reachable but its search
+// endpoint flaked this run (mangakatana's class: fine for downloads), so it
+// only crosses the recommend bar after 2 such runs, never instantly.
+function healthRowView(h) {
+  const down = h.lastStatus === "down";
+  const reason = h.lastReason;
+  if (down) {
+    let detail;
+    if (reason === "unreachable") detail = "unreachable";
+    else if (reason === "blocked") detail = "blocked · repeated failures";
+    else if (reason === "probe_stuck") detail = "probe hung";
+    else if (reason === "late_fanout") detail = "timed out";
+    else detail = h.lastFanoutS != null ? `error · ${h.lastFanoutS.toFixed(1)}s` : "unreachable";
+    return { down, statusLabel: "down", detail, barPct: 100 };
+  }
+  let detail, barPct;
+  if (reason === "search_error") {
+    // Reachable host, its search endpoint flaked — not slow, not dead. Show the
+    // fail latency (how long it churned before erroring) and size the bar by it.
+    const s = h.lastFanoutS != null ? h.lastFanoutS : 0;
+    detail = h.lastFanoutS != null ? `search error · ${s.toFixed(1)}s` : "search error";
+    barPct = Math.min(100, Math.max(8, (s / FANOUT_BUDGET_S) * 100));
+  } else if (reason === "slow_probe" && h.lastProbeS != null) {
+    detail = `probe ${h.lastProbeS.toFixed(1)}s`;
+    barPct = Math.min(100, Math.max(8, (h.lastProbeS / PROBE_BUDGET_S) * 100));
+  } else {
+    const s = h.lastFanoutS != null ? h.lastFanoutS : 0;
+    detail = `fan-out ${s.toFixed(1)}s`;
+    barPct = Math.min(100, Math.max(8, (s / FANOUT_BUDGET_S) * 100));
+  }
+  return { down, statusLabel: "slow", detail, barPct };
+}
+
 export default function SearchTab({
   searchState,
   searchLogs,
@@ -101,9 +161,15 @@ export default function SearchTab({
   onSaveSettings,
   resumable = [],
   onResumeDownload,
+  searchSiteHealth = {},
+  onManageSources,
 }) {
   const [query, setQuery] = useState("");
   const [downloadDialog, setDownloadDialog] = useState(null);
+  // Session-only "don't recommend these again" set for the SlowSitesCallout.
+  // Persists nothing — a chronically-bad site re-surfaces next session, which
+  // is the intended nudge. Cleared implicitly on app restart (fresh state).
+  const [dismissedSites, setDismissedSites] = useState(() => new Set());
   // Lazy-initialize from persisted settings.searchOpts (saved by previous
   // sessions). Falls back to DEFAULT_OPTS for first run + any partial state.
   // Spread merge means we pick up new fields gracefully if DEFAULT_OPTS is
@@ -259,6 +325,62 @@ export default function SearchTab({
     }
     return map;
   }, [searchState?.results]);
+
+  // Set of currently-disabled handler names (durable setting). A disabled site
+  // is already excluded from the fan-out, so it must never be re-recommended.
+  const disabledSet = useMemo(
+    () => new Set((Array.isArray(settings?.disabledSites) ? settings.disabledSites : [])
+      .map((s) => String(s).toLowerCase())),
+    [settings?.disabledSites],
+  );
+
+  // The recommendation set for the callout: tracked sites that crossed the
+  // strike threshold (or went down last run), minus anything already disabled
+  // or dismissed this session. Sorted down-first, then by strikes, then by the
+  // worst measured latency — the most-worth-disabling site leads.
+  const recommendedSites = useMemo(() => {
+    const out = [];
+    for (const [site, h] of Object.entries(searchSiteHealth || {})) {
+      if (!h) continue;
+      const recommend = (h.strikes || 0) >= RECOMMEND_STRIKE_THRESHOLD || h.lastStatus === "down";
+      if (!recommend) continue;
+      if (disabledSet.has(site.toLowerCase())) continue;
+      if (dismissedSites.has(site)) continue;
+      out.push({ site, ...h });
+    }
+    out.sort((a, b) => {
+      const dr = (a.lastStatus === "down" ? 0 : 1) - (b.lastStatus === "down" ? 0 : 1);
+      if (dr) return dr;
+      if ((b.strikes || 0) !== (a.strikes || 0)) return (b.strikes || 0) - (a.strikes || 0);
+      const la = a.lastFanoutS ?? a.lastProbeS ?? 0;
+      const lb = b.lastFanoutS ?? b.lastProbeS ?? 0;
+      return lb - la;
+    });
+    return out;
+  }, [searchSiteHealth, disabledSet, dismissedSites]);
+
+  // Add the chosen sites to the durable disabled list, then re-run the SAME
+  // search — now faster, since the fan-out skips them. The merged list is
+  // passed explicitly in opts (not just saved) so the re-search doesn't race
+  // the async settings write (see useDownloader.runSearch's disabledSites note).
+  const handleDisableAndReSearch = (siteNames) => {
+    if (!siteNames?.length) return;
+    const cur = Array.isArray(settings?.disabledSites) ? settings.disabledSites : [];
+    const merged = Array.from(new Set([...cur, ...siteNames]));
+    onSaveSettings?.({ disabledSites: merged });
+    const q = (searchState?.query || query || "").trim();
+    if (q) runSearch(q, { ...opts, disabledSites: merged });
+  };
+
+  // Dismiss = stop recommending the CURRENTLY-listed sites this session. A
+  // different site going bad later still surfaces a fresh callout.
+  const handleDismissCallout = () => {
+    setDismissedSites((prev) => {
+      const next = new Set(prev);
+      for (const s of recommendedSites) next.add(s.site);
+      return next;
+    });
+  };
 
   return (
     <div className="flex flex-col h-full">
@@ -638,6 +760,22 @@ export default function SearchTab({
           </div>
         )}
 
+        {/* ── Slow/down-site advisory — slides in above the results. Gated on
+            having results so it never competes with the live search feed, and
+            on a non-empty recommendation set (strikes ≥ threshold / down, minus
+            disabled + dismissed). `key` remounts it — resetting the per-site
+            checkboxes to all-checked — whenever the recommended set changes. */}
+        {hasResults && recommendedSites.length > 0 && (
+          <SlowSitesCallout
+            key={recommendedSites.map((s) => s.site).join(",")}
+            sites={recommendedSites}
+            eligibleCount={searchState?.results?.eligible_count ?? null}
+            onDisable={handleDisableAndReSearch}
+            onDismiss={handleDismissCallout}
+            onManageSources={onManageSources}
+          />
+        )}
+
         {/* ── Results ── */}
         {hasResults && (
           <SearchResults
@@ -656,6 +794,173 @@ export default function SearchTab({
           onConfirm={confirmSearchDownload}
         />
       )}
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────
+// SLOW-SITES CALLOUT ("pop-up")
+//
+// Non-blocking inline advisory that slides in above the results when sites were
+// slow or unreachable this search. Instrument-panel styling WITHIN the app's
+// language: the amber "governed / heads-up" accent (same convention as
+// SettingsTab's ManagedBanner), a 3px left accent bar (echoing the App rail +
+// Settings nav active indicators), per-site checkboxes, a status pill, and the
+// memorable detail — a diagnostic latency bar that turns raw seconds into an
+// at-a-glance "this one's dragging" read (full red for down, proportional amber
+// for slow). Recommend-only: nothing changes until the user acts.
+//
+// Props: sites (recommended health entries, pre-sorted), eligibleCount (the
+// empty-roster guard denominator), onDisable(names[]), onDismiss(), onManageSources().
+// SearchTab remounts this via `key` when the recommended set changes, so the
+// per-site checkboxes always start all-checked for a fresh callout.
+// ────────────────────────────────────────────────────────────
+function SlowSitesCallout({ sites, eligibleCount, onDisable, onDismiss, onManageSources }) {
+  const [checked, setChecked] = useState(() => new Set(sites.map((s) => s.site)));
+  // Fill the latency bars from 0 → target on mount for a "gauge settling" read.
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setMounted(true), 30);
+    return () => clearTimeout(t);
+  }, []);
+
+  const toggle = (site) =>
+    setChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(site)) next.delete(site);
+      else next.add(site);
+      return next;
+    });
+
+  const checkedNames = sites.map((s) => s.site).filter((s) => checked.has(s));
+  const downCount = sites.filter((s) => s.lastStatus === "down").length;
+
+  // Empty-roster guard: disabling the checked sites must leave a workable set.
+  // Skipped when eligibleCount is unknown (payload from an older spawn).
+  const wouldRemain = eligibleCount != null ? eligibleCount - checkedNames.length : null;
+  const rosterTooSmall = wouldRemain != null && wouldRemain < MIN_REMAINING_ROSTER;
+  const canDisable = checkedNames.length > 0 && !rosterTooSmall;
+
+  const headline =
+    sites.length === 1
+      ? "1 site is slowing your searches"
+      : `${sites.length} sites are slowing your searches`;
+
+  return (
+    <div className="relative overflow-hidden rounded-lg border border-amber-500/30 bg-amber-500/[0.07] animate-slide-up">
+      {/* 3px left accent bar — the one distinctive structural touch. */}
+      <span aria-hidden="true" className="absolute left-0 top-0 bottom-0 w-[3px] bg-amber-500" />
+
+      <div className="pl-4 pr-3 py-3">
+        {/* Header */}
+        <div className="flex items-start gap-2.5">
+          <span className="mt-0.5 flex items-center justify-center w-7 h-7 rounded-md bg-amber-500/15 text-amber-600 dark:text-amber-400 shrink-0">
+            <Gauge className="w-4 h-4" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-semibold text-amber-800 dark:text-amber-200">
+              {headline}
+            </div>
+            <p className="text-[11px] text-amber-700/80 dark:text-amber-300/70 mt-0.5 leading-snug">
+              {downCount > 0
+                ? "They were unreachable or dragged the probe. Disable them to search faster."
+                : "They dragged the search probe. Disable them to search faster."}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onDismiss}
+            aria-label="Dismiss"
+            className="shrink-0 p-1 rounded text-amber-700/60 hover:text-amber-800 hover:bg-amber-500/10 dark:text-amber-300/50 dark:hover:text-amber-200 transition-colors"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+
+        {/* Per-site rows — staggered reveal, matching the results stagger. */}
+        <div className="mt-2.5 space-y-0.5">
+          {sites.map((h, i) => {
+            const view = healthRowView(h);
+            const isChecked = checked.has(h.site);
+            return (
+              <div
+                key={h.site}
+                className="flex items-center gap-2.5 rounded-md px-1.5 py-1.5 hover:bg-amber-500/[0.06] transition-colors animate-slide-up"
+                style={{ animationDelay: `${Math.min(i * 40, 240)}ms` }}
+              >
+                <Checkbox
+                  checked={isChecked}
+                  onCheckedChange={() => toggle(h.site)}
+                  className={cn(
+                    "border-amber-500/60",
+                    isChecked && "bg-amber-500 border-amber-500 text-white",
+                  )}
+                />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-xs font-medium truncate">
+                      {h.displayName || h.site}
+                    </span>
+                    <Badge
+                      variant={view.down ? "destructive" : "warning"}
+                      className="text-[9px] px-1.5 py-0 leading-tight shrink-0"
+                    >
+                      {view.statusLabel}
+                    </Badge>
+                    <span className="ml-auto shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+                      {view.detail}
+                    </span>
+                  </div>
+                  {/* Diagnostic latency bar. */}
+                  <div className="mt-1 h-1 rounded-full bg-muted/60 overflow-hidden">
+                    <div
+                      className={cn(
+                        "h-full rounded-full transition-all duration-500 ease-out",
+                        view.down ? "bg-red-500" : "bg-amber-500",
+                      )}
+                      style={{ width: mounted ? `${view.barPct}%` : "0%" }}
+                    />
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Empty-roster warning */}
+        {rosterTooSmall && (
+          <div className="mt-2 flex items-center gap-1.5 text-[10px] text-amber-700 dark:text-amber-300">
+            <AlertTriangle className="w-3 h-3 shrink-0" />
+            <span>That would leave too few sites to search — uncheck a few.</span>
+          </div>
+        )}
+
+        {/* Footer actions */}
+        <div className="mt-3 flex items-center gap-2">
+          <Button
+            size="sm"
+            onClick={() => onDisable?.(checkedNames)}
+            disabled={!canDisable}
+            className="gap-1.5 bg-amber-600 text-white hover:bg-amber-600/90"
+          >
+            <RotateCw className="w-3.5 h-3.5" />
+            Disable &amp; re-search
+          </Button>
+          <Button size="sm" variant="ghost" onClick={onDismiss} className="text-muted-foreground">
+            Dismiss
+          </Button>
+          {onManageSources && (
+            <button
+              type="button"
+              onClick={onManageSources}
+              className="ml-auto inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Manage in Settings
+              <ArrowRight className="w-3 h-3" />
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

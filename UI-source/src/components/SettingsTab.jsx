@@ -4,7 +4,7 @@ import {
 } from "@/components/ui/primitives";
 import {
   Save, RotateCcw, FolderOpen, FileText, Package, Terminal, RefreshCw,
-  Check, AlertTriangle, Gauge, Cpu, Network, Lock,
+  Check, AlertTriangle, Gauge, Cpu, Network, Lock, X,
   // Category-nav icons (2026-07-05 two-pane redesign) — one per CATEGORIES group.
   Settings, Image as ImageIcon, Tags, Search, Library,
 } from "lucide-react";
@@ -269,6 +269,16 @@ const DEFAULT_SETTINGS = {
   metadataSource: "none",
   metadataTagMinRank: 50,
   metadataRefresh: false,
+  // ── Disabled search sites (2026-07-13) ──
+  // Handler names the user opted out of (Settings → Search → "Search Sources"
+  // or the SearchTab slow-sites callout). Excluded from the search fan-out/probe
+  // AND multi-source download alternatives. Persisted top-level (mirrors
+  // collapseSplits). useDownloader injects it into runSearch (→ --disable-sites)
+  // and queueDownload (→ --disable-sites). IMMEDIATE-PERSIST from the Settings
+  // section (writes via onSave, not the Save button) — so it's in SKIP_TOP of
+  // countDirtySettings (never a dirty-badge count) and the hydration effect is
+  // diff-aware so an immediate write can't clobber unsaved draft edits.
+  disabledSites: [],
   // Whether the app is running from an installed .exe (bundled mode)
   // or from source (dev mode). Set by main.js, read-only here. Reset
   // preserves prev.isPackaged rather than this false (see handleReset).
@@ -450,7 +460,12 @@ const CATEGORIES = [
 // electron/history.js:saveSettings.
 function countDirtySettings(local, settings) {
   if (!settings) return 0;
-  const SKIP_TOP = new Set(["isPackaged"]);
+  // isPackaged: read-only from main.js. disabledSites: an IMMEDIATE-PERSIST
+  // array (saved the instant you toggle a site, never via the Save button), so
+  // it must never register as a pending change — and array `!==` is reference
+  // equality, which a fresh-array hydration would otherwise trip into a phantom
+  // permanent "1 changed".
+  const SKIP_TOP = new Set(["isPackaged", "disabledSites"]);
   const NESTED = ["defaults", "searchOpts"];
   let count = 0;
 
@@ -468,6 +483,25 @@ function countDirtySettings(local, settings) {
   }
 
   return count;
+}
+
+// ── Compact health detail for a Search-Sources chip/row ──
+// One-liner reason or worst measured latency for a rolling-health entry (the
+// same data the SearchTab callout renders, condensed). Kept local to this file
+// rather than shared with SearchTab.healthRowView to avoid coupling the two
+// components over a two-line formatter. Cross-file: useDownloader.setSearchSiteHealth
+// shapes the entry ({ lastStatus, lastReason, lastFanoutS, lastProbeS, ... }).
+function healthDetailText(h) {
+  if (!h) return "";
+  if (h.lastStatus === "down") {
+    if (h.lastReason === "blocked") return "blocked";
+    if (h.lastReason === "probe_stuck") return "probe hung";
+    if (h.lastReason === "late_fanout") return "timed out";
+    return h.lastFanoutS != null ? `error ${h.lastFanoutS.toFixed(1)}s` : "unreachable";
+  }
+  if (h.lastReason === "slow_probe" && h.lastProbeS != null) return `probe ${h.lastProbeS.toFixed(1)}s`;
+  if (h.lastFanoutS != null) return `fan-out ${h.lastFanoutS.toFixed(1)}s`;
+  return "slow";
 }
 
 // ── Save Settings button with dirty-state + confirmation sweep ──
@@ -614,7 +648,7 @@ function SaveSettingsButton({ dirty, onSave }) {
   );
 }
 
-export default function SettingsTab({ settings, onSave }) {
+export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, initialCategory }) {
   // Local copy of settings so changes don't apply until you click Save
   // Local copy of settings so changes don't apply until you click Save.
   // Sourced from the module-level DEFAULT_SETTINGS (single source of truth,
@@ -624,12 +658,18 @@ export default function SettingsTab({ settings, onSave }) {
   const [local, setLocal] = useState(() => structuredClone(DEFAULT_SETTINGS));
 
   // Which category pane is visible in the two-pane layout (2026-07-05 redesign).
-  // Resets to the first group ("general") on every mount — SettingsTab unmounts
-  // when you leave the Settings tab (App.jsx conditionally renders it), so this
-  // is deliberately not persisted. All 15 sections share the one `local` draft
-  // below, so edits in a hidden category survive navigation and still count
-  // toward the dirty badge / Save.
-  const [activeCategory, setActiveCategory] = useState("general");
+  // Defaults to `initialCategory` when App forced one (the SearchTab callout's
+  // "Manage in Settings → Search Sources" link passes "search"), else the first
+  // group ("general"). Read once at mount — SettingsTab unmounts when you leave
+  // the Settings tab (App.jsx conditionally renders it), so a fresh arrival
+  // re-applies it; App nulls the force on a manual rail visit. All sections
+  // share the one `local` draft below, so edits in a hidden category survive
+  // navigation and still count toward the dirty badge / Save.
+  const [activeCategory, setActiveCategory] = useState(initialCategory || "general");
+
+  // Free-text "disable a site by name" input for the Search Sources section.
+  // Component-level (renderSearchSources is a render closure, can't hold state).
+  const [addSiteInput, setAddSiteInput] = useState("");
 
   // Display-only resolved paths (what main.js would use as defaults when
   // local.pythonCmd / .scriptPath / .workingDir are empty). Shown as
@@ -679,6 +719,12 @@ export default function SettingsTab({ settings, onSave }) {
     };
   }, []);
 
+  // The settings object we last hydrated FROM. Lets the effect below pull only
+  // GENUINELY-changed upstream keys into `local` on re-hydration, instead of
+  // spreading the whole on-disk dict back over the draft. null until the first
+  // hydration (which does the original full spread).
+  const lastHydratedRef = useRef(null);
+
   // Load settings when they arrive from Electron
   useEffect(() => {
     if (settings) {
@@ -727,12 +773,49 @@ export default function SettingsTab({ settings, onSave }) {
         }
       }
 
-      setLocal((prev) => ({
-        ...prev,
-        ...migrated,
-        defaults: { ...prev.defaults, ...(migrated.defaults || {}) },
-        searchOpts: { ...prev.searchOpts, ...(migrated.searchOpts || {}) },
-      }));
+      // Diff-aware hydration. FIRST hydration (initial disk load) does the full
+      // spread, as before. LATER hydrations pull ONLY keys that changed upstream
+      // since the last one — so an immediate-persist write (disabledSites saved
+      // from the "Search Sources" section) round-tripping back through the
+      // settings prop can't clobber an in-progress unsaved draft edit to some
+      // untouched key. Nested `defaults`/`searchOpts` objects keep their old
+      // reference when nothing in them changed. Without this, a single
+      // disabledSites save would wipe every pending Settings edit.
+      const prevHydrated = lastHydratedRef.current;
+      lastHydratedRef.current = migrated;
+
+      setLocal((prev) => {
+        if (!prevHydrated) {
+          return {
+            ...prev,
+            ...migrated,
+            defaults: { ...prev.defaults, ...(migrated.defaults || {}) },
+            searchOpts: { ...prev.searchOpts, ...(migrated.searchOpts || {}) },
+          };
+        }
+        const next = { ...prev };
+        for (const k of Object.keys(migrated)) {
+          if (k === "defaults" || k === "searchOpts") continue;
+          if (migrated[k] !== prevHydrated[k]) next[k] = migrated[k];
+        }
+        const md = migrated.defaults || {};
+        const pd = prevHydrated.defaults || {};
+        let defaultsChanged = false;
+        const nd = { ...prev.defaults };
+        for (const k of Object.keys(md)) {
+          if (md[k] !== pd[k]) { nd[k] = md[k]; defaultsChanged = true; }
+        }
+        if (defaultsChanged) next.defaults = nd;
+        const ms = migrated.searchOpts || {};
+        const ps = prevHydrated.searchOpts || {};
+        let searchChanged = false;
+        const ns = { ...prev.searchOpts };
+        for (const k of Object.keys(ms)) {
+          if (ms[k] !== ps[k]) { ns[k] = ms[k]; searchChanged = true; }
+        }
+        if (searchChanged) next.searchOpts = ns;
+        return next;
+      });
     }
   }, [settings]);
 
@@ -747,6 +830,24 @@ export default function SettingsTab({ settings, onSave }) {
       ...prev,
       searchOpts: { ...prev.searchOpts, [key]: value },
     }));
+
+  // ── Disabled-sites mutators (IMMEDIATE PERSIST) ──
+  // A block-list should take effect the instant you click, matching the search
+  // callout — so these write straight through onSave (which persists + updates
+  // the settings prop) rather than into the `local` draft / Save button. They
+  // read the `settings` prop (on-disk truth), never `local`. Names are stored
+  // lowercased to match handler.name (Python's parse_disable_sites lowercases
+  // too), keeping the callout's programmatic adds and free-text adds canonical
+  // and de-duplicated. The diff-aware hydration above absorbs the settings-prop
+  // round-trip without disturbing unsaved draft edits.
+  const disabledSitesList = Array.isArray(settings?.disabledSites) ? settings.disabledSites : [];
+  const enableSite = (name) =>
+    onSave?.({ disabledSites: disabledSitesList.filter((s) => s !== name) });
+  const disableSite = (name) => {
+    const n = String(name || "").trim().toLowerCase();
+    if (!n || disabledSitesList.includes(n)) return;
+    onSave?.({ disabledSites: [...disabledSitesList, n] });
+  };
 
   // A Max-network preset (Resource Limits) hard-overrides the five concurrency
   // inputs below — imageWorkers, imageConcurrency, prefetch depth/parallel, and
@@ -2422,6 +2523,143 @@ export default function SettingsTab({ settings, onSave }) {
     </div>
   );
 
+  // ── Search › Search Sources (disabled-site block list) ──
+  // Immediate-persist (reads the `settings` prop, writes via onSave) — a block
+  // list should apply instantly, matching the SearchTab callout, so it stays
+  // out of the `local` draft + Save button. Three parts: the current disabled
+  // list (each re-enableable), sites flagged slow/down this session (in-memory,
+  // empty after a restart — expected), and a free-text add-by-name.
+  const renderSearchSources = () => {
+    const disabled = disabledSitesList;
+    const flagged = Object.entries(searchSiteHealth || {})
+      .filter(([site, h]) => h && (h.strikes || 0) >= 1 && !disabled.includes(site))
+      .sort((a, b) => (b[1].strikes || 0) - (a[1].strikes || 0));
+    return (
+      <div className="space-y-4">
+        <p className="text-[11px] text-muted-foreground leading-snug">
+          Disabled sites are skipped during search <strong>and</strong> as multi-source
+          download fallbacks — use this for sites that are unreachable or slow on your
+          connection. The search runs faster without them. Changes here save immediately.
+        </p>
+
+        {/* Current disabled list */}
+        <div>
+          <Label className="text-xs">Disabled sites</Label>
+          {disabled.length === 0 ? (
+            <p className="text-[11px] text-muted-foreground mt-1.5">
+              None. Sites you disable — here, or from the banner above your search results
+              — appear as removable chips in this list.
+            </p>
+          ) : (
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              {disabled.map((site) => {
+                const h = searchSiteHealth?.[site];
+                return (
+                  <span
+                    key={site}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-secondary/60 pl-2.5 pr-1 py-0.5"
+                  >
+                    <span className="font-mono text-[11px]">{h?.displayName || site}</span>
+                    {h && (
+                      <span className="font-mono text-[9px] tabular-nums text-muted-foreground">
+                        {healthDetailText(h)}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => enableSite(site)}
+                      aria-label={`Re-enable ${site}`}
+                      title="Re-enable"
+                      className="ml-0.5 p-0.5 rounded-full text-muted-foreground hover:text-foreground hover:bg-background transition-colors"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </span>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Flagged this session (in-memory rolling health) */}
+        {flagged.length > 0 && (
+          <div>
+            <Label className="text-xs">Flagged this session</Label>
+            <p className="text-[10px] text-muted-foreground mt-0.5 mb-1.5">
+              Slow or unreachable in recent searches but not disabled yet. Resets when the
+              app restarts.
+            </p>
+            <div className="space-y-1">
+              {flagged.map(([site, h]) => (
+                <div
+                  key={site}
+                  className="flex items-center gap-2 rounded-md border border-border/60 px-2.5 py-1.5"
+                >
+                  <span className="font-mono text-[11px] truncate flex-1 min-w-0">
+                    {h.displayName || site}
+                  </span>
+                  <Badge
+                    variant={h.lastStatus === "down" ? "destructive" : "warning"}
+                    className="text-[9px] px-1.5 py-0 leading-tight shrink-0"
+                  >
+                    {h.lastStatus === "down" ? "down" : "slow"}
+                  </Badge>
+                  <span className="font-mono text-[10px] tabular-nums text-muted-foreground shrink-0">
+                    {healthDetailText(h)}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => disableSite(site)}
+                    className="h-6 px-2 text-[10px] shrink-0"
+                  >
+                    Disable
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Add by name */}
+        <div>
+          <Label className="text-xs">Disable a site by name</Label>
+          <div className="mt-1.5 flex gap-2">
+            <Input
+              value={addSiteInput}
+              onChange={(e) => setAddSiteInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  disableSite(addSiteInput);
+                  setAddSiteInput("");
+                }
+              }}
+              placeholder="handler name, e.g. mangakatana"
+              className="h-8 text-xs font-mono flex-1"
+            />
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              onClick={() => {
+                disableSite(addSiteInput);
+                setAddSiteInput("");
+              }}
+              disabled={!addSiteInput.trim()}
+            >
+              Disable
+            </Button>
+          </div>
+          <p className="text-[10px] text-muted-foreground mt-1">
+            Use the site's handler name — the lowercase id shown on each source card — not
+            its display title.
+          </p>
+        </div>
+      </div>
+    );
+  };
+
   // ── Library › Library & Update Checks ──
   const renderLibrary = () => (
     <>
@@ -2522,6 +2760,7 @@ export default function SettingsTab({ settings, onSave }) {
     { group: "network",     title: "Multi-source Fallback",         render: renderMultiSource },
     { group: "metadata",    title: "AniList Enrichment",            render: renderMetadata },
     { group: "search",      title: "Search Options",                render: renderSearch },
+    { group: "search",      title: "Search Sources",                render: renderSearchSources },
     { group: "library",     title: "Library & Update Checks",       render: renderLibrary },
   ];
 

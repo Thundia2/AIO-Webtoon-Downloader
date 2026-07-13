@@ -7497,6 +7497,20 @@ def main():
              "that aren't in the curated list.",
     )
     p.add_argument(
+        "--disable-sites",
+        default=None,
+        help="Comma-separated handler names to exclude from cross-site search, "
+             "the image-quality probe, AND multi-source download alternatives. "
+             "Names match handler.name (the JSON 'site' field, e.g. "
+             "'mangakatana,zeroscans'). The UI's Search tab writes this from the "
+             "user's disabled-sites list — sites that are unreachable from their "
+             "connection or chronically slow. A directly-downloaded URL is never "
+             "filtered (an explicit pick overrides the block); only search "
+             "candidates and multi-source alternatives are dropped. Parsed by "
+             "aio_search_cli.parse_disable_sites; excluded sites also get no "
+             "site_health entry in --search-json (they're already opted out).",
+    )
+    p.add_argument(
         "--enable-ml-rating",
         action="store_true",
         default=os.environ.get("AIO_ENABLE_ML_RATING", "").lower() in (
@@ -9178,6 +9192,26 @@ def main():
                 # Legacy / unexpected shape — treat the whole thing as the alts dict.
                 _ms_alts = _ms_result if isinstance(_ms_result, dict) else {}
                 _ms_consensus = None
+            # Guard-filter (2026-07-13): drop the user's disabled sites from the
+            # assembled alternatives. This is the CORRECTNESS net for the
+            # download-scope disable — it catches prefetched/disk-cached alts
+            # that predate the disable (the live find_alternatives path also
+            # passes exclude_sites, but the build_alternatives_from_prefetched /
+            # _from_payload carriers don't). Because _ms_alts IS
+            # _ms_result["alternatives_by_chap_num"] (same object), this also
+            # scrubs the payload persisted to run_params.json below, so a
+            # disabled site can't get re-cached. The primary anchor is never in
+            # this dict, so it's never filtered. grep parse_disable_sites.
+            from aio_search_cli import parse_disable_sites as _parse_disable_sites
+            _disable_set = _parse_disable_sites(args)
+            if _disable_set and _ms_alts:
+                for _cf in list(_ms_alts):
+                    _ms_alts[_cf] = [
+                        _a for _a in _ms_alts[_cf]
+                        if (_a.get("site", "") or "").lower() not in _disable_set
+                    ]
+                    if not _ms_alts[_cf]:
+                        del _ms_alts[_cf]
             if _ms_alts:
                 _multi_source_alternatives = _ms_alts
                 _multi_source_consensus_set = _ms_consensus
