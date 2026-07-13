@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -403,14 +402,19 @@ class ZeroScansSiteHandler(BaseSiteHandler):
         # anchor on a search call (we don't know which TLD the user
         # prefers until they pick a result), so this is the path that
         # actually exercises the domains-tuple probe.
-        try:
-            data = self._api_request("/comics", scraper, make_request)
-        except (RuntimeError, ValueError, json.JSONDecodeError):
-            # All mirrors failed OR JSON came back invalid. Empty result
-            # set so the orchestrator drops this source and moves on; the
-            # explicit error message in _api_request gets surfaced to the
-            # log by make_request's higher-level handling.
-            return []
+        # Let _api_request's failure PROPAGATE (was: swallowed to []). When every
+        # mirror is unreachable it raises RuntimeError; a 200-but-garbage mirror
+        # raises ValueError/JSONDecodeError. Returning [] here made a fully-down
+        # ZeroScans indistinguishable from "up, no matches": the orchestrator's
+        # _run_one recorded a SUCCESS for a dead host (poisoning the
+        # ProbeFailureCache) and the search-health signal saw only a slow
+        # fan-out, never 'down'. Propagating lets _run_one record the host
+        # failure + tag the site errored; _run_one still catches and returns []
+        # so search RESULTS are unchanged — only the failure ATTRIBUTION
+        # improves, and the emit-time reachability probe then confirms
+        # unreachable → down. (2026-07-13, fix 1 — grep _run_one /
+        # _probe_site_reachable in sites/search_orchestrator.py.)
+        data = self._api_request("/comics", scraper, make_request)
         all_comics = data.get("data", {}).get("comics") or []
         if not isinstance(all_comics, list):
             return []

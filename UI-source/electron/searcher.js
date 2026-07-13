@@ -65,6 +65,19 @@ function buildSearchArgs(query, opts = {}) {
   // _ML_RATING_ENABLED docstring for the full rationale.
   if (opts.enableMlRating) args.push("--enable-ml-rating");
 
+  // User-disabled search sites (Settings → Search → "Search Sources", or the
+  // SlowSitesCallout's "Disable & re-search"). Comma-joined handler names →
+  // --disable-sites, which drops them from the fan-out AND the image-quality
+  // probe (Python: aio_search_cli.parse_disable_sites → search_all
+  // exclude_sites). useDownloader.runSearch injects opts.disabledSites from
+  // settings.disabledSites on every search; the callout ALSO passes an explicit
+  // list in opts to dodge the settings-ref update race on its immediate
+  // re-search (opts wins in the hook's finalOpts merge). Array+length guarded,
+  // mirroring the download-path emitter in downloader.js:buildCliArgs.
+  if (Array.isArray(opts.disabledSites) && opts.disabledSites.length) {
+    args.push("--disable-sites", opts.disabledSites.join(","));
+  }
+
   return args;
 }
 

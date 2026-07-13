@@ -57,9 +57,14 @@ class RizzComicSiteHandler(MangaThemesiaSiteHandler):
     def _probe_chapter_aggregate(
         self, hit, scraper, make_request,
         max_samples: Optional[int] = None,
+        fetch_memo=None,
     ) -> Optional[Tuple[float, Dict]]:
+        # fetch_memo forwarded verbatim (sites/fetch_memo.py) — this wrapper
+        # only post-processes the parent's RESULT, so the memo plumbing is
+        # pure passthrough.
         result = super()._probe_chapter_aggregate(
             hit, scraper, make_request, max_samples=max_samples,
+            fetch_memo=fetch_memo,
         )
         if result is None:
             # Parent returned None — hard failure before even the fetch loop

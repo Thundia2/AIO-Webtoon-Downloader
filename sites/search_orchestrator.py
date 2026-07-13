@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import threading
 import time
@@ -178,6 +179,18 @@ PROBE_FAILURE_TTL_S = 3600  # 1 hour
 # means we re-probe a (site, series) at most once a month under normal use.
 IMG_QUALITY_TTL_S = 30 * 24 * 3600
 
+# Clamped-probe entries (max_samples-limited: non-top-candidate sources and
+# EXPENSIVE_PROBE quick-probes) cache with this shorter TTL. They ARE cached
+# now (2026-07-12 — previously deliberately uncached, so every search re-paid
+# them, including comix's 15-70s browser probe when comix wasn't the top
+# candidate). The shorter window bounds how long the noisier 1-sample signal
+# can serve before a refresh; effective expiry is min(cache ttl_s, this) so a
+# test-constructed cache with a tiny ttl_s still expires clamped entries
+# first. The read/serve rule lives in search_all's cache loop (a clamped
+# entry only serves a source that would be clamped again anyway — grep
+# _desired_max_samples); the entry flag is the additive sibling key "clamped".
+IMG_QUALITY_CLAMPED_TTL_S = 7 * 24 * 3600
+
 # Chapter-image probe is heavier than cover probe (3-4 HTTP requests vs 1).
 # We only run it for sites with seed_quality at or above this threshold —
 # the long tail of Madara/MangaThemesia extras (default seed 0.50) gets
@@ -257,6 +270,120 @@ IS_OFFICIAL_REQUIRES_TITLE_MATCH = 0.85
 # wall-time overhead is modest, but the deadline needs headroom.
 PROBE_PHASE_DEADLINE_S = 240.0
 
+# --- Fan-out phase tunables (2026-07-12 rewrite) ------------------------
+# The handler fan-out used to run on a ThreadPoolExecutor whose `with`-block
+# join waited for the SLOWEST handler — the per-future result timeout was
+# dead code because as_completed only yields already-finished futures. It now
+# runs on daemon worker threads with a SOFT barrier: search_all stops WAITING
+# at _FANOUT_DEADLINE_S and moves on, but the straggler threads keep running;
+# any that complete before result finalization (post-T3) merge their hits
+# with title-match + seed/cached quality only (no probe, no T3 — user
+# decision 2026-07-12). See search_all's fan-out block + the late-adoption
+# block near the end of search_all.
+#
+# _FANOUT_MAX widens the fan-out beyond --search-parallelism (which also
+# governs the probe phase, where every task hammers a single host and
+# politeness matters). Fan-out tasks are 1-2 requests to DISTINCT hosts, so
+# a wide pool is politeness-safe; 16 puts the ~31 --seeded-only handlers in
+# 2 waves instead of 6. Env override for field tuning without a release.
+_FANOUT_MAX = 16
+try:
+    _FANOUT_MAX = max(1, int(os.environ.get("AIO_SEARCH_FANOUT_MAX", "") or _FANOUT_MAX))
+except (TypeError, ValueError):
+    pass
+
+# Soft barrier on the fan-out phase. NOT a kill switch: worker threads are
+# daemons and keep running past it — the deadline only bounds how long the
+# pipeline WAITS before proceeding with what's in hand. Env override exists
+# for tuning + lets the offline regression test exercise the barrier without
+# a real 60s wait (tools/_test_search_perf_opts.py patches the module attr).
+_FANOUT_DEADLINE_S = 60.0
+try:
+    _FANOUT_DEADLINE_S = max(
+        1.0, float(os.environ.get("AIO_SEARCH_FANOUT_DEADLINE", "") or _FANOUT_DEADLINE_S)
+    )
+except (TypeError, ValueError):
+    pass
+
+# --- Search-health "slow site" thresholds (2026-07-13) ------------------
+# A participating site whose fan-out search or image-quality probe exceeds
+# these is flagged "slow" in search_all's `diagnostics["site_health"]` payload,
+# which aio_search_cli surfaces in --search-json so the UI can recommend
+# disabling chronically slow/down sites (grep _classify_site_health /
+# SlowSitesCallout in UI-source). ABSOLUTE, not relative-to-phase: fan-out is
+# parallel (one site's share of wall-clock is meaningless) and the probe covers
+# only the top 1-2 candidates' cache-miss sources (each probe is ~100% of the
+# phase by construction). SLOW_FANOUT_S sits below the single-retry request
+# cost (search_timeout×2 → a retry-then-succeed site legitimately takes ~20s)
+# yet well above a healthy sub-3s search. SLOW_PROBE_S is DELIBERATELY not
+# applied to constitutionally-slow handlers (SEARCH_COST_HINT=="slow" /
+# EXPENSIVE_PROBE / OFFICIAL_PUBLISHER) whose deep browser/licensed probe is
+# slow by design — see _classify_site_health; without that gate comix's healthy
+# ~40-70s breadth probe would trip "slow" every run and get perpetually
+# recommended for disabling. Env-overridable, same pattern as the deadlines.
+SEARCH_SLOW_FANOUT_S = 10.0
+try:
+    SEARCH_SLOW_FANOUT_S = max(
+        0.0, float(os.environ.get("AIO_SEARCH_SLOW_FANOUT_S", "") or SEARCH_SLOW_FANOUT_S)
+    )
+except (TypeError, ValueError):
+    pass
+
+SEARCH_SLOW_PROBE_S = 30.0
+try:
+    SEARCH_SLOW_PROBE_S = max(
+        0.0, float(os.environ.get("AIO_SEARCH_SLOW_PROBE_S", "") or SEARCH_SLOW_PROBE_S)
+    )
+except (TypeError, ValueError):
+    pass
+
+# --- Search-health reachability probe (2026-07-13, fix 3) ---------------
+# _classify_site_health below answers "how did this site's SEARCH behave this
+# run" (raised? slow? never finished?) — NOT "is the site actually reachable".
+# Those diverge in exactly the ways users hit: a site whose SEARCH endpoint
+# times out ~40s then raises looks identical to a dead host (both 'down/error')
+# even though its DOWNLOAD path is fine, while a site that swallows its own
+# all-mirrors-dead failure to [] (grep zeroscans.search) or is merely slow in
+# the image probe looks 'slow' though it's unreachable. To split those,
+# _emit_site_health runs a bounded liveness GET against each FLAGGED (non-ok)
+# eligible site at return time and _refine_with_reachability rewrites the
+# verdict: reachable+errored -> a softer 'slow/search_error' (site up, its
+# search flaked — no longer the alarming 'down' that auto-recommends disabling
+# a download-healthy site), unreachable+anything -> 'down/unreachable' (the one
+# true dead bucket). This DELIBERATELY reverses the feature's original "zero
+# new network round-trips" constraint (plan
+# ~/.claude/plans/certain-sites-that-we-refactored-elephant.md) — that
+# constraint is precisely what made the labels mechanism-based-and-wrong.
+# BOUNDED so it can't re-inflate the wall time the 2026-07-12 perf rework won
+# back: fires ONLY when a site was already flagged (a healthy all-ok search
+# probes NOTHING → +0s), skips constitutionally-slow/official/expensive
+# handlers (comix — its scraper_factory would launch Patchright), runs parallel
+# daemon workers under a hard phase deadline, single-attempts each host with a
+# short timeout (NOT make_request's 6× retry chain). Kill-switch
+# AIO_SEARCH_REACHABILITY=0 restores the pure-mechanism classification.
+_REACHABILITY_ENABLED = (
+    os.environ.get("AIO_SEARCH_REACHABILITY", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+SEARCH_REACHABILITY_TIMEOUT_S = 5.0
+try:
+    SEARCH_REACHABILITY_TIMEOUT_S = max(
+        0.5,
+        float(os.environ.get("AIO_SEARCH_REACHABILITY_TIMEOUT_S", "") or SEARCH_REACHABILITY_TIMEOUT_S),
+    )
+except (TypeError, ValueError):
+    pass
+SEARCH_REACHABILITY_DEADLINE_S = 12.0
+try:
+    SEARCH_REACHABILITY_DEADLINE_S = max(
+        1.0,
+        float(os.environ.get("AIO_SEARCH_REACHABILITY_DEADLINE", "") or SEARCH_REACHABILITY_DEADLINE_S),
+    )
+except (TypeError, ValueError):
+    pass
+_REACHABILITY_MAX_URLS = 3     # candidate hosts probed per handler (cap the fan)
+_REACHABILITY_MAX_SITES = 16   # flagged sites probed per run (whole-connection-down backstop)
+
 
 # --- Data shapes --------------------------------------------------------
 @dataclass
@@ -316,6 +443,38 @@ class SourceEntry:
     count_outlier: bool = False
 
 
+def _quality_basis(s: "SourceEntry") -> str:
+    """Provenance of the rating the UI displays for this source.
+
+      - "chapter_probe": img_quality_score came from real chapter pages — at
+        least one sampled page was fetched + scored (samples_succeeded > 0,
+        the same test T3's _has_real_probe applies). Cache-restored entries
+        qualify (full AND clamped) because the cached metadata rides along.
+      - "cover": a score exists but NO chapter page was successfully
+        measured — the cover-image fallback path, or a chapter probe that
+        failed every sample (base's 0/8 aggregate, rizzcomic's 0.0 stub).
+      - "seed": img_quality_score is None — the displayed rating falls back
+        to the per-site seed prior (probe_candidate_limit-skipped
+        candidates, SKIP_QUALITY_PROBE handlers, late-adopted fan-out
+        stragglers, probe hard-failures with no cover, plain cache misses).
+
+    Cross-file: emitted as `quality_basis` in SeriesCandidate.to_json;
+    UI-source/src/components/SearchSourceCard.jsx renders a red
+    AlertTriangle next to the site name whenever this != "chapter_probe"
+    (user request 2026-07-12 — flag any rating not grounded in measured
+    chapter pages, like the retired comix BROKEN_HANDLERS affordance).
+    """
+    if s.img_quality_score is None:
+        return "seed"
+    m = s.img_quality_metadata or {}
+    try:
+        if int(m.get("samples_succeeded") or 0) > 0:
+            return "chapter_probe"
+    except (TypeError, ValueError):
+        pass
+    return "cover"
+
+
 @dataclass
 class SeriesCandidate:
     canonical_title: str
@@ -336,6 +495,7 @@ class SeriesCandidate:
                     "seed_quality": round(s.seed_quality, 4),
                     "img_quality_score": round(s.img_quality_score, 4) if s.img_quality_score is not None else None,
                     "img_quality_metadata": s.img_quality_metadata,
+                    "quality_basis": _quality_basis(s),
                     "composite_score": round(s.composite_score, 4),
                     "chapter_count_hint": s.chapter_count_hint,
                     "actual_chapter_count": s.actual_chapter_count,
@@ -654,6 +814,15 @@ class ImageQualityCache:
                             "metadata": v.get("metadata") or {},
                             "expires_at": expires_at,
                             "schema_version": self.SCHEMA_VERSION,
+                            # Clamped-probe flag (2026-07-12). MUST be
+                            # re-emitted here: this rebuild uses a FIXED key
+                            # set, so without an explicit passthrough the
+                            # flag evaporates on the first disk reload and a
+                            # clamped 1-sample entry would silently serve a
+                            # full-breadth target. Absent = False, which is
+                            # factually correct for pre-flag entries (only
+                            # full/cover probes were ever written).
+                            "clamped": bool(v.get("clamped", False)),
                         }
                 self._state = cleaned
         except (OSError, json.JSONDecodeError):
@@ -709,16 +878,57 @@ class ImageQualityCache:
             metadata = entry.get("metadata") or {}
             return float(score), metadata
 
-    def set(self, site: str, series_url: str, score: float, metadata: Optional[Dict] = None) -> None:
+    def get_full(
+        self, site: str, series_url: str
+    ) -> Optional[Tuple[float, Dict, bool]]:
+        """Like get_with_metadata(), plus the entry's `clamped` flag as a
+        third element so search_all's cache loop can decide whether a
+        clamped (max_samples-limited) entry is servable for the source's
+        CURRENT probe role — a clamped score must never serve a source that
+        has become the top candidate (it would lock in the noisier 1-sample
+        signal for the entry's whole TTL). Returns None on miss / expiry /
+        type mismatch, same contract as get_with_metadata."""
+        if not site or not series_url:
+            return None
+        key = self._key(site, series_url)
+        with self._lock:
+            entry = self._state.get(key)
+            if not entry:
+                return None
+            if entry.get("expires_at", 0.0) <= time.time():
+                self._state.pop(key, None)
+                self._save_snapshot()
+                return None
+            score = entry.get("score")
+            if not isinstance(score, (int, float)):
+                return None
+            metadata = entry.get("metadata") or {}
+            return float(score), metadata, bool(entry.get("clamped", False))
+
+    def set(
+        self, site: str, series_url: str, score: float,
+        metadata: Optional[Dict] = None, *, clamped: bool = False,
+    ) -> None:
+        """``clamped=True`` marks a max_samples-limited probe result
+        (non-top-candidate source / EXPENSIVE_PROBE quick-probe). Stored
+        with the shorter IMG_QUALITY_CLAMPED_TTL_S expiry — min()'d against
+        the instance ttl_s so a short-TTL test cache still expires clamped
+        entries no later than full ones — and served back only when the
+        source would be clamped again anyway (search_all's cache loop; a
+        full-breadth target treats the entry as a miss and overwrites it
+        unclamped). The flag is an additive sibling key: absent means
+        False, correct for all pre-2026-07-12 entries."""
         if not site or not series_url:
             return
         key = self._key(site, series_url)
+        ttl = min(self.ttl_s, IMG_QUALITY_CLAMPED_TTL_S) if clamped else self.ttl_s
         with self._lock:
             self._state[key] = {
                 "score": max(0.0, min(1.0, float(score))),
                 "metadata": metadata or {},
-                "expires_at": time.time() + self.ttl_s,
+                "expires_at": time.time() + ttl,
                 "schema_version": self.SCHEMA_VERSION,
+                "clamped": bool(clamped),
             }
             self._save_snapshot()
 
@@ -2252,6 +2462,7 @@ def _run_pairwise_ranking(
     make_request: Callable,
     on_status: Optional[Callable[[str], None]] = None,
     probe_failure_cache: "Optional[ProbeFailureCache]" = None,
+    fetch_memo=None,
 ) -> None:
     """v6 anchor-free pairwise T3 ranking. In-place updates to
     candidate.sources[].img_quality_score with `pairwise_adjustment`.
@@ -2291,6 +2502,14 @@ def _run_pairwise_ranking(
 
     Budgeted: PAIRWISE_BUDGET_S total + PAIRWISE_PER_CANDIDATE_BUDGET_S
     per candidate. Skipped (no-op) when candidates is empty.
+
+    ``fetch_memo`` (2026-07-12, sites/fetch_memo.py): when provided, the
+    per-source chapter-list fetch and scraper construction route through
+    the per-run memo. The probe phase already populated it for every
+    probed source (full AND clamped probes both call get_chapters), so
+    the chapter-list step here is normally a zero-network in-run hit —
+    it used to RE-FETCH fetch_comic_context + get_chapters that Phase B
+    had just fetched.
 
     Cross-file: invoked from search_all post-probe-phase (replacing the
     previous _run_paired_comparison call). JPEG-ghost helper
@@ -2414,9 +2633,21 @@ def _run_pairwise_ranking(
                         )
                     continue
                 try:
-                    scraper = scraper_factory(handler)
-                    ctx = handler.fetch_comic_context(src.url, scraper, make_request)
-                    chapters = handler.get_chapters(ctx, scraper, "en", make_request)
+                    if fetch_memo is not None:
+                        # Reuse the probe phase's scraper (CF clearance and
+                        # cookies included) + its already-fetched chapter
+                        # list. Normally zero network here.
+                        scraper = fetch_memo.get_scraper(
+                            src.site, src.url,
+                            lambda h=handler: scraper_factory(h),
+                        )
+                        chapters = fetch_memo.get_chapters(
+                            handler, src.url, "en", scraper, make_request,
+                        )
+                    else:
+                        scraper = scraper_factory(handler)
+                        ctx = handler.fetch_comic_context(src.url, scraper, make_request)
+                        chapters = handler.get_chapters(ctx, scraper, "en", make_request)
                     if chapters:
                         chapter_lists[src.site] = chapters
                 except Exception:
@@ -2451,16 +2682,33 @@ def _run_pairwise_ranking(
                 picked_chapnums = shared_sorted
 
             # Fetch middle pages + compute components per (source, chapter).
+            #
+            # 2026-07-12: parallel across sources (was strictly sequential —
+            # the single biggest T3 wall-clock cost: 3 sources × 3 chapters
+            # × (get_chapter_images + image GET) all serialized). One task
+            # per source; each task keeps its own sequential chapter loop +
+            # per_cand_deadline checks, so per-source behavior is unchanged.
+            # The win-counting below runs AFTER the join and is a pure
+            # symmetric function of whatever components got fetched, so
+            # parallelism cannot change the math on the same data — it can
+            # only ADD data (a source late in `top` no longer starves when
+            # an earlier source eats the whole deadline). max_workers is
+            # bounded by PAIRWISE_TOP_SOURCES-sized `top`; each task hits
+            # ONE host sequentially, so cross-source parallelism is
+            # politeness-safe (same argument as the fan-out pool). T1
+            # component math is numpy/PIL on task-local data — already run
+            # from 6 parallel probe workers elsewhere, thread-safe.
             components_by_source: "Dict[str, Dict[float, Dict]]" = defaultdict(dict)
             ghost_by_source: "Dict[str, Optional[float]]" = {}
-            for src in top:
+
+            def _fetch_source_components(src) -> None:
                 if src.site not in per_source_by_chapnum:
-                    continue
+                    return
                 if time.monotonic() > per_cand_deadline:
-                    break
+                    return
                 handler = get_handler_by_name(src.site)
                 if handler is None:
-                    continue
+                    return
                 # Mirror the cooldown gate from the chapter-list loop above.
                 # A host could have flipped to suppressed BETWEEN the two
                 # loops (record_cooldown is set when make_request crosses a
@@ -2468,13 +2716,20 @@ def _run_pairwise_ranking(
                 # cheap and prevents an in-flight pairwise pass from
                 # racing the cache update.
                 if _host_blocked(handler):
-                    continue
+                    return
                 try:
-                    scraper = scraper_factory(handler)
+                    if fetch_memo is not None:
+                        scraper = fetch_memo.get_scraper(
+                            src.site, src.url,
+                            lambda: scraper_factory(handler),
+                        )
+                    else:
+                        scraper = scraper_factory(handler)
                 except Exception:
-                    continue
+                    return
                 src_content_type = (src.img_quality_metadata or {}).get("content_type") or "unknown"
                 first_blob_for_ghost: Optional[bytes] = None
+                local_components: "Dict[float, Dict]" = {}
                 for chapnum in picked_chapnums:
                     if time.monotonic() > per_cand_deadline:
                         break
@@ -2501,19 +2756,38 @@ def _run_pairwise_ranking(
                     page_components = _compute_pairwise_components(blob, src_content_type)
                     if page_components is None:
                         continue
-                    components_by_source[src.site][chapnum] = page_components
+                    local_components[chapnum] = page_components
                     if first_blob_for_ghost is None:
                         first_blob_for_ghost = blob
 
                 # JPEG-ghost (per-source) on the first successful blob.
+                ghost_val: Optional[float] = None
                 if first_blob_for_ghost is not None:
                     try:
-                        ghost_score, _g_diag = _compute_jpeg_ghost(first_blob_for_ghost)
-                        ghost_by_source[src.site] = ghost_score
+                        ghost_val, _g_diag = _compute_jpeg_ghost(first_blob_for_ghost)
                     except Exception:
-                        ghost_by_source[src.site] = None
-                else:
-                    ghost_by_source[src.site] = None
+                        ghost_val = None
+                # Each task writes only ITS OWN site key — no cross-task
+                # key contention (GIL-atomic dict assignment suffices).
+                components_by_source[src.site] = local_components
+                ghost_by_source[src.site] = ghost_val
+
+            page_workers = max(1, min(3, len(top)))
+            if page_workers == 1:
+                for src in top:
+                    _fetch_source_components(src)
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=page_workers, thread_name_prefix="t3-pages",
+                ) as t3_pool:
+                    t3_futs = [
+                        t3_pool.submit(_fetch_source_components, s) for s in top
+                    ]
+                    for f in as_completed(t3_futs):
+                        try:
+                            f.result()
+                        except Exception:
+                            pass
 
             # Pairwise win counting.
             wins_per_source: "Dict[str, Dict[str, int]]" = defaultdict(lambda: defaultdict(int))
@@ -4963,6 +5237,235 @@ def _best_title_match(query: str, hit: SearchHit) -> float:
     return best
 
 
+def _desired_max_samples(
+    src: "SourceEntry", handler, top_candidate_urls: set,
+) -> Optional[int]:
+    """Probe-depth plan for one source: None = full 8-chapter breadth probe,
+    an int = clamp to that many chapters.
+
+    Single source of truth shared by search_all's cache-read loop ("may a
+    cached CLAMPED entry serve this source?") and _probe_one's probe plan
+    ("what max_samples do we pass?") so the two can never drift — a drift
+    would either re-probe forever (read expects full, write stores clamped)
+    or lock a top-candidate source onto a stale 1-sample score.
+
+    Semantics are the 2026-05-20 rank-based clamp, unchanged: only the top
+    title-match candidate's sources run the full breadth probe;
+    EXPENSIVE_PROBE handlers with weak title-match clamp to 2; every other
+    candidate's sources clamp to 1. ``handler`` may be None (unknown site) —
+    getattr degrades to the non-expensive path.
+    """
+    is_top_candidate = src.url in top_candidate_urls
+    quick_probe = (
+        getattr(handler, "EXPENSIVE_PROBE", False)
+        and src.title_match < EXPENSIVE_PROBE_QUICK_THRESHOLD
+    )
+    if not is_top_candidate:
+        return 1
+    if quick_probe:
+        return 2
+    return None
+
+
+# --- Search-health classification --------------------------------------
+def _classify_site_health(
+    fanout_s: Optional[float],
+    probe_s: Optional[float],
+    *,
+    errored: bool,
+    blocked: bool,
+    never_finished: bool,
+    stuck: bool,
+    constitutionally_slow: bool,
+) -> Tuple[str, Optional[str]]:
+    """Map a site's per-run search signals to a (status, reason) health verdict.
+
+    status is "down" | "slow" | "ok". Hard-down signals always win over slow.
+    `never_finished` = still pending at the fan-out soft barrier AND never
+    adopted late (search_all's return-time `late_pending`); `stuck` = still
+    in-flight when the probe phase abandoned at its deadline. `constitutionally_
+    slow` handlers (SEARCH_COST_HINT=="slow" / EXPENSIVE_PROBE / OFFICIAL_
+    PUBLISHER — comix's browser probe, official-publisher deep probes) are
+    EXEMPT from the slow_probe signal only (their deep probe is slow by design);
+    they still catch every hard-down signal. Pure function so
+    tools/_test_site_health.py can exercise the truth table offline.
+    """
+    if errored:
+        return "down", "error"
+    if blocked:
+        return "down", "blocked"
+    if never_finished:
+        return "down", "late_fanout"
+    if stuck:
+        return "down", "probe_stuck"
+    if fanout_s is not None and fanout_s >= SEARCH_SLOW_FANOUT_S:
+        return "slow", "slow_fanout"
+    if (
+        not constitutionally_slow
+        and probe_s is not None
+        and probe_s >= SEARCH_SLOW_PROBE_S
+    ):
+        return "slow", "slow_probe"
+    return "ok", None
+
+
+# --- Search-health reachability probe (2026-07-13, fix 3) ---------------
+def _reachability_urls(handler) -> List[str]:
+    """Base URLs to liveness-check for a handler, best-host first, deduped and
+    capped at _REACHABILITY_MAX_URLS. Prefers a failover handler's own
+    _candidate_domains() (so a moved-domain site like zeroscans → zscans.com is
+    checked at its CURRENT mirrors, not just domains[0]), then any explicit
+    base_url / _BASE_URL, then the universal `domains` tuple (apex form, www-
+    deduped). Cross-file: consumed only by _probe_site_reachable."""
+    urls: List[str] = []
+    seen: set = set()
+
+    def _add(u: Optional[str]) -> None:
+        if isinstance(u, str) and u:
+            key = u.rstrip("/").lower()
+            if key not in seen:
+                seen.add(key)
+                urls.append(u)
+
+    cand = getattr(handler, "_candidate_domains", None)
+    if callable(cand):
+        try:
+            for d in cand():
+                if d:
+                    _add(f"https://{d}/")
+        except Exception:
+            pass
+    for attr in ("base_url", "_BASE_URL"):
+        b = getattr(handler, attr, None)
+        if isinstance(b, str) and b:
+            _add(b if b.startswith("http") else f"https://{b}/")
+    for d in (getattr(handler, "domains", None) or ()):
+        if isinstance(d, str) and d:
+            apex = d[4:] if d.startswith("www.") else d
+            _add(f"https://{apex}/")
+    return urls[:_REACHABILITY_MAX_URLS]
+
+
+def _probe_site_reachable(handler, scraper_factory, *, timeout_s: float) -> Optional[bool]:
+    """One bounded liveness GET per candidate host. Returns:
+      True  — a host returned ANY HTTP status (even 4xx/5xx / a Cloudflare
+              challenge: the server ANSWERED, so the site is reachable and any
+              search-side failure is endpoint-specific, not a dead host).
+      False — every candidate failed at the socket layer (DNS / conn refused /
+              SSL / timeout) within the budget → genuinely unreachable.
+      None  — couldn't attempt (no domains, unusable scraper, kwarg-signature
+              mismatch) → caller keeps the mechanism verdict.
+    Single attempt per host with a short timeout — deliberately NOT make_request
+    (its 6× retry + backoff would re-eat ~40s and defeat a liveness check) and
+    NOT its cross-process cooldown machinery (a raw .get must not trip the
+    rate-limit coordinator). Handler-agnostic: uses the scraper's .get; a
+    browser/exotic scraper without a compatible .get yields None (callers
+    already skip constitutionally-slow/browser handlers — this is a backstop).
+    Module-level (not a closure) so tools/_test_site_health.py can monkeypatch
+    it for deterministic offline coverage."""
+    urls = _reachability_urls(handler)
+    if not urls:
+        return None
+    try:
+        scraper = scraper_factory(handler)
+    except Exception:
+        return None
+    getter = getattr(scraper, "get", None)
+    if not callable(getter):
+        return None
+    for url in urls:
+        try:
+            r = getter(url, timeout=timeout_s, allow_redirects=True)
+        except TypeError:
+            # scraper.get doesn't accept our kwargs — don't risk an unbounded
+            # bare call; report 'unknown' and keep the mechanism verdict.
+            return None
+        except Exception:
+            continue  # socket-layer failure on THIS host — try the next mirror
+        if getattr(r, "status_code", None) is not None:
+            return True
+    return False
+
+
+def _refine_with_reachability(
+    status: str, reason: Optional[str], reachable: Optional[bool]
+) -> Tuple[str, Optional[str]]:
+    """Second-stage correction of a mechanism verdict using an emit-time
+    liveness result. `reachable` is True / False / None (not probed → keep as
+    is). Pure function — offline truth-table in tools/_test_site_health.py.
+
+    - `blocked` is untouched: the ProbeFailureCache is the authority there and
+      the host was NOT re-probed.
+    - unreachable (False) → down/unreachable for every non-blocked reason. This
+      is the ONE true 'the site is dead' bucket (zeroscans' swallowed all-
+      mirrors failure; omegascans timing out).
+    - reachable (True) → the host is UP, so a search-side problem is never
+      'down': an errored search softens to slow/search_error (mangakatana — its
+      search flaked but downloads are fine), and any other hard-down verdict
+      (late_fanout / probe_stuck) softens to 'slow' keeping its reason. An
+      already-'slow' verdict is unchanged.
+    """
+    if reason == "blocked":
+        return status, reason
+    if reachable is False:
+        return "down", "unreachable"
+    if reachable is True:
+        if reason == "error":
+            return "slow", "search_error"
+        if status == "down":
+            return "slow", reason
+        return status, reason
+    return status, reason
+
+
+def _run_reachability_probe(
+    pending: List[dict], scraper_factory
+) -> Dict[str, Optional[bool]]:
+    """Liveness-probe a list of flagged-site pending dicts in parallel daemon
+    workers under a hard phase deadline. Returns {name -> True/False/None};
+    names unresolved when the deadline fires are omitted (the caller treats a
+    missing name as None → keeps the mechanism verdict). Mirrors the fan-out /
+    image-probe daemon+deadline pattern so a wedged host can't hang the run."""
+    results: Dict[str, Optional[bool]] = {}
+    rlock = threading.Lock()
+    rq: "queue.Queue" = queue.Queue()
+    for p in pending:
+        rq.put(p)
+
+    def _rworker() -> None:
+        while True:
+            try:
+                p = rq.get_nowait()
+            except queue.Empty:
+                return
+            verdict: Optional[bool] = None
+            try:
+                verdict = _probe_site_reachable(
+                    p["handler"], scraper_factory,
+                    timeout_s=SEARCH_REACHABILITY_TIMEOUT_S,
+                )
+            except Exception:
+                verdict = None
+            with rlock:
+                results[p["name"]] = verdict
+
+    n_workers = max(1, min(len(pending), _FANOUT_MAX))
+    threads = [
+        threading.Thread(target=_rworker, name="search-reach", daemon=True)
+        for _ in range(n_workers)
+    ]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + SEARCH_REACHABILITY_DEADLINE_S
+    for t in threads:
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            break
+        t.join(timeout=rem)
+    with rlock:
+        return dict(results)
+
+
 # --- Public entrypoint --------------------------------------------------
 def search_all(
     query: str,
@@ -4980,6 +5483,10 @@ def search_all(
     skip_probe_sites: Optional[Set[str]] = None,
     on_status: Optional[Callable[[str], None]] = None,
     seeded_only: bool = False,
+    probe_candidate_limit: Optional[int] = None,
+    fetch_memo=None,
+    exclude_sites: Optional[Set[str]] = None,
+    diagnostics: Optional[dict] = None,
 ) -> List[SeriesCandidate]:
     """Fan out search across all search-capable handlers, dedupe, rank.
 
@@ -5018,11 +5525,65 @@ def search_all(
         for the download.
       on_status: optional progress callback for human output (e.g., the
         "[*] Probing image quality across N sources..." line in Phase 2).
+      probe_candidate_limit: cap how many top candidates get their sources
+        image-quality probed at ALL (2026-07-12). None = every candidate
+        (today's behavior; api.py + tests). Callers that only ever read the
+        top candidate(s) pass a small int: aio_search_cli passes 1 for
+        --auto-pick and direct-URL --multi-source (only candidates[0] is
+        consumed) and 2 for UI searches (user decision: "titles can be
+        slightly different", keep the runner-up comparable). Safe for
+        ranking because candidate ORDER is pure title-match — probes only
+        reorder sources WITHIN a candidate. Skipped sources keep
+        img_quality_score=None → seed fallback, same as SKIP_QUALITY_PROBE.
+      fetch_memo: optional sites.fetch_memo.FetchMemo shared across this
+        run's phases. The probe phase populates it (scrapers + contexts +
+        chapter lists); T3 and the caller's winner chapter fetch then reuse
+        those instead of re-fetching identical data a 2nd/3rd time.
+      exclude_sites: optional set of handler names (lowercase) to drop from the
+        fan-out + probe entirely — the user's disabled-sites list (--disable-
+        sites). Filtered in the eligibility loop before the blocked/seeded
+        checks. A URL seed_hit for an excluded site still rides (explicit user
+        intent overrides the block); excluded sites also get NO site_health
+        entry (below) so a disabled site isn't re-flagged as down.
+      diagnostics: optional mutable dict the caller passes to receive per-run
+        observability WITHOUT changing the return type (same collaborator
+        pattern as probe_failure_cache / img_quality_cache / fetch_memo). When
+        provided, search_all fills diagnostics["site_health"] (a list of
+        {site, display_name, host, status, reason, fanout_s, probe_s} for every
+        slow/down participating site), ["eligible_count"], and ["phase_times"].
+        Assembled at return under the fan-out/probe locks (stragglers may still
+        be mutating the timing containers). See _classify_site_health.
 
     Returns:
       List of SeriesCandidate, ranked best-first.
     """
     from . import iter_search_capable_handlers, get_handler_by_name
+
+    # Phase-timing instrumentation (2026-07-12): monotonic checkpoints at
+    # entry / post-fan-out / post-probe-join / post-T3, surfaced via
+    # on_status as one summary line before return. Pure observability — the
+    # numbers are what the live benchmarks in the perf plan compare.
+    _phase_t0 = time.monotonic()
+    _fanout_elapsed = 0.0
+    _probe_elapsed = 0.0
+    _t3_elapsed = 0.0
+
+    # Per-site timing + failure attribution for the search-health signal
+    # (2026-07-13). Populated by the fan-out and probe phases below (each under
+    # its own lock — fanout_lock / probe_track_lock) and snapshotted at return
+    # time to build diagnostics["site_health"]. HOISTED to function scope (out
+    # of the `if eligible:` fan-out block and the nested probe block) so the
+    # return-time assembly is valid even when a phase never runs — no eligible
+    # handlers, img_cache None, or zero cache-misses. errored_names is written
+    # by _run_one's except branches UNDER fanout_lock so the return snapshot
+    # can't tear; blocked_skipped is captured single-threaded in the
+    # eligibility loop.
+    fanout_times: Dict[str, float] = {}
+    probe_times: List[Tuple[str, float]] = []
+    probe_inflight: Dict[Tuple[str, str], float] = {}
+    probe_track_lock = threading.Lock()
+    errored_names: Set[str] = set()
+    blocked_skipped: List[Tuple[str, str, str]] = []  # (name, display_name, host)
 
     cache = probe_failure_cache  # may be None
     img_cache = img_quality_cache  # may be None — probe phase skipped if None
@@ -5075,8 +5636,17 @@ def search_all(
     # so the filter is consistent with how scoring would have treated them.
     eligible: List[BaseSiteHandler] = []
     skipped_unseeded = 0
+    disabled_skipped = 0
+    _exclude = {s.lower() for s in exclude_sites} if exclude_sites else set()
     for h in handlers:
         host = (h.domains[0] if getattr(h, "domains", None) else "") or ""
+        # User-disabled sites (--disable-sites) drop out FIRST — before the
+        # blocked/seeded checks — so the disable is authoritative. A matching
+        # URL-seed hit (if any) still rides in all_hits: an explicit URL
+        # overrides the block, same as the primary anchor in a download.
+        if _exclude and h.name.lower() in _exclude:
+            disabled_skipped += 1
+            continue
         if h.name in seeded_sites:
             # Skip silently — mangafire (or whichever site the URL maps to)
             # is already represented by a seed_hit that goes into
@@ -5094,6 +5664,9 @@ def search_all(
         if cache and host and cache.is_blocked(host):
             if on_status:
                 on_status(f"  skipping {h.name} ({host} suppressed)")
+            # Blocked = 2+ recent failures (down/unreachable). Surface it in the
+            # health signal even though it never enters `eligible`.
+            blocked_skipped.append((h.name, getattr(h, "display_name", h.name), host))
             continue
         if seeded_only and h.name.lower() not in seed:
             skipped_unseeded += 1
@@ -5104,6 +5677,19 @@ def search_all(
             f"  --seeded-only: skipped {skipped_unseeded} handler(s) not in "
             f"quality_seed.json"
         )
+    if disabled_skipped and on_status:
+        on_status(f"  --disable-sites: skipped {disabled_skipped} handler(s)")
+
+    # Slow-first enqueue order (2026-07-12): handlers whose search() is
+    # expensive (SEARCH_COST_HINT="slow" — comix's browser-driven typeahead
+    # is the only one today) start at t=0 so their multi-second search
+    # overlaps everyone else's, instead of landing in a late wave and ADDING
+    # its full duration to the fan-out phase. Stable sort keeps registry
+    # order within each cost class. Cross-file: BaseSiteHandler.
+    # SEARCH_COST_HINT (sites/base.py) + ComixSiteHandler's override.
+    eligible.sort(
+        key=lambda h: 0 if getattr(h, "SEARCH_COST_HINT", "normal") == "slow" else 1
+    )
 
     # Seed hits enter the scoring pipeline before the parallel search results.
     # If a seed hit's site is also returned by the parallel search, dedupe-
@@ -5132,6 +5718,11 @@ def search_all(
         try:
             scraper = scraper_factory(handler)
         except Exception:
+            # Attribute this run's failure to the site for the health signal —
+            # under fanout_lock so the return-time set(errored_names) snapshot
+            # can't tear against a straggler still erroring past the barrier.
+            with fanout_lock:
+                errored_names.add(handler.name)
             if cache and host:
                 cache.record_failure(host)
             return []
@@ -5141,28 +5732,265 @@ def search_all(
             )
             if not isinstance(hits, list):
                 hits = []
-            if cache and host:
-                # Empty results don't count as failures (the site is up but
-                # has no match for this query); only exceptions do.
+            if cache and host and hits:
+                # Record success ONLY on a NON-EMPTY result — that's the sole
+                # proof we actually reached AND parsed the site. An empty list
+                # is ambiguous: a genuine no-match, OR a handler that swallowed
+                # its own network failure to [] (grep zeroscans.search's all-
+                # mirrors-down path). The old UNCONDITIONAL record_success
+                # marked a fully-unreachable host 'healthy', hiding it from both
+                # the ProbeFailureCache block path AND the search-health signal
+                # (2026-07-13, fix 1). Empty now records NOTHING — neither
+                # success nor failure; the emit-time reachability probe
+                # (_probe_site_reachable) is what splits down-from-slow for a
+                # zero-hit site. Exceptions still record_failure below.
                 cache.record_success(host)
             return hits
         except Exception:
+            # Attribute this run's failure to the site for the health signal —
+            # under fanout_lock so the return-time set(errored_names) snapshot
+            # can't tear against a straggler still erroring past the barrier.
+            with fanout_lock:
+                errored_names.add(handler.name)
             if cache and host:
                 cache.record_failure(host)
             return []
 
-    workers = max(1, min(parallelism, len(eligible)))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="search") as pool:
-        futures = {pool.submit(_run_one, h): h for h in eligible}
-        for fut in as_completed(futures, timeout=None):
-            try:
-                hits = fut.result(timeout=per_site_timeout_s)
-            except Exception:
-                hits = []
-            if hits:
-                all_hits.extend(hits)
+    # --- Fan-out (2026-07-12 rewrite): daemon workers + soft barrier -----
+    # WHY not ThreadPoolExecutor: (a) its `with`-block join waited for the
+    # SLOWEST handler — the old `fut.result(timeout=per_site_timeout_s)` was
+    # dead code because as_completed only yields already-finished futures,
+    # so the phase was unbounded in practice; (b) late adoption requires NOT
+    # joining: a straggler past the barrier must keep running so its hits
+    # can merge at finalization, and non-daemon executor threads would also
+    # block interpreter exit on a wedged handler. Same daemon-thread pattern
+    # as the probe phase below. Workers record success/failure into the
+    # ProbeFailureCache themselves (inside _run_one, which is lock-guarded)
+    # — only COMPLETED calls record, so a slow-but-alive straggler is never
+    # punished as a dead host.
+    fanout_results: Dict[str, List[SearchHit]] = {}
+    fanout_lock = threading.Lock()
+    fanout_pending: Set[str] = {h.name for h in eligible}
+    fanout_done = threading.Event()
+    late_pending: Set[str] = set()
+    if not fanout_pending:
+        fanout_done.set()
+
+    _fanout_started = time.monotonic()
+    if eligible:
+        fan_q: "queue.Queue" = queue.Queue()
+        for h in eligible:
+            fan_q.put(h)
+
+        # fanout_times (per-site search durations for the "slowest" diagnostic
+        # line — the mangakatana class of problem is invisible without per-site
+        # attribution) is hoisted to function scope; populated here under
+        # fanout_lock so the return-time health assembly can snapshot it.
+
+        def _fanout_worker() -> None:
+            while True:
+                try:
+                    h = fan_q.get_nowait()
+                except queue.Empty:
+                    return
+                _t = time.monotonic()
+                hits = _run_one(h)  # never raises; swallows + records per-host
+                with fanout_lock:
+                    fanout_times[h.name] = time.monotonic() - _t
+                    fanout_results[h.name] = hits or []
+                    fanout_pending.discard(h.name)
+                    if not fanout_pending:
+                        fanout_done.set()
+
+        # Wider than the probe phase's `parallelism`: fan-out tasks are 1-2
+        # requests to DISTINCT hosts (politeness-safe), and at width 6 the
+        # ~31 seeded handlers ran in 6 sequential waves. max() keeps a
+        # user-raised --search-parallelism authoritative above _FANOUT_MAX.
+        fan_workers = max(1, min(len(eligible), max(parallelism, _FANOUT_MAX)))
+        for _ in range(fan_workers):
+            threading.Thread(
+                target=_fanout_worker, name="search-fan", daemon=True,
+            ).start()
+
+        fanout_done.wait(timeout=_FANOUT_DEADLINE_S)
+        with fanout_lock:
+            late_pending = set(fanout_pending)
+            fanout_slowest = sorted(fanout_times.items(), key=lambda kv: -kv[1])[:5]
+            for _name, hits in fanout_results.items():
+                if hits:
+                    all_hits.extend(hits)
+        if on_status and fanout_slowest:
+            on_status(
+                "[*] fan-out slowest: "
+                + " · ".join(f"{n} {t:.1f}s" for n, t in fanout_slowest)
+            )
+        if late_pending and on_status:
+            on_status(
+                f"[!] fan-out: {len(late_pending)} site(s) still searching at "
+                f"{_FANOUT_DEADLINE_S:.0f}s ({', '.join(sorted(late_pending))}) "
+                f"— continuing; late results merge before finalization"
+            )
+    _fanout_elapsed = time.monotonic() - _fanout_started
+
+    # ---- Search-health snapshot (2026-07-13) ----
+    # Reuse the timing the phases ALREADY measured (zero added network work) to
+    # tell the caller which participating sites were slow or down. Defined here
+    # (after the fan-out barrier) and called before EVERY return path — the
+    # no-hits / no-match early returns below INCLUDED, because "every site is
+    # down → no hits → early return" is exactly when the signal matters most.
+    # Snapshots under the existing locks: daemon fan-out stragglers past the
+    # barrier and probe workers past the deadline can still be mutating these
+    # containers, so a bare read risks "dict/list changed size during iteration".
+    # `late_pending` holds sites still pending at the barrier; by the FINAL
+    # return the adoption block below has discarded any straggler that finished
+    # late (those keep a real fanout_times entry and classify "slow" instead),
+    # leaving only genuinely never-finished sites (down/late_fanout). Excluded
+    # (user-disabled) sites get no entry so a disabled site isn't re-flagged as
+    # down. Consumed by aio_search_cli's --search-json payload → the UI's
+    # SlowSitesCallout. Closure over the phase locals (read at call time).
+    def _emit_site_health() -> None:
+        if diagnostics is None:
+            return
+        with fanout_lock:
+            _ft = dict(fanout_times)
+            _errored = set(errored_names)
+            _never = set(late_pending)
+            _blocked = list(blocked_skipped)
+        with probe_track_lock:
+            _stuck = {site for (site, _u) in probe_inflight}
+            _probe_by_site: Dict[str, float] = {}
+            for _site, _secs in probe_times:
+                # A site can be probed once per source across the top 1-2
+                # candidates; keep its WORST single probe.
+                if _secs > _probe_by_site.get(_site, 0.0):
+                    _probe_by_site[_site] = _secs
+
+        # Stage 1 — mechanism verdict per eligible site (pure, no network). Each
+        # _pending entry carries what the reachability refinement + payload
+        # assembly below need. Blocked-skipped sites are appended afterward as
+        # down/blocked and are NOT reachability-probed (the cache is authority).
+        _pending: List[dict] = []
+        for h in eligible:
+            name = h.name
+            if _exclude and name.lower() in _exclude:
+                continue
+            host = (h.domains[0] if getattr(h, "domains", None) else "") or ""
+            fo = _ft.get(name)
+            pr = _probe_by_site.get(name)
+            constitutionally_slow = (
+                getattr(h, "SEARCH_COST_HINT", "normal") == "slow"
+                or getattr(h, "EXPENSIVE_PROBE", False)
+                or getattr(h, "OFFICIAL_PUBLISHER", False)
+            )
+            status, reason = _classify_site_health(
+                fo, pr,
+                errored=(name in _errored),
+                blocked=bool(cache and host and cache.is_blocked(host)),
+                never_finished=(name in _never),
+                stuck=(name in _stuck),
+                constitutionally_slow=constitutionally_slow,
+            )
+            _pending.append({
+                "handler": h, "name": name, "host": host,
+                "fo": fo, "pr": pr, "status": status, "reason": reason,
+                "constitutionally_slow": constitutionally_slow,
+            })
+
+        # Stage 2 — bounded emit-time reachability probe (2026-07-13, fix 3).
+        # ONLY sites already flagged non-ok are probed, and only plain-HTTP
+        # handlers: constitutionally-slow / official / expensive handlers are
+        # slow-or-special by design (probing comix's scraper_factory would
+        # launch Patchright), and a blocked-verdict eligible site (a host that
+        # crossed the cache threshold mid-run) is left to the cache. A healthy
+        # all-ok search reaches here with an empty _to_probe → zero added
+        # latency. See the reachability-constant header for the full rationale.
+        _reach: Dict[str, Optional[bool]] = {}
+        if _REACHABILITY_ENABLED:
+            _to_probe = [
+                p for p in _pending
+                if p["status"] != "ok"
+                and p["reason"] != "blocked"
+                and not p["constitutionally_slow"]
+            ][:_REACHABILITY_MAX_SITES]
+            if _to_probe:
+                _reach = _run_reachability_probe(_to_probe, scraper_factory)
+
+        # Stage 3 — refine each mechanism verdict with the liveness result, feed
+        # a confirmed-unreachable host into the cache, and assemble the payload.
+        _health: List[dict] = []
+        _unreachable_ct = 0
+        for p in _pending:
+            if p["status"] == "ok":
+                continue  # healthy → no entry (keep the payload tiny)
+            reachable = _reach.get(p["name"])
+            status, reason = _refine_with_reachability(p["status"], p["reason"], reachable)
+            if status == "ok":  # defensive — refine never returns ok, but guard
+                continue
+            # A newly-confirmed-unreachable site that did NOT already error this
+            # run (its _run_one never recorded a failure — a swallow-to-[]
+            # handler, or a slow-but-alive host that died before the emit probe)
+            # feeds the cache so a persistently-dead host trends toward a block +
+            # auto-skip on later runs. Errored sites already recorded in
+            # _run_one's except — don't double-count (that would block a host
+            # after a single run instead of the intended 2).
+            if reachable is False:
+                _unreachable_ct += 1
+                if p["reason"] != "error" and cache and p["host"]:
+                    try:
+                        cache.record_failure(p["host"])
+                    except Exception:
+                        pass
+            _health.append({
+                "site": p["name"],
+                "display_name": getattr(p["handler"], "display_name", p["name"]),
+                "host": p["host"],
+                "status": status,
+                "reason": reason,
+                "fanout_s": round(p["fo"], 1) if p["fo"] is not None else None,
+                "probe_s": round(p["pr"], 1) if p["pr"] is not None else None,
+            })
+        # ProbeFailureCache-blocked sites never entered `eligible` — surface
+        # them as down/blocked (unless the user already disabled them).
+        for name, display_name, host in _blocked:
+            if _exclude and name.lower() in _exclude:
+                continue
+            _health.append({
+                "site": name,
+                "display_name": display_name,
+                "host": host,
+                "status": "down",
+                "reason": "blocked",
+                "fanout_s": None,
+                "probe_s": None,
+            })
+        if on_status and _reach:
+            on_status(
+                f"[*] reachability: probed {len(_reach)} flagged site(s), "
+                f"{_unreachable_ct} unreachable"
+            )
+        diagnostics["site_health"] = _health
+        diagnostics["eligible_count"] = len(eligible)
+        # The names of the sites actually fanned out this run (disabled /
+        # seed-hit / blocked / unseeded sites never enter `eligible`). The UI
+        # folds site_health as STRIKES and uses this as the DECAY set: a site
+        # in tested_sites but absent from site_health came back healthy this
+        # run → decay its strike; a site in NEITHER wasn't measured → leave it
+        # untouched. Without this the UI can't tell "tested & ok" from "not
+        # tested", so recovered sites would never drop off the recommend list.
+        # Cross-file: useDownloader.js setSearchSiteHealth fold (grep tested_sites).
+        diagnostics["tested_sites"] = [h.name for h in eligible]
+        diagnostics["phase_times"] = {
+            "fanout": round(_fanout_elapsed, 1),
+            "probe": round(_probe_elapsed, 1),
+            "t3": round(_t3_elapsed, 1),
+        }
 
     if not all_hits:
+        # Nothing matched by the barrier and no seeds. Stragglers (if any)
+        # are abandoned here — an empty result at ~the barrier matches the
+        # user's "stop waiting" semantics; a handler that alone needs >60s
+        # for the only hits is the degenerate case we accept.
+        _emit_site_health()
         return []
 
     # Score every hit against the query.
@@ -5173,6 +6001,7 @@ def search_all(
             scored.append((score, hit))
 
     if not scored:
+        _emit_site_health()
         return []
 
     # Group by canonical title key. Within a candidate, multiple sources may
@@ -5229,8 +6058,84 @@ def search_all(
         root = _find(keys[0])
         groups.setdefault(root, []).append((score, hit))
 
+    # Source comparator, shared by (a) the initial per-candidate sort in the
+    # build loop below, (b) the post-probe/post-T3 re-sort, and (c) the
+    # late-adoption re-sort. Hoisted out of the build loop 2026-07-12 (it
+    # used to be redefined per group iteration, which meant it simply didn't
+    # EXIST when the groups dict was empty — the late-adoption path can
+    # create the very first candidate in that edge case). Pure functions of
+    # module constants; hoisting is behavior-identical.
+    #
+    # Sort order of decision:
+    #   1. DMCA-likely sources go to the back. A source with 1/96 chapters
+    #      accessible should never beat one with 96/96 regardless of
+    #      quality. Fixes the canonical Witch Hat Atelier case where
+    #      MangaDex's higher seed_quality (0.92) was beating MangaFire
+    #      (0.85) even though MangaDex was DMCA-hollowed.
+    #   2. Official publisher wins. When one source is the publisher's own
+    #      platform (e.g. linewebtoon = webtoons.com, the literal LINE
+    #      publisher) and the other is an aggregator re-hosting that
+    #      same content (toonily, asura, etc.), the publisher wins
+    #      regardless of title_match spread or measured image quality.
+    #      Both sources have already been merged by union-find as the
+    #      same series, so we trust the canonical bytes from the
+    #      publisher. Fixes the webtoons.com vs toonily case where
+    #      vertical-scroll PNG at 720-800px scored below toonily's
+    #      upscaled JPEG on the probe's res_score formula (which
+    #      treats 800-2400px as the credit band) despite the PNG
+    #      being lossless and the JPEG being generation-loss.
+    #   3. Title match within TIEBREAKER_WINDOW (0.10) → image-quality
+    #      decides. Use img_quality_score when measured (Phase 2 cover
+    #      probe); fall back to seed_quality when probe failed or hasn't
+    #      run yet. Per the plan, ANY measurement replaces the seed —
+    #      cover-bytes are deterministic, not noisy estimates.
+    #   4. Otherwise title_match wins.
+    # Pairwise comparator gives deterministic behavior at window boundaries.
+    def _quality_for(s: SourceEntry) -> float:
+        # `is not None` (not `> 0`): a measured 0.0 is meaningful — it's
+        # the aggregate probe's "5/5 fetches failed" signal. We want it
+        # used as the rank input even though it'll lose to anything seed-
+        # based, because a broken CDN should rank LAST among its peers.
+        return s.img_quality_score if s.img_quality_score is not None else s.seed_quality
+
+    def _cmp(a: SourceEntry, b: SourceEntry) -> int:
+        # Sink signal: dmca_likely OR count_outlier. Both push the source
+        # to the back of the candidate's source list — they are the same
+        # signal at the ranking layer, surfaced differently in to_json
+        # (only dmca_likely; count_outlier is intentionally internal).
+        # See the cross-site count check in the build loop for how each
+        # is set.
+        a_sink = a.dmca_likely or a.count_outlier
+        b_sink = b.dmca_likely or b.count_outlier
+        if a_sink != b_sink:
+            return 1 if a_sink else -1
+        # Official-publisher tiebreaker — gated behind a title_match
+        # floor + within-window check so a weak-match official hit can't
+        # outrank a strong-match aggregator. See
+        # IS_OFFICIAL_REQUIRES_TITLE_MATCH for the rationale; the gate
+        # exists alongside per-hit is_official (which already filters
+        # canvas) as a generic backstop for any future handler that
+        # might surface low-confidence official hits.
+        if a.is_official != b.is_official:
+            strong_a = a.title_match >= IS_OFFICIAL_REQUIRES_TITLE_MATCH
+            strong_b = b.title_match >= IS_OFFICIAL_REQUIRES_TITLE_MATCH
+            within = abs(a.title_match - b.title_match) <= TIEBREAKER_WINDOW
+            if strong_a and strong_b and within:
+                return -1 if a.is_official else 1
+            # else fall through — title_match decides below.
+        if abs(a.title_match - b.title_match) <= TIEBREAKER_WINDOW:
+            qa, qb = _quality_for(a), _quality_for(b)
+            if qa != qb:
+                return -1 if qa > qb else 1
+            return 0
+        return -1 if a.title_match > b.title_match else 1
+
     from collections import Counter
     candidates: List[SeriesCandidate] = []
+    # root-of-union-find → candidate object, for the late-adoption merge
+    # (a straggler's hit attaches to an existing candidate when any of its
+    # normalized title-keys _find()s to one of these roots).
+    candidate_by_root: Dict[str, SeriesCandidate] = {}
     for key, members in groups.items():
         # canonical_title: most-common title across the bucket; shortest as
         # tiebreaker. Length-as-primary biases toward edition variants like
@@ -5341,80 +6246,18 @@ def search_all(
                     # "One Piece" with 20 real episodes union-find-merged
                     # with the actual 1100-chapter One Piece).
                     s.count_outlier = True
-        # Sort sources within candidate. Order of decision:
-        #   1. DMCA-likely sources go to the back. A source with 1/96 chapters
-        #      accessible should never beat one with 96/96 regardless of
-        #      quality. Fixes the canonical Witch Hat Atelier case where
-        #      MangaDex's higher seed_quality (0.92) was beating MangaFire
-        #      (0.85) even though MangaDex was DMCA-hollowed.
-        #   2. Official publisher wins. When one source is the publisher's own
-        #      platform (e.g. linewebtoon = webtoons.com, the literal LINE
-        #      publisher) and the other is an aggregator re-hosting that
-        #      same content (toonily, asura, etc.), the publisher wins
-        #      regardless of title_match spread or measured image quality.
-        #      Both sources have already been merged by union-find as the
-        #      same series, so we trust the canonical bytes from the
-        #      publisher. Fixes the webtoons.com vs toonily case where
-        #      vertical-scroll PNG at 720-800px scored below toonily's
-        #      upscaled JPEG on the probe's res_score formula (which
-        #      treats 800-2400px as the credit band) despite the PNG
-        #      being lossless and the JPEG being generation-loss.
-        #   3. Title match within TIEBREAKER_WINDOW (0.10) → image-quality
-        #      decides. Use img_quality_score when measured (Phase 2 cover
-        #      probe); fall back to seed_quality when probe failed or hasn't
-        #      run yet. Per the plan, ANY measurement replaces the seed —
-        #      cover-bytes are deterministic, not noisy estimates.
-        #   4. Otherwise title_match wins.
-        # Pairwise comparator gives deterministic behavior at window boundaries.
-        def _quality_for(s: SourceEntry) -> float:
-            # `is not None` (not `> 0`): a measured 0.0 is meaningful — it's
-            # the aggregate probe's "5/5 fetches failed" signal. We want it
-            # used as the rank input even though it'll lose to anything seed-
-            # based, because a broken CDN should rank LAST among its peers.
-            return s.img_quality_score if s.img_quality_score is not None else s.seed_quality
-
-        def _cmp(a: SourceEntry, b: SourceEntry) -> int:
-            # Sink signal: dmca_likely OR count_outlier. Both push the source
-            # to the back of the candidate's source list — they are the same
-            # signal at the ranking layer, surfaced differently in to_json
-            # (only dmca_likely; count_outlier is intentionally internal).
-            # See the cross-site count check above for how each is set.
-            a_sink = a.dmca_likely or a.count_outlier
-            b_sink = b.dmca_likely or b.count_outlier
-            if a_sink != b_sink:
-                return 1 if a_sink else -1
-            # Official-publisher tiebreaker — gated behind a title_match
-            # floor + within-window check so a weak-match official hit can't
-            # outrank a strong-match aggregator. See
-            # IS_OFFICIAL_REQUIRES_TITLE_MATCH for the rationale; the gate
-            # exists alongside per-hit is_official (which already filters
-            # canvas) as a generic backstop for any future handler that
-            # might surface low-confidence official hits.
-            if a.is_official != b.is_official:
-                strong_a = a.title_match >= IS_OFFICIAL_REQUIRES_TITLE_MATCH
-                strong_b = b.title_match >= IS_OFFICIAL_REQUIRES_TITLE_MATCH
-                within = abs(a.title_match - b.title_match) <= TIEBREAKER_WINDOW
-                if strong_a and strong_b and within:
-                    return -1 if a.is_official else 1
-                # else fall through — title_match decides below.
-            if abs(a.title_match - b.title_match) <= TIEBREAKER_WINDOW:
-                qa, qb = _quality_for(a), _quality_for(b)
-                if qa != qb:
-                    return -1 if qa > qb else 1
-                return 0
-            return -1 if a.title_match > b.title_match else 1
-
-        # Capture the comparator for re-use after the probe phase populates
-        # img_quality_score; we sort once now (with seed fallback) so output
-        # is deterministic even if the probe phase fails entirely.
+        # Sort with the shared comparator (hoisted above the loop) so output
+        # is deterministic even if the probe phase fails entirely; the same
+        # comparator re-sorts after the probe phase populates
+        # img_quality_score.
         sources.sort(key=cmp_to_key(_cmp))
-        candidates.append(
-            SeriesCandidate(
-                canonical_title=canonical_title or key,
-                canonical_year=year,
-                sources=sources,
-            )
+        cand_obj = SeriesCandidate(
+            canonical_title=canonical_title or key,
+            canonical_year=year,
+            sources=sources,
         )
+        candidates.append(cand_obj)
+        candidate_by_root[key] = cand_obj
 
     # ---- Image-quality probe phase (Phase 2) ----
     # For each unique (site, url, hit-with-cover) across all candidates'
@@ -5446,17 +6289,30 @@ def search_all(
             {s.url for s in candidates[0].sources} if candidates else set()
         )
 
+        _probe_started = time.monotonic()
+
         # Index hit-by-url for quick lookup during probe (so we can pass the
         # full SearchHit to handler._probe_chapter_aggregate / _probe_cover_image,
         # not just the source).
         hit_by_url: Dict[str, SearchHit] = {h.url: h for _, h in scored}
+        # Probe scope (2026-07-12): probe_candidate_limit caps how many of
+        # the (already title-match-ranked) candidates get their sources
+        # probed at all — see the parameter doc. Candidates outside the
+        # scope keep img_quality_score=None → seed fallback in _quality_for,
+        # exactly like SKIP_QUALITY_PROBE sources; candidate RANK can't
+        # change because it's pure title-match (the pre-rank sort above ==
+        # the final candidate sort below).
+        if probe_candidate_limit is not None:
+            probe_scope = candidates[: max(0, int(probe_candidate_limit))]
+        else:
+            probe_scope = candidates
         # Collect unique (site, url) source entries needing probe.
         # Same-(site,url) appearing in multiple candidates can share the same
         # cached result — but in practice each (site, url) lives in one
         # candidate after the union-find merge, so this is mostly redundant.
         seen_pairs: set = set()
         sources_to_probe: List[SourceEntry] = []
-        for c in candidates:
+        for c in probe_scope:
             for src in c.sources:
                 key = (src.site, src.url)
                 if key in seen_pairs:
@@ -5465,24 +6321,22 @@ def search_all(
                 sources_to_probe.append(src)
 
         # Cache hits short-circuit; only un-cached sources need a fetch.
-        # Use get_with_metadata so cached entries restore img_quality_metadata
-        # too — without this the UI tooltip loses bpp/is_grayscale/outlier on
-        # every repeat search (cache hit path was returning score-only).
+        # get_full restores score + img_quality_metadata (the UI tooltip
+        # needs bpp/is_grayscale/outlier on repeat searches) + the clamped
+        # flag that drives the serve rule below.
         cache_misses: List[SourceEntry] = []
         for src in sources_to_probe:
-            # SKIP_QUALITY_PROBE handlers (currently only comix — see
-            # sites/comix.py for the rationale) opt out of probing
-            # entirely: their per-source probe cost is dominated by a
-            # single-threaded browser bridge that would trip the 240 s
-            # probe-phase deadline before any candidate completed. The
-            # comparator `_quality_for` (~line 5329) falls back to
-            # seed_quality when img_quality_score is None, so leaving
-            # the score un-set IS how the calibrated seed becomes the
-            # effective ranking signal. We also skip the persistent-
-            # cache read so stale per-URL scores from earlier buggy
-            # probes (which scored 0.0 because synthetic
-            # `comix-page://` URLs aren't HTTP-fetchable) don't leak
-            # back into ranking.
+            # SKIP_QUALITY_PROBE handlers opt out of probing entirely: the
+            # score stays None and the comparator `_quality_for` (~line 5329)
+            # falls back to seed_quality, so the calibrated seed becomes the
+            # effective ranking signal. We also skip the persistent-cache read
+            # so no stale per-URL score leaks back in. This is a generic
+            # opt-out hook — NO handler sets it today. comix used to (its
+            # browser-bridge probe was too slow for the 240 s deadline), but it
+            # now ships a custom single-chapter probe override instead of
+            # opting out (see sites/comix.py:_probe_chapter_aggregate). Kept
+            # because the trade-off it guards is real for any future
+            # browser-only handler.
             handler = get_handler_by_name(src.site)
             if handler is not None and getattr(
                 handler, "SKIP_QUALITY_PROBE", False,
@@ -5508,17 +6362,39 @@ def search_all(
                 # and aio_search_cli.find_alternatives_for_direct_url
                 # (primary_handler.name).
                 continue
-            cached = img_cache.get_with_metadata(src.site, src.url)
+            cached = img_cache.get_full(src.site, src.url)
             if cached is not None:
-                score, metadata = cached
-                src.img_quality_score = score
-                src.img_quality_metadata = metadata or None
-            else:
-                cache_misses.append(src)
+                score, metadata, was_clamped = cached
+                # Clamped-entry serve rule (2026-07-12): a CLAMPED (probe-
+                # depth-limited, typically 1-sample) entry serves this
+                # source only when the source would be clamped again anyway
+                # — i.e. its current probe plan is itself clamped — or when
+                # re-probing can't produce anything different (handler gone,
+                # or the handler ignores max_samples via PROBE_SAMPLES_FIXED
+                # so its cached result already IS the full form). A source
+                # promoted to full-breadth (now in the top candidate)
+                # treats the clamped entry as a MISS: the full probe below
+                # overwrites it unclamped, so the noisier 1-sample score
+                # can never lock in for a top-candidate ranking decision.
+                servable = (
+                    not was_clamped
+                    or handler is None
+                    or getattr(handler, "PROBE_SAMPLES_FIXED", False)
+                    or _desired_max_samples(src, handler, top_candidate_urls)
+                    is not None
+                )
+                if servable:
+                    src.img_quality_score = score
+                    src.img_quality_metadata = metadata or None
+                    continue
+            cache_misses.append(src)
 
         if cache_misses:
             if on_status:
-                on_status(f"[*] Probing image quality across {len(cache_misses)} sources...")
+                on_status(
+                    f"[*] Probing image quality across {len(cache_misses)} "
+                    f"sources... (fan-out took {_fanout_elapsed:.1f}s)"
+                )
 
             def _probe_one(src: SourceEntry) -> None:
                 hit = hit_by_url.get(src.url)
@@ -5528,7 +6404,19 @@ def search_all(
                 if handler is None:
                     return
                 try:
-                    scraper = scraper_factory(handler)
+                    if fetch_memo is not None:
+                        # Per-run memo (sites/fetch_memo.py): register this
+                        # source's scraper so T3 + the caller's winner
+                        # chapter fetch reuse it (CF clearance included)
+                        # instead of building fresh sessions. Keyed per
+                        # (site, url) — probe workers touch distinct keys by
+                        # construction (seen_pairs dedup above).
+                        scraper = fetch_memo.get_scraper(
+                            src.site, src.url,
+                            lambda: scraper_factory(handler),
+                        )
+                    else:
+                        scraper = scraper_factory(handler)
                 except Exception:
                     return
                 # Tiered probe selection. High-seed sites (those listed in
@@ -5550,26 +6438,19 @@ def search_all(
                     # so the extra 7 chapter fetches × N sources per
                     # sub-candidate is wasted bandwidth — especially on
                     # browser-driven handlers (seconds per chapter).
-                    # The existing EXPENSIVE_PROBE quick_probe clamp still
-                    # fires on top of this for weak-title-match results
-                    # within a candidate (mostly redundant now that
-                    # non-top-candidate sources already clamp).
-                    is_top_candidate = src.url in top_candidate_urls
-                    quick_probe = (
-                        getattr(handler, "EXPENSIVE_PROBE", False)
-                        and src.title_match < EXPENSIVE_PROBE_QUICK_THRESHOLD
+                    # The plan (incl. the EXPENSIVE_PROBE quick_probe clamp)
+                    # lives in _desired_max_samples — the SAME helper the
+                    # cache-read loop above uses to decide whether a cached
+                    # clamped entry may serve, so read rule and probe plan
+                    # can't drift.
+                    max_samples = _desired_max_samples(
+                        src, handler, top_candidate_urls,
                     )
-                    if not is_top_candidate:
-                        max_samples = 1
-                    elif quick_probe:
-                        max_samples = 2
-                    else:
-                        max_samples = None  # full 8-chapter breadth
-                    clamped = (max_samples is not None)
                     try:
                         aggregate = handler._probe_chapter_aggregate(
                             hit, scraper, make_request,
                             max_samples=max_samples,
+                            fetch_memo=fetch_memo,
                         )
                     except Exception:
                         aggregate = None
@@ -5577,16 +6458,27 @@ def search_all(
                         score, metadata = aggregate
                         src.img_quality_score = score
                         src.img_quality_metadata = metadata
-                        # Skip caching clamped results: the next search may
-                        # rank this source higher (different query → it
-                        # could become the top candidate and want the full
-                        # breadth probe). A cached 1-sample result would
-                        # otherwise serve from cache and lock the source
-                        # into the noisier score. Clamped probes are cheap
-                        # enough to redo on demand. Full probes (top
-                        # candidate, unclamped) DO cache.
-                        if not clamped:
-                            img_cache.set(src.site, src.url, score, metadata=metadata)
+                        # Clamped results cache too now (2026-07-12 — they
+                        # were deliberately uncached before, re-paid on
+                        # EVERY search; comix's browser probe alone was
+                        # 15-70s of that). The `clamped` flag + shorter TTL
+                        # keep the noisier limited-sample score from ever
+                        # serving a source that has since become the top
+                        # candidate: the cache-read loop treats clamped
+                        # entries as misses for full-breadth targets (grep
+                        # _desired_max_samples) and the full probe then
+                        # overwrites the entry unclamped. Handlers whose
+                        # override IGNORES max_samples (PROBE_SAMPLES_FIXED,
+                        # comix) always produce their full form → cache
+                        # unclamped in both roles.
+                        entry_clamped = (
+                            max_samples is not None
+                            and not getattr(handler, "PROBE_SAMPLES_FIXED", False)
+                        )
+                        img_cache.set(
+                            src.site, src.url, score, metadata=metadata,
+                            clamped=entry_clamped,
+                        )
                         return
                     # Aggregate failed (no chapters / total CDN failure / etc.)
                     # — fall through to cover probe so we still get *some*
@@ -5624,11 +6516,23 @@ def search_all(
             # search_mr's per-attempt timeout) keep hung probes from leaking
             # bandwidth indefinitely; they finish on their own within ~30s
             # and cache results for next run if they manage to complete.
-            import queue
+            # (`queue` is a module-level import now — an inline `import
+            # queue` here would make the name function-local for ALL of
+            # search_all and break the fan-out block above, which runs
+            # earlier and also uses queue.Queue.)
             q: "queue.Queue" = queue.Queue()
             for s in cache_misses:
                 q.put(s)
             probe_workers = max(1, min(parallelism, len(cache_misses)))
+
+            # Per-source probe attribution: durations feed the "probe slowest"
+            # line below, and the in-flight map lets the deadline message NAME
+            # the source(s) still running — without it, "1/6 workers still
+            # running" gave no clue that (live example) mangakatana was the one
+            # re-eating the deadline every search. probe_track_lock /
+            # probe_inflight / probe_times are hoisted to function scope
+            # (populated here) so the return-time health assembly can snapshot
+            # them under the lock.
 
             def _worker_loop() -> None:
                 while True:
@@ -5636,10 +6540,17 @@ def search_all(
                         s = q.get_nowait()
                     except queue.Empty:
                         return
+                    _t = time.monotonic()
+                    with probe_track_lock:
+                        probe_inflight[(s.site, s.url)] = _t
                     try:
                         _probe_one(s)
                     except Exception:
                         pass
+                    finally:
+                        with probe_track_lock:
+                            probe_inflight.pop((s.site, s.url), None)
+                            probe_times.append((s.site, time.monotonic() - _t))
 
             workers: List[threading.Thread] = []
             for _ in range(probe_workers):
@@ -5658,13 +6569,24 @@ def search_all(
                     break
                 t.join(timeout=remaining)
             still_running = sum(1 for t in workers if t.is_alive())
-            if still_running and on_status:
-                on_status(
-                    f"[!] Probe phase: {still_running}/{probe_workers} workers "
-                    f"still running at {PROBE_PHASE_DEADLINE_S:.0f}s deadline; "
-                    f"abandoning to avoid hang. Their results will populate the "
-                    f"cache if the underlying calls return."
-                )
+            if on_status:
+                with probe_track_lock:
+                    stuck = sorted({site for (site, _u) in probe_inflight})
+                    probe_slowest = sorted(probe_times, key=lambda kv: -kv[1])[:5]
+                if probe_slowest:
+                    on_status(
+                        "[*] probe slowest: "
+                        + " · ".join(f"{n} {t:.1f}s" for n, t in probe_slowest)
+                    )
+                if still_running:
+                    on_status(
+                        f"[!] Probe phase: {still_running}/{probe_workers} workers "
+                        f"still running at {PROBE_PHASE_DEADLINE_S:.0f}s deadline "
+                        f"(in-flight: {', '.join(stuck) or 'unknown'}); "
+                        f"abandoning to avoid hang. Their results will populate the "
+                        f"cache if the underlying calls return."
+                    )
+        _probe_elapsed = time.monotonic() - _probe_started
 
         # T3 anchor-free pairwise ranking runs AFTER the worker pool joins
         # so it can compare T1 components against the now-populated
@@ -5676,6 +6598,7 @@ def search_all(
         # path (_run_paired_comparison) remains in this module for
         # back-compat with tests/test_paired_comparison.py but is no
         # longer wired into search_all.
+        _t3_started = time.monotonic()
         if candidates:
             if on_status:
                 on_status(
@@ -5686,10 +6609,12 @@ def search_all(
                 _run_pairwise_ranking(
                     candidates, scraper_factory, make_request, on_status,
                     probe_failure_cache=probe_failure_cache,
+                    fetch_memo=fetch_memo,
                 )
             except Exception as _e:
                 if on_status:
                     on_status(f"[!] T3 pairwise ranking failed: {_e}; T3 adjustments skipped")
+        _t3_elapsed = time.monotonic() - _t3_started
 
         # Re-sort each candidate's sources now that img_quality_score is
         # populated. The comparator uses _quality_for which prefers measured
@@ -5699,11 +6624,147 @@ def search_all(
         for c in candidates:
             c.sources.sort(key=cmp_to_key(_cmp))
 
+    # ---- Late fan-out adoption (2026-07-12) ----
+    # Stragglers that completed AFTER the soft barrier merge here — post-T3,
+    # pre-final-rank — scored by title-match with seed/cached quality only.
+    # No fresh probe, no T3 (both phases already ran; user decision: a late
+    # site "doesn't participate in T3 and just gives T1 rating... no visible
+    # timing change even then" — this block is pure in-memory work).
+    # Documented edge, accepted by the same decision: a late candidate with
+    # the best title-match can become candidates[0] with seed/cache-only
+    # quality, so --auto-pick then picks on title-match + seed. Late entries
+    # also skip the cross-site DMCA/count-outlier analysis (it ran at build
+    # time); hit-level dmca_likely (e.g. mangadex sets it per-hit) still
+    # rides in and still sinks in _cmp.
+    if late_pending:
+        with fanout_lock:
+            late_now: Dict[str, List[SearchHit]] = {
+                name: fanout_results[name]
+                for name in list(late_pending)
+                if name in fanout_results
+            }
+            for name in late_now:
+                late_pending.discard(name)
+        # Attach to an existing candidate when any normalized title-key
+        # resolves through the union-find to a known root (READ-ONLY lookups
+        # — parent is not mutated here, so pre-built candidates keep their
+        # roots); late hits that match no existing candidate cluster among
+        # THEMSELVES via late_key_map so two stragglers returning the same
+        # series form one new candidate, not two.
+        late_key_map: Dict[str, SeriesCandidate] = {}
+        adopted_hits = 0
+        adopted_sites: set = set()
+        for _name, hits in late_now.items():
+            for hit in hits or []:
+                score = _best_title_match(query, hit)
+                if score < min_match:
+                    continue
+                keys: List[str] = []
+                for t in [hit.title] + list(hit.alt_titles or []):
+                    k = _normalize_title(t)
+                    if k and k not in keys:
+                        keys.append(k)
+                if not keys:
+                    continue
+                target: Optional[SeriesCandidate] = None
+                for k in keys:
+                    if k in parent:
+                        target = candidate_by_root.get(_find(k))
+                        if target is not None:
+                            break
+                if target is None:
+                    for k in keys:
+                        target = late_key_map.get(k)
+                        if target is not None:
+                            break
+                # Same is_official derivation as the build loop: site-level
+                # class attr ANDed with the per-hit flag when present.
+                site_level = hit.site.lower() in official_sites
+                per_hit = hit.is_official
+                src_is_official = (
+                    site_level if per_hit is None
+                    else (bool(per_hit) and site_level)
+                )
+                entry = SourceEntry(
+                    site=hit.site,
+                    url=hit.url,
+                    title=hit.title,
+                    cover=hit.cover,
+                    title_match=score,
+                    seed_quality=seed.get(hit.site.lower(), 0.5),
+                    composite_score=score,
+                    chapter_count_hint=hit.chapter_count_hint,
+                    actual_chapter_count=hit.actual_chapter_count,
+                    dmca_likely=hit.dmca_likely,
+                    raw_score=hit.raw_score,
+                    is_official=src_is_official,
+                )
+                # FREE cache read: a previously-probed (site, url) keeps its
+                # measured score. Clamped entries welcome here — this is a
+                # display/rank fallback, not a probe-depth decision, and
+                # cached-anything beats the bare seed prior.
+                if img_cache is not None:
+                    cached_late = img_cache.get_full(hit.site, hit.url)
+                    if cached_late is not None:
+                        entry.img_quality_score = cached_late[0]
+                        entry.img_quality_metadata = cached_late[1] or None
+                if target is None:
+                    target = SeriesCandidate(
+                        canonical_title=hit.title or keys[0],
+                        canonical_year=hit.year if isinstance(hit.year, int) else None,
+                        sources=[],
+                    )
+                    candidates.append(target)
+                for k in keys:
+                    late_key_map.setdefault(k, target)
+                # Per-site dedupe within the candidate — same rule as the
+                # build loop's per_site_best (highest title_match wins). A
+                # same-site entry can only pre-exist from THIS late batch:
+                # the handler was late, so none of its hits were in the
+                # pre-barrier build, and seeded sites never enter `eligible`.
+                existing = next(
+                    (s for s in target.sources if s.site == entry.site), None,
+                )
+                if existing is not None:
+                    if entry.title_match <= existing.title_match:
+                        continue
+                    target.sources[target.sources.index(existing)] = entry
+                else:
+                    target.sources.append(entry)
+                adopted_hits += 1
+                adopted_sites.add(hit.site)
+        if adopted_hits:
+            # Re-sort every candidate's sources with the shared comparator —
+            # adopted entries landed after the post-probe re-sort. Cheap
+            # (in-memory, tiny lists).
+            for c in candidates:
+                c.sources.sort(key=cmp_to_key(_cmp))
+            if on_status:
+                on_status(
+                    f"[*] fan-out: merged {adopted_hits} late hit(s) from "
+                    f"{', '.join(sorted(adopted_sites))} (seed/cached rating "
+                    f"only — no probe, no T3)"
+                )
+
     # Rank candidates: best title_match across any of their sources.
     candidates.sort(
         key=lambda c: max((s.title_match for s in c.sources), default=0.0),
         reverse=True,
     )
+    if on_status:
+        on_status(
+            f"[*] Search phases: fan-out {_fanout_elapsed:.1f}s · probe "
+            f"{_probe_elapsed:.1f}s · T3 {_t3_elapsed:.1f}s · total "
+            f"{time.monotonic() - _phase_t0:.1f}s"
+        )
+
+    # Emit the search-health snapshot on the success path too (defined after
+    # the fan-out barrier above; also called before the no-hits/no-match early
+    # returns). By this FINAL call the late-adoption block has run, so
+    # late_pending holds only never-finished sites and the probe phase's timing
+    # is included.
+    _emit_site_health()
+
     return candidates
 
 
@@ -5718,4 +6779,5 @@ __all__ = [
     "TIEBREAKER_WINDOW",
     "DEFAULT_PER_SITE_TIMEOUT_S",
     "IMG_QUALITY_TTL_S",
+    "IMG_QUALITY_CLAMPED_TTL_S",
 ]
