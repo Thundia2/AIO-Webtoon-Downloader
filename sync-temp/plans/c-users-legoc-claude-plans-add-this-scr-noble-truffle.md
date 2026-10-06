@@ -1,10 +1,12 @@
 # Device Sync — non-UI implementation plan
 
-**Status: draft rev 2 (2026-10-06, cloud session on `wip/device-sync-handoff`), awaiting approval.**
+**Status: draft rev 3 (2026-10-06, cloud session on `wip/device-sync-handoff`), awaiting approval.**
 - Rev 1 (2026-09-30) got an adversarial review on 2026-10-01: 2 critical, 9 major, 14 minor.
-  Rev 2 checks every finding against the code and AOSP and folds in the confirmed ones. Where the
-  review was wrong or a better fix exists, it says so. The per-finding disposition is the last
-  section.
+  Rev 2 checked every finding against the code and AOSP and folded in the confirmed ones. Where the
+  review was wrong or a better fix exists, it says so.
+- Rev 2's new designs got a second adversarial review the same day: 0 critical, 9 major, 11 minor.
+  Rev 3 checks and folds those in.
+- Both disposition tables are the last section.
 - Parent plan (behavior rules 1-13, the decisions table, the UI design), approved 2026-09-30:
   `sync-temp/plans/add-this-script-s-features-linked-pumpkin.md`. Rule numbers below refer to it.
   The `~/.claude/plans/` copies are pruned after about 30 days; the `sync-temp/plans/` copies are
@@ -32,9 +34,10 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
   - no adb server start, no socket, no device monitor;
   - no library pre-hash and no quit-gate term;
   - no writes under `userData/sync/`.
-- Every IPC handler is registered. All of them except `sync:get-state` and `sync:label-preview`
-  answer `{ok:false, code:'disabled'}`. That includes `sync:config-op` (it writes files),
-  `sync:locate-adb` (it spawns adb.exe) and `sync:find-sources:start` (it spawns Python).
+- Every IPC handler is registered. All of them answer `{ok:false, code:'disabled'}` except
+  `sync:get-state`, `sync:label-preview` and the two cancel channels (see the IPC contract). That
+  includes `sync:config-op` (it writes files), `sync:locate-adb` (it spawns adb.exe) and
+  `sync:find-sources:start` (it spawns Python).
 - **The exception is the app-wide single-instance lock** (your answer, 2026-10-06). It changes
   behavior with sync off: a second launch focuses the running window instead of starting a second
   copy. Dev and installed builds share userData, so they can no longer run side by side.
@@ -62,23 +65,64 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
      - make every operation idempotent, or stamp sequence numbers;
      - fsync, and keep a `.bak`.
    - Sharding removes the cost that motivated the journal instead:
-     - each managed device folder gets its own file, `targets/<id>/folders/<h>.json`;
+     - each managed device folder gets its own file, `targets/<id>/folders/<shardId>.json`;
      - a change rewrites only that folder's file, atomically (write a tmp, fsync it, rename);
      - a typical series shard is tens of KB, and the largest (One Piece, 1,197 chapters) is
        estimated at about 250 KB.
-   - Intent: before a push, the file's entry becomes `pending` and carries `prev`, the entry it
+   - **Shards are named by a stable random id, not by the folder name** (second review #4).
+     - The device folder name lives inside the shard, and a plan loads every shard into a
+       name → shard map.
+     - So a folder rename rewrites one field, and a re-probed `caseInsensitive` changes nothing on
+       disk. A slot key depends on that measured flag, so a name-hashed file would move under a
+       flipped probe and orphan its old copy.
+   - **One `recordEpoch` ties the record together** (second review #5).
+     - The epoch is a random value. `header.json`, every shard and `selection.json` carry it, and a
+       file with a different epoch is ignored and garbage-collected.
+     - Forget-record, and rule 12's clear on a device, root or profile change, become a single
+       atomic header write with a new epoch, followed by lazy deletion.
+     - A half-finished `rmSync` (antivirus EBUSY) can therefore never leave old shards that a later
+       Verify would trust again.
+   - **Intent.** Before a push, the file's entry becomes `pending` and carries `prev`, the entry it
      replaces. After OKAY it becomes `pushed`. That is two shard writes per file.
-   - Because each write is fsync'd, intent also survives an OS crash. Rev 1's journal covered
-     process kills only (review #6e).
+   - **Every rename carries the same intent** (second review #4). This covers a folder rename,
+     rename-to-match, and a case-only rename through a temp name:
+     1. write `renameIntent {from, via?, to}` into the shard;
+     2. STA2 the destination and require ENOENT. A shell `mv A B` onto an existing B moves A *into*
+        B;
+     3. run the `mv`;
+     4. rewrite the shard once, atomically.
+
+     The next plan resolves a leftover intent by STA2-ing both names.
+   - **Write mechanics** (second review #6).
+     - Writes go through an async single-flight queue per path that coalesces to the latest
+       content, with unique tmp names `<name>.<pid>.<seq>.tmp`. Overlapping writes can therefore
+       never interleave in one tmp file.
+     - A separate synchronous writer is used only by `shutdownNow()`, after it abandons the queue.
+     - A failed write throws `record-write-failed`, which aborts the run. **A failed `pending`
+       write stops that file's SEND**: a push without recorded intent would break this deviation's
+       guarantee.
+   - **Durability, stated exactly** (second review #10). libuv renames with `MoveFileExW(…,
+     MOVEFILE_REPLACE_EXISTING)` only, with no write-through (`src/win/fs.c:2341`), and Node can't
+     fsync a directory on Windows.
+     - So a shard write is **durable across a process kill, and atomic but not durable across an OS
+       crash**: after a power loss, the previous shard may come back.
+     - That outcome is safe. The rewritten slot then fails its (size, devMtime) check, reads as
+       foreign, and is never pre-selected for a delete.
+     - For the same reason a `.bak` buys nothing: the old or the new shard always survives, and
+       either is safe. On POSIX the directory is fsync'd too.
    - A shard that fails to parse marks its folder unverified, and that folder is re-verified before
      its ops are planned. This is safe by construction: an unverified folder is never deleted from
      (rule 3, coverage).
+   - **A shard is dropped only** when its folder is absent from a trusted root listing **and** a
+     STA2 of the folder returns ENOENT. A missing bound folder plans as described under "Provenance".
    - The PC hash cache stays one file, and **main is its only writer**: hash workers return
      results and never touch the disk. That removes review #6b's compaction race. It is flushed
-     every 500 hashes and at the end; losing it costs a re-hash, never a wrong answer.
-   - P3 measures the cost. If two fsyncs per file add more than 5% to a transfer of typical chapter
-     files, intent is batched per N files. That is still safe: an unresolved `pending` resolves
-     through RECV.
+     every 500 hashes, at each job end and in `shutdownNow()`. Losing it costs a re-hash, never a
+     wrong answer.
+   - **Cost.** P3 builds the batching path, but the fsync cost is measured on your PC (NTFS), since
+     a Linux container's numbers can't decide it. If two fsyncs per file add more than 5% to a
+     transfer of typical chapter files, intent is batched per N files. That is still safe: an
+     unresolved `pending` resolves through RECV.
 2. **Hash-while-push.**
    - The bytes streamed to the device are hashed on the fly, so the record's sha is always the sha
      of what was actually sent.
@@ -104,16 +148,29 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
    `error == 0` plus a directory mode, never from "STA2 answered", because STA2 never FAILs
    (review #3).
 8. **Shutdown is synchronous-safe by construction.**
-   - Deviation 1 means nothing durable ever waits in memory: every record change is on disk when it
-     happens.
-   - So `shutdownNow()` is synchronous:
-     - destroy the sockets (adbd then unlinks the partial file);
-     - stop the hash workers;
-     - write the job's cancelled status;
-     - spawn the find-sources taskkill, a separate process that finishes even after Electron exits.
-   - It runs from the `quit` event. Every exit emits `quit`: `app.exit()` too, per main.js's own
-     comment at :1832. That covers the `app.quit()` paths that never emit `window-all-closed`
-     (`quit-app` at :1816, the updater, macOS Cmd+Q).
+   - Under deviation 1, every record change is on disk when it happens. What else waits in memory
+     is written at fixed points (second review #12):
+     - the run log before and after each destructive batch, not only at job end;
+     - `selection.json` on every `sync:set-selection`;
+     - `find-sources.json` per row;
+     - the PC hash cache at each job end and in `shutdownNow()`.
+   - So `shutdownNow()` is synchronous and idempotent (it runs again after `window-all-closed`'s
+     awaited `shutdown()`). Its steps:
+     1. **First**, while the root PID is still alive, spawn the find-sources taskkill with
+        `{detached: true, stdio: "ignore", windowsHide: true}` plus `unref()`. libuv puts every
+        non-detached child in a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+        (`src/win/process.c:93-96`, `:1149-1152`). A plain spawn would therefore die with Electron
+        (second review #11).
+     2. Destroy the sockets; adbd then unlinks the partial file.
+     3. Stop the hash workers.
+     4. Write the job's cancelled status and the PC hash cache through the synchronous writer.
+   - It runs from the `quit` event. `app.exit()` emits `quit` too: main.js's own comment at :1832
+     says so, and the second review confirmed it in Electron's source (`App::OnQuit`). That covers
+     the `app.quit()` paths that never emit `window-all-closed`: `quit-app` at :1816, the updater,
+     macOS Cmd+Q.
+   - **Exits it can't cover:** logoff or OS shutdown, a crash, a Task Manager kill. The record is
+     still consistent by deviation 1. Only a find-sources Python tree may outlive the app, as a
+     download's can today.
    - This replaces the review's "prevent `will-quit` once, await, quit again" (#13), which would
      add a second quit state machine next to `quitConfirmed`.
    - The awaited `shutdown()` still runs alongside `cancelAll()` in `window-all-closed` and
@@ -166,9 +223,13 @@ detail:
 - P0 checks whether this container can run `npm ci`, `npm run build` and launch Electron (under
   xvfb). Anything it can't run moves to your PC and is named in the phase report.
 
-**Shipping order.** This feature cannot ship ahead of the in-flight work: `seriesIdentityKey` and
-`normalizeSeriesUrl` exist only in the in-flight `library.js`, and `series-merge.js` (which supplies
-`compareChapterLabels`) is new in the WIP commit. See open decision 1.
+**Shipping order.** This feature cannot ship ahead of the in-flight work:
+- `seriesIdentityKey` and `normalizeSeriesUrl` exist only in the in-flight `library.js`;
+- `series-merge.js`, which supplies `compareChapterLabels`, is new in the WIP commit;
+- find-sources searches through mangafire, whose profile lock is the in-flight
+  `sites/profile_lock.py` (review #23).
+
+See open decision 1.
 
 ## Architecture — `UI-source/electron/sync/`
 
@@ -187,18 +248,18 @@ No module requires `electron`. Collaborators are injected, following the `series
 | `provenance.js` | Pure: the origin model, "ours", and pending resolution: absent / pushed / restore previous / partial, from a listing plus RECV hashes | New (split out of the planner so the matrix is testable on its own) |
 | `planner.js` | As parent (pure, stable op ids, rules 1-5) | Free space per transport (see `transports.js`); `settling` files; `adopted-size` never pre-selects a delete |
 | `job-record.js` | As parent: one lane, runId-stamped emits, coalesced progress (≤10/s), snapshot | Adds the FIFO queue for automatic plans, dropped on device removal |
-| `store.js` | `writeJsonAtomic` (tmp, fsync, close, rename; 5 retries with backoff on EBUSY/EPERM/EACCES, then throws); the sharded `RecordStore`; the startup sweep of stale `.tmp` files | Deviation 1. `history.js:_saveJson` (102-137) is **not** the model: it falls back to a non-atomic copy and swallows errors |
+| `store.js` | `writeJsonAtomic`: a unique tmp, fsync, close, rename; 5 async retries with backoff on EBUSY/EPERM/EACCES, then it throws `record-write-failed`. Also: the per-path single-flight write queue; `writeJsonAtomicSync` for `shutdownNow()` only; the sharded `RecordStore` (random shard ids, `recordEpoch`, epoch GC); the startup sweep of stale `.tmp` files | Deviation 1. `history.js:_saveJson` (102-137) is **not** the model: it falls back to a non-atomic copy and swallows errors |
 | `hash-pool.js` | As parent: `worker_threads` via an inline eval'd worker, main-thread fallback, cache keyed by path → `{size, mtimeNs, sha256}` | Main is the single writer of the cache. Workers use synchronous reads so hashing doesn't occupy the shared fs thread pool. Throttle (deviation 3) |
 | `pc-inventory.js` | As parent: async walk of `getConfiguredOutputRoot`, identity / url / title / `anilist_*`, hard failure on a missing or empty root | — |
-| `adb/wire.js` | Pure codecs: request framing (byte lengths), OKAY/FAIL, sync packets at full struct sizes, shell-v2 packets, `devices -l` rows parsed from the end, track frames split across chunks | New |
+| `adb/wire.js` | Pure codecs: request framing (byte lengths), OKAY/FAIL, sync packets at full struct sizes, shell-v2 packets, `devices -l` rows (keyed fields stripped from the end, state from the known set), track frames split across chunks | New |
 | `adb/client.js` | Sockets: host services, transport binding (`tport` with a `transport` fallback), `shell()`, `SyncSession` (stat, list, push, pull) with the session lifecycle below | New |
 | `adb/locate.js` | Candidates from the configured path, PATH, ANDROID_HOME/ANDROID_SDK_ROOT and `%LOCALAPPDATA%\Android\Sdk` (each with `adb version`); `startServer(bin)` | Replaces the locate half of the parent's `adb.js` |
 | `transports.js` | The interface; `AdbTransport` on the client; `FolderTransport` (dot-temp + rename, `fs.statfs`, async presence stat with a 3 s timeout and one check in flight per target); `validatePath`; `shq`; `freeSpaceNeeded(ops)` per transport | `validatePath` caps remote paths at 1018 bytes (see the framing section) |
-| `executor.js` | As parent: per-series order and the failure model (rules 6-7) | Per-file results; devMtime only from the post-series listing; intent shard writes; the error policy in the error table |
-| `monitor.js` | `host:track-devices-l` on a persistent socket (backoff 2→60 s, polling `host:devices-l` every 5 s after 3 straight failures), folder presence, focus-aware prompt state machine (rule 10) | No CLI child process; prompt marks keyed with a boot epoch |
+| `executor.js` | As parent: per-series order and the failure model (rules 6-7) | Per-file results; devMtime only from listings (the post-series one, or the next one for an interrupted series); intent shard writes, renames included; the error policy in the error table |
+| `monitor.js` | `host:track-devices-l` on a persistent socket (backoff 2→60 s, polling `host:devices-l` every 5 s after 3 straight failures), folder presence, focus-aware prompt state machine (rule 10) | No CLI child process; prompt marks keyed with a boot epoch and honored for 30 min only |
 | `find-sources.js` | Runner: sequential searches on its own `Searcher`, top 5 candidates, resumable, retry with an edited query; waits while Check All or the Search tab's search runs | Unchanged scope |
-| `service.js` | `initDeviceSync(deps)`, every `sync:*` handler, settings hooks, quit hooks, library-change notifications, badge computation. The returned facade **never throws**: every method catches and logs | Failure isolation (review #2) |
-| `electron/proc-kill.js` | `killTree(child, {timeoutMs})` → a Promise that resolves when the child closes (or on timeout). win32: `taskkill /pid N /t /f` with `windowsHide`. Elsewhere: `process.kill(-pid)` on a detached group, then SIGKILL on timeout | New shared helper. `downloader.js:952` keeps its inline copy because that file is in-flight |
+| `service.js` | `initDeviceSync(deps)`, every `sync:*` handler, settings hooks, quit hooks, library-change notifications, badge computation. It validates `deps` and throws loudly at init if any is missing or has the wrong type. The returned facade **never throws and never rejects**: every method catches, logs and resolves | Failure isolation (review #2; second review #1, #18) |
+| `electron/proc-kill.js` | `killTree(child, {timeoutMs, detached})` → a Promise that resolves when the child closes (or on timeout). win32: `taskkill /pid N /t /f` with `windowsHide`; `detached: true` (only `shutdownNow()` uses it) spawns taskkill outside libuv's kill-on-close job and `unref()`s it. Elsewhere: `process.kill(-pid)` on a detached group, then SIGKILL on timeout | New shared helper. `downloader.js:952` keeps its inline copy because that file is in-flight |
 | `src/hooks/useDeviceSync.js` | Renderer mirror: buffers events until the snapshot lands, adopts the snapshot, applies events by kind, exposes state and action wrappers. Opens with exactly one `import {…} from "react";` line, which the tools harness strips | Written and tested, **not mounted** (mounting in App.jsx is the UI pass's job) |
 
 ## The adb wire client
@@ -217,8 +278,8 @@ P5 reads the tablet's feature list rather than assuming a version.
 - `host:devices-l`
 - `host:track-devices-l` (`services.cpp:252-258`)
 - `host:tport:serial:<s>`, answered with OKAY plus an 8-byte transport id (`adb.cpp:1303-1345`).
-  If a server FAILs it, the client falls back to `host:transport:<s>` and takes the id from the
-  `devices -l` row.
+  If a server FAILs it as an unknown service, the client falls back to `host:transport:<s>` and
+  takes the id from the `devices -l` row.
 - `host-serial:<s>:features`
 
 **Shell.**
@@ -253,9 +314,13 @@ P5 reads the tablet's feature list rather than assuming a version.
   - a RECV of a file it can't open (`:639-642`);
   - QUIT (`:852-853`).
 - So a session is dead after any FAIL or EOF. The client reopens it lazily for the next operation.
-  **A reopen never costs the error budget**; only the FAIL that caused it counts. Rev 1's design
-  would have charged the budget for the spurious EOFs too: one bad file trips the default budget
-  of 3, and every re-run aborts at the same file.
+- **The reopen after a received FAIL is free**; only the FAIL itself counts against the budget.
+  Rev 1's design would have charged the budget for the spurious EOFs that follow a FAIL too: one bad
+  file trips the default budget of 3, and every re-run aborts at the same file.
+- **An EOF during an operation on a session believed alive is a real failure** (second review #8).
+  It charges 1 and is retried once on a fresh session. Otherwise a deterministic drop on one path
+  would loop forever or fail every file without ever tripping the budget. Possible causes: adbd, or
+  a local security product resetting connections to 127.0.0.1:5037.
 - **Pushes are acknowledged one file at a time**: SEND, DATA…, DONE, then read OKAY or FAIL before
   the next SEND.
   - The adb CLI pipelines SENDs and reads deferred acknowledgements
@@ -268,6 +333,12 @@ P5 reads the tablet's feature list rather than assuming a version.
   write fails, then drains DATA until DONE (`:423-453`). An early FAIL therefore stops the stream
   and destroys the socket, instead of sending the rest of a multi-GB file. ENOSPC is where this
   matters.
+  - **One framed reader per session** serves both the early-FAIL watch and the per-file status
+    read, so they can never split bytes between them. A FAIL is `FAIL` + u32 length + text, whether
+    it arrives mid-DATA or after DONE.
+  - **Writes honor backpressure**: they await `drain`, or Node would buffer a whole multi-GB file
+    in memory. The idle watchdog counts flushed bytes, not write calls.
+  - There is no deadlock risk: adbd's failure path keeps reading until DONE (`:430-450`).
 - `readSmall` and `device-cover` STA2 each path first and RECV only regular files that exist, so
   one missing `details.json` no longer kills every read queued behind it.
 
@@ -286,6 +357,10 @@ P5 reads the tablet's feature list rather than assuming a version.
   - STA2 a folder before trusting an empty LIS2 of it.
   - A root that lists 0 folders while the record holds folders is a **failed listing**. Planning
     refuses with `device-listing-suspect` instead of offering to push everything.
+  - A managed folder missing from the root listing is STA2'd before it counts as absent.
+    `do_list` stops at readdir's first NULL, which may be an error rather than the end, and
+    still sends DONE (`:210-251`). A FUSE error partway through therefore yields a truncated root
+    that the zero-folder check alone misses (second review #17).
   - The case-sensitivity probe and browse-remote's `exists` read the `error` field.
 - This covers file-based-encryption tablets that accept adb before the first unlock after a
   reboot, while `/storage/emulated/0` is still inaccessible, and a wrong root.
@@ -299,9 +374,18 @@ P5 reads the tablet's feature list rather than assuming a version.
   hostile-names list.
 - The 1,024-byte limit covers the path plus `,33188`, so `validatePath` caps remote paths at
   **1,018 bytes**, not the parent plan's 4,096. The 255-byte per-segment cap stays.
-- `devices -l` rows pad the serial with `%-22s`, and a serial can contain spaces
-  (`(no serial number)`, `transport.cpp:1407-1416`). So `transport_id:` and the state are parsed
-  from the end of the row.
+- **`devices -l` rows** (`transport.cpp:1407-1433`, second review #15).
+  - The layout is the serial padded with `%-22s`, then the state, then an optional unkeyed devpath,
+    then `product:`, `model:`, `device:` and `transport_id:`.
+  - A serial can contain spaces (`(no serial number)`).
+  - So the parser strips the keyed fields from the end. The state is the first token after the
+    serial that belongs to the known state set (`adb.cpp:140-175`): `device`, `offline`,
+    `unauthorized`, `authorizing`, `connecting`, `detached`, `bootloader`, `recovery`, `rescue`,
+    `sideload`, `host`, plus Linux's multi-word "no permissions" text.
+- **A `(no serial number)` device is listed but not targetable.** `host:tport:serial:` can't
+  select it, because `MatchesTarget` never matches an empty serial (`transport.cpp:1289-1291`).
+- **`host:tport:` falls back to `host:transport:`** only on an unknown-service FAIL, never on
+  `device '…' not found`.
 - Device file names are bytes. A name that isn't valid UTF-8 is unmanaged: it is listed, never
   planned, and never passed to `rm` or `mv` in a lossily decoded form.
 - The tracking socket is exempt from the 60 s idle watchdog.
@@ -321,8 +405,15 @@ P5 reads the tablet's feature list rather than assuming a version.
 **devMtime comes only from listings** (review #4).
 - The `pushed` write carries size and sha only.
 - The entry's `devMtime` is filled from the listing taken after the series' pushes (rule 6's
-  listing step). It is normalized to whole seconds for every listing method: LIS2 reports seconds,
-  while `find -printf %T@` and `fs.stat` report fractions.
+  listing step). It is normalized to whole seconds **by truncation** for every listing method:
+  LIS2 reports `st_mtime` seconds, while `find -printf %T@` and `fs.stat` report fractions.
+- **When that listing goes through the shell** (no `ls_v2`), it runs on a different socket and could
+  race the last file's `lutimes`. So one STA2 is sent on the push session first: adbd serves it
+  only after `lutimes` (second review #16).
+- **A `pushed` entry still without devMtime**, because an unplug, cancel or kill landed before the
+  post-series listing, adopts the devMtime of the next listing that shows its exact size. The file
+  was acknowledged, and hash-while-push knows its sha. Without this, every interrupted series would
+  read as "changed on device" on resume (second review #7).
 - Reason: `sync_to_tablet.py:16-17` recorded that on this tablet "adb push does NOT preserve source
   mtime (tablet mtimes are push-time)". Whatever the cause, only a value read the same way as the
   next plan's listing is comparable to it.
@@ -333,11 +424,13 @@ P5 reads the tablet's feature list rather than assuming a version.
 | Kind | What produces it | Policy |
 |---|---|---|
 | `device-lost` | `device '…' not found` (the text behind the 106 cascaded failures), `no devices/emulators found`; or EOF/ECONNRESET/EPIPE when the serial is gone from `devices -l` after a ~1 s recheck; or the same serial with a new transport id (a removal plus an add) | Abort the run once: "disconnected — reconnect to resume" |
-| `session-closed` | EOF/ECONNRESET/EPIPE while the serial is still listed as `device` | Reopen the session; no budget charge |
-| `unauthorized` | state `unauthorized`; FAIL text `device unauthorized.` or `device still authorizing` | Abort with USB-debugging guidance |
+| `session-closed` | EOF/ECONNRESET/EPIPE while the serial is still listed as `device` | After a received FAIL: reopen, no charge. During an operation on a live session: charge 1 and retry once on a fresh session |
+| `unauthorized` | state `unauthorized`; FAIL text `device unauthorized.` | Abort with USB-debugging guidance |
+| `connecting` | state `authorizing` or `connecting`; FAIL text `device still authorizing` or `device still connecting` (`transport.cpp:988-993`) | Transient: wait for the monitor's next state, never a failure |
 | `offline` | state `offline`; FAIL text `device offline` | Abort |
 | `server-unavailable` | ECONNREFUSED at connect, or mid-job | Abort the run (the server died) |
-| `no-space` | a sync FAIL carrying ENOSPC | Abort the run. adbd drains each SEND to DONE, so every further attempt costs a whole file of DATA |
+| `no-space` | a sync FAIL carrying ENOSPC | Abort the run: every later file would fail the same way |
+| `record-write-failed` | `store.js` gave up on a write (C: full, a persistent antivirus lock) | Abort the run. A failed `pending` write stops that file's SEND |
 | `read-only` | a sync FAIL carrying EROFS | Abort the run |
 | `remote-fail` | any other sync FAIL (EACCES, …) | Counts against the consecutive-failure budget |
 | `timeout` | idle watchdog: no socket progress for 60 s. Verify uses a scaled budget (see Verify) | Counts against the budget |
@@ -370,22 +463,44 @@ P5 reads the tablet's feature list rather than assuming a version.
   `sha256sum`.
 
 **Ours** is pushed, adopted, adopted-size or partial, provided the listing's size and devMtime still
-equal the entry's. **Rule 5 never pre-selects the delete of an `adopted-size` file** (parent rule 8:
-"Weak entries of that kind never pre-select a delete"). Its updates still apply.
+equal the entry's.
 
-**Pending resolution**, at the next plan, from the listing plus RECV:
+**`adopted-size`, pinned down** (second review #14):
+- It stores the **PC file's sha at adoption time**. So a later PC change still proposes an update,
+  and an unchanged PC file reads as in sync.
+- **Rule 5 never pre-selects its delete** (parent rule 8: "Weak entries of that kind never
+  pre-select a delete"). Its updates still apply.
+- An in-sync `adopted-size` file **does not count as covering a label** when rule 5 decides whether
+  to pre-select *another* file's delete.
+- A folder verified with `adopt-size` **does not count as verified for rule 10's "Sync now"**.
+  One click must never overwrite files matched by size alone.
+
+**Pending resolution**, at the next plan, from the listing plus RECV (your decision: RECV). Rows are
+checked top to bottom.
 
 | Listing shows | Check | Outcome |
 |---|---|---|
 | no file | — | Drop the entry. With a `prev`, the old copy was unlinked, so the slot plans a push |
-| the planned size | RECV the file and hash it on the PC: equals the planned sha | `pushed` |
-| `prev`'s size | RECV + hash equals `prev.sha256` | **Restore `prev`**: the old copy survived. Either the SEND never reached adbd, or a FolderTransport temp never got renamed |
-| anything else, or the RECV hash matches neither | — | `partial` (ours; its update is pre-selected) |
-| any | the RECV fails | Stays `pending`, and the folder is flagged. Never a delete candidate |
+| `prev`'s exact (size, devMtime) | none: SEND always unlinks and recreates, so an unchanged mtime means it never ran | **Restore `prev`**: the old copy survived |
+| the planned size, `prev`'s size, or both (same-size updates such as `details.json` are common) | One RECV, hashed on the PC and compared against both shas | Planned sha → `pushed`. `prev.sha256` → restore `prev` (the SEND never reached adbd, or a FolderTransport temp never got renamed) |
+| any other size, or the RECV hash matches neither | — | `partial` (ours; its update is pre-selected) |
+| any | the RECV fails | Stays `pending`, and the folder is flagged. **It plans as a pre-selected update**, because the app was writing that slot and the PC still has the file. Never a delete candidate |
 
-**Case-only renames through a temp name** carry the same intent: `{renameIntent: {from, via, to}}`
-is written to the shard before the first move. The next plan finishes or reverts the rename, so a
-dot-temp left by a kill is never an invisible leaked copy (review #15).
+The RECV costs one file's transfer, and only the file that was in flight is ever pending (or N
+files under batched intent). Open decision 11 covers large files.
+
+**Every rename carries intent** (deviation 1): folder renames, rename-to-match, and case-only renames
+through a temp name. The next plan finishes or reverts a leftover intent by STA2-ing both names, so a
+dot-temp left by a kill is never an invisible leaked copy (review #15), and a renamed folder never
+loses its shard.
+
+**A bound folder that is gone from the device** (an absent root listing plus a STA2 ENOENT) is not
+silently re-created. Parent rule 1 says a bound folder is never re-created, and a multi-GB re-push
+shouldn't be pre-selected just because you deleted the series on the tablet.
+- Its binding is kept, marked `missing`.
+- Its pushes are listed **unticked**, under an anomaly "Removed on <target>" with Re-push and
+  Exclude actions.
+- Open decision 10 has the alternative.
 
 **Verify modes** (`sync:verify {mode}`):
 - `device-hash` is the default. It runs
@@ -394,7 +509,9 @@ dot-temp left by a kill is never an invisible leaked copy (review #15).
 - `read-back` RECVs each file and hashes it on the PC. It is exact and needs no shell, but it is
   slow: every byte crosses USB again.
 - `adopt-size` records size matches as `adopted-size`.
-- On a device without `sha256sum`, the service offers `read-back` or `adopt-size`.
+- On a device without `sha256sum`, the service offers `read-back` or `adopt-size`. A plan that
+  needs an automatic Verify on such a device (a newly linked folder, an unparsable shard) answers
+  `needs-mode` instead of choosing for you.
 - **Timeout:** `sha256sum` prints nothing while it hashes one file, so a flat 60 s idle watchdog
   would fail a multi-GB volume on every attempt (review #19). Verify's idle budget is
   60 s + (the folder's largest file ÷ 8 MiB/s).
@@ -442,7 +559,9 @@ Per-target fields live in `sync-targets.json` and persist immediately (the disab
 
 **Constants.** These are guards and platform limits, each commented where it is defined:
 - mass-delete acknowledgment at ≥50% of a series' chapter files (with ≥10 files), or ≥200 in total;
-- a free-space reserve of 1 GiB;
+- a free-space reserve of 1 GiB. It also absorbs the space that a file unlinked while Komikku
+  holds it open doesn't free yet, so `freeSpaceNeeded` is a bound only together with it (review
+  #16);
 - a re-stat minimum age of 30 s, which is also the `settling` age;
 - a re-plan debounce of 10 s;
 - event coalescing at ≤10/s;
@@ -460,34 +579,43 @@ Per-target fields live in `sync-targets.json` and persist immediately (the disab
 
 ## Persistent files — `userData/sync/`
 
-All are written through `store.js`'s `writeJsonAtomic`:
-1. write `<name>.tmp`;
+All are written through `store.js`'s per-path single-flight queue and `writeJsonAtomic`:
+1. write a unique `<name>.<pid>.<seq>.tmp`;
 2. fsync it, then close it;
-3. rename it over the target, retrying on EBUSY/EPERM/EACCES (5 tries with backoff);
-4. otherwise throw.
+3. rename it over the target, retrying on EBUSY/EPERM/EACCES (5 async tries with backoff);
+4. otherwise throw `record-write-failed`.
 
-Startup sweeps stale `.tmp` files.
+`shutdownNow()` alone uses the synchronous twin. Startup sweeps stale `.tmp` files. Durability is
+as deviation 1 states it: durable across a process kill, atomic across an OS crash.
 
 **`sync-targets.json`.** Holds `{version, adbPath, targets[]}`. `version` increments on every op, and
 an op may carry `expectVersion` for optimistic concurrency.
 
-**`targets/<id>/header.json`.** kind, serial or folderRoot, canonicalRoot, profile, caseInsensitive,
-and caps (lsV2, statV2, shellV2, sha256sum, findPrintf, statF). On a mismatch with the target, the
-record is ignored for deletes and orphans until re-verified (rule 3).
+**`targets/<id>/header.json`.** It holds:
+- `recordEpoch`;
+- kind, serial or folderRoot, canonicalRoot, profile, caseInsensitive;
+- caps (lsV2, statV2, shellV2, sha256sum, findPrintf, statF).
 
-**`targets/<id>/folders/<sha1(folderSlotKey)>.json`.** One shard per managed device folder (deviation 1):
-- the folder fields: `{name, identityKey, pcFolder, verifiedAt, verifyMode, renameIntent?, files}`;
+On a mismatch with the target, the record is ignored for deletes and orphans until re-verified
+(rule 3).
+
+**`targets/<id>/folders/<shardId>.json`.** One shard per managed device folder (deviation 1). The
+`shardId` is random and stable.
+- The folder fields: `{recordEpoch, name, identityKey, pcFolder, state: bound / missing,
+  verifiedAt, verifyMode, renameIntent?, files}`.
 - `files` is keyed by the file's slot key. Each entry is
   `{name, size, sha256, devMtime, origin, prev?}`.
+- A shard whose `recordEpoch` differs from the header's is ignored and garbage-collected.
 
-**`targets/<id>/selection.json`.** Maps an op id to `{sha, selected}` (rule 7: a newer PC version
-is proposed again).
+**`targets/<id>/selection.json`.** `{recordEpoch, ops}`. `ops` maps an op id to `{sha, selected}`
+(rule 7: a newer PC version is proposed again). It is written on every `sync:set-selection`, and a
+forget invalidates it through the epoch.
 
 **`targets/<id>/find-sources.json`.** Holds rows of `{folder, query, include, state,
-candidates[≤5], pick, pinnedUrl, skip, error}`.
+candidates[≤5], pick, pinnedUrl, skip, error}`, written per row.
 
 **`targets/<id>/logs/<ts>.json`.** Keeps 30. Each holds planned totals, final status, and every
-destructive action.
+destructive action. It is written before and after each destructive batch.
 
 **`targets/<id>/covers/<sha1(folder)>.jpg`.** The cache file name is hashed, never built from the
 folder name the renderer supplies (review #22).
@@ -501,34 +629,55 @@ doesn't re-prompt the same connection.
   tablet the same small id, and the prompt never appears again (review #5).
 - A mark is deleted when the monitor sees its device leave, or loses its tracking socket to a server
   restart.
-- Residual risk, accepted: the adb server restarts while the app is closed, without a PC reboot, and
-  hands the tablet the same id. One prompt is then skipped; the Sync tab still works.
+- **A mark is honored for 30 minutes only** (second review #9).
+  - Why: on Windows, `os.uptime()` is `GetTickCount64()/1000` (libuv `src/win/util.c:502-503`).
+    Windows' default "Shut down" is Fast Startup, which hibernates the kernel session, so uptime
+    and the boot epoch survive it. Meanwhile the adb server restarts its id counter.
+  - Without the time limit, the skipped prompt that review #5 described would still be the normal
+    morning case.
+  - 30 minutes still covers what persistence is for: a relaunch after a crash, an update or a
+    reinstall.
+- Residual, accepted: a skipped prompt needs a server restart, the same id, and a reconnect within
+  30 minutes of the mark. The Sync tab still works then.
 
 **`pc-hash-cache.json`.** Main is the only writer.
 
-`forget-record` deletes `targets/<id>/folders/` and `header.json`.
+**Forget and clear.** `forget-record`, and rule 12's clear, write a new `recordEpoch` into
+`header.json` in one atomic write, then delete the stale shards lazily. A half-finished delete can
+therefore never resurrect old entries.
 
 ## IPC contract
 
 Invoke channels use the `sync:` namespace, following `search:` and `app-update:` (`main.js:1845`).
 One push channel, `sync-event`, is kebab-case like every other push channel. The full plan and the
 selection stay in main (parent IPC section); the renderer gets summaries and fetches per-file
-detail per series. **Every channel except `get-state` and `label-preview` answers `disabled` while
-sync is off.**
+detail per series.
+
+**Rules for every channel** (second review #18).
+- **One refusal shape:** `{ok:false, code, message, …extra}`. The codes are `disabled`, `busy`,
+  `disconnected`, `library-missing`, `record-mismatch`, `device-listing-suspect`, `needs-mode`,
+  `blocked`, `invalid` and `version-conflict`.
+- **While sync is off,** every channel answers `disabled` except four:
+  - `get-state`, which then reports `enabled:false` from settings alone and never touches port
+    5037;
+  - `label-preview`, which is pure;
+  - `cancel` and `find-sources:cancel`, so a job can always be stopped.
+- **Turning sync off mid-job** (`applySettings` with `syncEnabled:false`) cancels the job and the
+  find-sources run first, then stops the monitor.
 
 | Channel | Request → response |
 |---|---|
 | `sync:get-state` | → `{enabled, settings, config, adb:{binary, serverVersion, error}, devices[], folderPresence, job, plans:{[targetId]: summary}, prompt, find, prewarm}` |
-| `sync:config-op` | `{op, expectVersion?, …}` → `{ok, config}` or `{ok:false, code, error}`. Ops: `add-target`, `update-target`, `remove-target`, `forget-record`, `set-adb-path`, `add-alias`/`remove-alias`, `add-exclude`/`remove-exclude`, `set-selection-mode`, `ack-anomaly`/`unack-anomaly`, `ignore-suggestion`/`unignore-suggestion`. Identity-changing ops are refused while that target's job runs. `add-target`/`update-target` validate the root (containment rule above) |
+| `sync:config-op` | `{op, expectVersion?, …}` → `{ok, config}` or a refusal (`invalid`, `version-conflict`, `busy`). Ops: `add-target`, `update-target`, `remove-target`, `forget-record`, `set-adb-path`, `add-alias`/`remove-alias`, `add-exclude`/`remove-exclude`, `set-selection-mode`, `ack-anomaly`/`unack-anomaly`, `ignore-suggestion`/`unignore-suggestion`. Identity-changing ops are refused while that target's job runs. `add-target`/`update-target` validate the root (containment rule above) |
 | `sync:locate-adb` | `{rescan?}` → `{candidates:[{path, version, build, source}], resolved, serverVersion}` |
 | `sync:list-devices` | → `{ok, devices:[{serial, state, model, product, transportId}]}`; may start the server (review #8) |
 | `sync:browse-remote` | `{serial, path?}` → `{ok, path (canonical), parent, entries:[{name, isDir}], presets:[{label, path, exists}]}` |
-| `sync:plan` | `{targetId, overrides?:{hashMode, deletePolicy, verifyFirst}}` → `{ok, runId}` or `{ok:false, error: busy / disabled / disconnected / library-missing / record-mismatch / device-listing-suspect}` |
+| `sync:plan` | `{targetId, overrides?:{hashMode, deletePolicy, verifyFirst, verifyMode}}` → `{ok, runId}` or a refusal: `busy`, `disabled`, `disconnected`, `library-missing`, `record-mismatch`, `device-listing-suspect`, or `needs-mode` (an automatic Verify on a device without `sha256sum`) |
 | `sync:series-detail` | `{targetId, seriesKey}` → per-file rows `{opId, kind, name, label, unit, size, origin, preselected, selected, reason, loss, settling}`, plus anomalies and suggestions |
 | `sync:set-selection` | `{targetId, changes:[{opId, selected}]}` or `{bulk:'covered-extras'/'split-parts'/'group', …}` → `{ok, totals, losses, massDelete:{required, count}, changedSeries}` |
-| `sync:verify` | `{targetId, mode?: 'device-hash' / 'read-back' / 'adopt-size', folders?}` → `{ok, runId}` or `{ok:false, code:'needs-mode'}` when the device has no `sha256sum` and no mode was given |
-| `sync:prune` / `sync:rename-device-folder` | → `{ok, runId}` |
-| `sync:apply` | `{targetId, overrides, ackMassDelete, ackLosses:[opId]}` → `{ok, runId}` or `{ok:false, reason:'blocked', blocking, dropped}`. Main re-lists, re-plans and re-checks losses first (rule 6) |
+| `sync:verify` | `{targetId, mode?: 'device-hash' / 'read-back' / 'adopt-size', folders?}` → `{ok, runId}`, or the `needs-mode` refusal when the device has no `sha256sum` and no mode was given |
+| `sync:prune` / `sync:rename-device-folder` | → `{ok, runId}`. Both run as jobs (phases `prune` and `rename`), and both are in the quit-ask set |
+| `sync:apply` | `{targetId, overrides, ackMassDelete, ackLosses:[opId]}` → `{ok, runId}` or the `blocked` refusal with `{blocking, dropped}`. Main re-lists, re-plans and re-checks losses first (rule 6) |
 | `sync:cancel` | → `{ok, wasRunning}` |
 | `sync:prompt-response` | `{promptId, action: review / sync-now / not-now}` → `{ok}` |
 | `sync:library-status` | → `{asOf, bySeries:{[folderPath]: [{targetId, state: synced / pending / absent, pending}]}}` |
@@ -539,8 +688,8 @@ sync is off.**
 
 `sync-event` kinds (each carries `kind`, and job-bound ones carry `runId`):
 - `device`
-- `job`: phase plan/verify/apply/prune; state running/done; byte and file progress; current file;
-  a final `{status: completed / cancelled / failed / disconnected, summary}`
+- `job`: phase plan/verify/apply/prune/rename; state running/done; byte and file progress; current
+  file; a final `{status: completed / cancelled / failed / disconnected, summary}`
 - `config`
 - `prompt`
 - `find`
@@ -549,23 +698,35 @@ sync is off.**
 
 ## Integration edits in existing files
 
-Line numbers are from this branch (`a27aaf4` content). All five rev 1 anchors that `sync-temp/README.md`
-spot-checked match. Every hook call is `try { deviceSync?.x(…) } catch {}` on top of the facade's
-own catch-all (review #2), so a sync defect can't break a path every user runs with sync off.
+Line numbers are from this branch (`a27aaf4` content). The second review re-checked every anchor
+below. Every hook call is `try { deviceSync?.x(…) } catch {}` on top of the facade's own
+catch-all (review #2), so a sync defect can't break a path every user runs with sync off.
+
+**Rev 2 had two identifier bugs here that would have shipped silently** (second review #1, #2):
+- Its init call used four names main.js doesn't define. Building the argument would have thrown, the
+  try/catch would have swallowed it, and sync would have stayed dead with no `sync:*` handler
+  registered.
+- Its merge hook read `args` where the parameter is `opts`. Every merge, dry runs included, would
+  have answered `merge_failed`, for every user.
+
+Rev 3 spells every dependency out. `_test_device_sync_main_isolation.js` asserts the real
+`initDeviceSync` was called once with every dependency present and correctly typed, and it runs a
+dry and a real merge.
 
 | File | Where | Edit |
 |---|---|---|
-| `main.js` | new block after the requires (after `:48`; the in-flight hunk is `:36-41`) | `require("./sync/service")`; `let deviceSync = null;`; `const gotSingleInstanceLock = app.requestSingleInstanceLock(); if (!gotSingleInstanceLock) app.quit();`; `app.on("second-instance", …)` restores and focuses `mainWindow`, or whichever window exists during first-run setup (`BrowserWindow.getAllWindows()[0]`) |
-| `main.js` | the `whenReady` callback, first line (`:1880`) | `if (!gotSingleInstanceLock) return;` |
-| `main.js` | close listener `:555-569` | Ask only while a sync **apply or prune** runs; a plan or verify is cancelled on quit without asking (review #13). The sync term is evaluated after the download term, inside try/catch. The early return becomes "no downloads and no sync blocker". Payload `{running: downloader?.getRunning?.() ?? [], sync}`; `running` is unchanged, so ConfirmQuitDialog keeps working |
+| `main.js` | new block after the requires (after `:48`; the in-flight hunk is `:36-41`) | `let initDeviceSync = null; try { ({ initDeviceSync } = require("./sync/service")); } catch (e) { console.error("[deviceSync] load failed", e); }`. The require itself is isolated, so a load-time throw anywhere in the module tree can't abort main.js (second review #3). Then `let deviceSync = null;`, `const gotSingleInstanceLock = app.requestSingleInstanceLock(); if (!gotSingleInstanceLock) app.quit();`, and `app.on("second-instance", …)`. That handler restores and focuses `mainWindow`, or whichever window exists during first-run setup (`BrowserWindow.getAllWindows()[0]`). When no window exists but the app is ready, setup is done and it isn't quitting, it calls `createWindow()`, so a second launch never just vanishes (second review #19). P5's `AIO_USER_DATA_DIR` hook, if it is ever added, must run **before** the lock call, because Electron keys the lock on the userData directory at call time |
+| `main.js` | the `whenReady` callback, first line (`:1880`) | `if (!gotSingleInstanceLock) return;`. An `app.quit()` before ready defers shutdown, and the ready promise can still resolve |
+| `main.js` | close listener `:555-569` | Ask only while a sync **apply, prune or rename** runs; a plan or verify is cancelled on quit without asking (review #13). The sync term is evaluated after the download term, inside try/catch. The early return becomes "no downloads and no sync blocker". Payload `{running: downloader?.getRunning?.() ?? [], sync}`; `running` is unchanged, so ConfirmQuitDialog keeps working |
 | `main.js` | `onComplete` `:603-606` | After the two existing calls: `notifyLibraryChanged("download")`. A throw here would skip `downloader.js:910`'s `entry._resolveClose()`, making quit wait the full 5 s |
-| `main.js` | metadata:update `:910`, scan-library `:965-1049`, delete-series `:1059`, save-series-meta `:1781` | `notifyLibraryChanged(reason)` after the handler's work |
-| `main.js` | merge-series-folders `:1759` (the handler is itself in-flight) | `const r = await …; if (r?.ok && !args.dryRun) notifyLibraryChanged("merge"); return r;` |
-| `main.js` | save-settings `:694-710` | `deviceSync?.applySettings(merged)` after `appUpdater.applySettings`, fire-and-forget with its own catch, so a sync defect never turns a successful save into a rejected IPC call. It starts or stops the monitor and pre-warm |
+| `main.js` | scan-library `:965-1049`, delete-series `:1059`, save-series-meta `:1781` | `notifyLibraryChanged(reason)` after the handler's work |
+| `main.js` | metadata:update `:910` (today a bare `return runMetadataCli(…)`) | `const r = await runMetadataCli(…); notifyLibraryChanged("metadata"); return r;` |
+| `main.js` | merge-series-folders `:1759` (the handler is itself in-flight; its parameter is `opts`) | `const r = await mergeSeriesFolders({…}); if (r?.ok && r.dryRun === false) notifyLibraryChanged("merge"); return r;`. It tests the **result's** `dryRun` (`series-merge.js:455`, `:493`), because the module defaults `dryRun = true` (`:372`) and a call that omits the flag is a dry run |
+| `main.js` | save-settings `:694-710` | `deviceSync?.applySettings(merged)` after `appUpdater.applySettings`, fire-and-forget with its own catch, so a sync defect never turns a successful save into a rejected IPC call. It starts or stops the monitor and pre-warm, and turning sync off cancels a running job first |
 | `main.js` | reinstall-python `:1824-1842` | Refuse while a sync job runs. `await deviceSync?.cancelFindSources()` (killTree resolves on close, ≤5 s) before `deleteEnv`, whose `rmSync` would otherwise throw EBUSY on a dying `python.exe` (`setup.js:1450-1454`) |
 | `main.js` | app-update:apply-now `:1862-1873`, window-all-closed `:1953-1961` | `await Promise.allSettled([downloader?.cancelAll(), deviceSync?.shutdown({timeoutMs: 5000})])`, run in parallel, with `applyNow()` / `app.quit()` in a `finally` |
 | `main.js` | new `app.on("quit", …)` | `deviceSync?.shutdownNow()` (deviation 8). It covers `app.quit()` (`quit-app` `:1816`, the updater) and `app.exit()` (reinstall-python), neither of which emits `window-all-closed` |
-| `main.js` | after `initDownloader()` `:1934`, before `createWindow()` | `try { deviceSync = initDeviceSync({ipcMain, send: sendToUI, userDataDir, getSettings: () => history.getSettings(), getLibraryRoot, getRunningDownloads, isCheckAllRunning: () => _updateCheck.isRunning(), isSearchRunning: () => searcher?.isRunning(), resolveSpawnPaths, extraEnv: buildPythonEnv(), onFocus: (cb) => app.on("browser-window-focus", cb), isFocused: () => !!BrowserWindow.getFocusedWindow(), getWindow: () => mainWindow, showSaveDialog}) } catch (e) { console.error(…) }`. Window-dependent deps read lazily, because the window doesn't exist yet (review #12) |
+| `main.js` | after `initDownloader()` `:1934`, before `createWindow()` | `if (initDeviceSync) try { deviceSync = initDeviceSync({…}) } catch (e) { console.error("[deviceSync] init failed", e) }`, with every dependency spelled out: `ipcMain`, `send: sendToUI`, `userDataDir: path.join(app.getPath("userData"), "sync")`, `getSettings: () => history.getSettings()`, `getLibraryRoot: () => getConfiguredOutputRoot(resolveSpawnPaths(history.getSettings()).workingDir)` (the merge handler's own expression, `:1761-1769`), `getRunningDownloads: () => downloader?.getRunning?.() ?? []`, `isCheckAllRunning: () => _updateCheck.isRunning()`, `isSearchRunning: () => searcher?.isRunning?.() ?? false`, `resolveSpawnPaths`, `extraEnv: buildPythonEnv()`, `onFocus: (cb) => app.on("browser-window-focus", cb)`, `isFocused: () => !!BrowserWindow.getFocusedWindow()`, `getWindow: () => mainWindow`, `showSaveDialog: (o) => dialog.showSaveDialog(mainWindow, o)`. Window-dependent deps read lazily, because the window doesn't exist yet (review #12) |
 | `preload.js` | the `electronAPI` object | A `sync*` wrapper per channel, plus `onSyncEvent(cb)` returning an unsubscribe (the `onConfirmQuit` shape, `:86-90`) |
 | `library.js` | a new line after `:1118` | `module.exports.KOMIKKU_CH_RE = KOMIKKU_CH_RE; // deviceSync` (review #23: `:1118` is itself in-flight) |
 | `searcher.js` | spawn options; `cancel()` `:255-263`; close handler `:202-208` | (review #11) **(a)** Cancellation is tracked per process, in a `WeakSet` the close handler checks. A single flag would break runSearch's own cancel-previous path (`:120-124`): a new search would reset it, and the old process's late close would report "exited with code 1". **(b)** `cancel()` returns false when `proc.exitCode !== null` or `proc.signalCode !== null`, so a taskkill can't hit a recycled PID between `exit` and `close`. **(c)** It calls `killTree(proc)` and exposes `cancelAndWait()` for callers that must wait. **(d)** On non-Windows the spawn uses `detached: true`, so the group kill reaches Python's children. The close handler treats a tracked cancel as cancelled regardless of code and signal; taskkill gives code 1 and signal null |
@@ -637,7 +798,8 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
 
 **P3. Transports and execution.** `store` (shards), `hash-pool`, `pc-inventory`, `transports`,
 `executor`.
-- Test: `tools/_test_device_sync_exec.js`. Also measure the cost of the per-file shard fsync
+- Test: `tools/_test_device_sync_exec.js`. The batched-intent path is built and tested here; the
+  per-file fsync cost that decides whether it's switched on is measured on your PC in P5
   (deviation 1).
 - **Stop:** green.
 
@@ -655,6 +817,7 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
   - settings load with 0 changed, and Save round-trips;
   - the close-with-download dialog is unchanged, and quit time is unchanged;
   - no `userData/sync/` folder appears;
+  - a series merge works, dry run then real;
   - a second launch focuses the first window.
 - **Stop:** a tools script drives the service end to end through a fake `ipcMain`, against
   FolderTransport and the fake adb server.
@@ -663,14 +826,21 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
 - **Isolate the test first.** Check whether Chromium's `--user-data-dir` moves Electron's `userData`
   for the unpacked exe.
   - If it does, use it.
-  - If not, add a 3-line `AIO_USER_DATA_DIR` hook to main.js, **asking you first**.
+  - If not, add a 3-line `AIO_USER_DATA_DIR` hook to main.js, **asking you first**. It must run
+    before `requestSingleInstanceLock()`, or the test instance still collides with the installed
+    app.
   - Either way, back up `%APPDATA%\aio-downloader-ui\*.json` first; the memory's shared-userData
     trap applies, and so does the single-instance lock (close the installed app first).
 - **Packaged smoke.** Run `npx electron-builder --dir`, then launch the unpacked exe with a temp
   library (`AIO_OUTPUT_DIR`), sync enabled and a folder target.
   - The exe is a GUI app, so it **writes a marker file** under `userData/sync/logs/` instead of
     relying on stdout (review #25).
-  - The marker must show the pre-warm from the eval'd workers inside asar, then a clean quit.
+  - The marker must show that `sync/service` loaded from inside asar, then the pre-warm from the
+    eval'd workers, then a clean quit.
+  - **The NTFS fsync cost per shard write** is measured here; it decides whether batched intent is
+    switched on (deviation 1).
+  - **Quit paths:** after `app.exit()` (the reinstall-python path, simulated) and after a normal
+    close, no find-sources process tree survives (deviation 8).
 - **Live tablet, only with your OK and your hands on the cable.** `tools/_live_device_sync.js` runs
   on the scratch root `/storage/emulated/0/Download/aio-sync-test/` with three series, including
   the SPY×FAMILY and Hell's Paradise name shapes. It measures:
@@ -683,7 +853,10 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
   - **a listing after a reboot, before the first unlock** (review #3);
   - throughput versus adb.exe on the same files, and per-file acks versus a pipelined run;
   - byte-exact UTF-8 names, and `realpath /sdcard`;
-  - an unplug mid-run: abort once, then resume;
+  - an unplug mid-run: abort once, then resume. The resumed plan must show the files acknowledged
+    before the unplug as in sync, not as replaces (second review #7);
+  - **the connect prompt after a Windows "Shut down" (Fast Startup)**: with the app closed, shut
+    down, power on, plug in, and the prompt appears (second review #9);
   - **Komikku reads a synced `local/` with `.nomedia`** (the parent's check, restored; review #25).
 - **Search timing.** Measure the per-query time split on 5 real find-sources queries. Only if the
   probe phase dominates, propose `AIO_SEARCH_PROBE_DEADLINE`. That would touch the in-flight
@@ -716,16 +889,23 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
 - **Settings.** Resolver defaults and invalid-value fallback.
 - **Profiles.** Fill-in of null fields.
 - **Provenance matrix.** pushed / adopted / adopted-size / partial / foreign / pending /
-  changed-on-device. Every pending-resolution row: absent, pushed, restore `prev`, partial, RECV
-  failure.
+  changed-on-device.
+  - Every pending-resolution row: absent; `prev`'s (size, devMtime) shortcut; planned size equal to
+    `prev`'s (one RECV, both shas); pushed; restore `prev`; partial; RECV failure, which plans as a
+    pre-selected update.
+  - A `pushed` entry without devMtime adopts the next listing's devMtime at an equal size.
+- **`adopted-size`.** It stores the PC sha. Its delete is never pre-selected. It never covers a
+  label for another file's delete. A size-verified folder never makes "Sync now" eligible.
+- **Missing bound folder.** Its pushes are listed unticked under the "Removed on <target>"
+  anomaly, and the binding is kept as `missing`.
 - **Per-slot planning.** In sync, update, replace (unticked group), kept name, rename toggle, push,
   `settling`.
-- **Preselection.** Guarded vs add-only; every rule-5 case; an `adopted-size` delete is never
-  pre-selected.
+- **Preselection.** Guarded vs add-only; every rule-5 case.
 - **Losses.** Recomputed on toggle; the mass-delete threshold.
 - **Rule 6.** The re-plan at apply time: changed or vanished ops are dropped, and a new loss blocks.
 - **Rule 10.** "Sync now" eligibility, and one prompt covering several targets on one device.
-- **Rule 12.** The record is cleared when a target's device, root or profile changes.
+- **Rule 12.** The record is cleared when a target's device, root or profile changes, through a new
+  `recordEpoch`; old shards and the old selection are ignored afterwards.
 - **Rule 13.** A series that just finished downloading never shows "synced".
 - **Selection persistence.** Keyed by (op id, sha).
 - **Adoption ladder.** Identity, content ≥90%, name, weak, on sanitized fixtures shaped like the
@@ -743,30 +923,41 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
 - **Golden-byte codecs** for every packet type, at the AOSP struct sizes (STA2 72, DNT2 76, DENT 20
   bytes, including DONE). They include 64-bit sizes and byte-length framing with `×` and `’`.
 - Frames split at every byte offset; an empty `0000` frame.
-- **`devices -l`.** Padding, `transport_id`, the `(no serial number)` serial.
+- **`devices -l`.** Full rows with devpath, `product:`, `model:`, `device:` and `transport_id:`;
+  padding; every state in the set, including `authorizing`, `connecting` and the multi-word
+  "no permissions"; the `(no serial number)` serial, listed but not targetable.
 - shell-v2 demux, exit codes, CloseStdin sent; the legacy `shell:` CRLF path.
 - **Session lifecycle.**
   - A FAIL on file 2 of 5: files 3 to 5 still land, the budget shows 1, and the session is
     reopened.
-  - An early FAIL mid-DATA stops the stream.
+  - An early FAIL mid-DATA stops the stream, read through the single framed reader.
   - A missing `details.json` doesn't kill the reads queued behind it.
+  - **A session that closes without a FAIL on every SEND matching a pattern** charges the budget
+    and aborts the run at it, instead of looping.
+  - Backpressure: pushing a file larger than the test's heap allowance keeps memory bounded, and
+    the idle watchdog counts flushed bytes.
 - **Quiet failures.**
   - A DONE-only listing of a missing directory is not trusted.
   - `.`, `..` and error entries are skipped.
   - The STA2 `error` field drives the case probe and `exists`.
   - Locked storage makes the plan refuse with `device-listing-suspect`.
+  - A truncated root listing (a FUSE error mid-readdir) doesn't turn the missing managed folders
+    into absences: each one is STA2'd first.
+  - A shell-path post-series listing is preceded by a same-session STA2.
 - **Errors.**
   - Classification uses the real `device 'A06B4A372090333' not found` text.
   - ENOSPC and EROFS abort the run.
   - ECONNRESET is handled as EOF, with the ~1 s recheck.
   - The same serial with a new transport id is a removal plus an add.
+  - `device still connecting` and `device still authorizing` are transient, never failures.
 - **Names.**
   - SPY×FAMILY and `Hell’s Paradise` names land byte-exact.
   - A comma in a name survives the last-comma split.
   - A 1,019-byte path is refused before it is sent.
   - A name that isn't valid UTF-8 is never planned.
 - **Cancel mid-SEND.** The socket is destroyed and the fake adbd unlinks the partial.
-- **Fallbacks.** v1; `tport` → `transport`; tracking → polling after 3 failures.
+- **Fallbacks.** v1; `tport` → `transport` only on an unknown-service FAIL (never on
+  `device '…' not found`); tracking → polling after 3 failures.
 - **Server.** `start-server` is called only when the server is unreachable, also for explicit
   actions with no target yet. `kill-server` is never sent.
 
@@ -776,9 +967,18 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
 - **Shard crash windows.** Each one recovers correctly at the next plan:
   - a kill between the `pending` write and the SEND;
   - a kill between OKAY and the `pushed` write;
+  - **a kill after `pushed` writes but before the post-series listing, and a cancel mid-series**:
+    the resumed plan shows those files in sync;
   - a leftover `.tmp`;
-  - a zero-length or unparsable shard, which leaves that folder unverified.
-- A case-only rename killed midway is finished or reverted from `renameIntent`.
+  - a zero-length or unparsable shard, which leaves that folder unverified;
+  - a shard with a stale `recordEpoch` after a half-finished forget: ignored and collected.
+- **Renames.** A folder rename and a case-only rename, each killed before and after the `mv`, are
+  finished or reverted from `renameIntent`. A rename onto an existing destination is refused before
+  `mv` runs.
+- **Writes.** Overlapping writes to one shard coalesce, and their tmp files never collide.
+  `record-write-failed` aborts the run, and a failed `pending` write stops that file's SEND.
+- **Folder-shard drop rule.** A folder absent from a truncated listing keeps its shard; one absent
+  from a trusted listing and STA2 ENOENT goes `missing`.
 - The delete gate: a failed replacement keeps its delete.
 - The slot guard: a case-only rename on a case-insensitive target never deletes the new file.
 - Device loss aborts once, not per series.
@@ -806,14 +1006,22 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
     disconnect.
   - **The prompt appears again after a server restart that reuses the transport id** (an injected
     boot epoch), and a mark clears on disconnect.
+  - **A mark older than 30 minutes is ignored** even when serial, id and boot epoch all match (the
+    Fast Startup case, with an injected clock).
 - **Service E2E.**
-  - Disabled means inert: no socket, no writes under `userData/sync`, and **every** handler except
-    the two named answers `disabled`.
+  - Disabled means inert: no socket (`get-state` included), no writes under `userData/sync`, and
+    **every** handler except the four named answers `disabled`.
+  - Turning sync off mid-job cancels the job and find-sources first; both cancel channels still
+    work while off.
+  - Every refusal has the one shape `{ok:false, code, message}`.
+  - The facade never throws and never rejects, even when its internals do.
+  - `sync:rename-device-folder` runs as a `rename` job and is in the quit-ask set.
   - Config ops: validation (including root containment), versioning, refusal during a job.
   - The main flow: plan → selection → apply → modify / rename / delete on the PC → re-plan (kept
     name) → both delete policies → verify → prune → library root unplugged (refusal).
-  - Quit: `shutdown()` finishes within 5 s; `shutdownNow()` is synchronous and leaves a consistent
-    record.
+  - Quit: `shutdown()` finishes within 5 s. `shutdownNow()` is synchronous and idempotent (called
+    twice), leaves a consistent record, flushes the PC hash cache, and spawns its taskkill
+    detached.
   - find-sources with a fake Searcher.
 - **Contract.** Preload `sync:*` literals equal `contract.CHANNELS`; the hook's event kinds equal
   `EVENT_KINDS`.
@@ -827,10 +1035,16 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
   - Cancel after a natural exit returns false.
   - `cancelAndWait()` resolves on close.
 - **Main isolation** (`_test_device_sync_main_isolation.js`). It loads main.js under a stub
-  `electron` module, with a `deviceSync` whose every method throws. It then checks that
-  get-settings, save-settings, the close listener, onComplete, window-all-closed and the `quit` hook
-  all behave as they do without sync. If main.js's top level can't run under a stub without edits,
-  this test is dropped and the dev-app smoke carries the check; the P4 report would say so.
+  `electron` module.
+  - **With the real `sync/service`:** `initDeviceSync` is called exactly once, with every
+    dependency present and of the right type, and the `sync:*` handlers get registered (second
+    review #1).
+  - **With a `sync/service` that throws at require time:** main.js still loads (second review #3).
+  - **With a `deviceSync` whose every method throws or rejects:** get-settings, save-settings, the
+    close listener, onComplete, metadata:update, merge-series-folders (dry and real, second review
+    #2), window-all-closed and the `quit` hook all behave as they do without sync.
+  - If main.js's top level can't run under a stub without edits, this test is dropped and the
+    dev-app smoke carries the check; the P4 report would say so.
 
 **Hostile names.** `'`, `$`, backtick, `|`, `,`, `DocumentsX`, `..`, newline, NUL, invalid UTF-8,
 names over 255 bytes and paths over 1,018 bytes are rejected or safely quoted, in both
@@ -844,8 +1058,11 @@ names over 255 bytes and paths over 1,018 bytes are rejected or safely quoted, i
 ## Open decisions and risks (my pick → what changes otherwise)
 
 1. **Shipping with in-flight work.** Decided after P6, per CLAUDE.md.
-   - Pick: ship with or after the in-flight library.js / series-merge work.
+   - Pick: ship with or after the in-flight work (`library.js`, `series-merge.js`,
+     `sites/profile_lock.py`).
    - Otherwise the identity rules get duplicated into `sync/`, and two definitions drift.
+   - Either way, the feature diff (`git diff a27aaf4 HEAD -- UI-source`) is rebased onto your local
+     in-flight tree **as it stands at ship time**, which may have moved on from `a27aaf4`.
 2. **AIO-for-Android library as a root.**
    - Pick: it is a plain folder root with a reader profile. Series synced there are read-only in
      the tablet app, because no `.aio_series.json` is pushed.
@@ -876,8 +1093,25 @@ names over 255 bytes and paths over 1,018 bytes are rejected or safely quoted, i
    - Otherwise: pipeline small files with deferred acks, as the adb CLI does. That is faster for
      many small files, but one FAIL then fails the whole pipeline.
 9. **Prompt-mark residual** (`prompted.json`).
-   - Pick: accept one possibly skipped prompt after an adb server restart while the app was closed.
+   - Pick: keep persisted marks, honored for 30 minutes. A prompt can then be skipped only when the
+     server restarts, hands out the same id, and the device reconnects within that window.
    - Otherwise: drop persistence, so every app restart re-prompts a still-connected device.
+10. **A bound folder deleted on the tablet.**
+    - Pick: keep the binding as `missing`, and list its pushes unticked under a "Removed on
+      <target>" anomaly with Re-push and Exclude actions. Deleting a series on the tablet usually
+      means "done reading", and a pre-selected multi-GB re-push would fight that.
+    - Otherwise: drop the binding and plan the series as new, so its pushes are pre-selected (the
+      old scripts' behavior).
+11. **Large `pending` files under your RECV decision.**
+    - Context: resolving a pending file reads it back over USB inside a plan, including the
+      automatic plan behind the connect prompt. One 3 GB volume adds about a minute and a half at
+      30 MB/s.
+    - The `prev` (size, devMtime) shortcut skips the RECV when the SEND never ran. Only the one file
+      that was in flight is ever pending, or N files under batched intent.
+    - Pick: keep RECV as decided, for all sizes.
+    - Otherwise: above 256 MiB, use the device's `sha256sum` when the header reports it, and RECV
+      only without it. Faster, but it leans on the shell for that case, which your decision chose
+      to avoid.
 
 ## Adversarial review disposition (review of rev 1, 2026-10-01)
 
@@ -894,7 +1128,7 @@ on this branch, and AOSP `packages/modules/adb` `main` (commit `1cf2f01`). Verdi
 | 3 | LIST/STA2 fail quietly; DONE is full-size | Confirmed | `:207-208`, `:162-191`, `:210-246`; struct sizes in `file_sync_protocol.h` | Quiet failures; fake fidelity |
 | 4 | devMtime must come from the listing | Partly | "OKAY before the file handle closes" is wrong: the fd closes before OKAY, and only `lutimes` follows it (`:419-421`, `:552-557`); a same-session STA2 runs after `lutimes`. The fix stands for the push-time observation (`sync_to_tablet.py:16-17`, read) and for precision | devMtime section; P5 measurement |
 | 5 | `serial#transportId` suppresses prompts | Confirmed; the fix is extended | `transport.cpp:284-285`: a static counter starting at 1 per server process. A boot epoch alone misses a server restart without a reboot, so marks also clear on disconnect and on server loss | `prompted.json`; open decision 9 |
-| 6 | The journal design is incomplete | Changed fix | The analysis is sound; the journal is replaced by per-folder shards with fsync'd atomic rewrites | Deviation 1; shard crash tests |
+| 6 | The journal design is incomplete | Changed fix | The analysis is sound; the journal is replaced by per-folder shards with fsync'd atomic rewrites. The `.bak` (#6d) is dropped: an atomic rename always leaves the old or the new shard, and either is safe | Deviation 1; shard crash tests |
 | 7 | Two instances share userData/sync | Confirmed | No `requestSingleInstanceLock` in `electron/*.js` (rg) | Your decision: app-wide lock |
 | 8 | The first adb target can't be created | Confirmed | The rev 1 text | When adb.exe still runs |
 | 9 | get-settings spread persists undecided defaults | Confirmed | `SettingsTab.jsx:795-802`, `:913-916`; `history.js:229`, `:58-67` | Settings section; handoff obligation |
@@ -904,16 +1138,45 @@ on this branch, and AOSP `packages/modules/adb` `main` (commit `1cf2f01`). Verdi
 | 13 | Quit coverage gaps | Changed fix | `main.js:1816` (`app.quit()`), `:1832` (`quit` is emitted on `app.exit`); no before-quit/will-quit handlers exist (rg) | Deviation 8; close-listener row |
 | 14 | A hash mismatch must update the PC cache | Confirmed | Logic | Deviation 2 |
 | 15 | Pending needs more outcomes | Confirmed | `:563-576` ("missing ," / "bad mode" FAIL before `send_impl`'s unlink) | Pending-resolution table; `renameIntent` |
-| 16 | Free space depends on the transport | Confirmed | Logic | `freeSpaceNeeded`; exec test |
+| 16 | Free space depends on the transport | Confirmed | Logic | `freeSpaceNeeded`; exec test; the 1 GiB reserve covers a file Komikku holds open |
 | 17 | Error classification | Confirmed | Logic, plus the FAIL texts the review cites (not re-checked against the server's source) | Error table |
 | 18 | Wire-level details | Confirmed | `:563`; `client/file_sync_client.cpp:585`; `commandline.cpp:546`; `transport.cpp:1407-1416`; `adb.cpp:1303-1345` | Framing details; fallbacks |
 | 19 | Verify timeout | Confirmed | Logic (`sha256sum` is silent per file) | Verify budget |
 | 20 | Folder-target containment; presence threads | Confirmed | Logic | `root` field; transports row |
 | 21 | Re-stat age vs debounce | Confirmed | 30 s vs 10 s in rev 1 | Deviation 9 |
 | 22 | Cover cache path | Confirmed | Logic | Hashed cover names |
-| 23 | Editing in-flight files | Confirmed | `git show d1ae7d6:…/library.js` export at `:923`; WIP at `:1118`. The baseline is now commit `a27aaf4` | Branch protocol; library.js row |
+| 23 | Editing in-flight files | Confirmed | `git show d1ae7d6:…/library.js` export at `:923`; WIP at `:1118`. The baseline is now commit `a27aaf4` | Branch protocol; library.js row; `sites/profile_lock.py` in the shipping order |
 | 24 | Test gaps | Confirmed | `_test_update_check_hook.js:42-47` (one-import strip) | Verification lists |
 | 25 | P5 gaps | Confirmed | The parent plan's Phase 6 list | P5 |
+
+### Second review (of rev 2, 2026-10-06)
+
+Rev 3 checked the second review's load-bearing claims against main.js, `series-merge.js`, AOSP, and
+libuv `v1.x` (`src/win/process.c`, `util.c`, `fs.c`). Every one held. The review found no
+delete-safety hole: each failure it built ends in "foreign" or "unverified".
+
+| # | Finding | Verdict | Evidence checked | Where it landed |
+|---|---|---|---|---|
+| 1 | `initDeviceSync` deps name identifiers main.js lacks | Confirmed | `rg -c` on main.js: `userDataDir`, `getLibraryRoot`, `getRunningDownloads`, `showSaveDialog` all 0 | Integration init row; isolation test |
+| 2 | The merge hook reads `args`; the parameter is `opts` | Confirmed | `main.js:1759`; `series-merge.js:372` (default `true`), `:455`, `:493` | Merge row tests `r.dryRun === false`; metadata:update reshaped |
+| 3 | The `require` isn't isolated | Confirmed | Logic | Integration require row |
+| 4 | Shards keyed by name; no rename protocol | Confirmed | Rev 2 text; shell `mv` semantics | Deviation 1 (random ids, rename intent, drop rule); missing-folder rule |
+| 5 | Header and shards can disagree after a partial clear | Confirmed | Rev 2 text | `recordEpoch` |
+| 6 | Write mechanics under-specified | Confirmed | Rev 2 text | Deviation 1 write mechanics; `record-write-failed` |
+| 7 | `pushed` without devMtime breaks resume | Confirmed | Rev 2 text | devMtime adoption rule; exec test; P5 check |
+| 8 | Free reopen allows endless or unaborted runs | Confirmed | Rev 2 text | Session lifecycle; error table; fake injection |
+| 9 | Fast Startup keeps the boot epoch | Confirmed | libuv `src/win/util.c:502-503` (`GetTickCount64`); Fast Startup is hibernation (recall) | 30-minute mark limit; P5 check |
+| 10 | Durability overstated | Confirmed | libuv `src/win/fs.c:2341` (`MoveFileExW`, no write-through) | Deviation 1 wording |
+| 11 | taskkill spawned at `quit` dies with Electron | Confirmed | libuv `src/win/process.c:93-96`, `:1149-1152` (kill-on-close job) | Deviation 8; proc-kill `detached` |
+| 12 | State still waiting in memory | Confirmed | Rev 2 text | Deviation 8 write points |
+| 13 | Pending-resolution gaps | Confirmed; one part left to you | The RECV cost is real, but replacing RECV with device hashing would change your decision | Pending table; `needs-mode`; open decision 11 |
+| 14 | `adopted-size` unpinned | Confirmed | Rev 2 text | The `adopted-size` rules |
+| 15 | `devices -l` parsing | Confirmed | `transport.cpp:1407-1433`, `:1289-1291`, `:988-993`; `adb.cpp:140-175` | Framing details; `connecting` kind |
+| 16 | DATA reader, backpressure, listing race | Confirmed | `:419-421` vs `:552-557`; `:430-450` | Session lifecycle; devMtime section |
+| 17 | A truncated root listing goes unnoticed | Confirmed | `:210-251` | Quiet failures |
+| 18 | Contract and lifecycle inconsistencies | Confirmed | Rev 2 text | IPC rules; the rename job |
+| 19 | Single-instance edge cases | Confirmed | Logic; the review read Electron's `OnQuit` and lock code (not re-checked) | Integration lock row; P5 |
+| 20 | Gaps in the first disposition table | Confirmed | This section | #6, #16 and #23 rows; open decision 1 |
 
 ## Figures
 
@@ -931,4 +1194,7 @@ on this branch, and AOSP `packages/modules/adb` `main` (commit `1cf2f01`). Verdi
 | ~250 KB | Estimated largest shard (One Piece, 1,197 chapters × ~200 B per entry) | derived; the 1,197 is from the parent plan (doc) |
 | 3,072 B shell cap vs 4 KiB legacy payload | Keeps chunked commands valid on every adbd | recall: adb `MAX_PAYLOAD_V1`, not re-checked; the review called it conservative |
 | 22 invoke channels + 1 event channel | The IPC surface this pass ships | derived: the contract table |
+| `GetTickCount64()/1000`; `MoveFileExW(…, MOVEFILE_REPLACE_EXISTING)`; kill-on-close job | Why the boot epoch survives Fast Startup; why a rename is atomic but not durable; why a quit-time taskkill must be detached | read: libuv v1.x `src/win/util.c:502-503`, `fs.c:2341`, `process.c:93-96,1149-1152` |
+| 30 min | How long a prompt mark is honored | this plan's choice: covers crash, update and reinstall relaunches |
+| ~90 s | RECV of a 3 GB pending volume at 30 MB/s | derived; the 30 MB/s USB rate is an assumption, which P5 measures |
 | 30 s settling / re-stat, 10 s debounce, 60 s idle, 8 MiB/s Verify rate, 1 s recheck, 5 s polling, 5 s quit wait, 1 GiB reserve, ≤10 events/s, ≤4 workers, 500-hash flush | Engine constants | this plan's choices (the 8 MiB/s is a deliberately low floor for slow flash, not a measurement) |

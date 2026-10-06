@@ -7,11 +7,12 @@ log; git history owns the events.
 ## Where it stands (2026-10-06)
 
 - **Parent plan:** `plans/add-this-script-s-features-linked-pumpkin.md`, approved 2026-09-30.
-- **Non-UI plan:** `plans/c-users-legoc-claude-plans-add-this-scr-noble-truffle.md`, **draft rev 2,
+- **Non-UI plan:** `plans/c-users-legoc-claude-plans-add-this-scr-noble-truffle.md`, **draft rev 3,
   awaiting your approval.**
-  - Rev 2 folds in the 2026-10-01 adversarial review of rev 1. Every finding was checked against the
-    code and AOSP adb; the plan's last section holds the disposition table.
-  - A second adversarial pass, on rev 2's new designs, is folded in before rev 2 is presented.
+  - Rev 2 folded in the 2026-10-01 adversarial review of rev 1.
+  - Rev 3 folds in a second review of rev 2's new designs (0 critical, 9 major, 11 minor).
+  - Every finding of both reviews was checked against the code, AOSP adb and libuv. The plan's
+    last section holds both disposition tables.
 - **Next:** your approval. Then P0 (groundwork + environment check), reported together with P1
   (pure core).
 - **No sync code exists yet.** `UI-source/electron/sync/` does not exist.
@@ -26,9 +27,18 @@ log; git history owns the events.
 
 ## Open decisions
 
-1. From the plan's own "Open decisions" section: shipping with the in-flight work, the AIO-for-Android
-   root, the downloader.js tree-kill, the push-in-place window, older devices, mid-phase checkpoint
-   commits, sharded record vs journal, per-file acks, the prompt-mark residual.
+1. From the plan's own "Open decisions" section:
+   - shipping with the in-flight work;
+   - the AIO-for-Android root;
+   - the downloader.js tree-kill;
+   - the push-in-place window;
+   - older devices;
+   - mid-phase checkpoint commits;
+   - sharded record vs journal;
+   - per-file acks;
+   - the prompt-mark residual (marks honored for 30 minutes);
+   - a bound folder deleted on the tablet (pick: keep the binding as `missing`, pushes unticked);
+   - large pending files under the RECV decision (pick: RECV for all sizes).
 2. P5's `AIO_USER_DATA_DIR` hook, if Chromium's `--user-data-dir` doesn't isolate the packaged
    test: ask first.
 3. P5's `AIO_SEARCH_PROBE_DEADLINE`, only if measurement shows the probe phase dominates: ask first
