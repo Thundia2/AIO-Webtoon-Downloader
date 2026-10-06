@@ -134,20 +134,60 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // with provider-aware scheduling — same-site jobs don't pile onto the
   // same CDN unless every other site is also in-flight. Emits per-series
   // progress via onUpdateCheckProgress (events tagged by `kind`).
-  checkAllUpdates: () => ipcRenderer.invoke("check-all-updates"),
+  // `opts.force` is the ONLY way to preempt a sweep that is already running
+  // — main refuses a plain call and hands back { status: "already-running",
+  // snapshot } instead, so a Library tab that just remounted resyncs rather
+  // than restarting a half-finished 30-series scan. The Updates Center's
+  // Rescan button is the one caller that passes force.
+  checkAllUpdates: (opts) => ipcRenderer.invoke("check-all-updates", opts || {}),
+  // Snapshot of the current / most recent sweep, or null if none ran this
+  // session. Shape: { runId, state, completed, total, durationMs, aborted,
+  // startedAt, rows: [row] }. Read once on renderer startup by
+  // src/hooks/useUpdateCheck.js so a sweep started before this renderer
+  // existed (window reload) is adopted instead of lost.
+  getUpdateCheckState: () => ipcRenderer.invoke("get-update-check-state"),
   // Abort an in-flight Check All sweep. Kills any running Python procs and
   // prevents queued series from starting. Returns { ok: true } when a scan
   // was active, { ok: false } when no-op (e.g. raced with completion).
   cancelCheckAllUpdates: () => ipcRenderer.invoke("cancel-check-all-updates"),
   // Save or update .aio_series.json (manual URL entry for old downloads)
   saveSeriesMeta: (folderPath, metaData) => ipcRenderer.invoke("save-series-meta", folderPath, metaData),
-  // Progress events during check-all-updates. Payload shape varies by
-  // `kind`:
-  //   { kind: "queued",    folderPath, title, cover, site, total }
-  //   { kind: "running",   folderPath, title, site, completed, total }
-  //   { kind: "completed", folderPath, title, result, completed, total }
-  //   { kind: "done",      completed, total, durationMs, aborted }
-  // The renderer dispatches on `kind` — see UpdatesCenter.jsx.
+  // Fold duplicate series folders into one. Call it TWICE: once with
+  // dryRun:true to get the plan the confirmation dialog renders, then with
+  // dryRun:false to carry it out. Never overwrites — a chapter present in both
+  // folders is reported as a collision and left where it is — and the source
+  // folder is removed only when nothing of value remains in it.
+  // Returns { ok, dryRun, targetFolder, chaptersBefore, chaptersAfter, plans }
+  // on success, or { ok:false, error } for a refusal: "outside_library",
+  // "identity_mismatch" (not provably the same series), "download_running",
+  // "missing_folder". Main owns every rule; see mergeSeriesFolders in main.js.
+  mergeSeriesFolders: (opts) => ipcRenderer.invoke("merge-series-folders", opts),
+  // Cross out (ignored:true) or restore (false) chapters for one series.
+  // `chapters` is an array of labels as they appear in a check result. Persists
+  // to .aio_series.json:chapters_ignored, which the update-check withholds from
+  // `newChapters` and reports as `ignoredChapters` instead — so a crossed-out
+  // chapter keeps showing up (struck through, undoable) but no download button
+  // ever queues it. Main re-reads the file per call, so rapid clicks can't
+  // clobber each other. Returns { ok, chaptersIgnored } — the new full list.
+  setChaptersIgnored: (folderPath, chapters, ignored) =>
+    ipcRenderer.invoke("set-chapters-ignored", folderPath, chapters, ignored),
+  // Progress events during check-all-updates. Every event carries `runId`
+  // (main drops emissions from a superseded run, so the renderer can treat
+  // a changed runId as "a new sweep started"). Payload by `kind`:
+  //   { kind: "queued",    runId, row, completed, total }
+  //   { kind: "running",   runId, row, completed, total }
+  //   { kind: "completed", runId, row, updatedMeta, completed, total }
+  //   { kind: "done",      runId, completed, total, durationMs, aborted }
+  // `row` is the fully-derived panel row ({ folderPath, title, cover, site,
+  // state, newChapters?, ignoredChapters?, total?, error?, errorMessage?,
+  // enqueuedAt }) — main builds it so a live event and a
+  // get-update-check-state snapshot can not disagree. The renderer stores it
+  // verbatim; it does NOT re-derive state from a result shape any more. See
+  // src/hooks/useUpdateCheck.js.
+  // `newChapters` is what the download buttons queue; `ignoredChapters` is
+  // what the user crossed out (rendered struck through, undoable) and rides
+  // BOTH the "found" and "uptodate" states — a series whose every missing
+  // chapter is crossed out is up to date, but still needs its undo affordance.
   onUpdateCheckProgress: (callback) => {
     const handler = (_event, data) => callback(data);
     ipcRenderer.on("update-check-progress", handler);

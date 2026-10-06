@@ -18,13 +18,18 @@ from pathlib import Path
 
 import pytest
 
+import json
+
 from aio_android import (
     _CPU_PRESETS,
+    _MOBILE_SEARCH_PARALLELISM,
     _NET_DEFAULTS,
     _NETWORK_PRESETS,
     apply_network_limit,
     build_argv,
     cpu_percent_for_level,
+    effective_limits,
+    effective_limits_json,
     is_network_limited,
     resume_throttle_flags,
     resume_throttle_flags_json,
@@ -229,3 +234,116 @@ def test_preset_tables_match_the_javascript(js_path):
     assert _js_nested(source, "NETWORK_PRESETS") == _NETWORK_PRESETS
     assert _js_flat(source, "CPU_PRESETS") == _CPU_PRESETS
     assert _js_flat(source, "NET_DEFAULTS") == _NET_DEFAULTS
+
+
+# --------------------------------------------------------------------------
+# effective_limits — the D9 display lie
+#
+# apply_network_limit is a HARD OVERRIDE, and until this existed nothing could
+# ask what it had overridden. The Download screen kept rendering the user's
+# typed imageWorkers while every run used the preset's. These tests pin the
+# property the UI needs: BOTH numbers, always, so it can show the real one and
+# still restore the typed one when the level goes back to unlimited.
+# --------------------------------------------------------------------------
+
+def test_unlimited_reports_the_stored_values_unchanged():
+    limits = effective_limits({"imageWorkers": 9, "imageConcurrency": 12})
+    assert limits["networkManaged"] is False
+    assert limits["knobs"]["imageWorkers"] == {"effective": 9, "stored": 9}
+    assert limits["knobs"]["imageConcurrency"] == {"effective": 12, "stored": 12}
+    assert limits["networkPreview"] is None
+    assert limits["cpuPreview"] is None
+    assert limits["maxCpuPercent"] == 100
+
+
+def test_a_preset_overrides_the_effective_value_but_preserves_the_stored_one():
+    """The exact shape of D9: 9 is what the user typed, 1 is what will run, and
+    the UI has to be able to say both."""
+    limits = effective_limits({"networkLimit": "low", "imageWorkers": 9})
+    assert limits["networkManaged"] is True
+    assert limits["knobs"]["imageWorkers"]["effective"] == 1
+    assert limits["knobs"]["imageWorkers"]["stored"] == 9
+
+
+def test_effective_values_equal_what_build_argv_actually_emits():
+    """The report and the command line must not be able to disagree — that
+    disagreement IS the defect. Checked against the real emitter rather than
+    against the preset table, so a change in either is caught."""
+    settings = {"networkLimit": "balanced", "imageWorkers": 9, "imageConcurrency": 12}
+    limits = effective_limits(settings)
+    emitted = _pairs(build_argv(dict(settings)))
+    for knob, flag in (
+        ("imageConcurrency", "--image-concurrency"),
+        ("imageWorkers", "--image-workers"),
+        ("imagePrefetchDepth", "--image-prefetch-depth"),
+        ("imagePrefetchParallel", "--image-prefetch-parallel"),
+    ):
+        assert emitted[flag] == str(limits["knobs"][knob]["effective"]), knob
+
+
+def test_an_unset_knob_reports_the_python_default_not_none():
+    """A UI cannot render None in a number field. An untouched knob still has a
+    concrete value, and it is aio-dl.py's argparse default."""
+    limits = effective_limits({})
+    for knob, default in _NET_DEFAULTS.items():
+        if knob == "searchParallelism":
+            continue
+        assert limits["knobs"][knob]["stored"] == default
+
+
+def test_search_parallelism_reports_the_mobile_baseline_not_the_desktop_one():
+    """build_search_argv defaults to 4 on Android where aio-dl.py's argparse
+    defaults to 6. Reporting 6 would be a second display lie dressed up as a
+    fix for the first."""
+    assert _NET_DEFAULTS["searchParallelism"] == 6
+    limits = effective_limits({})
+    assert limits["knobs"]["searchParallelism"]["stored"] == _MOBILE_SEARCH_PARALLELISM
+    assert limits["knobs"]["searchParallelism"]["effective"] == _MOBILE_SEARCH_PARALLELISM
+
+
+def test_search_parallelism_effective_matches_the_search_argv():
+    from aio_android import build_search_argv
+
+    settings = {"networkLimit": "low"}
+    limits = effective_limits(dict(settings))
+    argv = build_search_argv("x", dict(settings))
+    emitted = argv[argv.index("--search-parallelism") + 1]
+    assert emitted == str(limits["knobs"]["searchParallelism"]["effective"])
+
+
+def test_cpu_level_is_reported_independently_of_the_network_level():
+    limits = effective_limits({"cpuLimit": "high"})
+    assert limits["networkManaged"] is False
+    assert limits["maxCpuPercent"] == 75
+    assert limits["cpuPreview"] == "~75% of CPU cores"
+    assert limits["cpuLimitLabel"] == "High"
+
+
+def test_preview_strings_mirror_the_renderer_reference():
+    """Same text as networkPreviewText / cpuPreviewText in
+    UI-source/src/lib/resourceLimits.js, so the two apps describe a preset the
+    same way."""
+    limits = effective_limits({"networkLimit": "low", "cpuLimit": "low"})
+    assert limits["networkPreview"] == "curl_cffi 2 · workers 1 · prefetch 1×1 · search 2"
+    assert limits["cpuPreview"] == "~25% of CPU cores"
+
+
+def test_unknown_levels_fail_open_here_too():
+    limits = effective_limits({"networkLimit": "nonsense", "cpuLimit": 7})
+    assert limits["networkLimit"] == "unlimited"
+    assert limits["cpuLimit"] == "unlimited"
+    assert limits["networkManaged"] is False
+
+
+def test_effective_limits_json_never_raises_on_a_bad_blob():
+    """A settings screen that cannot ask this question would have to guess, and
+    guessing is the defect it exists to close."""
+    for bad in ("", "not json", "[1,2]", "null"):
+        payload = json.loads(effective_limits_json(bad))
+        assert payload["networkLimit"] == "unlimited"
+        assert payload["networkManaged"] is False
+
+
+def test_effective_limits_json_round_trips():
+    payload = json.loads(effective_limits_json(json.dumps({"networkLimit": "high"})))
+    assert payload == effective_limits({"networkLimit": "high"})

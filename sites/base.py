@@ -45,10 +45,98 @@ except Exception:
 # symbol there before this refactor.
 try:
     from curl_cffi.requests import AsyncSession as _CurlCffiAsyncSession
+    from curl_cffi.const import CurlHttpVersion as _CurlHttpVersion
+    from curl_cffi.const import CurlOpt as _CurlOpt
     _CURL_CFFI_AVAILABLE = True
 except Exception:  # ImportError or any sub-dep failure
     _CurlCffiAsyncSession = None  # type: ignore[assignment]
+    _CurlHttpVersion = None  # type: ignore[assignment]
+    _CurlOpt = None  # type: ignore[assignment]
     _CURL_CFFI_AVAILABLE = False
+
+
+# --- fast-download timeout semantics ---------------------------------------
+# THE BUG THIS ENCODES A FIX FOR (bench/linewebtoonlogs.md, 2026-08-20):
+# curl_cffi's scalar `timeout=` is a TOTAL-TRANSFER deadline (it sets only
+# CurlOpt.TIMEOUT_MS — see curl_cffi/requests/utils.py:set_curl_options), while
+# `requests`/cloudscraper's `timeout=` — which aio-dl.py:_try_download_url uses
+# on the SLOW path — is a per-read STALL timeout. So the same `--http-timeout 30`
+# means "30s of silence" on the slow path and "30s total, healthy or not" here.
+# On LINE Webtoon (400-800 KB vertical-strip pages on Naver's swebtoon-phinf
+# CDN) a page that HTTP/2-starves down to ~20 KB/s needs ~35s, so it was
+# guillotined mid-transfer, retried from byte 0, and guillotined again:
+# 17 of the 18 logged failures were transfers still making progress, one at
+# 670472 of 678424 bytes (98.8%). Two such pages then failed the chapter's
+# zero-tolerance gate and --multi-source "rescued" a 120-page official chapter
+# with a 103-page third-party re-host.
+#
+# The fix is to measure STALLS instead of totals: LOW_SPEED_LIMIT/_TIME abort
+# only when throughput actually collapses, so a slow-but-live transfer finishes
+# while a dead socket still dies on the user's `--http-timeout` schedule.
+# TIMEOUT_MS survives as a ceiling so nothing can hang indefinitely on a
+# trickle that stays just above the low-speed floor.
+#
+# Deliberately NOT done: HTTP Range resume on retry. Neither observed
+# pathology needs it (a progressing transfer now completes on the first
+# attempt; a hard-stalled one needs a different CONNECTION, not a byte
+# offset), and partial-body resume would have to be validated against CDNs
+# that silently ignore Range and re-serve from 0.
+
+# A transfer below this many bytes/sec for the caller's whole `timeout` window
+# is dead rather than slow. Well under the ~20 KB/s a starved HTTP/2 stream on
+# a busy CDN connection still achieves, so genuinely-moving transfers never
+# trip it. The DURATION is the caller's --http-timeout, not a constant here,
+# which is what makes the flag mean the same thing it means on the slow path.
+_FAST_DL_STALL_BYTES_PER_SEC = 1024
+
+# Absolute per-page ceiling as a multiple of the caller's timeout, applied via
+# TIMEOUT_MS. 6x the 30s default = 3 min, comfortably above the ~40s a worst-
+# case 800 KB page needs at the slowest rate observed live (17 KB/s).
+_FAST_DL_CEILING_MULTIPLIER = 6
+
+# Attempts per page. Attempt 0 rides the shared multiplexed session; later
+# attempts escalate onto their own connection (see _fast_dl_retry_options),
+# which is what breaks an HTTP/2 stream that stalled at a fixed byte offset
+# (the log shows the same URL dying at exactly 131064 bytes three times, then
+# "HTTP/2 stream 211 was not closed cleanly: PROTOCOL_ERROR").
+_FAST_DL_DEFAULT_ATTEMPTS = 3
+
+
+def _fast_dl_stall_options(timeout: float) -> Dict[Any, Any]:
+    """curl options implementing "abort on stall, not on elapsed time".
+
+    Returned as a session-level `curl_options` dict because curl_cffi applies
+    those AFTER every option it derives itself ("set extra options, after all
+    others, because it will alter some options"), which is what lets these
+    override the CONNECTTIMEOUT the scalar `timeout=` would otherwise leave
+    unset. Per-request `curl_options` is NOT available on AsyncSession.request
+    in curl_cffi 0.15 — only on the constructor — hence one session per
+    attempt tier rather than one option dict per call.
+    """
+    if not _CURL_CFFI_AVAILABLE:
+        return {}
+    t = max(1.0, float(timeout))
+    return {
+        _CurlOpt.CONNECTTIMEOUT_MS: int(t * 1000),
+        _CurlOpt.LOW_SPEED_LIMIT: _FAST_DL_STALL_BYTES_PER_SEC,
+        _CurlOpt.LOW_SPEED_TIME: int(math.ceil(t)),
+    }
+
+
+def _fast_dl_retry_options(timeout: float) -> Dict[Any, Any]:
+    """Stall options plus "do not touch the pooled connection".
+
+    FRESH_CONNECT opens a new connection for the request and FORBID_REUSE
+    closes it afterwards, so a retry cannot land back on the same HTTP/2
+    connection whose stream just stalled — and cannot poison the pool for the
+    pages still succeeding on it.
+    """
+    opts = _fast_dl_stall_options(timeout)
+    if opts:
+        opts[_CurlOpt.FRESH_CONNECT] = 1
+        opts[_CurlOpt.FORBID_REUSE] = 1
+    return opts
+
 
 # Exceptions from a probe fetch that mean "we couldn't MEASURE this page in time"
 # (slowness), NOT "the page/CDN is definitively broken". The image-quality probe
@@ -745,6 +833,7 @@ class BaseSiteHandler:
         record_host_failure: Optional[Callable[..., None]] = None,
         scraper: Any = None,
         pending_suffix: str = "",
+        attempts: int = _FAST_DL_DEFAULT_ATTEMPTS,
     ) -> List[Tuple[int, Optional[str]]]:
         """Bulk-download chapter images via curl_cffi async + HTTP/2.
 
@@ -765,8 +854,17 @@ class BaseSiteHandler:
           concurrency:    asyncio.Semaphore bound. 8 is the bench-stable
                           default. Past ~12 is diminishing returns on most
                           home networks (network-bandwidth-limited).
-          timeout:        Per-request socket timeout. 30s matches aio-dl.py's
-                          default _HTTP_TIMEOUT.
+          timeout:        STALL budget, not a total-transfer deadline: a page
+                          is abandoned after `timeout` seconds below
+                          _FAST_DL_STALL_BYTES_PER_SEC, not after `timeout`
+                          seconds of downloading. Also the connect timeout.
+                          30s matches aio-dl.py's default _HTTP_TIMEOUT and
+                          the meaning `requests` gives the same number on the
+                          slow path. An absolute ceiling of
+                          _FAST_DL_CEILING_MULTIPLIER x timeout still applies.
+                          See the module-level comment above
+                          _FAST_DL_STALL_BYTES_PER_SEC for why this is not
+                          curl_cffi's default scalar-timeout behaviour.
           is_cancelled:   Optional callback. When True, every in-flight fetch
                           checks before sending the next request and bails.
           record_host_failure: Optional callback fired when a URL hard-fails.
@@ -787,6 +885,12 @@ class BaseSiteHandler:
                           like LineWebtoon ride along their .webtoons.com
                           age-gate cookies even though the curl_cffi session
                           is a separate TLS session from cloudscraper's.
+          attempts:       Tries per page before it counts as a miss. Attempt 0
+                          shares the multiplexed session; every later attempt
+                          gets its own connection, and the last also drops to
+                          HTTP/1.1 (grep _fast_dl_retry_options). Callers pass
+                          the user's --http-max-retries; the old hardcoded 2
+                          ignored it entirely.
           pending_suffix: Appended to the ".pending_<base>" tempfile name (NOT
                           the final page name — finalize_pending_image renames by
                           the explicit `base`). aio-dl.py's image-prefetch worker
@@ -840,8 +944,16 @@ class BaseSiteHandler:
         first_host_for_headers = urlparse(download_tasks[0][1]).netloc
         headers = self._fast_dl_build_headers(first_host_for_headers)
 
+        # Stall budget vs. absolute ceiling — see the module-level comment on
+        # _FAST_DL_STALL_BYTES_PER_SEC. `timeout` is what the user set with
+        # --http-timeout; `ceiling` only exists so a transfer that trickles
+        # just above the low-speed floor can't run forever.
+        stall_timeout = max(1.0, float(timeout))
+        ceiling = stall_timeout * _FAST_DL_CEILING_MULTIPLIER
+        n_attempts = max(1, int(attempts))
+
         async def _fetch_one(
-            session, sema, page_idx: int, url: str, folder: str, filename: str
+            get_session, sema, page_idx: int, url: str, folder: str, filename: str
         ) -> Tuple[int, Optional[str]]:
             base, _ = os.path.splitext(filename)
             if not base:
@@ -849,14 +961,26 @@ class BaseSiteHandler:
             pending_path = os.path.join(folder, f".pending_{base}{pending_suffix}")
             host = urlparse(url).netloc
 
-            # Two attempts: original + one retry on transient failure. No
-            # variant cascade — alternates rarely exist on image CDNs and
+            # Escalating attempts rather than N identical tries. Attempt 0 uses
+            # the shared multiplexed session; later attempts get their own
+            # connection so a page whose HTTP/2 stream stalled is not retried
+            # onto the very connection that starved it, and the final attempt
+            # also drops to HTTP/1.1 (grep _tier_for_attempt).
+            # No URL-variant cascade — alternates rarely exist on image CDNs and
             # subclasses can override fast_download_images entirely if they
             # need one. (MangaFire confirmed: alternative path segments
             # /o/, /full/, /orig/ and extensions .png, .webp all 404.)
-            for attempt in range(2):
+            #
+            # The inter-attempt backoff is deliberately taken OUTSIDE the
+            # semaphore: a page that is only sleeping must not occupy one of
+            # the `concurrency` slots that its still-healthy siblings need.
+            retry_delay = 0.0
+            for attempt in range(n_attempts):
                 if is_cancelled is not None and is_cancelled():
                     return page_idx, None
+                if retry_delay:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = 0.0
                 async with sema:
                     # Re-check after sema acquire — coroutines that were
                     # queued before cancel was set should still bail here
@@ -866,7 +990,8 @@ class BaseSiteHandler:
                     if is_cancelled is not None and is_cancelled():
                         return page_idx, None
                     try:
-                        r = await session.get(url, headers=headers, timeout=timeout)
+                        session = await get_session(attempt)
+                        r = await session.get(url, headers=headers, timeout=ceiling)
                     except Exception as exc:
                         # Per-attempt visibility: shows up in aio-dl's stderr
                         # which the UI's LogPanel surfaces. Ported from the
@@ -876,8 +1001,8 @@ class BaseSiteHandler:
                         # fast_download_images and skip the print.
                         import sys
                         print(f"[-] curl_cffi exception: {exc} for URL: {url}", file=sys.stderr)
-                        if attempt < 1:
-                            await asyncio.sleep(1.0)
+                        if attempt < n_attempts - 1:
+                            retry_delay = min(4.0, 1.0 * (attempt + 1))
                             continue
                         if record_host_failure is not None:
                             try:
@@ -906,8 +1031,22 @@ class BaseSiteHandler:
                         f"size={body_len} for URL: {url}",
                         file=sys.stderr,
                     )
-                    if attempt < 1:
-                        await asyncio.sleep(1.0)
+                    # A permanent 4xx will not become a 200 on attempt 4, and
+                    # retrying it costs more than wall-clock: record_host_failure
+                    # only fires on the LAST attempt, so grinding through the
+                    # full budget also DELAYS the ghost-chapter detector that
+                    # feeds on those uniform (status, body_size) signatures
+                    # (mangafire's 5051-byte 403 placeholders — grep
+                    # _is_ghost_chapter_signature in aio-dl.py). 408/429 are the
+                    # two 4xx that genuinely mean "later", so they keep retrying.
+                    # Mirrors _classify_response_failure's permanent/retryable
+                    # split on the slow path.
+                    permanent = (
+                        400 <= r.status_code < 500
+                        and r.status_code not in (408, 429)
+                    )
+                    if attempt < n_attempts - 1 and not permanent:
+                        retry_delay = min(4.0, 1.0 * (attempt + 1))
                         continue
                     if record_host_failure is not None:
                         try:
@@ -954,19 +1093,70 @@ class BaseSiteHandler:
                 return page_idx, final
             return page_idx, None
 
+        # Three session tiers, regardless of how many attempts the user allows:
+        #   0 = shared, multiplexed, keep-alive (the fast path)
+        #   1 = own connection per request, still HTTP/2
+        #   2 = own connection per request, forced HTTP/1.1
+        # Collapsing the middle attempts onto one tier matters because each
+        # tier is a real AsyncSession (curl_options is constructor-only in
+        # curl_cffi 0.15) — keying tiers by raw attempt number would build a
+        # fresh session per retry for no behavioural difference.
+        _TIER_SHARED, _TIER_FRESH, _TIER_H11 = 0, 1, 2
+
+        def _tier_for_attempt(attempt: int) -> int:
+            if attempt <= 0:
+                return _TIER_SHARED
+            if attempt >= n_attempts - 1 and n_attempts >= 3:
+                return _TIER_H11
+            return _TIER_FRESH
+
+        def _session_kwargs_for_tier(tier: int) -> Dict[str, Any]:
+            """AsyncSession kwargs for one tier. Later tiers open their own
+            connection per request, and the last also drops to HTTP/1.1, so a
+            page that a stalled or protocol-erroring HTTP/2 connection could
+            not deliver gets a genuinely different transport rather than
+            another identical try on the same wire."""
+            kw: Dict[str, Any] = {"impersonate": self.FAST_DL_IMPERSONATE}
+            if cookies:
+                kw["cookies"] = cookies
+            if tier == _TIER_SHARED:
+                kw["curl_options"] = _fast_dl_stall_options(stall_timeout)
+            else:
+                kw["curl_options"] = _fast_dl_retry_options(stall_timeout)
+                if tier == _TIER_H11 and _CurlHttpVersion is not None:
+                    kw["http_version"] = _CurlHttpVersion.V1_1
+            return kw
+
         async def _run() -> List[Tuple[int, Optional[str]]]:
             sema = asyncio.Semaphore(max(1, int(concurrency)))
-            # Single AsyncSession across all pages of this chapter so HTTP/2
-            # multiplex + connection keepalive amortize TLS handshake cost.
-            # impersonate sets the JA3/JA4 + h2 settings frame to match a
+            # Tier 0: one AsyncSession across all pages of this chapter so
+            # HTTP/2 multiplex + connection keepalive amortize TLS handshake
+            # cost. impersonate sets the JA3/JA4 + h2 settings frame to match a
             # real browser — should not strictly be needed for cookieless
             # edge-cached image CDNs, but defensive (and free).
-            session_kwargs: Dict[str, Any] = {"impersonate": self.FAST_DL_IMPERSONATE}
-            if cookies:
-                session_kwargs["cookies"] = cookies
-            async with _CurlCffiAsyncSession(**session_kwargs) as s:
+            #
+            # Retry tiers are built LAZILY and cached: a clean chapter (the
+            # overwhelmingly common case) never pays for a second session, but
+            # when several pages do fail they share one retry session instead
+            # of each constructing their own.
+            sessions: Dict[int, Any] = {}
+            session_lock = asyncio.Lock()
+
+            async def _get_session(attempt: int):
+                tier = _tier_for_attempt(attempt)
+                s = sessions.get(tier)
+                if s is not None:
+                    return s
+                async with session_lock:
+                    s = sessions.get(tier)
+                    if s is None:
+                        s = _CurlCffiAsyncSession(**_session_kwargs_for_tier(tier))
+                        sessions[tier] = s
+                    return s
+
+            try:
                 tasks = [
-                    _fetch_one(s, sema, p_idx, url, folder, name)
+                    _fetch_one(_get_session, sema, p_idx, url, folder, name)
                     for p_idx, url, folder, name in download_tasks
                 ]
                 # return_exceptions=True (INFRA-1): a single page coroutine that
@@ -981,6 +1171,15 @@ class BaseSiteHandler:
                     out.append(res if not isinstance(res, BaseException)
                                else (p_idx, None))
                 return out
+            finally:
+                # Close every tier we actually opened. Swallowing here is
+                # deliberate: a close failure must not turn a chapter whose
+                # pages all landed into a failed one.
+                for s in sessions.values():
+                    try:
+                        await s.close()
+                    except Exception:
+                        pass
 
         # Run in this thread's own event loop. asyncio.run constructs a fresh
         # loop, so works whether called from main thread or from a daemon

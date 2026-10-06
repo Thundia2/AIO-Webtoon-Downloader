@@ -50,8 +50,10 @@ from aio_config import (
     CANONICAL_HID_MARKER,
     DEFAULT_OUTPUT_DIR,
     ignored_library_filenames,
+    load_aio_config,
     read_hid_marker,
     resolve_output_dir,
+    supported_hid_markers,
     write_hid_marker,
 )
 from sites import get_handler_by_name, get_handler_for_url
@@ -257,6 +259,16 @@ _PERMANENT_SKIP_REASONS = frozenset({
     "mature_login_required", "locked", "comix_pages_stalled",
     "decode_dropped_pages",
 })
+
+# Seconds to wait before the ONE quick primary retry a near-miss chapter gets
+# ahead of --multi-source (grep NEAR-MISS in _process_chapter_strict). Short on
+# purpose: the whole justification for this retry is that reason=="incomplete"
+# proves the host is alive, so it is a blip-length pause, not the CDN-recovery
+# wait that --inline-chapter-backoff owns (30s, doubling, and it still runs
+# after alternatives). Env-only rather than a CLI flag — "how long is a blip"
+# is not a decision worth another knob, and the useful override is really just
+# 0 for tests.
+_NEAR_MISS_RETRY_BACKOFF = float(os.getenv("AIO_NEAR_MISS_RETRY_BACKOFF", "5"))
 
 
 # -----------------------------------------------------------
@@ -491,12 +503,438 @@ def _sanitize_folder_component(name: str) -> str:
     return name or "comic"
 
 
-def allocate_series_output_dir(title: str, hid: str, root: str = DEFAULT_OUTPUT_DIR) -> str:
+# ──────────────────────────────────────────────────────────────────
+# SERIES FOLDER IDENTITY
+#
+# A series folder is identified by WHAT IT HOLDS, never by what it is called.
+# Two files carry that identity: `.aio_series.json` (url + hid + site, written
+# at the end of every successful run) and `.series_hid` (the bare hid, written
+# EAGERLY at allocation time — so it is all a run that crashed before its first
+# chapter leaves behind).
+#
+# WHY THIS EXISTS (2026-08-21): allocate_series_output_dir used to key purely on
+# the site's TITLE STRING, consulting `.series_hid` only for the single path
+# that title produced. So when a site RENAMED a series the title-derived folder
+# did not exist and a second folder was created — carrying an IDENTICAL
+# `.series_hid`. Two real cases, both forked nine seconds apart during one
+# library update sweep: MangaDex retitled "Isekai de Slow Life o (Ganbou)" ->
+# "...wo (Ganbou)" (59 chapters + 5), atsumaru retitled "Konosuba:" ->
+# "Konosuba!" (133 + 1). The library then showed two entries per series and the
+# update check broke in BOTH directions: the 59-chapter folder reported "5 new"
+# forever (the delta kept landing in the fork) and the fork reported "59 new".
+# The hid marker was a collision TIEBREAKER and never a lookup INDEX; these
+# helpers make it the index.
+#
+# Read by allocate_series_output_dir (the fix) and by _warn_duplicate_series_
+# folders (the end-of-run net for the one shape identity cannot catch: a site
+# that changes its hid AND its url in the same relaunch, leaving nothing in
+# common — only anilist_id, which is not known until enrichment has run).
+#
+# MIRROR TWINS on the UI side, which scans the library in JS and cannot import
+# this: UI-source/electron/library.js:seriesIdentityKey / groupEntriesBySeries,
+# and library_state.py:series_identity_key for the Android/CLI scanner. Grep
+# seriesIdentityKey if you touch the matching rules here.
+# ──────────────────────────────────────────────────────────────────
+
+# The literal also appears at the _load_series_meta / _load_cached_anilist_id
+# readers and the writer in main(); library_state.SERIES_META_FILE is the same
+# string for the Android side. Grep .aio_series.json.
+_SERIES_META_FILENAME = ".aio_series.json"
+
+# What a reader would actually see in a series folder. Mirrors
+# library_state.SUPPORTED_BOOK_EXTS and library.js's OUTPUT_EXTENSIONS.
+_SERIES_PAYLOAD_EXTS = {".pdf", ".epub", ".cbz"}
+
+
+def _strip_rotating_hid_suffix(value: str) -> str:
+    # Asura (and similar) bake a rotating hex hash into the slug they use
+    # as the hid: "sss-class-suicide-hunter-46f09241". The asura handler
+    # now stabilizes the hid by stripping that hash, but folders downloaded
+    # before the fix are still marked with the OLD full-slug hid. Reduce
+    # both to a hash-free base so a stabilized hid maps onto the existing
+    # folder. Non-rotating hids (comick short ids, mangadex UUIDs whose
+    # groups never change) only reach here when existing != want, which
+    # for stable hids never happens — so this is effectively asura-only.
+    return re.sub(r"-[0-9a-f]{6,}$", "", str(value or ""))
+
+
+def _hids_match(existing: Optional[str], want: str) -> bool:
+    # True when the folder belongs to this series. Exact match, or equal
+    # once a rotating hash suffix is stripped from both sides (migration
+    # for the stabilized asura hid). Require a non-empty base so two
+    # unrelated markers can't both collapse to "" and false-match.
+    if existing is None:
+        return False
+    if str(existing) == str(want):
+        return True
+    base_existing = _strip_rotating_hid_suffix(str(existing))
+    return bool(base_existing) and base_existing == _strip_rotating_hid_suffix(str(want))
+
+
+def _normalize_series_url(value: Any) -> str:
+    """Comparable form of a stored series URL; "" when there isn't one.
+
+    args.comic_url is a LIST until main() collapses it (grep `args.comic_url =
+    urls[0]`), and a .aio_series.json written from either shape has to compare
+    equal, so a list is reduced to its first element rather than str()'d into
+    "['https://...']". Scheme/host are case-folded and a leading www. and
+    trailing slash dropped; the PATH is left alone because plenty of sites
+    serve case-sensitive slugs.
+    """
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    m = re.match(r"^(https?://)(?:www\.)?([^/]+)(.*)$", text, re.IGNORECASE)
+    if not m:
+        return text.lower()
+    return f"{m.group(1).lower()}{m.group(2).lower()}{m.group(3)}"
+
+
+def _read_series_folder_record(
+    folder: str, *, markers: Tuple[str, ...]
+) -> Optional[Dict[str, Any]]:
+    """Identity + payload weight for one series folder. None when unreadable.
+
+    `markers` is hoisted by the caller ON PURPOSE: aio_config.read_hid_marker
+    re-reads aio_config.json on EVERY call, which is fine once and is not fine
+    136 times per allocation.
+    """
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return None
+
+    marker_hid: Optional[str] = None
+    for marker in markers:
+        if marker not in names:
+            continue
+        try:
+            with open(os.path.join(folder, marker), "r", encoding="utf-8", errors="ignore") as f:
+                value = f.read().strip()
+        except OSError:
+            continue
+        if value:
+            marker_hid = value
+            break
+
+    meta: Dict[str, Any] = {}
+    if _SERIES_META_FILENAME in names:
+        try:
+            with open(os.path.join(folder, _SERIES_META_FILENAME), "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                meta = loaded
+        except (OSError, ValueError):
+            meta = {}
+
+    # Payload weight decides which folder wins when several match — i.e. when
+    # the library already carries a fork. Counts what a reader would see:
+    # archives at the folder root plus --format none chapter dirs.
+    n_files = sum(1 for n in names if os.path.splitext(n)[1].lower() in _SERIES_PAYLOAD_EXTS)
+    if "images" in names:
+        images_dir = os.path.join(folder, "images")
+        try:
+            n_files += sum(
+                1
+                for n in os.listdir(images_dir)
+                if n.lower().startswith(("chapter_", "ch_"))
+                and os.path.isdir(os.path.join(images_dir, n))
+            )
+        except OSError:
+            pass
+
+    return {
+        "folder": folder,
+        "name": os.path.basename(folder),
+        "marker_hid": marker_hid,
+        "url": meta.get("url"),
+        "hid": meta.get("hid"),
+        "site": meta.get("site"),
+        "title": meta.get("title"),
+        "anilist_id": meta.get("anilist_id"),
+        "n_downloaded": len(meta.get("chapters_downloaded") or []),
+        "n_files": n_files,
+    }
+
+
+def _series_identity_matches(
+    record: Dict[str, Any], *, hid: str, site: Optional[str] = None, url: Optional[str] = None
+) -> bool:
+    """True when `record` describes the same series as (hid, site, url).
+
+    Three tiers, strongest first:
+      url     — a URL names exactly one series page, so it wins outright and is
+                site-independent (it survives a site changing its id scheme).
+      site+hid— the ordinary path. The site guard is NEW and closes a latent
+                hazard: markers hold a bare hid, so two sites that both mint
+                short base-36 ids (atsumaru, comix) could collide on one.
+      marker  — only when the folder has no .aio_series.json, i.e. a run that
+                crashed before its first chapter. That is exactly the trust the
+                pre-fix code already extended to the title-derived folder.
+
+    `site=None` keeps the old hid-only behavior, so a caller that has no site to
+    offer is never made stricter than it was.
+    """
+    want_url = _normalize_series_url(url)
+    if want_url and _normalize_series_url(record.get("url")) == want_url:
+        return True
+
+    if not any(
+        _hids_match(candidate, hid)
+        for candidate in (record.get("marker_hid"), record.get("hid"))
+        if candidate
+    ):
+        return False
+
+    record_site = str(record.get("site") or "").strip()
+    if record_site and site:
+        return record_site == str(site).strip()
+    return True
+
+
+def _series_folder_sort_key(record: Dict[str, Any]) -> Tuple[Any, ...]:
+    # Richest first: a fork's new chapters belong beside the bulk of the series,
+    # not in the husk. `_preferred` is layered on by the caller so an exact tie
+    # keeps whichever folder the site's CURRENT title points at, and `name` makes
+    # the remaining ties deterministic. MIRROR TWIN of the primary-selection rule
+    # in UI-source/electron/library.js:groupEntriesBySeries — grep it.
+    return (
+        -(1 if (record["n_files"] or record["n_downloaded"]) else 0),
+        -record["n_downloaded"],
+        -record["n_files"],
+        0 if record.get("_preferred") else 1,
+        record["name"],
+    )
+
+
+def find_matching_series_folders(
+    root: str,
+    *,
+    hid: str,
+    site: Optional[str] = None,
+    url: Optional[str] = None,
+    preferred: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Every folder under `root` that IS this series, richest first.
+
+    One os.listdir plus at most two small reads per folder — measured at ~35 ms
+    across a real 136-series library, paid once per download.
+    """
+    markers = supported_hid_markers(load_aio_config())
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+
+    preferred_abs = os.path.abspath(preferred) if preferred else None
+    matches: List[Dict[str, Any]] = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        folder = os.path.join(root, name)
+        if not os.path.isdir(folder):
+            continue
+        record = _read_series_folder_record(folder, markers=markers)
+        if record is None or not _series_identity_matches(record, hid=hid, site=site, url=url):
+            continue
+        record["_preferred"] = bool(
+            preferred_abs and os.path.abspath(folder) == preferred_abs
+        )
+        matches.append(record)
+
+    matches.sort(key=_series_folder_sort_key)
+    return matches
+
+
+def find_duplicate_series_folders(
+    root: str,
+    out_dir: str,
+    *,
+    hid: str,
+    site: Optional[str] = None,
+    url: Optional[str] = None,
+    anilist_id: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    """Sibling folders holding the SAME series as `out_dir`, richest first.
+
+    Superset of find_matching_series_folders: it adds an anilist_id tier. That
+    tier exists for the one shape identity matching cannot catch — a site that
+    changes its hid AND its url in one relaunch leaves nothing in common — and
+    anilist_id is only known AFTER enrichment, i.e. long after the folder was
+    allocated. So this can only ever be an after-the-fact report, never a
+    prevention; allocate_series_output_dir is what prevents.
+    """
+    markers = supported_hid_markers(load_aio_config())
+    out_abs = os.path.abspath(out_dir)
+    try:
+        want_anilist = int(anilist_id) if anilist_id else None
+    except (TypeError, ValueError):
+        want_anilist = None
+
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+
+    found: List[Dict[str, Any]] = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        folder = os.path.join(root, name)
+        if not os.path.isdir(folder) or os.path.abspath(folder) == out_abs:
+            continue
+        record = _read_series_folder_record(folder, markers=markers)
+        if record is None:
+            continue
+        if _series_identity_matches(record, hid=hid, site=site, url=url):
+            record["_reason"] = "same-series"
+        elif want_anilist is not None and record.get("anilist_id") == want_anilist:
+            record["_reason"] = "same-anilist"
+        else:
+            continue
+        found.append(record)
+
+    found.sort(key=_series_folder_sort_key)
+    return found
+
+
+def _warn_duplicate_series_folders(
+    root: str,
+    out_dir: str,
+    *,
+    hid: str,
+    site: Optional[str] = None,
+    url: Optional[str] = None,
+    anilist_id: Optional[Any] = None,
+) -> None:
+    """Tell a CLI user their library holds this series twice. Never raises.
+
+    The GUI has its own affordance (a warning badge on the library card plus a
+    guarded merge; grep merge-series-folders), so this line is the CLI's only
+    signal. Deliberately not a flag and deliberately non-destructive: the run
+    already succeeded, and deciding what to do with a duplicate is the user's.
+    """
+    try:
+        duplicates = find_duplicate_series_folders(
+            root, out_dir, hid=hid, site=site, url=url, anilist_id=anilist_id
+        )
+    except Exception:
+        return
+    if not duplicates:
+        return
+    same_series = [d for d in duplicates if d["_reason"] == "same-series"]
+    same_anilist = [d for d in duplicates if d["_reason"] == "same-anilist"]
+    if same_series:
+        names = ", ".join(f"'{d['name']}'" for d in same_series)
+        print(
+            f"\n[!] Duplicate library folders: this series also lives in {names}. "
+            f"Its chapters are split across folders, so update checks will "
+            f"under-report on each. Merge them from the Library tab.",
+            file=sys.stderr,
+        )
+    if same_anilist:
+        names = ", ".join(f"'{d['name']}' ({d.get('site') or 'unknown site'})" for d in same_anilist)
+        print(
+            f"\n[!] Possible duplicate: {names} appears to be the same series "
+            f"from another source (matching AniList id). Nothing was changed — "
+            f"merge them from the Library tab if they are the same.",
+            file=sys.stderr,
+        )
+
+
+def _resolve_requested_series_dir(
+    series_dir: str,
+    *,
+    root: str,
+    hid: str,
+    site: Optional[str] = None,
+    url: Optional[str] = None,
+) -> Optional[str]:
+    """Validate a --series-dir request; return the folder, or None to fall back.
+
+    The UI names the folder it showed the user, so a grouped update-check row
+    and the download it queues cannot disagree about where the chapters land.
+    Every failure DEGRADES to normal allocation rather than erroring, because a
+    stale path is an ordinary consequence of the library moving or of the folder
+    having been merged away since the scan.
+
+    Two guards: the path must be an existing directory strictly inside `root`
+    (so the flag can never write outside the library), and it must actually BE
+    this series — claiming a stale path would recreate the very fork this whole
+    change exists to prevent. An unclaimed EMPTY folder is accepted, which is
+    what makes the flag usable by hand ("put this series here").
+    """
+    requested = os.path.abspath(series_dir)
+    root_abs = os.path.abspath(root)
+
+    def _decline(reason: str) -> None:
+        print(
+            f"[!] Ignoring --series-dir '{series_dir}' ({reason}); "
+            f"falling back to the normal series-folder lookup.",
+            file=sys.stderr,
+        )
+
+    try:
+        inside = os.path.commonpath([root_abs, requested]) == root_abs
+    except ValueError:
+        # Different drives on Windows — commonpath refuses rather than returning
+        # a non-match, so treat it as the "outside the library" answer it is.
+        inside = False
+    if not inside or requested == root_abs:
+        _decline("not inside the library root")
+        return None
+    if not os.path.isdir(requested):
+        _decline("no such folder")
+        return None
+
+    record = _read_series_folder_record(
+        requested, markers=supported_hid_markers(load_aio_config())
+    )
+    if record is None:
+        _decline("folder is unreadable")
+        return None
+    if _series_identity_matches(record, hid=hid, site=site, url=url):
+        return requested
+    unclaimed = (
+        not record.get("marker_hid")
+        and not record.get("hid")
+        and not record.get("url")
+        and not record["n_files"]
+    )
+    if unclaimed:
+        return requested
+    _decline(f"it holds a different series ('{record.get('title') or record['name']}')")
+    return None
+
+
+def allocate_series_output_dir(
+    title: str,
+    hid: str,
+    root: str = DEFAULT_OUTPUT_DIR,
+    *,
+    site: Optional[str] = None,
+    url: Optional[str] = None,
+    series_dir: Optional[str] = None,
+) -> str:
     """Choose a per-series output folder.
 
-    Normally uses: root/<title>. Falls back to root/<title> (hid=<hid>) only on
-    a genuine collision: a DIFFERENT series with the same title that already has
-    downloaded content.
+    Resolution order:
+      1. `series_dir` — an explicit target from the UI (--series-dir). Honored
+         only when it exists under `root` AND its identity matches, so a stale
+         path (library moved, folder merged away) degrades to normal allocation
+         instead of claiming a folder nobody chose.
+      2. IDENTITY — any existing folder that IS this series, whatever it is
+         called. This is what stops a site RENAME from forking a second folder;
+         see the SERIES FOLDER IDENTITY block above for the two real cases.
+         When several match, the library already carries a fork: the richest
+         wins so new chapters land beside the bulk of the series, and every
+         match is named in a warning.
+      3. TITLE — root/<title>, the historical path, for a series with no folder
+         yet.
+      4. root/<title> (hid=<hid>) on a genuine collision: a DIFFERENT series
+         with the same title AND real downloaded content.
 
     A hidden marker file (.series_hid) stores the hid so multiple runs and
     processes stay consistent. Matching is hash-tolerant: a marker is reused
@@ -505,8 +943,8 @@ def allocate_series_output_dir(title: str, hid: str, root: str = DEFAULT_OUTPUT_
     full-slug hid). An EMPTY existing folder is always reclaimed, even when a
     stale marker points at a different hid — this prevents the empty orphan
     folders left when a run crashes after allocation but before any chapter is
-    written and the next attempt carries a different hid. See _marker_matches
-    and the reclaim branch below.
+    written and the next attempt carries a different hid. See _hids_match and
+    the reclaim branch below.
     """
     clean_title = re.sub(r"\s*\(hid=[^)]+\)\s*$", "", str(title or "")).strip() or "comic"
     base = _sanitize_folder_component(clean_title)
@@ -527,39 +965,51 @@ def allocate_series_output_dir(title: str, hid: str, root: str = DEFAULT_OUTPUT_
     def _write_marker(folder: str):
         write_hid_marker(folder, str(hid))
 
-    def _strip_rotating_suffix(value: str) -> str:
-        # Asura (and similar) bake a rotating hex hash into the slug they use
-        # as the hid: "sss-class-suicide-hunter-46f09241". The asura handler
-        # now stabilizes the hid by stripping that hash, but folders downloaded
-        # before the fix are still marked with the OLD full-slug hid. Reduce
-        # both to a hash-free base so a stabilized hid maps onto the existing
-        # folder. Non-rotating hids (comick short ids, mangadex UUIDs whose
-        # groups never change) only reach here when existing != want, which
-        # for stable hids never happens — so this is effectively asura-only.
-        return re.sub(r"-[0-9a-f]{6,}$", "", str(value or ""))
-
-    def _marker_matches(existing: "str | None", want: str) -> bool:
-        # True when the folder belongs to this series. Exact match, or equal
-        # once a rotating hash suffix is stripped from both sides (migration
-        # for the stabilized asura hid). Require a non-empty base so two
-        # unrelated markers can't both collapse to "" and false-match.
-        if existing is None:
-            return False
-        if existing == str(want):
-            return True
-        base_existing = _strip_rotating_suffix(existing)
-        return bool(base_existing) and base_existing == _strip_rotating_suffix(str(want))
-
     with _AIOFileLock(lock_path):
         preferred = os.path.join(root, base)
+
+        # 1. Explicit target from the UI. Guarded on containment + identity so a
+        #    stale path can only ever cost us the fallback, never a wrong folder.
+        if series_dir:
+            resolved = _resolve_requested_series_dir(
+                series_dir, root=root, hid=hid, site=site, url=url
+            )
+            if resolved:
+                _write_marker(resolved)
+                return resolved
+
+        # 2. Identity. Runs BEFORE the title branches so a renamed series finds
+        #    its existing home, and runs unconditionally (not just when
+        #    `preferred` is missing) so an already-forked library converges onto
+        #    the richest folder instead of growing the husk.
+        matches = find_matching_series_folders(
+            root, hid=hid, site=site, url=url, preferred=preferred
+        )
+        if matches:
+            winner = matches[0]
+            folder = winner["folder"]
+            if not winner.get("_preferred"):
+                print(
+                    f"[i] Series folder: reusing '{winner['name']}' — this site now "
+                    f"titles the series '{clean_title}'. Chapters stay together; "
+                    f"the folder is not renamed.",
+                    file=sys.stderr,
+                )
+            if len(matches) > 1:
+                others = ", ".join(f"'{m['name']}'" for m in matches[1:])
+                print(
+                    f"[!] {len(matches)} folders hold this same series: "
+                    f"'{winner['name']}' (chosen) plus {others}. Merge them from "
+                    f"the Library tab — until then the others stay behind.",
+                    file=sys.stderr,
+                )
+            # Converge the marker onto the current (canonical) hid so a
+            # stabilized hid is treated as an exact match next run.
+            if _read_marker(folder) != str(hid):
+                _write_marker(folder)
+            return folder
+
         if os.path.exists(preferred):
-            existing = _read_marker(preferred)
-            if _marker_matches(existing, hid):
-                # Converge the marker onto the current (canonical) hid so a
-                # stabilized hid is treated as an exact match next run.
-                if existing != str(hid):
-                    _write_marker(preferred)
-                return preferred
             # Empty folder: reclaim regardless of any stale marker — there is
             # no downloaded content to protect. This is what kills the empty
             # orphan folders left when a run crashes AFTER folder allocation
@@ -574,15 +1024,19 @@ def allocate_series_output_dir(title: str, hid: str, root: str = DEFAULT_OUTPUT_
                 return preferred
             # Otherwise a genuine collision: a DIFFERENT series with the same
             # title AND real downloaded content. Disambiguate with a suffix.
+            #
+            # This loop used to ALSO reuse a "(hid=...)" sibling whose marker
+            # matched. That branch is gone because it is now both unreachable
+            # and wrong: the identity scan above already swept every folder in
+            # root, so a matching sibling was returned there — and a sibling the
+            # scan REJECTED (its .aio_series.json names a different site) must
+            # not then be adopted here on a bare-marker match. Anything reaching
+            # this loop is by construction not this series, so we only look for
+            # a free name.
             candidate_base = _sanitize_folder_component(f"{clean_title} (hid={hid})")
             candidate = os.path.join(root, candidate_base)
             k = 2
             while os.path.exists(candidate):
-                ex = _read_marker(candidate)
-                if _marker_matches(ex, hid):
-                    if ex != str(hid):
-                        _write_marker(candidate)
-                    return candidate
                 candidate = os.path.join(root, f"{candidate_base} ({k})")
                 k += 1
             os.makedirs(candidate, exist_ok=True)
@@ -7006,6 +7460,11 @@ def _run_image_prefetch_job(job: _ImgPrefetchJob) -> None:
                 download_tasks,
                 concurrency=fast_conc,
                 timeout=fast_timeout,
+                # Same budget as the foreground (see its call site). A page the
+                # prefetch drops costs the whole prefetched chapter — the
+                # partial-failure branch below wipes tdir and the foreground
+                # re-downloads it from scratch.
+                attempts=int(globals().get("_HTTP_MAX_RETRIES", 6)),
                 record_host_failure=_prefetch_backoff_feedback,
                 # S5-2 (write race): bail per-page once the foreground adopts
                 # this tdir (consume timeout) so we stop writing the shared
@@ -8495,6 +8954,18 @@ def main():
         type=str,
         default=None,
         help="Directory to place library outputs. Priority: this flag, AIO_OUTPUT_DIR, aio_config.json, then 'manga'.",
+    )
+    p.add_argument(
+        "--series-dir",
+        type=str,
+        default=None,
+        help="Write this series into an EXISTING folder instead of deriving one "
+             "from the site's title. The UI passes the folder its update-check "
+             "row showed, so a queued download can't land somewhere other than "
+             "the entry the user clicked. Ignored (with a warning, falling back "
+             "to the normal lookup) unless the path is an existing directory "
+             "inside --output-dir that either holds this same series or is "
+             "empty — a stale path must never claim a folder nobody chose.",
     )
     p.add_argument(
         "--epub-dir",
@@ -10349,11 +10820,25 @@ def main():
     # of truth on resume.
     _output_dir_root_for_resume = args.output_dir
     _epub_dir_root_for_resume = getattr(args, "epub_dir", None)
-    out_dir = allocate_series_output_dir(title, hid, root=args.output_dir)
+    # site + url make the lookup IDENTITY-based rather than title-based, which is
+    # what keeps a renamed series in the folder it already lives in instead of
+    # forking a second one (see the SERIES FOLDER IDENTITY block). --series-dir
+    # is the download root only: the epub root is a separate tree the UI never
+    # names, and it gets the same identity lookup on its own folders.
+    out_dir = allocate_series_output_dir(
+        title,
+        hid,
+        root=args.output_dir,
+        site=handler.name,
+        url=args.comic_url,
+        series_dir=getattr(args, "series_dir", None),
+    )
     setattr(args, "output_dir", out_dir)
     epub_dir_base = getattr(args, "epub_dir", None)
     if epub_dir_base:
-        epub_out_dir = allocate_series_output_dir(title, hid, root=epub_dir_base)
+        epub_out_dir = allocate_series_output_dir(
+            title, hid, root=epub_dir_base, site=handler.name, url=args.comic_url
+        )
         setattr(args, "epub_dir", epub_out_dir)
 
     # --- External metadata enrichment (--metadata-source anilist) ---
@@ -11428,6 +11913,16 @@ def main():
                         fast_conc,
                     )
                     fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
+                    # Same retry budget the slow path gives an image (grep
+                    # _try_download_url's `for attempt in range(max_retries)`).
+                    # The fast path used to hardcode 2 attempts and ignore
+                    # --http-max-retries entirely, so the sites routed through
+                    # it (linewebtoon, mangafire) were the LEAST resilient ones
+                    # — and a single unrecovered page fails the whole chapter's
+                    # zero-tolerance gate. Wall-clock stays bounded by the
+                    # per-chapter watchdog (--chapter-deadline-seconds), which
+                    # cancels every in-flight attempt via is_cancelled.
+                    fast_attempts = int(globals().get("_HTTP_MAX_RETRIES", 6))
                     log_verbose(
                         f"  Downloading {len(download_tasks)} image(s) via "
                         f"{handler.name} fast path (curl_cffi async, conc={fast_conc})..."
@@ -11436,6 +11931,7 @@ def main():
                         download_tasks,
                         concurrency=fast_conc,
                         timeout=fast_timeout,
+                        attempts=fast_attempts,
                         is_cancelled=_chapter_cancelled,
                         # Bridge to _record_failure: classify all fast-path
                         # failures as 'retryable' (we don't have HTTP status
@@ -12660,13 +13156,18 @@ def main():
 
         Behavior the user explicitly asked for after seeing partial PDFs:
           1. Never accept a partial chapter (any missing page → fallback or retry).
-          2. Try alternative sources first (cheap — no sleep) — EXCEPT
+          2. NEAR-MISS FIRST (2026-08-20): a reason=="incomplete" failure means
+             the primary served nearly the whole chapter, so give it ONE quick
+             retry (_NEAR_MISS_RETRY_BACKOFF) before looking at other sources —
+             otherwise a 2-page transient miss trades the publisher's own
+             120-page chapter for a shorter third-party re-host. Grep NEAR-MISS.
+          3. Then try alternative sources (cheap — no long sleep) — EXCEPT
              aux-bearing chapters (webtoons BGM/motion, tapas BGM): those are
              never alt-rescued because alt sites lack the audio/motion content
              (2026-07-03 directive; grep _chapter_carries_aux). They go
              straight to the inline retry on the primary.
-          3. If all sources fail: long inline retry on primary (CDN recovery).
-          4. If inline retries don't recover: stop the run with a clear error.
+          4. If all sources fail: long inline retry on primary (CDN recovery).
+          5. If inline retries don't recover: stop the run with a clear error.
 
         Backoff schedule: --inline-chapter-backoff seconds, doubling each
         retry. With defaults (base=30s, retries=2): waits 30s, then 60s.
@@ -12690,6 +13191,69 @@ def main():
             return _process_chapter(ch, force_redownload=redo_primary, next_chapter=next_chapter, upcoming_chapters=upcoming_chapters)
         except ChapterSkippedError as cse_primary:
             primary_err: ChapterSkippedError = cse_primary
+
+        # NEAR-MISS quick retry on the primary, ahead of alternatives
+        # (2026-08-20, bench/linewebtoonlogs.md).
+        #
+        # reason=="incomplete" structurally means FEWER than
+        # --chapter-host-poison distinct URLs fully failed — 5+ would have
+        # classified as host_poison, and a uniform-signature failure would have
+        # classified as ghost_chapter. So the host just proved it is alive by
+        # serving nearly the whole chapter, and the one thing it has NOT been
+        # given is a second try.
+        #
+        # WHY this outranks the alternatives-first ordering documented above:
+        # that ordering was designed for chapters BROKEN on the primary, where
+        # an alt is strictly better. A near-miss is the opposite shape. In the
+        # log, LINE Webtoon (OFFICIAL_PUBLISHER — the canonical bytes) lost 2 of
+        # 120 pages to a transient CDN stall and was "rescued" by a 103-page
+        # comix re-host; the same run swapped a 109-page chapter for a 91-page
+        # one. Trading the publisher's own pages for a shorter third-party
+        # re-host is a downgrade the old ordering had no way to see.
+        #
+        # Deliberately narrow: ONE attempt, short wait, and only for
+        # "incomplete" — ghost_chapter/host_poison/time_budget/locked all
+        # describe something a 5s pause will not change, and they keep going
+        # straight to alternatives. The full long-backoff retry loop still runs
+        # after alternatives, unchanged.
+        #
+        # Placed BEFORE the lazy-discovery trigger so a chapter that recovers
+        # here never pays for the cross-site search, and before the aux veto so
+        # aux-bearing chapters (which can never be alt-rescued at all) get the
+        # fast retry too instead of waiting out the full 30s backoff.
+        #
+        # primary_err is deliberately NOT reassigned from this attempt: the
+        # downstream ghost/permanent-skip classification reasons about the
+        # FIRST failure, and the long-retry loop below tracks its own last_err.
+        near_miss_attempts = 0
+        if primary_err.reason == "incomplete" and not run_cancelled():
+            print(
+                f"  [!] Chapter {n_for_log} near-miss on {primary_state[0].name} "
+                f"({primary_err.pages_ok}/{primary_err.pages_total} pages) — "
+                f"retrying the primary in {_NEAR_MISS_RETRY_BACKOFF:.0f}s before "
+                f"considering other sources..."
+            )
+            # Chunked so Cancel actually cancels, same reason as the long-retry
+            # wait below (verified on-device 2026-08-08).
+            waited = 0.0
+            while waited < _NEAR_MISS_RETRY_BACKOFF:
+                if run_cancelled():
+                    break
+                chunk = min(2.0, _NEAR_MISS_RETRY_BACKOFF - waited)
+                time.sleep(chunk)
+                waited += chunk
+            if not run_cancelled():
+                near_miss_attempts = 1
+                try:
+                    return _process_chapter(
+                        ch, force_redownload=True, next_chapter=next_chapter
+                    )
+                except ChapterSkippedError as cse_near:
+                    print(
+                        f"  [!] Chapter {n_for_log} still incomplete after the "
+                        f"quick retry ({cse_near.pages_ok}/{cse_near.pages_total} "
+                        f"pages) — falling through to alternative sources."
+                    )
 
         # Faithful-archival veto (2026-07-03): a chapter that carries sidecar
         # aux content on the primary (webtoons BGM / motion-toon, tapas BGM —
@@ -12912,7 +13476,7 @@ def main():
             host=last_err.host,
             pages_ok=last_err.pages_ok,
             pages_total=last_err.pages_total,
-            attempts=max_retries + 1 + len(alts),
+            attempts=max_retries + 1 + len(alts) + near_miss_attempts,
         ) from last_err
 
 
@@ -13706,6 +14270,33 @@ def main():
             key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
         )
 
+        # Chapters the USER crossed out in the Library update-check panel.
+        # Purely carried forward here — nothing in this file ever ADDS to it;
+        # the only writer is electron/main.js's set-chapters-ignored IPC. It
+        # needs a line anyway because this writer rebuilds series_meta from
+        # scratch rather than merging over existing_meta, so a key it does not
+        # name is silently dropped on the next download.
+        #
+        # DISTINCT FROM chapters_skipped_fragments, which is machine-owned and
+        # subtracted from the update-check's chapter list entirely. These stay
+        # VISIBLE in the panel (struck through) so the user can undo them; they
+        # are only excluded from what the download buttons queue. grep
+        # chapters_ignored.
+        #
+        # MINUS merged_downloaded for the same reason as merged_skipped: once a
+        # chapter is actually on disk it is no longer something to offer or
+        # withhold, so leaving it here would just accumulate dead labels. That
+        # also means a deliberate re-download (--chapters, --update-all) clears
+        # the cross-out, which is the intuitive direction.
+        merged_ignored = sorted(
+            {
+                _chap_label_str(x)
+                for x in existing_meta.get("chapters_ignored", [])
+            }
+            - set(merged_downloaded),
+            key=lambda x: (_chap_as_float(x) is None, _chap_as_float(x) or 0.0),
+        )
+
         # What each combined archive on disk actually contains, as of the last
         # build of THAT FORMAT that really ran. DISTINCT from
         # chapters_downloaded, which is a running UNION across runs ON PURPOSE
@@ -13772,6 +14363,13 @@ def main():
             # update-check (main.js:_checkSeriesUpdates). Empty for single-source
             # / lazy / collapse-off series. grep chapters_skipped_fragments.
             "chapters_skipped_fragments": merged_skipped,
+            # User-crossed-out chapters, carried forward from existing_meta (see
+            # merged_ignored above). Written only when non-empty: it is opt-in
+            # per series, and an always-present empty list would add a key to
+            # every .aio_series.json in the library for nothing. Readers must
+            # therefore treat absent as empty — main.js and aio_android.py both
+            # do. grep chapters_ignored.
+            **({"chapters_ignored": merged_ignored} if merged_ignored else {}),
             # Absent (not null) when no build has ever been recorded — readers
             # must treat "missing" as "unknown", never as "covers nothing".
             **(
@@ -13801,6 +14399,20 @@ def main():
             json.dump(series_meta, f, indent=2)
     except Exception as e:
         log_verbose(f"  Warning: Failed to write .aio_series.json: {e}")
+
+    # Duplicate report. Runs HERE, not at allocation, because the anilist_id
+    # tier only becomes available once enrichment has written into comic_data —
+    # which happens long after the folder was claimed. _output_dir_root_for_resume
+    # is the pre-mutation library ROOT (args.output_dir is the per-series folder
+    # by now; grep the re-nesting invariant above it).
+    _warn_duplicate_series_folders(
+        _output_dir_root_for_resume,
+        out_dir,
+        hid=hid,
+        site=handler.name,
+        url=args.comic_url,
+        anilist_id=comic_data.get("anilist_id"),
+    )
 
     if getattr(args, "save_params", False):
         if original_cover_path and os.path.exists(original_cover_path):

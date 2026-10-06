@@ -41,12 +41,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.aio.downloader.DownloadService
 import com.aio.downloader.core.ActiveRun
 import com.aio.downloader.core.DownloadJob
-import com.aio.downloader.core.FinishedRun
+import com.aio.downloader.core.DownloadRepository
 import com.aio.downloader.core.ResumableRun
 import com.aio.downloader.core.ResumeRepository
 import com.aio.downloader.core.RunOutcome
+import com.aio.downloader.core.RunRecord
+import com.aio.downloader.core.finalFileDetail
 import com.aio.downloader.core.formatElapsed
 import com.aio.downloader.core.formatEta
 import com.aio.downloader.core.phaseLabel
@@ -82,12 +85,20 @@ import kotlinx.coroutines.launch
 fun QueueScreen(
     active: ActiveRun?,
     queue: List<DownloadJob>,
-    history: List<FinishedRun>,
+    history: List<RunRecord>,
     resumable: List<ResumableRun>,
     onCancelActive: () -> Unit,
     onRemoveQueued: (String) -> Unit,
     onClearHistory: () -> Unit,
     onNewDownload: () -> Unit,
+    /**
+     * Jobs that came back from the previous session, so their cards can say so.
+     *
+     * Defaulted rather than threaded through the shell: it is written once in
+     * `DownloadRepository.attach` before any composition and never changes, so
+     * there is nothing to observe and nothing for AioApp to hold.
+     */
+    restoredIds: Set<String> = DownloadRepository.restoredJobIds,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -156,10 +167,30 @@ fun QueueScreen(
             }
         }
 
+        // Queued work with nothing running. Normally impossible — every
+        // enqueue wakes the service — but it is exactly the state the app comes
+        // back in after being killed, because the restored queue deliberately
+        // does NOT auto-start. Without this card the Active section would be a
+        // header over nothing while three jobs sat below it, unexplained and
+        // with no way to start them.
+        if (active == null && queue.isNotEmpty()) {
+            item(key = "idle-queue") {
+                IdleQueueCard(
+                    waiting = queue.size,
+                    restored = queue.count { it.id in restoredIds },
+                    onStart = { DownloadService.ensureRunning(context) },
+                )
+            }
+        }
+
         if (queue.isNotEmpty()) {
             item { SectionHeader("Waiting (${queue.size})") }
             items(queue, key = { it.id }) { job ->
-                QueuedCard(job = job, onRemove = { onRemoveQueued(job.id) })
+                QueuedCard(
+                    job = job,
+                    restored = job.id in restoredIds,
+                    onRemove = { onRemoveQueued(job.id) },
+                )
             }
         }
 
@@ -178,10 +209,24 @@ fun QueueScreen(
                     )
                 }
             }
-            items(history, key = { it.id }) { entry -> HistoryCard(entry) }
+            // The store keeps far more than this (see HISTORY_LIMIT) because the
+            // resumable back-fill reads it, but a wall of finished downloads
+            // under the work that still needs attention is not a feature. The
+            // desktop shows none of its 200 at all.
+            items(history.take(HISTORY_VISIBLE), key = { it.finished.id }) { record ->
+                HistoryCard(record)
+            }
+            if (history.size > HISTORY_VISIBLE) {
+                item {
+                    HelpText("Showing the last $HISTORY_VISIBLE of ${history.size} runs.")
+                }
+            }
         }
     }
 }
+
+/** How many finished runs the Recent list shows. */
+private const val HISTORY_VISIBLE = 20
 
 // ── unfinished ─────────────────────────────────────────────────────────────
 
@@ -412,8 +457,58 @@ private fun ActiveCard(run: ActiveRun, queuedBehind: Int, onCancel: () -> Unit) 
 
 // ── queued ─────────────────────────────────────────────────────────────────
 
+/**
+ * "There is work here and nobody is doing it."
+ *
+ * ── WHY A RESTORED QUEUE DOES NOT START ITSELF ─────────────────────────────
+ * The desktop restores its queue and auto-starts the head
+ * (`UI-source/src/hooks/useDownloader.js`, grep `_restoreQueueItems`). A phone
+ * is not a desktop: the connection is likely metered, the app may have been
+ * killed hours ago in a different place, and DownloadService's own reasoning
+ * for START_NOT_STICKY — never silently spend someone's mobile data on a
+ * multi-hundred-megabyte download they did not just ask for — applies just as
+ * well to the moment the app reopens. So the queue comes back, and starting it
+ * is one deliberate tap.
+ */
 @Composable
-private fun QueuedCard(job: DownloadJob, onRemove: () -> Unit) {
+private fun IdleQueueCard(waiting: Int, restored: Int, onStart: () -> Unit) {
+    AioCard(borderColor = MaterialTheme.aio.warning.copy(alpha = 0.30f)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Filled.Schedule,
+                contentDescription = null,
+                tint = MaterialTheme.aio.warning,
+                modifier = Modifier.size(16.dp),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                if (waiting == 1) "1 download waiting" else "$waiting downloads waiting",
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.weight(1f),
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        HelpText(
+            if (restored > 0) {
+                "Restored from your last session — nothing starts on its own, so they " +
+                    "can't spend mobile data you didn't mean to."
+            } else {
+                "Nothing is running right now."
+            },
+        )
+        Spacer(Modifier.height(12.dp))
+        AioButton(
+            text = if (waiting == 1) "Start" else "Start all $waiting",
+            icon = Icons.Filled.PlayArrow,
+            compact = true,
+            onClick = onStart,
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+@Composable
+private fun QueuedCard(job: DownloadJob, restored: Boolean, onRemove: () -> Unit) {
     AioCard(provisional = true, contentPadding = PaddingValues(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(
@@ -443,7 +538,8 @@ private fun QueuedCard(job: DownloadJob, onRemove: () -> Unit) {
             )
         }
         AnimatedVisibility(
-            visible = job.format.isNotBlank() || job.chapters.isNotBlank(),
+            visible = restored || job.isResume ||
+                job.format.isNotBlank() || job.chapters.isNotBlank(),
             enter = AioMotion.revealEnter,
             exit = AioMotion.revealExit,
         ) {
@@ -451,6 +547,11 @@ private fun QueuedCard(job: DownloadJob, onRemove: () -> Unit) {
                 Modifier.padding(start = 24.dp, top = 6.dp),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
+                // "Restored" earns a pill because it changes what the row MEANS:
+                // this is not something queued a moment ago, it is something the
+                // app was carrying when it was killed.
+                if (restored) Pill("restored", tone = PillTone.Warning)
+                if (job.isResume) Pill("resume", tone = PillTone.Primary)
                 job.format.takeIf { it.isNotBlank() }?.let { Pill(it.uppercase()) }
                 job.chapters.takeIf { it.isNotBlank() && it != "all" }?.let { Pill(it, mono = true) }
             }
@@ -460,8 +561,20 @@ private fun QueuedCard(job: DownloadJob, onRemove: () -> Unit) {
 
 // ── history ────────────────────────────────────────────────────────────────
 
+/**
+ * One finished run.
+ *
+ * ── THE FINAL-FILE LINE IS THE POINT OF THIS CARD ──────────────────────────
+ * "cancelled · 3/40 ch" used to be the whole story, and it left the most
+ * important question unanswered: what happened to the combined archive that was
+ * already on disk? aio-dl.py answers it with a `final_file_skipped` event
+ * whenever it declines to rebuild, and [finalFileDetail] renders that answer in
+ * the same words the terminal notification uses — one wording, two surfaces,
+ * because a user reading both must not have to reconcile them.
+ */
 @Composable
-private fun HistoryCard(entry: FinishedRun) {
+private fun HistoryCard(record: RunRecord) {
+    val entry = record.finished
     val status = MaterialTheme.aio
     val (tint, icon, word) = when (entry.outcome) {
         RunOutcome.Completed -> Triple(status.success, Icons.Filled.Check, "completed")
@@ -506,6 +619,12 @@ private fun HistoryCard(entry: FinishedRun) {
             // above does not: 0 and 130 are already spelled out as completed and
             // cancelled.
             if (entry.outcome == RunOutcome.Failed) Pill("exit ${entry.exitCode}", mono = true)
+        }
+        record.finalFileSkip?.let { skip ->
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.padding(start = 24.dp)) {
+                HelpText(finalFileDetail(skip), tone = MaterialTheme.aio.warning)
+            }
         }
     }
 }

@@ -80,8 +80,16 @@ object ResumeRepository {
         val app = context.applicationContext
         scope.launch {
             try {
-                _runs.value = parseResumable(
-                    Aio.module(app).callAttr("scan_resumable").toString(),
+                // The back-fill is applied HERE, at the same seam the desktop
+                // applies its own (`UI-source/electron/main.js`, the
+                // `scan-resumable` handler): a tmp folder written before
+                // aio-dl.py had `run_meta.json` reports no URL, and without one
+                // `ResumableRun.canResume` is false and the card says so. The
+                // run history knows the URL, keyed by the same `hid` — see
+                // backfillResumable in core/RunPersistence.kt.
+                _runs.value = backfillResumable(
+                    parseResumable(Aio.module(app).callAttr("scan_resumable").toString()),
+                    DownloadRepository.history.value,
                 )
             } catch (t: Throwable) {
                 // Chaquopy surfaces the Python traceback as the message.

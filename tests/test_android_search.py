@@ -46,6 +46,49 @@ def test_comix_is_always_excluded():
     assert "comix" in _flag_value(argv, "--disable-sites").split(",")
 
 
+def test_unavailable_search_sites_holds_only_search_capable_handlers():
+    """The tuple feeds `--disable-sites`, which the orchestrator applies to the
+    SEARCH fan-out. Naming a handler that never searches is inert — it reads
+    like a guard while guarding nothing, which is what the old comment claiming
+    kagane belonged here would have produced."""
+    import sites
+
+    capable = {h.name for h in sites.iter_search_capable_handlers()}
+    for name in aio_android._UNAVAILABLE_SEARCH_SITES:
+        assert name in capable, f"{name} is not search-capable; excluding it is a no-op"
+
+
+def test_weebcentral_and_kagane_are_deliberately_absent():
+    """Both were named in this tuple's own comment as belonging here, and
+    neither does. Pinned so a future reader re-adding them has to argue with a
+    test rather than with a comment.
+
+    weebcentral rescues itself HERE: its ladder is `cloudscraper ->
+    rescue_cf_html -> raise`, and rescue_cf_html's second tier is the embedder
+    browser, i.e. this app's WebView bridge. impit is genuinely absent on
+    Android, which only means the first tier no-ops.
+
+    kagane is not search-capable on either platform — it never overrides
+    BaseSiteHandler.search, so the fan-out filters it out before disable-sites
+    is consulted. Its pywidevine dependency gates DOWNLOADS, a different list.
+    """
+    import inspect
+
+    import sites
+    from sites import weebcentral
+
+    assert "weebcentral" not in aio_android._UNAVAILABLE_SEARCH_SITES
+    assert "kagane" not in aio_android._UNAVAILABLE_SEARCH_SITES
+
+    capable = {h.name for h in sites.iter_search_capable_handlers()}
+    assert "weebcentral" in capable
+    assert "kagane" not in capable
+    # The seam the reasoning above rests on: if weebcentral stops going through
+    # rescue_cf_html, the "it rescues itself here" claim needs re-checking and
+    # this test is where that shows up.
+    assert "rescue_cf_html" in inspect.getsource(weebcentral)
+
+
 def test_comix_is_not_duplicated_when_the_user_already_disabled_it():
     argv = aio_android.build_search_argv("x", {"disabledSites": ["comix", "mangakatana"]})
     names = _flag_value(argv, "--disable-sites").split(",")

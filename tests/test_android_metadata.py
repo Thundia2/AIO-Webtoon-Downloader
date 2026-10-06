@@ -292,3 +292,149 @@ def test_write_without_configuration_refuses(library, monkeypatch):
     payload = json.loads(write_book_metadata(json.dumps([paths[0]]), json.dumps({"title": "T"})))
     assert [f["error"] for f in payload["failed"]] == ["not_configured"]
     assert payload["written"] == 0
+
+
+# --------------------------------------------------------------------------
+# write_book_metadata's cover argument
+#
+# The third argument used to be a hardcoded None, so the metadata editor could
+# never change a cover. The interesting decision is the CONTAINMENT SET: the
+# book must be in the library, but the cover cannot be — a picked image arrives
+# as a content:// URI Python cannot open(), so the caller copies it into the app
+# cache first. A library-only guard would reject every cover the feature can
+# produce. See aio_android._cover_path_error.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cover(tmp_path, monkeypatch):
+    """A configured cache dir holding one pickable image. Yields its path."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setitem(aio_android._CONFIGURED, "cache_dir", str(cache))
+    path = cache / "picked_cover.png"
+    path.write_bytes(PNG_1PX)
+    return str(path)
+
+
+def test_a_cover_from_the_app_cache_is_embedded(library, cover):
+    """The whole point: the cache is NOT the library, and it still has to work."""
+    _, paths = library
+    payload = json.loads(
+        write_book_metadata(json.dumps([paths[0]]), json.dumps({"title": "T"}), cover)
+    )
+    assert payload["ok"] is True
+    assert payload["written"] == 1
+    assert payload["cover"] is True
+    with zipfile.ZipFile(paths[0]) as archive:
+        embedded = [n for n in archive.namelist() if n.startswith("0000_cover")]
+        assert embedded == ["0000_cover.png"]
+        assert archive.read(embedded[0]) == PNG_1PX
+    # And the pages survived the repackage.
+    with zipfile.ZipFile(paths[0]) as archive:
+        assert "0001.jpg" in archive.namelist()
+
+
+def test_omitting_the_cover_leaves_the_existing_one_alone(library, cover):
+    """A text-only edit must not strip a cover a previous save embedded."""
+    _, paths = library
+    write_book_metadata(json.dumps([paths[0]]), json.dumps({"title": "T"}), cover)
+    write_book_metadata(json.dumps([paths[0]]), json.dumps({"title": "Renamed"}))
+    with zipfile.ZipFile(paths[0]) as archive:
+        assert "0000_cover.png" in archive.namelist()
+    assert json.loads(read_book_metadata(paths[0]))["metadata"]["title"] == "Renamed"
+
+
+def test_the_default_third_argument_keeps_the_old_two_argument_call_working():
+    """Kotlin calls this positionally. A required third argument would break
+    every existing call site the moment this shipped."""
+    import inspect
+
+    params = inspect.signature(write_book_metadata).parameters
+    assert list(params) == ["paths_json", "data_json", "cover_path"]
+    assert params["cover_path"].default == ""
+
+
+def test_a_cover_only_edit_is_allowed(library, cover):
+    """The user changed the picture and nothing else. Before the cover argument
+    existed this path returned no_fields, which would have made the picker a
+    silent no-op whenever the text fields happened to be untouched."""
+    _, paths = library
+    payload = json.loads(write_book_metadata(json.dumps([paths[0]]), "{}", cover))
+    assert payload["ok"] is True
+    assert payload["written"] == 1
+    with zipfile.ZipFile(paths[0]) as archive:
+        assert "0000_cover.png" in archive.namelist()
+
+
+def test_no_fields_and_no_cover_is_still_refused(library):
+    _, paths = library
+    assert json.loads(write_book_metadata(json.dumps(paths), "{}"))["error"] == "no_fields"
+
+
+def test_a_cover_outside_the_apps_own_directories_is_refused(library, cover, tmp_path):
+    """The bytes get copied INTO the user's archives, so an arbitrary
+    JNI-delivered path is not something to trust."""
+    outside = tmp_path / "elsewhere.png"
+    outside.write_bytes(PNG_1PX)
+    _, paths = library
+    payload = json.loads(
+        write_book_metadata(json.dumps([paths[0]]), json.dumps({"title": "T"}), str(outside))
+    )
+    assert payload["error"] == "cover_outside_app_dirs"
+
+
+def test_a_non_image_cover_is_refused(library, tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setitem(aio_android._CONFIGURED, "cache_dir", str(cache))
+    bogus = cache / "notes.txt"
+    bogus.write_text("nope")
+    _, paths = library
+    payload = json.loads(
+        write_book_metadata(json.dumps([paths[0]]), json.dumps({"title": "T"}), str(bogus))
+    )
+    assert payload["error"] == "unsupported_cover_format"
+
+
+def test_a_missing_cover_is_refused(library, tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setitem(aio_android._CONFIGURED, "cache_dir", str(cache))
+    _, paths = library
+    payload = json.loads(
+        write_book_metadata(
+            json.dumps([paths[0]]), json.dumps({"title": "T"}), str(cache / "gone.png")
+        )
+    )
+    assert payload["error"] == "cover_not_found"
+
+
+def test_a_bad_cover_fails_the_whole_call_rather_than_being_dropped(library, tmp_path):
+    """The opposite of how a bad BOOK path is treated, deliberately. Skipping
+    one unwritable archive out of 300 still leaves the user better off; silently
+    ignoring the cover they just picked and reporting ok:true does not."""
+    outside = tmp_path / "elsewhere.png"
+    outside.write_bytes(PNG_1PX)
+    _, paths = library
+    payload = json.loads(
+        write_book_metadata(json.dumps(paths), json.dumps({"title": "T"}), str(outside))
+    )
+    assert "ok" not in payload
+    assert payload["error"] == "cover_outside_app_dirs"
+    # Nothing was written — not even the metadata half.
+    assert json.loads(read_book_metadata(paths[0]))["metadata"]["title"] == ""
+
+
+def test_a_cover_inside_the_library_is_also_accepted(library):
+    """`cover.jpg` next to the archives is the one aio-dl.py itself writes, so
+    "re-embed the series cover" must not be refused by the guard."""
+    root, paths = library
+    existing = root / "Some Series" / "cover.jpg"
+    existing.write_bytes(PNG_1PX)
+    payload = json.loads(
+        write_book_metadata(json.dumps([paths[0]]), json.dumps({"title": "T"}), str(existing))
+    )
+    assert payload["ok"] is True
+    with zipfile.ZipFile(paths[0]) as archive:
+        assert "0000_cover.jpg" in archive.namelist()

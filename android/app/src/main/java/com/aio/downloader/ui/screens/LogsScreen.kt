@@ -1,5 +1,8 @@
 package com.aio.downloader.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -24,12 +27,15 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.derivedStateOf
@@ -42,13 +48,23 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.unit.dp
 import com.aio.downloader.core.LogLevel
 import com.aio.downloader.core.LogLine
 import com.aio.downloader.core.LogTail
+import com.aio.downloader.core.logMatchRanges
+import com.aio.downloader.core.logQueryTerms
+import com.aio.downloader.core.matchesLogQuery
 import com.aio.downloader.ui.components.AioButton
 import com.aio.downloader.ui.components.AioCard
+import com.aio.downloader.ui.components.AioTextField
 import com.aio.downloader.ui.components.ButtonTone
 import com.aio.downloader.ui.components.Hairline
 import com.aio.downloader.ui.components.HelpText
@@ -68,6 +84,19 @@ import com.aio.downloader.ui.theme.aio
  *
  * The lines arrive from [LogTail], already through the same strip/drop/classify
  * pipeline the desktop applies (`UI-source/electron/log-filter.js`).
+ *
+ * ── THE SCREEN NO LONGER OWNS THE READER ───────────────────────────────────
+ * [LogTail] is started at process start and runs for the process lifetime; this
+ * screen only reads it (and calls [LogTail.start] as a backstop, which is a
+ * no-op when the reader is already up). It used to start and STOP the reader
+ * with the composition, which combined with logcat's follow-from-now meant the
+ * run you opened this tab to understand was precisely the one with no output.
+ *
+ * ── AND WHY SEARCH AND COPY BELONG HERE ────────────────────────────────────
+ * The two things anyone does with a log they cannot fix themselves: find the
+ * line that matters, and send it to somebody. There is no other route to either
+ * on a phone — no text selection in a LazyColumn of unwrapped rows, and no
+ * terminal to pipe through grep.
  */
 @Composable
 fun LogsScreen(
@@ -75,18 +104,34 @@ fun LogsScreen(
     error: String?,
     onClear: () -> Unit,
 ) {
-    // The reader is only worth running while someone is looking. It follows
-    // logcat from "now", so a download that ran while this screen was closed is
-    // not retroactively visible — an accepted trade for not burning a thread
-    // and a process on a screen nobody has open. `adb logcat` still has it all.
-    DisposableEffect(Unit) {
-        LogTail.start()
-        onDispose { LogTail.stop() }
+    // A no-op while the reader is alive, which it normally is from
+    // MainActivity.onCreate. Kept as the backstop for the one case that is not
+    // covered: a reader that died while nobody was looking. Note there is no
+    // matching stop — see this file's header.
+    LaunchedEffect(Unit) { LogTail.start() }
+
+    val context = LocalContext.current
+    var levelFilter by rememberSaveable { mutableStateOf<String?>(null) }
+    var query by rememberSaveable { mutableStateOf("") }
+    // Saved alongside the query, and the two only ever move together (closing
+    // clears the query) — a rotation must not be able to hide an active search
+    // behind a collapsed field and leave the list mysteriously short.
+    var searchOpen by rememberSaveable { mutableStateOf(false) }
+    var notice by rememberSaveable { mutableStateOf<String?>(null) }
+
+    val terms = remember(query) { logQueryTerms(query) }
+    val filtered = remember(lines, levelFilter, terms) {
+        lines.filter { line ->
+            (levelFilter == null || line.level.name == levelFilter) &&
+                matchesLogQuery(line.text, terms)
+        }
     }
 
-    var levelFilter by rememberSaveable { mutableStateOf<String?>(null) }
-    val filtered = remember(lines, levelFilter) {
-        if (levelFilter == null) lines else lines.filter { it.level.name == levelFilter }
+    LaunchedEffect(notice) {
+        if (notice != null) {
+            kotlinx.coroutines.delay(2500)
+            notice = null
+        }
     }
 
     val listState = rememberLazyListState()
@@ -111,20 +156,79 @@ fun LogsScreen(
             lines = lines,
             active = levelFilter,
             onSelect = { levelFilter = it },
+            searchOpen = searchOpen,
+            onToggleSearch = {
+                searchOpen = !searchOpen
+                // Closing the field clears the query: leaving a hidden search
+                // in force is the same trap as a hidden level filter.
+                if (!searchOpen) query = ""
+            },
+            onCopy = {
+                val copied = copyLogLines(context, filtered)
+                notice = when {
+                    copied < 0 -> "Couldn't reach the clipboard"
+                    copied == 0 -> "Nothing to copy"
+                    else -> "Copied $copied line${if (copied == 1) "" else "s"}"
+                }
+            },
             onClear = onClear,
         )
+
+        AnimatedVisibility(
+            visible = searchOpen,
+            enter = AioMotion.revealEnter,
+            exit = AioMotion.revealExit,
+        ) {
+            SearchRow(
+                query = query,
+                onQueryChange = { query = it },
+                matches = filtered.size,
+                total = lines.size,
+            )
+        }
+
+        notice?.let {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp)) {
+                HelpText(it, tone = MaterialTheme.colorScheme.primary)
+            }
+        }
+
+        // A reader that died AFTER capturing something must not hide what it
+        // captured — that output is usually the reason the screen is open. The
+        // full-card ErrorState below is for the case where there is genuinely
+        // nothing to show.
+        if (error != null && lines.isNotEmpty()) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(Modifier.weight(1f)) {
+                    HelpText("Live capture stopped: $error", tone = MaterialTheme.aio.warning)
+                }
+                AioButton(
+                    text = "Try again",
+                    tone = ButtonTone.Ghost,
+                    compact = true,
+                    onClick = LogTail::restart,
+                )
+            }
+        }
+
         Hairline()
 
         Box(Modifier.weight(1f)) {
             when {
-                error != null -> ErrorState(error)
-                filtered.isEmpty() -> EmptyState(hasLines = lines.isNotEmpty())
+                error != null && lines.isEmpty() -> ErrorState(error, onRetry = LogTail::restart)
+                filtered.isEmpty() -> EmptyState(
+                    hasLines = lines.isNotEmpty(),
+                    searching = terms.isNotEmpty(),
+                )
                 else -> LazyColumn(
                     state = listState,
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
                 ) {
-                    items(filtered, key = { it.id }) { line -> LogRow(line) }
+                    items(filtered, key = { it.id }) { line -> LogRow(line, terms) }
                 }
             }
 
@@ -140,6 +244,44 @@ fun LogsScreen(
         }
     }
 }
+
+/**
+ * Put the visible lines on the clipboard. Returns how many made it, or -1 if
+ * the clipboard service could not be reached.
+ *
+ * COPIES WHAT IS ON SCREEN, not the whole buffer: a filtered view is the user
+ * having already said which lines they care about, and pasting 1500 lines into
+ * a chat message when they asked for the 4 errors is not helpfulness.
+ *
+ * Capped from the END. Android's clipboard rides a Binder transaction and a
+ * large clip fails — sometimes silently, sometimes as
+ * TransactionTooLargeException — so a very long selection keeps the most
+ * recent lines, which are the ones nearest whatever went wrong.
+ */
+private fun copyLogLines(context: Context, lines: List<LogLine>): Int {
+    if (lines.isEmpty()) return 0
+
+    val kept = ArrayDeque<String>()
+    var chars = 0
+    for (index in lines.indices.reversed()) {
+        val text = lines[index].text
+        if (chars + text.length + 1 > MAX_COPY_CHARS && kept.isNotEmpty()) break
+        kept.addFirst(text)
+        chars += text.length + 1
+    }
+
+    val clipboard = context.getSystemService(ClipboardManager::class.java) ?: return -1
+    return runCatching {
+        clipboard.setPrimaryClip(
+            ClipData.newPlainText("aio-dl log", kept.joinToString("\n")),
+        )
+        kept.size
+    }.getOrDefault(-1)
+}
+
+/** ~64k of text. Comfortably inside the Binder limit, and far more than anyone
+ *  pastes into a bug report. */
+private const val MAX_COPY_CHARS = 64_000
 
 /**
  * EXTRACTED RATHER THAN INLINED: inside the `Box` nested in this screen's
@@ -166,7 +308,7 @@ private fun JumpToLatest(visible: Boolean, onClick: () -> Unit, modifier: Modifi
 }
 
 @Composable
-private fun LogRow(line: LogLine) {
+private fun LogRow(line: LogLine, terms: List<String>) {
     val status = MaterialTheme.aio
     val color = when (line.level) {
         LogLevel.Error -> MaterialTheme.colorScheme.error
@@ -176,6 +318,23 @@ private fun LogRow(line: LogLine) {
         // hidden, because it is usually the answer when something looks wrong.
         LogLevel.Verbose -> status.mutedForeground.copy(alpha = 0.75f)
         LogLevel.Info -> MaterialTheme.colorScheme.onBackground.copy(alpha = 0.9f)
+    }
+    val highlight = MaterialTheme.colorScheme.primary.copy(alpha = 0.28f)
+    // Every matching line is a hit, so without marking the matched SPAN the
+    // search only tells you which lines qualified, not where to look on a row
+    // that scrolls sideways past the screen edge.
+    val rendered: AnnotatedString = remember(line.id, terms, highlight) {
+        val ranges = logMatchRanges(line.text, terms)
+        if (ranges.isEmpty()) {
+            AnnotatedString(line.text)
+        } else {
+            buildAnnotatedString {
+                append(line.text)
+                ranges.forEach { range ->
+                    addStyle(SpanStyle(background = highlight), range.first, range.last + 1)
+                }
+            }
+        }
     }
 
     Row(Modifier.fillMaxWidth()) {
@@ -196,7 +355,7 @@ private fun LogRow(line: LogLine) {
                 ),
         )
         Text(
-            text = line.text,
+            text = rendered,
             style = AioText.log,
             color = color,
             // Horizontal scroll, not wrap: aio-dl.py aligns its output in
@@ -217,6 +376,9 @@ private fun FilterBar(
     lines: List<LogLine>,
     active: String?,
     onSelect: (String?) -> Unit,
+    searchOpen: Boolean,
+    onToggleSearch: () -> Unit,
+    onCopy: () -> Unit,
     onClear: () -> Unit,
 ) {
     val errors = remember(lines) { lines.count { it.level == LogLevel.Error } }
@@ -247,7 +409,83 @@ private fun FilterBar(
             onSelect(if (active == LogLevel.Warning.name) null else LogLevel.Warning.name)
         }
         Spacer(Modifier.weight(1f))
+        // Icons, not labelled buttons: three more words would push the level
+        // chips off a phone-width row, and both actions are conventional
+        // enough to read as glyphs.
+        BarIcon(
+            icon = if (searchOpen) Icons.Filled.Close else Icons.Filled.Search,
+            description = if (searchOpen) "Close search" else "Search the log",
+            tint = if (searchOpen) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                MaterialTheme.aio.mutedForeground
+            },
+            onClick = onToggleSearch,
+        )
+        BarIcon(
+            icon = Icons.Filled.ContentCopy,
+            description = "Copy the visible lines",
+            tint = MaterialTheme.aio.mutedForeground,
+            onClick = onCopy,
+        )
         AioButton(text = "Clear", tone = ButtonTone.Ghost, compact = true, onClick = onClear)
+    }
+}
+
+@Composable
+private fun BarIcon(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    description: String,
+    tint: Color,
+    onClick: () -> Unit,
+) {
+    Icon(
+        icon,
+        contentDescription = description,
+        tint = tint,
+        modifier = Modifier
+            .clip(CircleShape)
+            .clickable(onClick = onClick)
+            .padding(7.dp)
+            .size(17.dp),
+    )
+}
+
+@Composable
+private fun SearchRow(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    matches: Int,
+    total: Int,
+) {
+    val focus = remember { FocusRequester() }
+    // Open the keyboard with the field. Opening a search box and then having to
+    // tap it is two gestures for one intention. runCatching because
+    // requestFocus throws if the node is not attached yet, which is a timing
+    // detail no user should ever see as a crash.
+    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+
+    Column(Modifier.padding(start = 14.dp, end = 14.dp, bottom = 8.dp)) {
+        AioTextField(
+            value = query,
+            onValueChange = onQueryChange,
+            placeholder = "Find in log — every word must match",
+            mono = true,
+            minHeight = 40,
+            modifier = Modifier.focusRequester(focus),
+            leading = {
+                Icon(
+                    Icons.Filled.Search,
+                    contentDescription = null,
+                    tint = MaterialTheme.aio.mutedForeground,
+                    modifier = Modifier.size(15.dp),
+                )
+            },
+        )
+        if (query.isNotBlank()) {
+            Spacer(Modifier.height(5.dp))
+            HelpText("$matches of $total lines match")
+        }
     }
 }
 
@@ -285,7 +523,7 @@ private fun FilterChip(
 // ── empty / error ──────────────────────────────────────────────────────────
 
 @Composable
-private fun EmptyState(hasLines: Boolean) {
+private fun EmptyState(hasLines: Boolean, searching: Boolean) {
     Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
         AioCard(contentPadding = PaddingValues(24.dp)) {
             Column(
@@ -308,15 +546,21 @@ private fun EmptyState(hasLines: Boolean) {
                 }
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    if (hasLines) "Nothing matches that filter" else "No output yet",
+                    when {
+                        searching -> "No line matches that search"
+                        hasLines -> "Nothing matches that filter"
+                        else -> "No output yet"
+                    },
                     style = MaterialTheme.typography.titleSmall,
                 )
                 Spacer(Modifier.height(4.dp))
                 HelpText(
-                    if (hasLines) {
-                        "Tap the chip again to see everything."
-                    } else {
-                        "Output appears here once a download starts."
+                    when {
+                        searching ->
+                            "Every word has to appear on the same line. Drop a word, or " +
+                                "close the search to see everything."
+                        hasLines -> "Tap the chip again to see everything."
+                        else -> "Output appears here once a download starts."
                     },
                 )
             }
@@ -325,7 +569,7 @@ private fun EmptyState(hasLines: Boolean) {
 }
 
 @Composable
-private fun ErrorState(message: String) {
+private fun ErrorState(message: String, onRetry: () -> Unit) {
     Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
         AioCard(
             borderColor = MaterialTheme.colorScheme.error.copy(alpha = 0.3f),
@@ -336,6 +580,18 @@ private fun ErrorState(message: String) {
             HelpText(
                 "$message\n\nThe download itself is unaffected — everything here is also " +
                     "in `adb logcat`.",
+            )
+            Spacer(Modifier.height(12.dp))
+            // The reader follows logcat from "now", so a retry cannot recover
+            // what was missed while it was down — it only starts capturing
+            // again, which is still the difference between a dead screen and a
+            // working one.
+            AioButton(
+                text = "Try again",
+                icon = Icons.Filled.Refresh,
+                tone = ButtonTone.Outline,
+                compact = true,
+                onClick = onRetry,
             )
         }
     }

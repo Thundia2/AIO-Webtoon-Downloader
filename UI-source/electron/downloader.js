@@ -55,6 +55,15 @@ function buildCliArgs(args) {
     width: "--width",
     aspectRatio: "--aspect-ratio",
     chapters: "--chapters",
+    // Pins the series folder for an update-check download. Set only by
+    // src/lib/downloadArgs.js:buildLibraryDownloadArgs, which passes the
+    // folderPath of the row the user clicked — so when a series is forked
+    // across two folders, the delta lands in the one the panel reported
+    // under instead of whichever one Python's own lookup would pick. Python
+    // ignores it (with a warning, falling back to the normal identity lookup)
+    // unless the path is an existing folder inside the library that holds this
+    // same series. grep seriesIdentityKey.
+    seriesDir: "--series-dir",
     language: "--language",
     split: "--split",
     site: "--site",

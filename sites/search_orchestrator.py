@@ -34,7 +34,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import cmp_to_key
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 from . import fuzzy_match
@@ -158,6 +158,18 @@ def _patch_torchvision_deprecated_apis() -> None:
 # 0.55 keeps "Frieren" matching "Sousou no Frieren" via alt-titles but kicks
 # out unrelated series that share a single word.
 DEFAULT_MIN_MATCH = 0.55
+
+# Seed alt-title matching (2026-08-20). In URL-seed mode aio_search_cli sets
+# `query = seed.title`, so the whole cross-site search runs against ONE site's
+# spelling — usually the English licensed title, while plenty of sites list
+# only the romaji. Scoring every hit against the seed's alt_names too closes
+# that gap; these two bound the widening. MIN_LEN drops fragments too short to
+# discriminate ("K.", a bare volume marker) — WRatio's partial_ratio component
+# would match those into anything. MAX caps the M*N score matrix so a series
+# with 20 localized aliases stays cheap on Android's pure-Python rapidfuzz
+# backend (see sites/fuzzy_match.py for why that backend is in play at all).
+_SEED_VARIANT_MIN_LEN = 4
+_SEED_VARIANT_MAX = 12
 
 # Tiebreaker window: when two sources for the same candidate score within
 # this much on title-match, the quality_seed prior breaks the tie. Above this
@@ -5200,7 +5212,9 @@ def _normalize_title(title: str) -> str:
 
 
 # --- Title matching -----------------------------------------------------
-def _best_title_match(query: str, hit: SearchHit) -> float:
+def _best_title_match(
+    query: str, hit: SearchHit, extra_queries: Sequence[str] = (),
+) -> float:
     """Compute rapidfuzz weighted similarity against title + alt_titles.
 
     Uses WRatio (weighted blend of partial_ratio, token_sort_ratio, and ratio)
@@ -5214,6 +5228,17 @@ def _best_title_match(query: str, hit: SearchHit) -> float:
     Cross-file: this is the only place query↔hit similarity is computed; if
     we ever migrate scorers, change here and update DEFAULT_MIN_MATCH above
     in the same edit.
+
+    ``extra_queries`` are additional spellings of the SAME series the caller
+    already knows (search_all passes the URL-seed's alt_names). The result is
+    the max over every (query variant x hit candidate) pair, so a hit is
+    admitted when it matches ANY known spelling. This is what lets a site that
+    lists only the romaji survive an English-titled query: matching
+    "The Disastrous Life of Saiki K." against comix's "Saiki Kusuo no Psi Nan"
+    scores 0.466 and dies against the 0.55 floor, while three unrelated comix
+    titles sharing one common word clear it — the gate was rejecting the right
+    answer and admitting noise. Empty by default, so keyword searches (no seed)
+    score exactly as they always did.
 
     Scores come from sites/fuzzy_match, which normalizes the three codepoints
     rapidfuzz's C++ and pure-Python backends disagree on. That matters most
@@ -5238,17 +5263,24 @@ def _best_title_match(query: str, hit: SearchHit) -> float:
     if not candidates:
         return 0.0
 
-    q = (query or "").strip()
-    if not q:
+    queries = [(query or "").strip()]
+    queries.extend((e or "").strip() for e in extra_queries or ())
+    queries = [q for q in queries if q]
+    if not queries:
         return 0.0
 
     best = 0.0
-    for cand in candidates:
-        if not cand:
-            continue
-        score = fuzzy_match.wratio(q, cand) / 100.0
-        if score > best:
-            best = score
+    for q in queries:
+        for cand in candidates:
+            if not cand:
+                continue
+            score = fuzzy_match.wratio(q, cand) / 100.0
+            if score > best:
+                best = score
+        # 1.0 is the ceiling — no later pair can raise it, and the variant
+        # loop is the hot path on a URL-seed search (hits x variants x alts).
+        if best >= 1.0:
+            return best
     return best
 
 
@@ -6008,10 +6040,40 @@ def search_all(
         _emit_site_health()
         return []
 
+    # Alternate spellings of the seeded series, harvested from the seed's own
+    # alt_names. URL-seed mode searches every other site with the seed site's
+    # title (aio_search_cli: `query = seed.title`), so without this a site that
+    # lists the series under a different romanization scores against a title it
+    # was never going to match. Only URL-seed searches populate seed_hits, so
+    # keyword searches keep their exact previous scores. Grep _SEED_VARIANT_MAX
+    # for the bounds and _best_title_match for how they are consumed.
+    seed_title_variants: List[str] = []
+    if seed_hits:
+        _seen_variants = {_normalize_title(query)}
+        for _sh in seed_hits:
+            for _alt in [_sh.title] + list(_sh.alt_titles or []):
+                if len(seed_title_variants) >= _SEED_VARIANT_MAX:
+                    break
+                _a = (_alt or "").strip()
+                if len(_a) < _SEED_VARIANT_MIN_LEN:
+                    continue
+                _k = _normalize_title(_a)
+                if not _k or _k in _seen_variants:
+                    continue
+                _seen_variants.add(_k)
+                seed_title_variants.append(_a)
+    if seed_title_variants and on_status:
+        _shown = ", ".join(seed_title_variants[:3])
+        _more = f" +{len(seed_title_variants) - 3} more" if len(seed_title_variants) > 3 else ""
+        on_status(
+            f"[*] Also matching against {len(seed_title_variants)} seed "
+            f"alt-title(s): {_shown}{_more}"
+        )
+
     # Score every hit against the query.
     scored: List[Tuple[float, SearchHit]] = []
     for hit in all_hits:
-        score = _best_title_match(query, hit)
+        score = _best_title_match(query, hit, seed_title_variants)
         if score >= min_match:
             scored.append((score, hit))
 
@@ -6699,7 +6761,7 @@ def search_all(
         adopted_sites: set = set()
         for _name, hits in late_now.items():
             for hit in hits or []:
-                score = _best_title_match(query, hit)
+                score = _best_title_match(query, hit, seed_title_variants)
                 if score < min_match:
                     continue
                 keys: List[str] = []

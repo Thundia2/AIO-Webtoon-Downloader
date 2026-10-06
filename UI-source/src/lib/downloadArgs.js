@@ -30,6 +30,14 @@
 //   d      — settings.defaults (the download-defaults dict). May be {}.
 //   chaptersStr — the chapter range string (from chaptersToRangeString).
 //   verboseAlways — settings.verboseAlways (the raw value; `?? true` applied here).
+//   folderPath — the series folder this download belongs to, forwarded as
+//     --series-dir. Optional, and only load-bearing when a series is FORKED
+//     across two folders (a site rename used to create those; grep
+//     seriesIdentityKey): the update-check row reports under the folder
+//     holding the bulk of the series, and without this the engine would
+//     re-derive the target itself and could pick the other one. Python
+//     validates it and falls back to its own identity lookup when the path is
+//     stale, so passing a folder that has since been merged away is harmless.
 //
 // NOTE the XF-2 quality default of 100 (NOT 85): any --quality < 100 flips the
 // child's _user_set_quality True and disables the CBZ byte-passthrough
@@ -54,6 +62,7 @@ export function buildLibraryDownloadArgs(
   d,
   chaptersStr,
   verboseAlways,
+  folderPath,
 ) {
   const m = meta || {};
   const def = d || {};
@@ -63,6 +72,7 @@ export function buildLibraryDownloadArgs(
     chapters: chaptersStr,
     language: m.language || "en",
     site: m.site || undefined,
+    seriesDir: folderPath || undefined,
     verbose: verboseAlways ?? true,
   };
   if (def.scaling && def.scaling !== 100) args.scaling = def.scaling;

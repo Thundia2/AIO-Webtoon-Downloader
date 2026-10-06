@@ -12,11 +12,20 @@ relax the test — check downloader.js first, since the two must agree.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 
 import pytest
 
-from aio_android import build_argv, build_argv_json
+import aio_android
+from aio_android import (
+    UnsupportedUrlError,
+    _BOOL_FLAGS,
+    _VALUED_FLAGS,
+    build_argv,
+    build_argv_json,
+)
 
 
 def _pairs(argv):
@@ -241,6 +250,228 @@ def test_build_argv_json_round_trip():
 def test_build_argv_json_rejects_bad_payloads(bad, exc):
     with pytest.raises(exc):
         build_argv_json(bad)
+
+
+# --------------------------------------------------------------------------
+# Flags added in Wave 2 (android/PARITY.md §3.4 "no table entry at all")
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("key,flag", [
+    ("noSidecarAssets", "--no-sidecar-assets"),
+    ("noGroupFallback", "--no-group-fallback"),
+    ("downloadVolumes", "--download-volumes"),
+])
+def test_new_bool_flags_are_emitted_and_require_exactly_true(key, flag):
+    assert build_argv({key: True}) == [flag]
+    for falsey in (False, None, 0, "", "true", 1):
+        assert build_argv({key: falsey}) == []
+
+
+def test_anilist_enrichment_is_reachable_from_the_settings_dict():
+    """The FLAG half of "AniList enrichment is off and cannot be turned on".
+    The env half is configure(metadata_source=…) — see
+    tests/test_android_repair.py."""
+    got = _pairs(build_argv({
+        "metadataSource": "anilist", "metadataTagMinRank": 80,
+    }))
+    assert got == {"--metadata-source": "anilist", "--metadata-tag-min-rank": "80"}
+    assert build_argv({"metadataRefresh": True}) == ["--metadata-refresh"]
+
+
+def test_epub_dir_is_emitted_verbatim():
+    """It moves the EPUB artifact only — the series metadata stays under
+    --output-dir, which is why aio-dl.py keys final-file coverage per format."""
+    assert _pairs(build_argv({"epubDir": "/storage/emulated/0/Books"})) == {
+        "--epub-dir": "/storage/emulated/0/Books"
+    }
+
+
+@pytest.mark.parametrize("key,flag,default,other", [
+    ("chapterDeadlineSeconds", "--chapter-deadline-seconds", 90, 180),
+    ("chapterHostPoisonThreshold", "--chapter-host-poison-threshold", 5, 8),
+    ("inlineChapterRetries", "--inline-chapter-retries", 2, 4),
+    ("inlineChapterBackoff", "--inline-chapter-backoff", 30, 15),
+])
+def test_watchdog_knobs_skip_their_python_default(key, flag, default, other):
+    """Each of these argparse defaults is itself read from an env var
+    (AIO_CHAPTER_DEADLINE and friends), so emitting the default would silently
+    BEAT an env override. Omitting it lets the override stand."""
+    assert build_argv({key: default}) == []
+    # A string carrying the same number is still the default — the reference's
+    # bare !== would emit it.
+    assert build_argv({key: str(default)}) == []
+    assert _pairs(build_argv({key: other})) == {flag: str(other)}
+
+
+def test_watchdog_zero_is_a_real_value_not_a_default():
+    """0 disables the deadline and the poison threshold outright, and 0 retries
+    means "abort on the first failed chapter". A truthiness filter drops all
+    three."""
+    got = _pairs(build_argv({
+        "chapterDeadlineSeconds": 0,
+        "chapterHostPoisonThreshold": 0,
+        "inlineChapterRetries": 0,
+    }))
+    assert got == {
+        "--chapter-deadline-seconds": "0",
+        "--chapter-host-poison-threshold": "0",
+        "--inline-chapter-retries": "0",
+    }
+
+
+def test_non_numeric_value_for_a_numeric_knob_is_dropped():
+    """argparse would hard-error on it (type=float) and kill the run, so the
+    safe direction is to omit and let Python apply its own default."""
+    assert build_argv({"chapterDeadlineSeconds": "soon"}) == []
+
+
+def test_every_table_flag_is_a_real_aio_dl_option():
+    """A key whose flag does not exist is not a typo that throws — it is a run
+    that dies at argparse. Checked against --help's own text rather than a
+    hand-kept list."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    help_text = subprocess.run(
+        [sys.executable, str(repo / "aio-dl.py"), "--help"],
+        capture_output=True, text=True, cwd=str(repo), timeout=300,
+    ).stdout
+    for flag in list(_VALUED_FLAGS.values()) + list(_BOOL_FLAGS.values()):
+        assert flag in help_text, f"{flag} is not an aio-dl.py option"
+
+
+# --------------------------------------------------------------------------
+# --group / --exclude-group: nargs="+" and the swallowed positional
+# --------------------------------------------------------------------------
+
+def test_group_emits_one_attached_flag_per_name():
+    assert build_argv({"group": "Team A, Team B"}) == ["--group=Team A", "--group=Team B"]
+    assert build_argv({"excludeGroup": "Bad TL"}) == ["--exclude-group=Bad TL"]
+
+
+def test_group_accepts_a_list_as_well_as_a_comma_string():
+    """The form field is free text today; a chip picker would hand over a list."""
+    assert build_argv({"group": ["A", "B"]}) == ["--group=A", "--group=B"]
+
+
+def test_group_drops_blank_names():
+    # "A, " is what a trailing comma in the text field produces.
+    assert build_argv({"group": "A, ,  B,"}) == ["--group=A", "--group=B"]
+    assert build_argv({"group": " , "}) == []
+
+
+def test_group_name_starting_with_a_dash_survives():
+    """The attached form is what makes this parseable at all — detached, it
+    would read as an unknown option."""
+    assert build_argv({"group": "-Odd"}) == ["--group=-Odd"]
+
+
+def _refresh_probe(extra_argv, library_dir):
+    """Run --refresh-library-metadata against an EMPTY library and return its
+    stdout.
+
+    A real-parser probe with no network in it: that mode returns right after a
+    directory scan, and its optional positional lands in the SAME `comic_url`
+    dest a download URL does — so it answers "did an option swallow the
+    positional" without downloading anything.
+    """
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        aio_android._run_engine(
+            ["--refresh-library-metadata", "-o", str(library_dir), *extra_argv]
+        )
+    return buffer.getvalue()
+
+
+def test_group_flag_does_not_swallow_the_positional(tmp_path):
+    """THE REGRESSION THIS SHAPE EXISTS TO FIX, against the real argparse.
+
+    `--group` is declared nargs="+", so the detached `--group A <positional>`
+    form makes argparse consume the positional as a second group name. On a
+    download that is fatal: aio-dl.py exits with "You must provide at least one
+    URL". It is reachable from an ordinary form — a user who sets a preferred
+    group and leaves every other knob at its default emits exactly that.
+    """
+    library = tmp_path / "manga"
+    library.mkdir()
+
+    fixed = _refresh_probe(build_argv({"group": "Team A"}) + ["MyFilter"], library)
+    assert "matching ['myfilter']" in fixed, fixed
+
+    # The pre-fix emission, to prove the probe can actually see the failure.
+    broken = _refresh_probe(["--group", "Team A", "MyFilter"], library)
+    assert "matching" not in broken, broken
+
+
+def test_exclude_group_flag_does_not_swallow_the_positional(tmp_path):
+    library = tmp_path / "manga"
+    library.mkdir()
+    out = _refresh_probe(build_argv({"excludeGroup": "Bad TL"}) + ["MyFilter"], library)
+    assert "matching ['myfilter']" in out, out
+
+
+# --------------------------------------------------------------------------
+# D7 — a pasted comix URL cannot start a download here
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("url", [
+    "https://comix.to/title/abc-some-slug",
+    "https://www.comix.to/title/abc",
+    "http://comix.to/",
+    "https://COMIX.TO/title/abc",
+    "https://cdn.comix.to/title/abc",
+    "https://comix.to:443/title/abc",
+])
+def test_comix_urls_are_refused(url):
+    """--disable-sites cannot do this: it explicitly exempts a directly
+    downloaded URL, so a pasted link would reach an engine that has no
+    Patchright to drive."""
+    with pytest.raises(UnsupportedUrlError) as excinfo:
+        build_argv({"url": url})
+    assert excinfo.value.site == "comix"
+
+
+@pytest.mark.parametrize("url", [
+    "https://mangadex.org/title/abc",
+    "https://weebcentral.com/series/abc",
+    # Adjacent hostnames that merely CONTAIN the name must still work — the
+    # check is host-scoped, not a substring match.
+    "https://comix.to.example.com/x",
+    "https://notcomix.to/x",
+    "https://example.com/comix.to/x",
+])
+def test_other_urls_still_pass(url):
+    assert build_argv({"url": url})[-1] == url
+
+
+def test_a_settings_blob_with_no_url_is_never_refused():
+    """The library update path builds argv without a positional in some flows;
+    refusing an empty URL would break every one of them."""
+    assert build_argv({"format": "cbz"}) == ["--format", "cbz"]
+    assert build_argv({"url": "", "format": "cbz"}) == ["--format", "cbz"]
+
+
+def test_build_argv_json_returns_a_renderable_object_for_a_refusal():
+    """Kotlin discriminates on the first character: `[` runs, `{` is shown. A
+    raise would cross JNI as a stringified traceback, which is a crash rather
+    than something a Compose screen can render."""
+    raw = build_argv_json(json.dumps({"url": "https://comix.to/title/abc"}))
+    assert raw.startswith("{")
+    payload = json.loads(raw)
+    assert payload["error"] == "unsupported_site"
+    assert payload["site"] == "comix"
+    assert payload["url"] == "https://comix.to/title/abc"
+    # A finished sentence, so the UI renders it rather than composing wording.
+    assert payload["message"].endswith(".")
+    assert len(payload["message"]) > 40
+
+
+def test_build_argv_json_success_is_still_a_bare_array():
+    raw = build_argv_json(json.dumps({"format": "cbz", "url": "https://e/x"}))
+    assert raw.startswith("[")
+    assert json.loads(raw) == ["--format", "cbz", "https://e/x"]
 
 
 def test_realistic_komikku_download_matches_expected_command_line():

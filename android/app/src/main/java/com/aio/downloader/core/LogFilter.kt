@@ -149,3 +149,68 @@ fun sanitizeLogLine(
     if (NOISY_LINE_RE.containsMatchIn(line)) return null
     return line to classifyLogLevel(line, successRe)
 }
+
+// ── text search (LogsScreen) ───────────────────────────────────────────────
+
+/**
+ * Split what the user typed into search terms.
+ *
+ * Whitespace-separated, and every term must match — AND, not OR. A download log
+ * is thousands of near-identical lines, so the useful query is almost always a
+ * narrowing one ("chapter 12 failed"), and OR would return more than the
+ * unfiltered list already shows.
+ *
+ * NOT a regex, deliberately: `[!]`, `(`, `+` and `.` are all ordinary
+ * characters in this output, and a user typing `[!]` to find the error lines
+ * would otherwise get a character class matching `!`, or a syntax error there
+ * is nowhere to report. Substring matching does the obvious thing instead.
+ */
+fun logQueryTerms(query: String): List<String> =
+    query.trim().split(WHITESPACE_RE).filter { it.isNotEmpty() }
+
+private val WHITESPACE_RE = Regex("""\s+""")
+
+/** True when every term in [terms] appears in [text], case-insensitively. */
+fun matchesLogQuery(text: String, terms: List<String>): Boolean =
+    terms.isEmpty() || terms.all { text.contains(it, ignoreCase = true) }
+
+/**
+ * Where [terms] occur in [text], as non-overlapping ranges in ascending order,
+ * for the Logs screen's match highlighting.
+ *
+ * Overlaps are MERGED rather than emitted twice: two terms whose hits touch
+ * (searching `chapter chap`) would otherwise produce nested spans, and
+ * `AnnotatedString` renders the later one over the earlier at full opacity —
+ * so an overlapping pair would visibly differ from a non-overlapping one for no
+ * reason the reader could explain.
+ */
+fun logMatchRanges(text: String, terms: List<String>): List<IntRange> {
+    if (text.isEmpty() || terms.isEmpty()) return emptyList()
+    val hits = ArrayList<IntRange>()
+    for (term in terms) {
+        if (term.isEmpty()) continue
+        var from = 0
+        while (from <= text.length - term.length) {
+            val at = text.indexOf(term, from, ignoreCase = true)
+            if (at < 0) break
+            hits += at until (at + term.length)
+            from = at + term.length
+        }
+    }
+    if (hits.size <= 1) return hits
+    hits.sortBy { it.first }
+
+    val merged = ArrayList<IntRange>(hits.size)
+    var current = hits.first()
+    for (index in 1 until hits.size) {
+        val next = hits[index]
+        current = if (next.first <= current.last + 1) {
+            current.first..maxOf(current.last, next.last)
+        } else {
+            merged += current
+            next
+        }
+    }
+    merged += current
+    return merged
+}

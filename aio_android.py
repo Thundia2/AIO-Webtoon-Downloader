@@ -71,7 +71,7 @@ import queue
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
 _CONFIG_LOCK = threading.Lock()
@@ -96,10 +96,20 @@ def _aio_dl():
 # ---------------------------------------------------------------------------
 
 
+#: What --metadata-source accepts (grep its argparse `choices` in aio-dl.py).
+#: Used to VALIDATE what configure() writes into AIO_METADATA_SOURCE — argparse
+#: uses that env var as the flag's DEFAULT, so an unrecognized value there is
+#: not an inert typo: it makes argparse reject its own default with "invalid
+#: choice" and every single run fails, including the ones that never asked for
+#: enrichment.
+_METADATA_SOURCES = ("none", "anilist")
+
+
 def configure(
     output_dir: str,
     cache_dir: str,
     temp_dir: Optional[str] = None,
+    metadata_source: Optional[str] = None,
 ) -> str:
     """Point the downloader at Android-writable locations. Call ONCE, before
     anything else in this module.
@@ -113,8 +123,20 @@ def configure(
                   path.
     temp_dir   -> working dir for tmp_<hid>/ and build_epub's staging tree.
                   Defaults to <cache_dir>/work.
+    metadata_source -> AniList enrichment, the ENV half ("none" | "anilist").
 
     Returns the resolved temp/working directory.
+
+    THE metadata_source ARGUMENT IS BELT-AND-BRACES, not the primary route.
+    [build_argv] emits `--metadata-source` from the settings dict, which covers
+    every download and is what a user's toggle should actually drive. This
+    covers the entry points that do NOT build their argv through build_argv and
+    therefore fall back to argparse's default: [list_chapters] and
+    [refresh_library_metadata] when called without an explicit source. Before
+    this existed, `--metadata-source` defaulted to "none" and nothing on the
+    device ever set it, so AniList enrichment was off and could not be turned
+    on from anywhere — android/PARITY.md's "the library can never be repaired"
+    row.
 
     WHY SET CWD rather than patch aio-dl.py: several paths there are resolved
     against the process CWD (`os.path.abspath(f"tmp_{hid}")`, build_epub's
@@ -142,9 +164,27 @@ def configure(
         # No terminal here; ANSI would just litter the log panel.
         os.environ.setdefault("NO_COLOR", "1")
 
+        # Set UNCONDITIONALLY rather than setdefault-ed: Chaquopy's interpreter
+        # outlives every screen, so a setdefault would pin whatever the first
+        # call passed for the life of the process and turning enrichment back
+        # OFF in the UI would silently not turn it off. Anything unrecognized
+        # normalizes to "none" — see _METADATA_SOURCES for why an invalid value
+        # here is not survivable.
+        source = str(metadata_source or "").strip().lower()
+        os.environ["AIO_METADATA_SOURCE"] = (
+            source if source in _METADATA_SOURCES else "none"
+        )
+
         os.chdir(work_dir)
         _CONFIGURED.update(
-            {"output_dir": output_dir, "cache_dir": cache_dir, "work_dir": work_dir}
+            {
+                "output_dir": output_dir,
+                "cache_dir": cache_dir,
+                "work_dir": work_dir,
+                # Recorded so diagnostics() answers "is enrichment on" without
+                # the reader having to know it lives in an env var.
+                "metadata_source": os.environ["AIO_METADATA_SOURCE"],
+            }
         )
         return work_dir
 
@@ -949,6 +989,20 @@ def _require_settings_object(settings_json: str) -> Dict[str, Any]:
     return settings
 
 
+def _contained_in(root: str, path: str) -> bool:
+    """Is `path` inside `root`? Both arguments must already be realpath'd.
+
+    The shared half of every containment guard in this module — see
+    [delete_series] for why they exist at all. commonpath raises rather than
+    returning False for paths on different Windows drives, which never happens
+    on device but does in the desktop test suite that also runs this file.
+    """
+    try:
+        return os.path.commonpath([root, path]) == root
+    except ValueError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Resource limits
 #
@@ -1073,6 +1127,119 @@ def resume_throttle_flags_json(settings_json: str) -> str:
     return json.dumps(resume_throttle_flags(_require_settings_object(settings_json)))
 
 
+#: Human labels for a level, so the UI's banner text and this module's idea of
+#: the level set cannot drift. Mirror of NETWORK_LEVELS in
+#: UI-source/src/lib/resourceLimits.js.
+_LEVEL_LABELS: Dict[str, str] = {
+    "unlimited": "Unlimited",
+    "high": "High",
+    "balanced": "Balanced",
+    "low": "Low",
+}
+
+
+def effective_limits(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """What the concurrency knobs will ACTUALLY be, given the resource limits.
+
+    Exists because [apply_network_limit] is a HARD OVERRIDE: at any level other
+    than unlimited it replaces the four download knobs outright, and there was
+    no way for a UI to find that out. The Android Download screen went on
+    rendering the user's typed `imageWorkers` while every run used the preset's
+    — android/PARITY.md D9, a display that is simply false. The desktop has had
+    the matching affordance since Resource Limits shipped (the lock icon and
+    the disabled-but-showing-the-real-number inputs in
+    UI-source/src/components/SettingsTab.jsx; the logic it calls is
+    `networkEffective` / `isNetworkManaged` / `networkPreviewText` in
+    UI-source/src/lib/resourceLimits.js, which this mirrors).
+
+    Returns, for each of the five knobs, BOTH numbers:
+
+        effective  what the run will use.
+        stored     what the user typed, untouched — a hard override never
+                   erases a manual setting, and returning it is what lets the
+                   UI restore the field the instant the level goes back to
+                   unlimited.
+
+    plus `networkManaged` (drives the lock/disabled state), the normalized
+    levels and their labels, `maxCpuPercent`, and the two one-line preview
+    strings the desktop shows under each dropdown. `networkPreview` /
+    `cpuPreview` are None at unlimited, matching the reference's `null`.
+
+    searchParallelism is in here even though [apply_network_limit] deliberately
+    leaves it alone — a search is where the user SEES that number, and its
+    Android baseline is [_MOBILE_SEARCH_PARALLELISM] (4), not the desktop's
+    argparse default of 6. Reporting the desktop's number would be a second
+    display lie in the shape of a fix for the first one.
+    """
+    settings = settings or {}
+    net_level = _norm_level(settings.get("networkLimit"))
+    cpu_level = _norm_level(settings.get("cpuLimit"))
+
+    stored: Dict[str, Any] = {
+        knob: (
+            settings[knob] if settings.get(knob) is not None else _NET_DEFAULTS[knob]
+        )
+        for knob in _NETWORK_KNOBS
+    }
+    effective = apply_network_limit(dict(stored), net_level)
+
+    # The search knob follows build_search_argv's own rule, not _NET_DEFAULTS'.
+    stored_search = settings.get("searchParallelism")
+    if stored_search is None:
+        stored_search = _MOBILE_SEARCH_PARALLELISM
+    effective_search = search_parallelism_for_level(stored_search, net_level)
+
+    knobs = {
+        knob: {"effective": effective[knob], "stored": stored[knob]}
+        for knob in _NETWORK_KNOBS
+    }
+    knobs["searchParallelism"] = {
+        "effective": effective_search,
+        "stored": stored_search,
+    }
+
+    preset = _NETWORK_PRESETS.get(net_level)
+    return {
+        "networkLimit": net_level,
+        "networkLimitLabel": _LEVEL_LABELS[net_level],
+        "networkManaged": net_level != "unlimited",
+        "cpuLimit": cpu_level,
+        "cpuLimitLabel": _LEVEL_LABELS[cpu_level],
+        "maxCpuPercent": cpu_percent_for_level(cpu_level),
+        "knobs": knobs,
+        "networkPreview": (
+            None
+            if preset is None
+            else (
+                f"curl_cffi {preset['imageConcurrency']} · "
+                f"workers {preset['imageWorkers']} · "
+                f"prefetch {preset['imagePrefetchParallel']}×"
+                f"{preset['imagePrefetchDepth']} · "
+                f"search {preset['searchParallelism']}"
+            )
+        ),
+        "cpuPreview": (
+            None
+            if cpu_level == "unlimited"
+            else f"~{_CPU_PRESETS[cpu_level]}% of CPU cores"
+        ),
+    }
+
+
+def effective_limits_json(settings_json: str) -> str:
+    """JSON-in / JSON-out wrapper around [effective_limits] for the Kotlin side.
+
+    Never raises: a settings screen that cannot ask this question would have to
+    guess, and guessing is the defect it exists to close. A malformed blob
+    reports the unlimited state, which is what an unconfigured app has anyway.
+    """
+    try:
+        settings = _require_settings_object(settings_json) if settings_json else {}
+    except (TypeError, ValueError):
+        settings = {}
+    return json.dumps(effective_limits(settings))
+
+
 # ---------------------------------------------------------------------------
 # CLI argument building
 #
@@ -1094,6 +1261,12 @@ def resume_throttle_flags_json(settings_json: str) -> str:
 _VALUED_FLAGS: Dict[str, str] = {
     "format": "--format",
     "epubLayout": "--epub-layout",
+    # Moves only the EPUB artifact, never the metadata — .aio_series.json and
+    # details.json stay in the series folder under --output-dir, which is why
+    # aio-dl.py's final-file coverage map is keyed per format (grep
+    # _final_file_recorded_coverage). A phone use for it: EPUBs onto shared
+    # storage for a reader app while the CBZ library stays app-scoped.
+    "epubDir": "--epub-dir",
     "quality": "--quality",
     "scaling": "--scaling",
     "width": "--width",
@@ -1122,6 +1295,20 @@ _VALUED_FLAGS: Dict[str, str] = {
     "maxCpuPercent": "--max-cpu-percent",
     "missedRetries": "--missed-retries",
     "missedLog": "--missed-log",
+    # ── Per-chapter watchdog + inline-retry knobs ──────────────────────────
+    # These matter MORE on a phone than on the desktop, which is why they are
+    # worth a settings surface here at all. The 90s default deadline was tuned
+    # against a wired connection; a chapter that would finish in 100s on a
+    # train is failed and retried from scratch, spending the radio twice. The
+    # backoff pair is the other direction — a mobile CDN under a captive
+    # portal or a carrier-grade NAT benefits from waiting longer, not from
+    # hammering. Emitted only when they differ from the Python default (see
+    # _VALUED_FLAG_DEFAULTS); each of those defaults is itself read from an env
+    # var, so an omitted flag lets an env override stand.
+    "chapterDeadlineSeconds": "--chapter-deadline-seconds",
+    "chapterHostPoisonThreshold": "--chapter-host-poison-threshold",
+    "inlineChapterRetries": "--inline-chapter-retries",
+    "inlineChapterBackoff": "--inline-chapter-backoff",
     "jobStallTimeout": "--job-stall-timeout",
     "jobHardTimeout": "--job-hard-timeout",
     "jobRetries": "--job-retries",
@@ -1145,6 +1332,14 @@ _BOOL_FLAGS: Dict[str, str] = {
     "noCleanup": "--no-cleanup",
     "noPartials": "--no-partials",
     "mixByUpvote": "--mix-by-upvote",
+    # Companion to `group`: skip a chapter that has none of the preferred
+    # groups rather than falling back to another one. RESUME-GATING on the
+    # Python side (grep _RESUME_GATING_DESTS) — toggling it invalidates the
+    # on-disk images, so a resume with it flipped re-downloads.
+    "noGroupFallback": "--no-group-fallback",
+    # Also resume-gating, and it changes WHICH listing the handler fetches, so
+    # it is a property of the download and not of the device.
+    "downloadVolumes": "--download-volumes",
     "verbose": "--verbose",
     "debug": "--debug",
     "noRetryMissedChapters": "--no-retry-missed-chapters",
@@ -1155,10 +1350,71 @@ _BOOL_FLAGS: Dict[str, str] = {
     "modernize": "--modernize",
     "noFastDownload": "--no-fast-download",
     "metadataRefresh": "--metadata-refresh",
+    # MORE THAN COSMETIC on a phone, which is why it earns a control here even
+    # though the desktop treats it as an archival nicety. Auxiliary assets are
+    # fetched by aio-dl.py's _fetch_binary_asset_bytes, which is deliberately
+    # EXEMPT from the per-chapter watchdog (grep the chapter-watchdog invariant
+    # in CLAUDE.md — honoring the deadline there silently dropped BGM that the
+    # ComicInfo had already claimed). The consequence on mobile: a slow audio
+    # CDN extends per-chapter wall time with nothing to cut it short, on a
+    # metered radio, and until this flag was emittable there was no way to
+    # decline. Not resume-gating, so turning it on mid-series is free.
+    "noSidecarAssets": "--no-sidecar-assets",
 }
 
 # `promptUrls` is in the Electron boolMap but omitted here on purpose: it makes
 # aio-dl.py read URLs from stdin, and there is no stdin under Chaquopy.
+
+
+# Keys whose CLI flag is declared `nargs="+"` in aio-dl.py, and which therefore
+# CANNOT be emitted as a plain `[flag, value]` pair.
+#
+# THE BUG THIS EXISTS TO FIX, which is a run-killer and not a nicety: with
+# `nargs="+"` argparse keeps consuming tokens until it meets the next option, so
+# whenever one of these is the LAST flag before the positional URL, argparse
+# swallows the URL as a group name and aio-dl.py dies with "You must provide at
+# least one URL". Reachable today from an ordinary form — a user who sets only a
+# preferred group and leaves every other knob at its default produces exactly
+# `--group A <url>`. Measured against the real parser, all three of
+# `--group "A, B" <url>`, `--group A --group B <url>` and
+# `--group A --exclude-group B <url>` lose the URL, so the repeated-flag form
+# alone does NOT fix it.
+#
+# The `=` form does: `--group=A` attaches the value to the option token, which
+# nargs cannot reach past. One flag per name, so a name arrives as its own
+# argparse entry rather than depending on main()'s later `group_string.split(",")`
+# (grep it in aio-dl.py) — the same shape _append_saved_update_options emits on
+# the --update-all replay path. It also makes a name that starts with "-" safe,
+# which the detached form does not.
+#
+# NOT a fix for a group name that CONTAINS a comma: main() splits every value on
+# commas after parsing, so that ambiguity is the CLI's own and cannot be closed
+# from the emitting side.
+_REPEATED_VALUE_FLAGS = frozenset({"group", "excludeGroup"})
+
+# Python-side defaults for valued keys, so an at-default value produces no flag.
+#
+# Emitting a default is not WRONG — argparse would apply the same number — but
+# the built command line is logged and read by a human when a run misbehaves,
+# and a wall of default flags is where the one genuinely odd flag hides. All
+# four watchdog defaults are additionally read from env vars in aio-dl.py's
+# argparse (AIO_CHAPTER_DEADLINE, AIO_CHAPTER_HOST_POISON,
+# AIO_INLINE_CHAPTER_RETRIES, AIO_INLINE_CHAPTER_BACKOFF), so an OMITTED flag
+# also lets an env override stand where an emitted one would silently beat it.
+#
+# String defaults compare as strings; numeric ones go through _differs, which
+# coerces — so a settings blob carrying "90" is recognized as the default rather
+# than emitted as a redundant flag. A non-numeric value for a numeric knob also
+# reads as "default" and is dropped, which is the safe direction: argparse would
+# hard-error on it and kill the run.
+_VALUED_FLAG_DEFAULTS: Dict[str, Any] = {
+    "chapters": "all",
+    "mtl": "avoid",
+    "chapterDeadlineSeconds": 90.0,
+    "chapterHostPoisonThreshold": 5,
+    "inlineChapterRetries": 2,
+    "inlineChapterBackoff": 30.0,
+}
 
 
 def _is_true(value: Any) -> bool:
@@ -1192,6 +1448,98 @@ def _differs(value: Any, default: float) -> bool:
     return n is not None and n != default
 
 
+def _is_default_valued(key: str, value: Any) -> bool:
+    """True when `value` is the Python-side default for `key`, so the flag can
+    be left off entirely. See [_VALUED_FLAG_DEFAULTS]."""
+    if key not in _VALUED_FLAG_DEFAULTS:
+        return False
+    default = _VALUED_FLAG_DEFAULTS[key]
+    if isinstance(default, str):
+        return str(value) == default
+    return not _differs(value, default)
+
+
+def _split_names(value: Any) -> List[str]:
+    """A `--group` / `--exclude-group` setting -> one name per entry.
+
+    Accepts BOTH shapes a caller may hold: the single comma-separated string the
+    Android form's free-text field produces today, and a list, which is what a
+    chip-style picker would produce. Splitting the string here rather than
+    forwarding it whole is what lets each name become its own argparse entry —
+    see [_REPEATED_VALUE_FLAGS].
+    """
+    if isinstance(value, (list, tuple)):
+        raw = [str(v) for v in value]
+    else:
+        raw = str(value).split(",")
+    return [name.strip() for name in raw if name.strip()]
+
+
+class UnsupportedUrlError(ValueError):
+    """A URL no download on this platform can serve.
+
+    Raised by [build_argv] and converted to a renderable JSON object by
+    [build_argv_json] — the JNI boundary carries structured data, never
+    exceptions. See [_UNSUPPORTED_DOWNLOAD_SITES] for what qualifies and
+    build_argv_json's docstring for the exact shape Kotlin receives.
+    """
+
+    def __init__(self, url: str, site: str, message: str) -> None:
+        super().__init__(message)
+        self.url = url
+        self.site = site
+        self.message = message
+
+
+# Handler name -> its base domain, for URLs this process must refuse to
+# download rather than fail halfway through.
+#
+# ONLY comix, and it is not the same reason it is excluded from search. A search
+# merely wastes fan-out budget on it (its search() swallows failures to []);
+# a DOWNLOAD cannot work at all, because comix drives its own Patchright
+# session (grep _comix_worker_loop in sites/comix.py) and never goes through
+# sites/browser_backend.py — so the WebView bridge that rescues every other
+# browser-dependent handler here does nothing for it.
+#
+# WHY build_argv HAS TO BE THE ONE TO REFUSE: `--disable-sites` explicitly
+# exempts a directly-downloaded URL ("an explicit pick overrides the block" —
+# grep the flag's help in aio-dl.py), and it is the only site filter that
+# reaches the download path. So forwarding `disabledSites` cannot stop a pasted
+# comix link; the engine would accept it, boot a browser that is not there, and
+# fail after the user had already queued the job.
+#
+# LITERAL DOMAINS, DELIBERATELY, rather than reading ComixSiteHandler.domains:
+# build_argv is a pure function that Kotlin calls at enqueue time and that the
+# offline tests exercise thousands of times, and importing the handler pulls in
+# the whole 303-entry registry. The cost of the literal is that a domain
+# rotation needs an edit here — grep `domains = (` in sites/comix.py, which is
+# the one line to compare against.
+_UNSUPPORTED_DOWNLOAD_SITES: Dict[str, str] = {
+    "comix": "comix.to",
+}
+
+
+def _unsupported_download_site(url: str) -> Optional[str]:
+    """The handler name that claims `url` and cannot download here, else None.
+
+    Subdomain-tolerant (`*.comix.to` matches) and port-tolerant, so the check
+    does not turn into a game of listing every host variant. A URL with no
+    parseable host never matches — this refuses known-broken sites, it is not a
+    URL validator, and aio-dl.py's own handler resolution owns that job.
+    """
+    try:
+        host = urlparse(str(url).strip()).netloc.lower()
+    except ValueError:
+        return None
+    host = host.rsplit("@", 1)[-1].split(":", 1)[0].rstrip(".")
+    if not host:
+        return None
+    for site, domain in _UNSUPPORTED_DOWNLOAD_SITES.items():
+        if host == domain or host.endswith("." + domain):
+            return site
+    return None
+
+
 def build_argv(settings: Dict[str, Any]) -> List[str]:
     """Turn a UI settings dict into an aio-dl.py argv (WITHOUT the program name).
 
@@ -1201,7 +1549,24 @@ def build_argv(settings: Dict[str, Any]) -> List[str]:
     Returns flags in a stable order: valued, then boolean, then the special
     cases. Matching the Electron order matters only for readability of the
     logged command line; aio-dl.py's argparse is order-insensitive.
+
+    RAISES [UnsupportedUrlError] for a URL no download here can serve. Callers
+    reaching this from Kotlin should use [build_argv_json], which converts that
+    into a renderable JSON object instead of an exception crossing JNI.
     """
+    # Checked FIRST, before any flag work: refusing the job is the whole
+    # outcome, and doing it here means the refusal happens at enqueue time with
+    # the user still looking at the screen, rather than inside a foreground
+    # Service several taps later.
+    unsupported = _unsupported_download_site(settings.get("url") or "")
+    if unsupported:
+        raise UnsupportedUrlError(
+            str(settings.get("url") or "").strip(),
+            unsupported,
+            f"{unsupported} downloads need a desktop browser this app does not "
+            "have, so this link cannot be downloaded on Android. Search for the "
+            "series instead and pick another source.",
+        )
     # Resource limits first, so everything below sees the EFFECTIVE knobs. A
     # network preset replaces the four image-concurrency values outright; the
     # CPU preset is emitted only below 100 so an unlimited run produces the same
@@ -1217,11 +1582,12 @@ def build_argv(settings: Dict[str, Any]) -> List[str]:
         value = settings.get(key)
         if value is None or value == "":
             continue
-        # Both are the Python-side defaults; emitting them would add noise to
-        # every single run for no behavioural change.
-        if key == "chapters" and value == "all":
+        if _is_default_valued(key, value):
             continue
-        if key == "mtl" and value == "avoid":
+        if key in _REPEATED_VALUE_FLAGS:
+            # `--flag=name`, one per name. The attached form is load-bearing,
+            # not a style choice — see _REPEATED_VALUE_FLAGS.
+            argv.extend(f"{flag}={name}" for name in _split_names(value))
             continue
         argv.extend([flag, str(value)])
 
@@ -1322,11 +1688,46 @@ def build_argv(settings: Dict[str, Any]) -> List[str]:
 def build_argv_json(settings_json: str) -> str:
     """JSON-in / JSON-out wrapper around build_argv for the Kotlin side.
 
-    Returns a JSON array string, which is exactly what run_download_json takes —
-    so Kotlin can log the command line and then run it without touching the
-    list. See run_download_json on why lists can't cross this boundary.
+    TWO RETURN SHAPES, and the caller MUST branch on which it got:
+
+        [ "--format", "cbz", "https://…" ]        success — a JSON ARRAY
+        { "error": "unsupported_site", … }        refusal — a JSON OBJECT
+
+    The array is exactly what run_download_json takes, so Kotlin can log the
+    command line and then run it without touching the list. The object carries
+    `error` ("unsupported_site"), `site` (the handler name), `url`, and
+    `message` — a finished, user-facing sentence, so the UI renders it rather
+    than composing its own wording from the code.
+
+    DISCRIMINATE ON THE FIRST CHARACTER. `{` and `[` are the only two openers
+    either shape can start with, which makes this a one-line branch with no
+    speculative parse:
+
+        val raw = aio.callAttr("build_argv_json", settingsJson).toString()
+        if (raw.startsWith("[")) JSONArray(raw)          // run it
+        else JSONObject(raw).getString("message")        // show it
+
+    WHY AN OBJECT rather than letting the exception cross JNI: Chaquopy turns a
+    Python raise into a PyException whose message is a stringified traceback.
+    That is a crash to Kotlin, not a thing a Compose screen can render, and the
+    one case this fires for — a pasted comix link — is an ordinary user mistake
+    that deserves a sentence, not a stack trace.
+
+    Cross-file: DownloadService.kt currently does a bare `JSONArray(...)` on
+    this result and would throw on the object; SearchScreen/DownloadScreen are
+    the natural places to surface `message`.
     """
-    return json.dumps(build_argv(_require_settings_object(settings_json)))
+    try:
+        return json.dumps(build_argv(_require_settings_object(settings_json)))
+    except UnsupportedUrlError as exc:
+        return json.dumps(
+            {
+                "error": "unsupported_site",
+                "site": exc.site,
+                "url": exc.url,
+                "message": exc.message,
+            }
+        )
 
 
 def run_download_json(argv_json: str, sink: Optional[Callable[[str], None]] = None) -> int:
@@ -1413,9 +1814,34 @@ def list_chapters(url: str, extra_args: Optional[List[str]] = None) -> str:
 #      ethernet NIC, and the Resource Limits presets tighten it further.
 # ---------------------------------------------------------------------------
 
-# Handlers that cannot work in this process, regardless of user settings. Kept
-# as a set (not a lone string) because the next one will not be the last —
-# kagane needs pywidevine, and weebcentral hard-raises without impit.
+# Search-capable handlers that cannot work in this process, regardless of user
+# settings.
+#
+# EXACTLY ONE ENTRY, and the two names this comment used to promise as "coming"
+# were both wrong — the tuple never contained them and, measured, neither
+# belongs:
+#
+#   weebcentral — its fallback ladder is `cloudscraper -> rescue_cf_html ->
+#       raise` now, and rescue_cf_html's SECOND tier is the embedder browser,
+#       i.e. this app's WebView bridge. So weebcentral rescues itself HERE. The
+#       old "hard-raises without impit" rationale described the pre-2026-08
+#       hand-ordered ladder; impit is genuinely absent on Android (see the
+#       "NOT INSTALLED" list in android/app/build.gradle.kts), which only means
+#       rescue_cf_html's first tier no-ops and the WebView tier takes it.
+#   kagane — not search-capable on EITHER platform. It never overrides
+#       BaseSiteHandler.search, so sites.iter_search_capable_handlers() filters
+#       it out before the fan-out and `--disable-sites kagane` would be inert.
+#       Its pywidevine dependency gates DOWNLOADS, which is a different list.
+#
+# Verify both claims:
+#   python -c "import sites; n={h.name for h in sites.iter_search_capable_handlers()}; print({s: s in n for s in ('comix','weebcentral','kagane')})"
+#   -> comix True, weebcentral True, kagane False
+#
+# A tuple rather than a bare string only because the shape should not have to
+# change when a second real entry appears. See [_UNSUPPORTED_DOWNLOAD_SITES] for
+# the download-path analogue, which is a DIFFERENT question with a different
+# consequence: excluding comix from search costs it fan-out budget, while a
+# comix DOWNLOAD cannot run at all.
 _UNAVAILABLE_SEARCH_SITES = ("comix",)
 
 # Mobile fan-out default, against aio-dl.py's argparse default of 6. Not a
@@ -1759,7 +2185,11 @@ def series_files(folder: str) -> str:
     return json.dumps({"files": files, "chapter_dirs": chapter_dirs})
 
 
-def check_series_updates(folder: str, collapse_splits: bool = False) -> str:
+def check_series_updates(
+    folder: str,
+    collapse_splits: bool = False,
+    peer_folders: Optional[List[str]] = None,
+) -> str:
     """Which chapters exist on the site but not on this device, as JSON.
 
     Behavioural port of UI-source/electron/main.js:_checkSeriesUpdates — the
@@ -1768,6 +2198,13 @@ def check_series_updates(folder: str, collapse_splits: bool = False) -> str:
     (fragment labels the download path merged away, which a consensus-free
     listing re-lists and which would otherwise read as new forever), and the
     same error vocabulary, so the two UIs can say the same things.
+
+    `peer_folders` are OTHER folders holding the same series — the forks a site
+    rename used to create (grep seriesIdentityKey; library_state.
+    group_entries_by_series is what finds them). Everything the check reads off
+    disk is unioned across `folder` + peers, because a series split over two
+    folders is still one series: without this the 59-chapter half reports
+    "5 new" while its 5-chapter fork reports "59 new" and neither is true.
 
     ONE DELIBERATE DIVERGENCE: the desktop offers two mutually exclusive modes —
     trust `chapters_downloaded` (its default) or scan filenames
@@ -1816,20 +2253,38 @@ def check_series_updates(folder: str, collapse_splits: bool = False) -> str:
             {"error": str(payload["error"]), "message": str(payload.get("message") or "")}
         )
 
-    downloaded = {str(c) for c in (meta.get("chapters_downloaded") or [])}
-    for number in scan_downloaded_chapters(folder):
-        downloaded.add(format_chapter_number(number))
-    skipped = {str(c) for c in (meta.get("chapters_skipped_fragments") or [])}
-    # Chapters the user crossed out in the desktop Updates Center. Split off
-    # rather than subtracted like `skipped`: the desktop renders them struck
-    # through so they can be undone, and this side reports them under the same
-    # key so an Android build that grows the affordance needs no engine change.
-    # Until it does, the effect here is simply that a chapter crossed out on the
-    # desktop is not offered for download on the device either — which is the
-    # whole point of the two UIs sharing one metadata file.
+    # Union across the series' folders. `folder` is always first so a lone
+    # series (the overwhelmingly common case) costs exactly what it used to.
+    downloaded: Set[str] = set()
+    skipped: Set[str] = set()
+    crossed_out: Set[str] = set()
+    for index, member in enumerate([folder, *(peer_folders or [])]):
+        member_meta = meta
+        if index:
+            member_path = os.path.join(member, ".aio_series.json")
+            try:
+                with open(member_path, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                member_meta = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                # An unreadable peer contributes nothing rather than failing the
+                # check — the primary's own answer is still worth reporting.
+                member_meta = {}
+        downloaded.update(str(c) for c in (member_meta.get("chapters_downloaded") or []))
+        for number in scan_downloaded_chapters(member):
+            downloaded.add(format_chapter_number(number))
+        skipped.update(str(c) for c in (member_meta.get("chapters_skipped_fragments") or []))
+        crossed_out.update(str(c) for c in (member_meta.get("chapters_ignored") or []))
+    # `crossed_out` (unioned above) is chapters the user crossed out in the
+    # desktop Updates Center. Split off rather than subtracted like `skipped`:
+    # the desktop renders them struck through so they can be undone, and this
+    # side reports them under the same key so an Android build that grows the
+    # affordance needs no engine change. Until it does, the effect here is
+    # simply that a chapter crossed out on the desktop is not offered for
+    # download on the device either — which is the whole point of the two UIs
+    # sharing one metadata file.
     # Cross-file: UI-source/electron/main.js:_checkSeriesUpdates does the same
     # split; grep chapters_ignored.
-    crossed_out = {str(c) for c in (meta.get("chapters_ignored") or [])}
 
     relevant = [str(c) for c in (payload.get("chapters") or []) if str(c) not in skipped]
     absent = [c for c in relevant if c not in downloaded]
@@ -1967,6 +2422,238 @@ def delete_series(folder: str) -> str:
     except OSError as exc:
         return json.dumps({"error": "delete_failed", "message": str(exc)})
     return json.dumps({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Library repair
+#
+# Two standalone aio-dl.py modes that REPAIR an existing library instead of
+# downloading into it. Before these there was no in-place repair path of ANY
+# kind on the device: a series enriched against the wrong AniList entry, or an
+# archive the overwrite guard declined to rebuild, stayed that way forever.
+#
+# Both follow list_chapters' shape rather than run_download's — engine lock
+# try-acquired (a repair that silently queued behind a 40-minute download would
+# look like a dead button), stdout captured (under Chaquopy stdout IS logcat),
+# a JSON verdict returned. Neither streams progress events: aio-dl.py's _emit
+# sites are all in the download path, so there is nothing to stream, and the
+# captured log is what a UI shows instead.
+#
+# NEITHER OPTS INTO INTERACTIVE CLOUDFLARE SOLVING, contrary to what a reading
+# of "it reaches main(), so it opts in" would suggest. main()'s grant sits at
+# the handler-resolution stage (grep allow_interactive_solving_for_this_run),
+# and both of these modes sys.exit/return well before it — the refresh from its
+# dispatch near the top of main(), build-final-file from the multi-URL runner.
+# _run_engine's interactive_solving(False) barrier holds regardless.
+# ---------------------------------------------------------------------------
+
+#: Cap on the captured log a repair returns. A 130-series refresh writes one
+#: line per series; this is roughly 500 of them, which is more than any UI will
+#: scroll and small enough to cross JNI without thought. The TAIL is kept
+#: because the summary line is at the end.
+_REPAIR_LOG_MAX_CHARS = 64_000
+
+
+def _tail(text: str, limit: int = _REPAIR_LOG_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return "…\n" + text[-limit:]
+
+
+def refresh_library_metadata(
+    folder_filter: str = "",
+    rewrite_cbz: bool = False,
+    force_refresh: bool = False,
+    tag_min_rank: int = 50,
+) -> str:
+    """Re-pull AniList metadata for the library IN PLACE, without downloading.
+
+    Runs `--refresh-library-metadata`, which for each series folder carrying a
+    `.aio_series.json` re-runs the AniList match and rewrites `details.json` +
+    `.aio_series.json` (and each chapter CBZ's ComicInfo.xml under
+    `rewrite_cbz`). A series that does not match is left untouched.
+
+    `folder_filter` restricts the sweep to series whose folder name or source
+    URL contains it, case-insensitively — the repair-one-series path, and the
+    documented cure for a poisoned AniList match (root CLAUDE.md, the
+    cached-ID self-heal). Empty sweeps everything.
+    `force_refresh` bypasses the cached anilist_id, for when AniList itself
+    re-tagged the series.
+    `tag_min_rank` is the AniList relevance floor for the tags that land in
+    ComicInfo/details.json; 50 is aio-dl.py's own default.
+
+    NOT GATED ON `--metadata-source`, which is worth knowing because it looks
+    like it should be: `_refresh_library_metadata` imports and calls
+    `enrich_from_anilist` directly and never reads that flag, so a repair works
+    even on a device where enrichment is switched off for live downloads.
+    Emitting `--metadata-source` here would therefore be inert, and it is not
+    emitted — `configure(metadata_source=…)` and build_argv's flag are what
+    govern LIVE downloads.
+
+    Returns `{"ok": true, "matched": N, "skipped": N, "failed": N,
+    "exitCode": N, "output": "<log tail>"}`, or one of:
+      {"error": "engine_busy"}    a download holds the engine
+      {"error": "not_configured"} configure() has not run
+      {"error": "refresh_failed", "detail": "..."}  the engine raised
+
+    `matched`/`skipped`/`failed` are parsed out of the mode's own summary line
+    and are absent-as-zero when it printed none (an empty library, or a filter
+    that matched nothing) — `output` is the authoritative record either way,
+    which is why it is always returned.
+
+    REWRITE_CBZ IS I/O-HEAVY: it repackages every chapter archive in every
+    matched series. On a phone that is the difference between a few seconds and
+    several minutes, and it rewrites files a reader app may have open.
+    """
+    import io
+    import re
+    from contextlib import redirect_stdout
+
+    root = _CONFIGURED.get("output_dir")
+    if not root:
+        return json.dumps({"error": "not_configured"})
+    if not _ENGINE_LOCK.acquire(blocking=False):
+        return json.dumps({"error": ENGINE_BUSY})
+    try:
+        # -o EXPLICITLY, rather than letting resolve_output_dir fall back to
+        # AIO_OUTPUT_DIR. configure() sets both to the same value, so in
+        # production they agree — but then the guard above and the directory
+        # actually swept would be reading two different sources, and any caller
+        # that set one without the other would sweep the wrong library while
+        # passing the check. One value, read once.
+        argv: List[str] = ["--refresh-library-metadata", "-o", str(root)]
+        if rewrite_cbz:
+            argv.append("--refresh-rewrite-cbz")
+        if force_refresh:
+            argv.append("--metadata-refresh")
+        rank = _num(tag_min_rank)
+        if rank is not None and int(rank) != 50:
+            argv.extend(["--metadata-tag-min-rank", str(int(rank))])
+
+        term = str(folder_filter or "").strip()
+        if term:
+            # `--` first: the filter is free text the user typed, and one
+            # starting with "-" would otherwise be parsed as an unknown option
+            # and kill the run with an argparse error instead of matching
+            # nothing. Verified against the real parser.
+            argv.extend(["--", term])
+
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                code = _run_engine(argv)
+        except Exception as exc:  # noqa: BLE001 - reported to the UI, not raised
+            return json.dumps(
+                {
+                    "error": "refresh_failed",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "output": _tail(buffer.getvalue()),
+                }
+            )
+
+        text = buffer.getvalue()
+        counts = {"matched": 0, "skipped": 0, "failed": 0}
+        summary = re.search(
+            r"Refresh complete: (\d+) updated, (\d+) skipped, (\d+) failed", text
+        )
+        if summary:
+            counts = {
+                "matched": int(summary.group(1)),
+                "skipped": int(summary.group(2)),
+                "failed": int(summary.group(3)),
+            }
+        return json.dumps(
+            {"ok": True, "exitCode": code, "output": _tail(text), **counts}
+        )
+    finally:
+        _ENGINE_LOCK.release()
+
+
+def build_final_file(folder: str) -> str:
+    """Recombine the per-chapter PDFs already in `folder` into one series PDF.
+
+    THIS IS A PDF-ONLY MODE, and saying so is the point of this docstring.
+    `--build-final-file` globs `*.pdf` in the folder, groups the matches by the
+    `<Series Title> Ch <n>.pdf` name shape, and merges each group — grep
+    build_final_pdf_from_chapter_folder in aio-dl.py. There is no CBZ or EPUB
+    branch, so a CBZ library gets `{"ok": true, "built": 0}` and a log line
+    saying no per-chapter PDFs were found. DO NOT present this as the recovery
+    for a skipped CBZ/EPUB rebuild; aio-dl.py's own guard prints the two
+    remedies separately for exactly this reason (grep _final_file_would_shrink
+    and read the two print() calls under the "partial_coverage" branch — the
+    `--build-final-file` hint is inside `if args.format == "pdf"`).
+
+    WHAT IT IS THE RECOVERY FOR: the archive-overwrite guard now KEEPS an
+    existing combined file when a run would shrink it, and emits
+    `final_file_skipped`. For a PDF series whose per-chapter files are still on
+    disk (`--keep-chapters`), this is the "recombine it now" button. For cbz and
+    epub the honest instruction is to re-run the URL with the full chapter
+    range, and a UI must say that instead of offering this.
+
+    Returns `{"ok": true, "built": N, "files": [...], "exitCode": N,
+    "output": "..."}` or an error object (`engine_busy`, `not_configured`,
+    `outside_library`, `not_found`, `build_failed`).
+
+    Containment-guarded like [delete_series]: the mode WRITES `<prefix>.pdf`
+    into the folder it is given, and that path has crossed JSON and JNI to get
+    here. The engine lock is held for the same reason [write_book_metadata]
+    holds it — a download may be writing archives into this very folder.
+    """
+    import io
+    import re
+    from contextlib import redirect_stdout
+
+    root = _CONFIGURED.get("output_dir")
+    if not root:
+        return json.dumps({"error": "not_configured"})
+    try:
+        real_root = os.path.realpath(root)
+        real_folder = os.path.realpath(str(folder or ""))
+    except OSError as exc:
+        return json.dumps({"error": "bad_path", "message": str(exc)})
+    if not _contained_in(real_root, real_folder):
+        return json.dumps({"error": "outside_library"})
+    if not os.path.isdir(real_folder):
+        return json.dumps({"error": "not_found"})
+
+    if not _ENGINE_LOCK.acquire(blocking=False):
+        return json.dumps({"error": ENGINE_BUSY})
+    try:
+        # NOTHING may be added to this argv. _validate_build_final_cli scans
+        # sys.argv and p.error()s on ANY option other than -v/-d, and
+        # _run_engine sets sys.argv to exactly what is passed here. The `--`
+        # is safe because that validator breaks at it, and it keeps a folder
+        # path that begins with "-" from being read as an option.
+        buffer = io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                code = _run_engine(["--build-final-file", "--", real_folder])
+        except Exception as exc:  # noqa: BLE001 - reported to the UI, not raised
+            return json.dumps(
+                {
+                    "error": "build_failed",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                    "output": _tail(buffer.getvalue()),
+                }
+            )
+
+        text = buffer.getvalue()
+        # The mode prints one "PDF saved → <name>" per file it built and
+        # returns no count, so the log IS the result. A per-folder failure is
+        # caught and printed by main() rather than raised, which is why an
+        # exitCode of 0 does not by itself mean anything was built.
+        files = re.findall(r"^PDF saved → (.+)$", text, flags=re.MULTILINE)
+        return json.dumps(
+            {
+                "ok": True,
+                "built": len(files),
+                "files": [name.strip() for name in files],
+                "exitCode": code,
+                "output": _tail(text),
+            }
+        )
+    finally:
+        _ENGINE_LOCK.release()
 
 
 # ---------------------------------------------------------------------------
@@ -2239,6 +2926,54 @@ _EDITABLE_BOOK_EXTS = (".cbz", ".epub", ".pdf")
 _METADATA_FIELDS = ("title", "writers", "pencillers", "genres", "publisher", "synopsis")
 
 
+#: Image extensions a picked cover may have. metadata_editor embeds the file
+#: as-is for CBZ (`0000_cover<ext>`), renames it to cover.jpg for EPUB and
+#: decodes it through PIL for PDF — so the gate here is "is this plausibly an
+#: image", not "is this the one format the writer wants".
+_COVER_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
+
+
+def _cover_path_error(path: str) -> Optional[str]:
+    """Why `path` may not be embedded as a cover, or None when it may be.
+
+    CONTAINMENT IS WIDER THAN [_book_path_error]'s, and deliberately so. The
+    book being edited must live in the library, but a picked cover CANNOT:
+    Android hands the picker's result back as a `content://` URI that Python
+    cannot open(), so the caller copies the bytes into an app cache file first
+    and passes THAT path (android/README.md on why SAF is not usable directly).
+    A library-only guard would therefore reject every cover the feature can
+    actually produce. The accepted set is the two directories this app owns —
+    the configured library root and the configured cache dir — which still
+    keeps an arbitrary JNI-delivered string from being copied into the user's
+    archives.
+
+    Empty is not an error: it means "leave the existing cover alone", which is
+    what every caller that only edits text fields passes.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+    roots = [
+        _CONFIGURED.get("output_dir") or "",
+        _CONFIGURED.get("cache_dir") or "",
+    ]
+    roots = [r for r in roots if r]
+    if not roots:
+        return "not_configured"
+    try:
+        real_path = os.path.realpath(raw)
+        real_roots = [os.path.realpath(r) for r in roots]
+    except OSError:
+        return "bad_cover_path"
+    if os.path.splitext(real_path)[1].lower() not in _COVER_EXTS:
+        return "unsupported_cover_format"
+    if not any(_contained_in(root, real_path) for root in real_roots):
+        return "cover_outside_app_dirs"
+    if not os.path.isfile(real_path):
+        return "cover_not_found"
+    return None
+
+
 def _book_path_error(path: str) -> Optional[str]:
     """Why `path` may not be edited, or None when it may be."""
     root = _CONFIGURED.get("output_dir")
@@ -2295,17 +3030,35 @@ def read_book_metadata(path: str) -> str:
     )
 
 
-def write_book_metadata(paths_json: str, data_json: str) -> str:
-    """Write the same metadata into one or more archives.
+def write_book_metadata(paths_json: str, data_json: str, cover_path: str = "") -> str:
+    """Write the same metadata — and optionally the same cover — into one or
+    more archives.
 
     Takes a JSON ARRAY of paths rather than a single one so "apply to every
     chapter" is ONE call holding the engine lock ONCE. Per-file calls would let
     a download start between files and leave the series half-edited, which is
     the worst of the available outcomes.
 
+    `cover_path` is an on-disk image to embed; "" (the default) leaves each
+    archive's existing cover alone. It must be a real filesystem path — a
+    picker's `content://` URI cannot be opened by Python, so the caller copies
+    the bytes to a cache file first and passes that. Guarded by
+    [_cover_path_error], whose containment set is wider than the book guard's
+    for exactly that reason; read its docstring before narrowing it.
+
+    A BAD COVER FAILS THE WHOLE CALL rather than being dropped, and that is the
+    opposite of how a bad book path is treated below. The asymmetry is
+    deliberate: skipping one unwritable archive out of 300 still leaves the
+    user better off, but silently ignoring the cover they just picked and
+    reporting `{"ok": true}` is a save that lies about what it did.
+
     Returns `{"ok": true, "written": N, "failed": [{path, error}]}`. A failure
     on one file never aborts the rest — with 300 chapter archives, stopping at
     the first bad one would leave the user worse off than skipping it.
+
+    NOTE embedding a cover REPACKAGES every archive it is applied to, so
+    "apply to all chapters" with a cover is far more expensive than the same
+    call without one. That is a UI decision, not one this function can make.
     """
     try:
         paths = json.loads(paths_json)
@@ -2320,8 +3073,18 @@ def write_book_metadata(paths_json: str, data_json: str) -> str:
     # empty one as "remove this element", so forwarding a default-empty field
     # would silently wipe metadata the editor never showed.
     payload = {key: data[key] for key in _METADATA_FIELDS if key in data}
-    if not payload:
+    cover = str(cover_path or "").strip()
+    # A cover-only edit is legitimate — the user changed the picture and
+    # nothing else — so "no fields" is only an error when there is no cover
+    # either. Before the cover argument existed this was an unconditional
+    # refusal, and leaving it that way would have made the picker a no-op
+    # whenever the text fields happened to be untouched.
+    if not payload and not cover:
         return json.dumps({"error": "no_fields"})
+
+    cover_error = _cover_path_error(cover)
+    if cover_error:
+        return json.dumps({"error": cover_error, "coverPath": cover})
 
     try:
         from metadata_editor import update_metadata
@@ -2340,11 +3103,17 @@ def write_book_metadata(paths_json: str, data_json: str) -> str:
                 failed.append({"path": path, "error": error})
                 continue
             try:
-                update_metadata(path, payload, None)
+                # None, not "": metadata_editor tests the argument for
+                # truthiness at every use site, so either works — but None is
+                # what its own signature defaults to and what the absence of a
+                # cover means.
+                update_metadata(path, payload, cover or None)
                 written += 1
             except Exception as exc:  # noqa: BLE001 - reported, never raised
                 failed.append({"path": path, "error": f"{type(exc).__name__}: {exc}"})
-        return json.dumps({"ok": True, "written": written, "failed": failed})
+        return json.dumps(
+            {"ok": True, "written": written, "failed": failed, "cover": bool(cover)}
+        )
     finally:
         _ENGINE_LOCK.release()
 

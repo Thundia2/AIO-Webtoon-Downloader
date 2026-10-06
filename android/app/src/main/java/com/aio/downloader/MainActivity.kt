@@ -15,9 +15,12 @@ import com.aio.downloader.browser.WebViewBridge
 import com.aio.downloader.core.Aio
 import com.aio.downloader.core.AioImageLoader
 import com.aio.downloader.core.AppSettingsStore
+import com.aio.downloader.core.AppUpdater
 import com.aio.downloader.core.DownloadForm
 import com.aio.downloader.core.DownloadJob
 import com.aio.downloader.core.DownloadRepository
+import com.aio.downloader.core.LogTail
+import com.aio.downloader.core.finalFileDetail
 import com.aio.downloader.ui.AioApp
 import com.aio.downloader.ui.theme.AioTheme
 import kotlinx.coroutines.Dispatchers
@@ -67,6 +70,17 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
+        // FIRST, and synchronously: this restores the queue the last session
+        // left behind, and everything below can enqueue. A restore that landed
+        // after the harness intent (or after the user tapped Start) would drop
+        // whichever job got there first. It is one preferences read of a few
+        // KB — see core/RunStore.kt for why it is not a coroutine.
+        DownloadRepository.attach(this)
+        // The log tail follows logcat from "now", so it has to be running
+        // BEFORE the output it should capture — not from the moment someone
+        // opens the Logs tab, which is usually after the interesting part.
+        LogTail.start()
+
         // API 33+ gates notifications behind a runtime grant. Without it the
         // foreground service still runs but is invisible — and so is its Cancel
         // action. Requested fire-and-forget: the download does not depend on it.
@@ -84,6 +98,15 @@ class MainActivity : ComponentActivity() {
         // singleTop path cannot swap the loader out from under in-flight
         // requests.
         SingletonImageLoader.setSafe { AioImageLoader.create(it) }
+
+        // Opt-in silent self-update. Idempotent (a singleTop relaunch re-enters
+        // onCreate) and returns immediately — its first check is delayed so it
+        // never competes with startup. Everything else is driven off its own
+        // status flow; see core/AppUpdater.kt's WIRING section, which also
+        // explains why it needs REQUEST_INSTALL_PACKAGES *declared* in the
+        // manifest or it reports itself unsupported rather than downloading an
+        // APK it could never hand over.
+        AppUpdater.start(this)
 
         setContent {
             AioTheme {
@@ -192,9 +215,10 @@ class MainActivity : ComponentActivity() {
      */
     private fun reportWhenFinished(jobId: String) {
         lifecycleScope.launch {
-            val entry = DownloadRepository.history
-                .first { history -> history.any { it.id == jobId } }
-                .first { it.id == jobId }
+            val record = DownloadRepository.history
+                .first { history -> history.any { it.finished.id == jobId } }
+                .first { it.finished.id == jobId }
+            val entry = record.finished
 
             // 130 is aio_android.CANCELLED_EXIT_CODE. Spelling it out keeps a log
             // reader (and android/TESTING.md) from reading a cancel as a failure.
@@ -209,6 +233,14 @@ class MainActivity : ComponentActivity() {
                     "%.1fs".format(entry.durationMs / 1000.0) +
                     "  chapters=${entry.processed}/${entry.total}",
             )
+            // On its own line, and only when it happened: this is the engine
+            // saying it declined to rebuild the combined archive, which is the
+            // one outcome an exit code cannot express (a partial-coverage skip
+            // exits 0). android/TESTING.md greps `[run] exit=`; this sits
+            // beside it rather than inside it so that grep is unaffected.
+            record.finalFileSkip?.let {
+                Log.i(TAG, "[run] final file NOT rebuilt: ${finalFileDetail(it)}")
+            }
             Log.i(TAG, describeTree())
         }
     }

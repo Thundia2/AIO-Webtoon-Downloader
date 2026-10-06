@@ -425,6 +425,184 @@ function getImageChaptersOnDevice(folderPath) {
 }
 
 // ============================================================
+// SERIES IDENTITY / DUPLICATE GROUPING
+//
+// Two folders are the SAME SERIES when they name the same page on the same
+// site, whatever they happen to be called on disk. A site RENAMING a series
+// used to fork a second folder (aio-dl.py's allocator keyed on the title
+// string), splitting the chapters and making the update check under-report on
+// both halves: the 59-chapter folder said "5 new" forever because the delta
+// kept landing in its 5-chapter fork, while the fork said "59 new".
+//
+// aio-dl.py:allocate_series_output_dir now prevents new forks. This is for the
+// ones already on disk — the check runs ONCE per group against the union of
+// what the members hold, so a forked library reports the truth until the user
+// merges the folders (see the merge-series-folders IPC in main.js).
+//
+// MIRROR TWINS — three implementations of one rule, because this process scans
+// the library in JS and cannot import the Python ones:
+//   * aio-dl.py       — _series_identity_matches / _series_folder_sort_key
+//   * library_state.py — series_identity_key / group_entries_by_series
+//   * here
+// Grep seriesIdentityKey if you change the matching or the primary rule. Same
+// arrangement as naturalCompare (above) and electron/resource-limits.js.
+// ============================================================
+
+/**
+ * Comparable form of a stored series URL; "" when there isn't one.
+ *
+ * Twin of aio-dl.py:_normalize_series_url. A list is reduced to its first
+ * element (args.comic_url is a list until main() collapses it, and older
+ * metadata could hold either shape), scheme/host are case-folded, a leading
+ * www. and a trailing slash are dropped. The PATH is left alone — plenty of
+ * sites serve case-sensitive slugs.
+ */
+function normalizeSeriesUrl(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const text = String(raw || "").trim().replace(/\/+$/, "");
+  if (!text) return "";
+  const m = text.match(/^(https?:\/\/)(?:www\.)?([^/]+)(.*)$/i);
+  if (!m) return text.toLowerCase();
+  return m[1].toLowerCase() + m[2].toLowerCase() + m[3];
+}
+
+/**
+ * Grouping key for a series, or null when the metadata can't identify one.
+ *
+ * site+hid first because it survives a URL changing (domain rotation), URL
+ * second because it survives a site changing its id scheme. A folder with
+ * neither is ungroupable and stays on its own — never fall back to the title,
+ * which is the exact signal that proved untrustworthy.
+ *
+ * @param {object|null} seriesMeta - parsed .aio_series.json
+ * @returns {string|null}
+ */
+function seriesIdentityKey(seriesMeta) {
+  if (!seriesMeta || typeof seriesMeta !== "object") return null;
+  const site = String(seriesMeta.site || "").trim();
+  const hid = String(seriesMeta.hid || "").trim();
+  if (site && hid) return `hid:${site}:${hid}`;
+  const url = normalizeSeriesUrl(seriesMeta.url);
+  return url ? `url:${url}` : null;
+}
+
+// Richest first. A fork's new chapters belong beside the bulk of the series,
+// not in the husk, so the fullest folder is the one the update check reports
+// under and the one a queued download targets (main.js passes it as
+// --series-dir). Twin of aio-dl.py's _series_folder_sort_key — keep the tiers
+// and their order in step, or the UI and the engine will disagree about which
+// folder a queued delta lands in.
+function _primaryRank(entry) {
+  const nDownloaded = (entry.seriesMeta?.chapters_downloaded || []).length;
+  // chapterCount is the images/Chapter_<n>/ dir count for archive series and
+  // the same for image-only ones, so files+chapters matches the Python side's
+  // "archives at the root plus --format none chapter dirs".
+  const nFiles = (entry.files?.length || 0) + (entry.chapterCount || 0);
+  return [nFiles || nDownloaded ? 1 : 0, nDownloaded, nFiles];
+}
+
+function _comparePrimary(a, b) {
+  const ra = _primaryRank(a);
+  const rb = _primaryRank(b);
+  for (let i = 0; i < ra.length; i += 1) {
+    if (ra[i] !== rb[i]) return rb[i] - ra[i];
+  }
+  return naturalCompare(a.title || "", b.title || "");
+}
+
+/**
+ * Collapse scanLibrary output into one group per series.
+ *
+ * An entry with no identity key becomes its own single-member group, so
+ * callers iterate groups uniformly instead of special-casing ungroupable
+ * folders. Order follows first appearance, which keeps the sweep's FIFO row
+ * order stable across runs.
+ *
+ * @param {Array} entries - scanLibrary output
+ * @returns {Array<{key: string, primary: object, members: Array}>}
+ */
+function groupEntriesBySeries(entries) {
+  const order = [];
+  const buckets = new Map();
+  (entries || []).forEach((entry, index) => {
+    const key = entry?.seriesKey || seriesIdentityKey(entry?.seriesMeta);
+    // Unidentifiable folders never share a bucket with each other.
+    const bucketKey = key || `solo:${index}`;
+    if (!buckets.has(bucketKey)) {
+      buckets.set(bucketKey, []);
+      order.push(bucketKey);
+    }
+    buckets.get(bucketKey).push(entry);
+  });
+
+  return order.map((bucketKey) => {
+    const members = buckets.get(bucketKey);
+    const primary = members.length === 1 ? members[0] : [...members].sort(_comparePrimary)[0];
+    return { key: bucketKey, primary, members };
+  });
+}
+
+/**
+ * Duplicate report for the library grid: folderPath → { reason, peers }.
+ *
+ * Two reasons, and they are NOT the same claim:
+ *   "same-series" — provably one series (identical site+hid or URL). These are
+ *                   forks; merging them is always right.
+ *   "same-anilist"— the same AniList id from DIFFERENT sources. A strong hint,
+ *                   not proof, and the two providers number chapters
+ *                   independently — which is exactly why these are never
+ *                   auto-grouped in the update check and only ever surfaced as
+ *                   a warning the user resolves by hand.
+ *
+ * @param {Array} entries - scanLibrary output
+ * @returns {Map<string, {reason: string, peers: Array<{folderPath: string, title: string, site: string|null}>}>}
+ */
+function findDuplicateSeries(entries) {
+  const out = new Map();
+  const byKey = new Map();
+  const byAnilist = new Map();
+
+  for (const entry of entries || []) {
+    const key = entry?.seriesKey;
+    if (key) {
+      if (!byKey.has(key)) byKey.set(key, []);
+      byKey.get(key).push(entry);
+    }
+    const anilistId = entry?.anilistId;
+    if (anilistId) {
+      if (!byAnilist.has(anilistId)) byAnilist.set(anilistId, []);
+      byAnilist.get(anilistId).push(entry);
+    }
+  }
+
+  const peerOf = (e) => ({
+    folderPath: e.folderPath,
+    title: e.title,
+    site: e.seriesMeta?.site || null,
+    chapterCount: (e.seriesMeta?.chapters_downloaded || []).length || e.chapterCount || 0,
+  });
+
+  const record = (group, reason) => {
+    if (group.length < 2) return;
+    for (const entry of group) {
+      // "same-series" is the stronger claim and must win: a forked pair also
+      // shares an anilist_id, and reporting it as a mere hint would understate
+      // it and offer the wrong merge copy.
+      const existing = out.get(entry.folderPath);
+      if (existing && existing.reason === "same-series") continue;
+      out.set(entry.folderPath, {
+        reason,
+        peers: group.filter((e) => e !== entry).map(peerOf),
+      });
+    }
+  };
+
+  for (const group of byKey.values()) record(group, "same-series");
+  for (const group of byAnilist.values()) record(group, "same-anilist");
+  return out;
+}
+
+// ============================================================
 // SCAN LIBRARY
 // ============================================================
 
@@ -596,6 +774,13 @@ function scanLibrary(mangasDir, thumbCacheDir) {
       totalSize,
       lastModified,
       seriesMeta,
+      // Duplicate detection inputs, derived once here so neither the grouping
+      // below nor the renderer has to re-parse seriesMeta. seriesKey groups
+      // forks of the SAME page on the same site; anilistId is the weaker
+      // cross-source hint that only ever produces a warning. grep
+      // seriesIdentityKey.
+      seriesKey: seriesIdentityKey(seriesMeta),
+      anilistId: seriesMeta?.anilist_id || null,
       // Image-only (--format none) extras. For archive series: false/0/null.
       // coverImagePath = first page on disk (cover fallback when no web cover
       // or PDF thumb). imageChapters = per-chapter rows for the detail view.
@@ -608,6 +793,16 @@ function scanLibrary(mangasDir, thumbCacheDir) {
 
   // Sort by title by default
   entries.sort((a, b) => naturalCompare(a.title, b.title));
+
+  // Duplicate report, attached per entry so the grid can badge a forked series
+  // without a second pass. Derived AFTER the loop because it is a property of
+  // the library as a whole, not of any one folder. Absent (undefined) on the
+  // overwhelming majority of entries — only a duplicate carries it.
+  const duplicates = findDuplicateSeries(entries);
+  for (const entry of entries) {
+    const dup = duplicates.get(entry.folderPath);
+    if (dup) entry.duplicate = dup;
+  }
   return entries;
 }
 
@@ -920,4 +1115,4 @@ function cleanupOrphanCovers(entries, thumbCacheDir) {
   return removed;
 }
 
-module.exports = { scanLibrary, saveThumbnail, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, extractChaptersFromFiles, getChaptersOnDevice, getImageChaptersOnDevice };
+module.exports = { scanLibrary, saveThumbnail, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, extractChaptersFromFiles, getChaptersOnDevice, getImageChaptersOnDevice, imageChapterToken: _imageChapterToken, seriesIdentityKey, groupEntriesBySeries, findDuplicateSeries, normalizeSeriesUrl };

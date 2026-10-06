@@ -73,13 +73,32 @@ export function formatEta(ms) {
 // UpdatesCenter.jsx (both rendered "new chapters" ranges). Grep
 // chaptersToRangeString. Input may be strings or numbers — mapped through
 // Number() before sorting.
-export function chaptersToRangeString(chapters) {
+//
+// `opts.excluding` is a list of chapter numbers that MUST NOT fall inside any
+// emitted range, and it exists because this string is not only a label — the
+// update-check download paths feed it to `--chapters`, where aio-dl.py's
+// is_chapter_wanted treats "10-11" as the closed interval and would happily
+// download a 10.5 that is not in `chapters` at all. That is exactly what a
+// user who crossed out 10.5 (or unticked it) asked us not to do. So a run is
+// extended only when nothing excluded sits strictly between the two ends;
+// otherwise the range is cut and a new one started.
+//
+// With no exclusions the output is byte-identical to before — every caller
+// that just renders a label is unaffected. Note this only fixes over-selection
+// the caller KNOWS about: a range can still span an already-downloaded chapter
+// the caller never passed either list, which is long-standing behavior (that
+// chapter simply gets re-downloaded) and deliberately left alone here.
+export function chaptersToRangeString(chapters, opts = {}) {
   if (!chapters || chapters.length === 0) return "";
   const nums = chapters.map(Number).sort((a, b) => a - b);
+  const excluded = (opts.excluding || []).map(Number).filter((n) => !Number.isNaN(n));
+  // Strict inequalities: an excluded value equal to either end would mean the
+  // two lists overlap, and then the caller's own intent is what should win.
+  const blocked = (lo, hi) => excluded.some((x) => x > lo && x < hi);
   const ranges = [];
   let start = nums[0], end = nums[0];
   for (let i = 1; i < nums.length; i++) {
-    if (nums[i] - end <= 1.001) {
+    if (nums[i] - end <= 1.001 && !blocked(end, nums[i])) {
       end = nums[i];
     } else {
       ranges.push(start === end ? String(start) : `${start}-${end}`);

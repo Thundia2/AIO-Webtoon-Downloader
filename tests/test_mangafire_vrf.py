@@ -768,3 +768,248 @@ def test_channel_launch_retries_before_giving_up():
     assert "_CHANNEL_LAUNCH_ATTEMPTS" in src
     assert "_channel_unsupported" in src
     assert mangafire_vrf._CHANNEL_LAUNCH_ATTEMPTS >= 2
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Profile contention (2026-08-20)
+#
+# The reported bug: library update checks failed on every mangafire series
+# while ordinary downloads succeeded. Cause, measured rather than guessed —
+# the desktop sweep runs up to 8 concurrent `--list-chapters` PROCESSES, and
+# the two launches are DIFFERENT BINARIES with different lock behaviour:
+#
+#   channel="chromium"  -> full Chromium            -> REFUSES a held profile
+#   channel-less        -> chromium_headless_shell  -> GETS IN ANYWAY
+#
+# So under contention the "graceful degradation" fallback was guaranteed to be
+# taken and guaranteed to succeed, trading the clean identity for one that
+# announces HeadlessChrome in Sec-CH-UA, userAgentData.brands AND
+# fullVersionList. Cloudflare then never auto-clears, and a background
+# operation may not ask a human — hence the asymmetry with downloads.
+# ────────────────────────────────────────────────────────────────────────
+
+def test_profile_is_claimed_before_any_launch(monkeypatch, tmp_path):
+    """Ordering IS the fix. A launch attempted before the claim is exactly the
+    race that let the fallback binary in behind a peer's back."""
+    monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_DIR", str(tmp_path))
+    monkeypatch.delenv("AIO_MANGAFIRE_NO_SIGNER", raising=False)
+    order = []
+    attempts = _fake_patchright(monkeypatch, [None])
+
+    session = mangafire_vrf._SignerSession()
+    real_acquire = session._acquire_profile
+
+    def _traced_acquire():
+        order.append("claim")
+        return real_acquire()
+
+    monkeypatch.setattr(session, "_acquire_profile", _traced_acquire)
+
+    import patchright.sync_api as psa
+    real_pw = psa.sync_playwright
+
+    def _traced_pw():
+        order.append("playwright")
+        return real_pw()
+
+    monkeypatch.setattr(psa, "sync_playwright", _traced_pw)
+
+    assert session._start() is True
+    session.close()
+    assert order and order[0] == "claim", f"launched before claiming: {order}"
+    assert attempts == ["chromium"]
+
+
+def test_contention_never_downgrades_the_identity(monkeypatch, tmp_path):
+    """THE regression guard. When a peer holds the profile we must not launch
+    AT ALL — least of all the channel-less fallback, which is the one binary
+    that would succeed and leave the run detectable for its whole lifetime."""
+    monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_DIR", str(tmp_path))
+    monkeypatch.delenv("AIO_MANGAFIRE_NO_SIGNER", raising=False)
+    attempts = _fake_patchright(monkeypatch, [None, None, None, None])
+
+    session = mangafire_vrf._SignerSession()
+    monkeypatch.setattr(session, "_acquire_profile", lambda: False)
+
+    assert session._start() is False
+    assert attempts == [], "launched a browser onto a profile a peer holds"
+
+
+def test_contention_is_not_a_sticky_verdict(monkeypatch, tmp_path):
+    """A busy peer is the one launch failure that is purely transient: it exits
+    and the next call works. Marking it sticky (like a missing browser binary)
+    would disable the signer for the rest of a run that is about to be fine."""
+    monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_DIR", str(tmp_path))
+    monkeypatch.delenv("AIO_MANGAFIRE_NO_SIGNER", raising=False)
+    attempts = _fake_patchright(monkeypatch, [None])
+
+    session = mangafire_vrf._SignerSession()
+    busy = {"v": True}
+
+    def _acquire():
+        if busy["v"]:
+            return False
+        session._profile_held = True
+        return True
+
+    monkeypatch.setattr(session, "_acquire_profile", _acquire)
+    assert session._start() is False
+    assert session._unavailable is None, "a busy peer was recorded as no-browser-here"
+
+    busy["v"] = False
+    assert session._start() is True, "the sticky verdict survived the peer exiting"
+    assert attempts == ["chromium"]
+
+
+def test_contention_error_names_the_real_cause(monkeypatch, tmp_path):
+    """The user-facing string must say 'another AIO process', not blame the
+    signer. The original report blamed a missing signer for a network block;
+    the same class of misdiagnosis here would send someone reinstalling
+    patchright to fix a lock."""
+    monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_DIR", str(tmp_path))
+
+    class _BusyLock:
+        def acquire(self, _timeout):
+            return False
+
+        def peek_owner(self):
+            return 4321
+
+    monkeypatch.setattr(mangafire_vrf._profile_lock, "get", lambda _p: _BusyLock())
+
+    session = mangafire_vrf._SignerSession()
+    assert session._acquire_profile() is False
+    reason = mangafire_vrf._LAST_UNAVAILABLE_REASON or ""
+    assert "another AIO process" in reason, reason
+
+
+def test_cleanup_keeps_the_claim_and_close_releases_it(monkeypatch, tmp_path):
+    """The teardown+relaunch dance (mode switch, UA relaunch) must happen inside
+    ONE hold. Releasing between the halves would let a peer take the profile
+    mid-handoff — in the worst case showing the user a verification window for a
+    browser that is about to be replaced."""
+    monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_DIR", str(tmp_path))
+    monkeypatch.delenv("AIO_MANGAFIRE_NO_SIGNER", raising=False)
+    _fake_patchright(monkeypatch, [None, None])
+
+    session = mangafire_vrf._SignerSession()
+    assert session._start() is True
+    assert session._profile_held is True
+
+    session._cleanup()
+    assert session._profile_held is True, "cleanup dropped the claim mid-relaunch"
+
+    session.close()
+    assert session._profile_held is False, "close() leaked the profile claim"
+    assert mangafire_vrf._profile_lock.get(str(tmp_path)).held() is False
+
+
+def test_failed_launch_hands_the_profile_back(monkeypatch, tmp_path):
+    """A process that cannot launch must not keep peers queued behind it for its
+    whole lifetime."""
+    monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_DIR", str(tmp_path))
+    monkeypatch.delenv("AIO_MANGAFIRE_NO_SIGNER", raising=False)
+    boom = RuntimeError("Executable doesn't exist at ...")
+    _fake_patchright(monkeypatch, [boom, boom])
+
+    session = mangafire_vrf._SignerSession()
+    assert session._start() is False
+    assert session._profile_held is False, "held the profile after failing to launch"
+    assert mangafire_vrf._profile_lock.get(str(tmp_path)).held() is False
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Identity degradation must not become permanent
+# ────────────────────────────────────────────────────────────────────────
+
+def test_the_fallback_binary_never_writes_the_ua_cache(monkeypatch, tmp_path):
+    """chromium_headless_shell reports an UNREDUCED build (`147.0.7727.15`)
+    where full Chromium reports `147.0.0.0`. Persisting that would pin the one
+    UA shape no genuine Chrome ever sends — and make the cached value oscillate
+    between the two binaries, where every flip costs a teardown + relaunch.
+    That oscillation is what printed the channel-failure banner twice per series
+    in the 2026-08-20 report."""
+    import sites.browser_identity as bid
+
+    monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_DIR", str(tmp_path))
+    monkeypatch.delenv("AIO_MANGAFIRE_NO_SIGNER", raising=False)
+    # Channel launch fails for a non-channel reason -> the fallback is taken.
+    boom = RuntimeError("Target page, context or browser has been closed")
+    _fake_patchright(
+        monkeypatch,
+        [boom for _ in range(mangafire_vrf._CHANNEL_LAUNCH_ATTEMPTS)] + [None],
+    )
+    shell_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) HeadlessChrome/147.0.7727.15 Safari/537.36"
+    )
+    monkeypatch.setattr(bid, "probe_true_user_agent", lambda c, p: shell_ua)
+    written = []
+    monkeypatch.setattr(
+        bid, "remember_stable_user_agent", lambda d, ua: written.append(ua)
+    )
+
+    session = mangafire_vrf._SignerSession()
+    assert session._start() is True
+    assert session._identity_degraded is True
+    assert written == [], f"the degraded launch poisoned the UA cache with {written}"
+    session.close()
+
+
+def test_a_clean_launch_still_writes_the_ua_cache(monkeypatch, tmp_path):
+    """The guard above must not disable the reconciliation on the good path."""
+    import sites.browser_identity as bid
+
+    monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_DIR", str(tmp_path))
+    monkeypatch.delenv("AIO_MANGAFIRE_NO_SIGNER", raising=False)
+    _fake_patchright(monkeypatch, [None])
+    chan_ua = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) HeadlessChrome/147.0.0.0 Safari/537.36"
+    )
+    # Pre-seed the profile's UA cache with what this launch will probe, so the
+    # pin already agrees and the one permitted reconciliation relaunch does not
+    # fire. Without this the first run legitimately launches twice (probe, then
+    # relaunch with the real value), which is a different path than this test is
+    # about.
+    (tmp_path / bid.UA_CACHE_FILENAME).write_text(
+        bid.stabilize_user_agent(chan_ua), encoding="utf-8"
+    )
+    bid._UA_MEMO.pop(str(tmp_path), None)
+    monkeypatch.setattr(bid, "probe_true_user_agent", lambda c, p: chan_ua)
+    written = []
+    monkeypatch.setattr(
+        bid, "remember_stable_user_agent", lambda d, ua: written.append(ua)
+    )
+
+    session = mangafire_vrf._SignerSession()
+    assert session._start() is True
+    assert session._identity_degraded is False
+    assert written == [bid.stabilize_user_agent(chan_ua)]
+    session.close()
+
+
+def test_both_launch_binaries_stabilize_to_one_user_agent():
+    """The root fix for the oscillation: whichever binary ran, the cached and
+    pinned UA must be identical, and must match what the HEADED handoff window
+    presents — measured `Chrome/147.0.0.0` for both."""
+    import sites.browser_identity as bid
+
+    chan = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) HeadlessChrome/147.0.0.0 Safari/537.36"
+    )
+    shell = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) HeadlessChrome/147.0.7727.15 Safari/537.36"
+    )
+    headed = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+    )
+    assert bid.stabilize_user_agent(chan) == bid.stabilize_user_agent(shell) == headed
+    assert "HeadlessChrome" not in bid.stabilize_user_agent(shell)
+    # Idempotent, and a UA already in reduced form is untouched — that is what
+    # makes applying it unconditionally safe for comix too.
+    assert bid.stabilize_user_agent(headed) == headed
+    assert bid.stabilize_user_agent(bid.FALLBACK_UA) == bid.FALLBACK_UA

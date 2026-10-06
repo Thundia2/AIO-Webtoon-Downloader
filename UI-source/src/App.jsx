@@ -181,7 +181,7 @@ export default function App() {
               libraryEntries={dl.libraryEntries}
               libraryLoading={dl.libraryLoading}
               loadLibrary={dl.loadLibrary}
-              setLibraryEntries={dl.setLibraryEntries}
+              updateCheck={dl.updateCheck}
             />
           )}
           {activeTab === "new" && (

@@ -21,6 +21,15 @@
          shows no notification — which also means no Cancel button. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- The opt-in self-updater hands a downloaded APK to the system installer.
+         DECLARING it here is a build-time fact; GRANTING it is a separate trip
+         to system settings. core/AppUpdater.kt reports those two failures
+         differently on purpose - an UNDECLARED permission cannot be granted at
+         all, so telling the user to visit Settings would be a lie. Without this
+         line the updater correctly reports itself unsupported and downloads
+         nothing. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <!-- OPT-IN, and unused unless the user picks a shared library folder in
          Settings. The default library lives in app-scoped external storage,
          which needs no permission at all.

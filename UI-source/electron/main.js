@@ -33,7 +33,12 @@ const {
 } = require("./resource-limits");
 const { HistoryManager } = require("./history");
 const { PythonSetup, isSetupComplete, deleteEnv, PYTHON_VERSION } = require("./setup");
-const { scanLibrary, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, getChaptersOnDevice, getImageChaptersOnDevice } = require("./library");
+const { scanLibrary, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, getChaptersOnDevice, getImageChaptersOnDevice, groupEntriesBySeries } = require("./library");
+// chapterLabel/compareChapterLabels live there rather than here because the
+// merge and set-chapters-ignored write the SAME file, so a single definition
+// is the only way they can't drift into different spellings of a chapter.
+const { mergeSeriesFolders, chapterLabel, compareChapterLabels } = require("./series-merge");
+const { createUpdateCheckRecord, resultRow: updateCheckResultRow } = require("./update-check-record");
 // App self-update (opt-OUT, settings.appAutoUpdate) — cheap require; the
 // heavy electron-updater load is deferred inside updater.js. NOT the manga
 // chapter update-check family below (check-for-updates etc.). Polarity is
@@ -144,6 +149,16 @@ let defaultWorkingDir = DEV_WORKING_DIR;
 // Cross-file: UI-source/electron/preload.js exposes cancelCheckAllUpdates;
 // UI-source/src/components/UpdatesCenter.jsx calls it from the Cancel button.
 let _checkAllAbortCtrl = null;
+
+// ── Check All sweep record ──
+// The AUTHORITY for what the Updates Center shows, and it lives here rather
+// than in the renderer because the renderer keeps losing it: App.jsx renders
+// tab bodies conditionally, so LibraryTab unmounts the instant the user clicks
+// another tab while the sweep keeps running in this process. A remounting tab
+// re-reads this via the get-update-check-state IPC instead of starting over.
+// All the state/derivation rules live in ./update-check-record.js — read its
+// header before changing anything here.
+const _updateCheck = createUpdateCheckRecord(sendToUI);
 
 // Quit-confirmation gate. The mainWindow "close" listener (createWindow)
 // preventDefaults while a download is actually RUNNING and asks the renderer
@@ -1069,6 +1084,13 @@ function setupIPC() {
   //     aborted, the in-flight Python proc is killed and the promise
   //     rejects with an aborted-shape error that the caller normalizes
   //     into { error: "aborted" }.
+  //   peerFolders — OTHER folders holding the SAME series (the forks a site
+  //     rename used to create; grep seriesIdentityKey). Everything read off
+  //     disk is unioned across the primary + peers, because a series split
+  //     over two folders is still one series. Without it the 59-chapter half
+  //     reports "5 new" while its 5-chapter fork reports "59 new", and
+  //     neither number is true. Empty/absent for the ordinary lone series,
+  //     which then costs exactly what it always did.
   async function _checkSeriesUpdates(folderPath, opts = {}) {
     const metaPath = path.join(folderPath, ".aio_series.json");
     // fs.promises.access throws on missing — translate to the no-metadata
@@ -1089,6 +1111,22 @@ function setupIPC() {
 
     if (!meta.url) {
       return { error: "no_url" };
+    }
+
+    // Primary first, so a lone series takes the identical path it always has.
+    // An unreadable peer contributes {} rather than failing the check — the
+    // primary's own answer is still worth reporting.
+    const peerFolders = Array.isArray(opts.peerFolders) ? opts.peerFolders : [];
+    const members = [{ folderPath, meta }];
+    for (const peer of peerFolders) {
+      let peerMeta = {};
+      try {
+        const parsed = JSON.parse(
+          await fs.promises.readFile(path.join(peer, ".aio_series.json"), "utf8")
+        );
+        if (parsed && typeof parsed === "object") peerMeta = parsed;
+      } catch {}
+      members.push({ folderPath: peer, meta: peerMeta });
     }
 
     const settings = history.getSettings();
@@ -1216,42 +1254,52 @@ function setupIPC() {
       let checkMode;
 
       if (useFileBased) {
-        // Scan the folder for actual files and extract chapter numbers.
+        // Scan each member folder for actual files and extract chapter numbers.
         // For individual files like "Title Ch 5~5.pdf" → chapter "5.5"
         // For combined range files like "Title Ch 1-50.pdf" → all site
         // chapters in [1, 50] are considered present on device.
         const OUTPUT_EXTS = new Set(["pdf", "epub", "cbz"]);
-        let diskFiles = [];
-        try {
-          const contents = await fs.promises.readdir(folderPath, { withFileTypes: true });
-          diskFiles = contents
-            .filter((f) => f.isFile() && !f.name.startsWith("."))
-            .filter((f) => {
-              const ext = path.extname(f.name).toLowerCase().slice(1);
-              return OUTPUT_EXTS.has(ext);
-            })
-            .map((f) => ({ name: f.name }));
-        } catch {}
+        const siteChapterList = (result.chapters || []).map(String);
+        downloadedChapters = new Set();
+        for (const member of members) {
+          let diskFiles = [];
+          try {
+            const contents = await fs.promises.readdir(member.folderPath, {
+              withFileTypes: true,
+            });
+            diskFiles = contents
+              .filter((f) => f.isFile() && !f.name.startsWith("."))
+              .filter((f) => {
+                const ext = path.extname(f.name).toLowerCase().slice(1);
+                return OUTPUT_EXTS.has(ext);
+              })
+              .map((f) => ({ name: f.name }));
+          } catch {}
 
-        downloadedChapters = getChaptersOnDevice(
-          diskFiles,
-          (result.chapters || []).map(String)
-        );
-        // --format none (image-only) series have no archive files for
-        // getChaptersOnDevice to read, so the diff above would mark every
-        // chapter "new". Recover the on-device set from the
-        // images/Chapter_<n>/ tree and union it in. (JSON mode below is
-        // unaffected — it reads chapters_downloaded, which aio-dl.py writes
-        // for every format including none.) grep getImageChaptersOnDevice.
-        if (diskFiles.length === 0) {
-          for (const c of getImageChaptersOnDevice(folderPath)) {
+          for (const c of getChaptersOnDevice(diskFiles, siteChapterList)) {
             downloadedChapters.add(c);
+          }
+          // --format none (image-only) series have no archive files for
+          // getChaptersOnDevice to read, so the diff above would mark every
+          // chapter "new". Recover the on-device set from the
+          // images/Chapter_<n>/ tree and union it in. (JSON mode below is
+          // unaffected — it reads chapters_downloaded, which aio-dl.py writes
+          // for every format including none.) grep getImageChaptersOnDevice.
+          if (diskFiles.length === 0) {
+            for (const c of getImageChaptersOnDevice(member.folderPath)) {
+              downloadedChapters.add(c);
+            }
           }
         }
         checkMode = "files";
       } else {
         // Use the JSON metadata list (what aio-dl.py recorded as downloaded)
-        downloadedChapters = new Set((meta.chapters_downloaded || []).map(String));
+        downloadedChapters = new Set();
+        for (const member of members) {
+          for (const c of member.meta.chapters_downloaded || []) {
+            downloadedChapters.add(String(c));
+          }
+        }
         checkMode = "json";
       }
 
@@ -1263,19 +1311,46 @@ function setupIPC() {
       // skipped fragment is never on disk, so the file-based path needs it too.
       // Cross-file: aio-dl.py writes chapters_skipped_fragments into
       // .aio_series.json (grep _skipped_fragment_labels).
-      const skippedFragments = new Set((meta.chapters_skipped_fragments || []).map(String));
+      // Unioned across members for the same reason the downloaded set is: a
+      // fragment the fork's run merged away is merged away for the series.
+      const skippedFragments = new Set();
+      for (const member of members) {
+        for (const c of member.meta.chapters_skipped_fragments || []) {
+          skippedFragments.add(String(c));
+        }
+      }
+
+      // Chapters the user crossed out in the Updates Center. DELIBERATELY NOT
+      // subtracted the way skippedFragments is: these stay in the reported set
+      // (as `ignoredChapters`) so the panel can render them struck through and
+      // the user can undo one. They are only withheld from `newChapters`, which
+      // is what every download button queues. grep chapters_ignored.
+      const ignoredSet = new Set();
+      for (const member of members) {
+        for (const c of member.meta.chapters_ignored || []) ignoredSet.add(String(c));
+      }
 
       // Compare: site chapters (minus intentionally-skipped fragments) not yet
       // on device = missing/new.
       const siteChapters = new Set((result.chapters || []).map(String));
       const relevantSiteChapters = [...siteChapters].filter((ch) => !skippedFragments.has(ch));
-      const newChapters = relevantSiteChapters
-        .filter((ch) => !downloadedChapters.has(ch))
-        .sort((a, b) => parseFloat(a) - parseFloat(b));
+      const byNumber = (a, b) => parseFloat(a) - parseFloat(b);
+      const missingChapters = relevantSiteChapters.filter((ch) => !downloadedChapters.has(ch));
+      // Split rather than filter, so the two arrays partition the missing set
+      // and `newChapters.length + ignoredChapters.length` is the honest "how
+      // many chapters this series is behind by".
+      const newChapters = missingChapters.filter((ch) => !ignoredSet.has(ch)).sort(byNumber);
+      // Intersected with what is actually missing on the site, so a stale
+      // cross-out — chapter pulled from the site, or since downloaded by hand —
+      // stops being rendered instead of accumulating forever. The on-disk list
+      // is left alone; aio-dl.py prunes it against chapters_downloaded on the
+      // next download of this series.
+      const ignoredChapters = missingChapters.filter((ch) => ignoredSet.has(ch)).sort(byNumber);
 
       return {
         ok: true,
         newChapters,
+        ignoredChapters,
         total: relevantSiteChapters.length,
         downloaded: downloadedChapters.size,
         checkMode,
@@ -1322,6 +1397,24 @@ function setupIPC() {
   // CDN when the user happens to have many mangafire series, without
   // sacrificing throughput in the typical mixed-source library.
   //
+  // THE SWEEP OUTLIVES THE LIBRARY TAB, so the renderer is NOT the record —
+  // `_updateCheck` (declared near _checkAllAbortCtrl) is. App.jsx renders
+  // tab bodies conditionally, so LibraryTab unmounts the moment the user
+  // clicks Queue, and every piece of scan state it owned went with it. Three
+  // rules follow, and the old handler broke all three:
+  //   1. Rows are built HERE and shipped whole on `event.row`; the renderer
+  //      only stores them. One reducer means a snapshot handed to a
+  //      remounting tab and a live event can never disagree about a row.
+  //   2. A re-entrant call while a sweep is running is REFUSED and answered
+  //      with the snapshot — it does NOT restart. The old handler aborted
+  //      the live controller and started from zero, which is exactly why a
+  //      second "Check All" click re-checked 30 series that were already
+  //      half done. Only opts.force (the panel's explicit Rescan) preempts.
+  //   3. Every emission is stamped with runId and dropped once the run is
+  //      superseded. A forced rescan preempts workers still awaiting Python;
+  //      their late "completed"/"done" events would otherwise land in the
+  //      NEW run's rows and flip it to done at ~0% progress.
+  //
   // Cancelable: the renderer can fire cancel-check-all-updates to stop the
   // sweep mid-flight; the in-flight Python procs are killed via the
   // per-call AbortSignal threaded into _checkSeriesUpdates. Tracked via the
@@ -1329,10 +1422,30 @@ function setupIPC() {
   //
   // Progress events: emits one "queued" per series upfront (renderer pre-
   // renders rows), then "running" / "completed" per worker hop, then a
-  // final "done" event carrying total duration. The old single-counter
-  // event shape ({ current, total, title }) is gone — the new richer
-  // events are dispatched by `kind` in the renderer.
-  ipcMain.handle("check-all-updates", async () => {
+  // final "done" event carrying total duration. Shapes are documented on
+  // preload.js:onUpdateCheckProgress.
+  // Sites whose Python handler drives a PERSISTENT Chromium profile, which
+  // exactly one process may hold at a time (Chromium locks its user-data-dir).
+  // Capped at one in-flight update check each — see claimNext/siteLimit below,
+  // and sites/profile_lock.py for the measurement that forced this. Values are
+  // the `site` strings stored in .aio_series.json, i.e. the Python handler
+  // `name` attributes (sites/mangafire.py, sites/comix.py).
+  const _SERIAL_BROWSER_SITES = new Set(["mangafire", "comix"]);
+
+  ipcMain.handle("check-all-updates", async (_event, opts = {}) => {
+    const force = !!(opts && opts.force);
+
+    // Rule 2. Answer with the live snapshot so a renderer that lost its copy
+    // (tab switch, window reload) resyncs onto the running sweep instead of
+    // kicking off a duplicate one.
+    if (_updateCheck.isRunning() && !force) {
+      return {
+        status: "already-running",
+        runId: _updateCheck.runId(),
+        snapshot: _updateCheck.snapshot(),
+      };
+    }
+
     const settings = history.getSettings();
     const { workingDir } = resolveSpawnPaths(settings);
     const mangaDir = getConfiguredOutputRoot(workingDir);
@@ -1357,11 +1470,40 @@ function setupIPC() {
       return !status || status === "Ongoing" || status === "Releasing";
     });
 
-    if (checkable.length === 0) {
-      sendToUI("update-check-progress", {
+    // ── One job per SERIES, not per folder ──
+    // A site rename used to fork a second folder for one series (grep
+    // seriesIdentityKey), and checking the halves independently is what made
+    // both of them lie: the 59-chapter folder reported "5 new" forever while
+    // its 5-chapter fork reported "59 new". Grouping runs ONE --list-chapters
+    // for the pair (their URL is identical, so the second call was pure waste
+    // anyway) and diffs it against the union of what both hold. The richest
+    // member becomes the row's folderPath, so a queued download targets the
+    // folder holding the bulk of the series — and main hands that same folder
+    // to Python as --series-dir so the two can't disagree about it.
+    //
+    // The overwhelming majority of groups have exactly one member, where this
+    // is byte-for-byte the old behavior.
+    const jobs = groupEntriesBySeries(checkable).map((group) => ({
+      entry: group.primary,
+      peerFolders: group.members
+        .filter((m) => m !== group.primary)
+        .map((m) => m.folderPath),
+    }));
+
+    // Supersede whatever came before. Past this point the record drops every
+    // emission carrying an older runId, so a preempted run can no longer
+    // write into the record it no longer owns.
+    if (_checkAllAbortCtrl) {
+      try { _checkAllAbortCtrl.abort(); } catch {}
+      _checkAllAbortCtrl = null;
+    }
+    const { runId, startedAt } = _updateCheck.begin(jobs.length);
+
+    if (jobs.length === 0) {
+      _updateCheck.emit(runId, {
         kind: "done", completed: 0, total: 0, durationMs: 0, aborted: false,
       });
-      return { results: [], total: 0, checked: 0 };
+      return { status: "done", runId, results: [], total: 0, checked: 0 };
     }
 
     const concurrency = Math.max(
@@ -1370,63 +1512,112 @@ function setupIPC() {
     );
     const collapseSplits = settings.collapseSplits === true;
 
-    // Fresh AbortController per scan. Replace any stale one (defensive: the
-    // previous scan's "done" event should have nulled it, but if cancel
-    // fired late or the renderer restarted, we don't want stale refs).
-    if (_checkAllAbortCtrl) {
-      try { _checkAllAbortCtrl.abort(); } catch {}
-    }
     _checkAllAbortCtrl = new AbortController();
     const ctrl = _checkAllAbortCtrl;
 
-    // Pre-emit a "queued" event for every series so the renderer can render
+    // Pre-emit a "queued" row for every series so the renderer can render
     // the full row list immediately with placeholders. Total carried on
     // every event so the renderer doesn't need a separate "init" message.
-    for (const e of checkable) {
-      sendToUI("update-check-progress", {
+    // enqueuedAt is one shared instant (this loop is synchronous) — FIFO
+    // order survives because the record's Map keeps insertion order and the
+    // panel's sort is stable.
+    for (const job of jobs) {
+      const e = job.entry;
+      _updateCheck.emit(runId, {
         kind: "queued",
-        folderPath: e.folderPath,
-        title: e.title,
-        cover: e.seriesMeta?.cover || null,
-        site: e.seriesMeta?.site || null,
-        total: checkable.length,
+        row: {
+          folderPath: e.folderPath,
+          title: e.title,
+          cover: e.seriesMeta?.cover || null,
+          site: e.seriesMeta?.site || null,
+          state: "queued",
+          enqueuedAt: startedAt,
+          ...(job.peerFolders.length ? { memberFolders: job.peerFolders } : {}),
+        },
+        completed: 0,
+        total: jobs.length,
       });
     }
 
-    const remaining = [...checkable];
+    const remaining = [...jobs];
     const inFlightBySite = new Map(); // site → count of workers currently checking
     const results = [];
     let completed = 0;
-    const startedAt = Date.now();
 
     // Provider-aware claim. findIndex+splice runs synchronously between
     // awaits so two workers can never claim the same job — the JS event
-    // loop only re-enters on the next await. When every site has an
-    // in-flight worker (concurrency ≥ unique-sites), the findIndex misses
-    // and we fall through to FIFO claim (idx 0) so progress doesn't stall.
+    // loop only re-enters on the next await.
+    //
+    // The FIFO fallback is CAPPED, not unconditional (fixed 2026-08-20). It
+    // used to claim idx 0 whenever every candidate's site was already in
+    // flight, which in a library dominated by one site meant piling the whole
+    // pool onto that site. For sites whose Python side drives a PERSISTENT
+    // BROWSER PROFILE that is the one thing that must never happen: Chromium
+    // locks a user-data-dir, so the extra processes cannot get the good launch
+    // and used to silently degrade to a headless binary that Cloudflare then
+    // refuses to clear — which is why mangafire update checks failed while
+    // ordinary downloads worked. Cross-file: sites/profile_lock.py's header has
+    // the measurement, and sites/mangafire_vrf.py waits on that lock as the
+    // Python-side backstop for anyone running the CLI directly.
+    function siteLimit(site) {
+      return _SERIAL_BROWSER_SITES.has(site) ? 1 : concurrency;
+    }
     function claimNext() {
       if (remaining.length === 0) return null;
+      // Prefer a site nobody is on, exactly as before.
       let idx = remaining.findIndex(
-        (e) => !inFlightBySite.get(e.seriesMeta?.site || "_"),
+        (j) => !inFlightBySite.get(j.entry.seriesMeta?.site || "_"),
       );
-      if (idx === -1) idx = 0;
+      if (idx === -1) {
+        // Otherwise take the first job whose site is still under its cap.
+        idx = remaining.findIndex((j) => {
+          const s = j.entry.seriesMeta?.site || "_";
+          return (inFlightBySite.get(s) || 0) < siteLimit(s);
+        });
+      }
+      if (idx === -1) return null; // everything left is capped — wait, don't pile on
       return remaining.splice(idx, 1)[0];
     }
 
     async function worker() {
       while (!ctrl.signal.aborted) {
-        const entry = claimNext();
-        if (!entry) return;
+        const job = claimNext();
+        if (!job) {
+          // Nothing claimable. Two different situations:
+          //   queue empty            -> this worker is done
+          //   everything left capped -> a peer is holding that site's only
+          //                             slot; wait for it rather than piling
+          //                             on (see claimNext) or exiting, which
+          //                             would shrink the pool permanently and
+          //                             could strand the remaining jobs.
+          // Termination is guaranteed: claimNext only returns null with jobs
+          // left when some site is at its cap, which means a peer is in flight
+          // and will free a slot when it finishes.
+          if (remaining.length === 0) return;
+          await new Promise((r) => setTimeout(r, 150));
+          continue;
+        }
+        const entry = job.entry;
         const site = entry.seriesMeta?.site || "_";
         inFlightBySite.set(site, (inFlightBySite.get(site) || 0) + 1);
 
-        sendToUI("update-check-progress", {
-          kind: "running",
+        const queuedRow = _updateCheck.rowFor(runId, entry.folderPath);
+        const base = {
           folderPath: entry.folderPath,
           title: entry.title,
+          cover: entry.seriesMeta?.cover || null,
           site,
+          enqueuedAt: queuedRow?.enqueuedAt || Date.now(),
+          // The other folders this row speaks for. Present only on a forked
+          // series, so an ordinary row is byte-identical to what it was.
+          ...(job.peerFolders.length ? { memberFolders: job.peerFolders } : {}),
+        };
+
+        _updateCheck.emit(runId, {
+          kind: "running",
+          row: { ...base, state: "running" },
           completed,
-          total: checkable.length,
+          total: jobs.length,
         });
 
         let r;
@@ -1434,6 +1625,7 @@ function setupIPC() {
           r = await _checkSeriesUpdates(entry.folderPath, {
             collapseSplits,
             signal: ctrl.signal,
+            peerFolders: job.peerFolders,
           });
         } catch (err) {
           // _checkSeriesUpdates already wraps its errors into a shape; this
@@ -1450,39 +1642,45 @@ function setupIPC() {
         }
 
         completed += 1;
-        const merged = {
-          folderPath: entry.folderPath,
-          title: entry.title,
-          cover: entry.seriesMeta?.cover || null,
-          site,
-          ...r,
-        };
-        results.push(merged);
-        sendToUI("update-check-progress", {
+        results.push({ ...base, ...r });
+        _updateCheck.emit(runId, {
           kind: "completed",
-          folderPath: entry.folderPath,
-          title: entry.title,
-          result: merged,
+          row: updateCheckResultRow(base, r),
+          // Fresh site metadata (status / authors / cover / genres) for the
+          // renderer to splice into its library entries. Not part of the row
+          // — it describes the SERIES, not the scan.
+          updatedMeta: r.updatedMeta || null,
           completed,
-          total: checkable.length,
+          total: jobs.length,
         });
       }
     }
 
-    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    try {
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    } finally {
+      // In a finally so a worker that throws its way out still closes the
+      // record — a run stuck at state:"running" would refuse every later
+      // Check All by rule 2 for the rest of the session.
+      const aborted = ctrl.signal.aborted;
+      if (_checkAllAbortCtrl === ctrl) _checkAllAbortCtrl = null;
+      _updateCheck.emit(runId, {
+        kind: "done",
+        completed,
+        total: jobs.length,
+        durationMs: Date.now() - startedAt,
+        aborted,
+      });
+    }
 
-    const aborted = ctrl.signal.aborted;
-    if (_checkAllAbortCtrl === ctrl) _checkAllAbortCtrl = null;
-    sendToUI("update-check-progress", {
-      kind: "done",
-      completed,
-      total: checkable.length,
-      durationMs: Date.now() - startedAt,
-      aborted,
-    });
-
-    return { results, total: checkable.length, checked: results.length };
+    return { status: "done", runId, results, total: jobs.length, checked: results.length };
   });
+
+  // ── Snapshot of the current / most recent Check All sweep ──
+  // Lets a freshly-mounted renderer adopt a sweep it never saw start (the
+  // Library tab unmounts on every tab switch; the sweep does not stop).
+  // Returns null when no sweep has run this session.
+  ipcMain.handle("get-update-check-state", async () => _updateCheck.snapshot());
 
   // ── Cancel an in-flight Check All sweep ──
   // Aborts the per-scan AbortController which propagates into every
@@ -1495,6 +1693,85 @@ function setupIPC() {
     try { _checkAllAbortCtrl.abort(); } catch {}
     _checkAllAbortCtrl = null;
     return { ok: true };
+  });
+
+  // ── Cross out / restore individual chapters in the update-check ──
+  // Writes .aio_series.json:chapters_ignored, the list _checkSeriesUpdates
+  // above withholds from `newChapters` (and reports separately so the panel
+  // can strike it through). The renderer calls this from the per-chapter "x"
+  // and its undo; nothing else writes the key, and aio-dl.py only carries it
+  // forward (grep merged_ignored).
+  //
+  // READ-MODIFY-WRITE LIVES HERE, NOT IN THE RENDERER, and that is the point
+  // of having a dedicated IPC rather than reusing save-series-meta: the panel
+  // holds a row, not the file, so two quick clicks on different chapters would
+  // both send a whole list computed from the same stale copy and the second
+  // would erase the first. Each call here re-reads the file.
+  //
+  // Batched (`chapters` is an array) so "cross out the rest" is one write.
+  // Returns the new list for the renderer to mirror into its library entry.
+  ipcMain.handle("set-chapters-ignored", async (_event, folderPath, chapters, ignored) => {
+    try {
+      const metaPath = path.join(folderPath, ".aio_series.json");
+      let meta;
+      try {
+        meta = JSON.parse(await fs.promises.readFile(metaPath, "utf8"));
+      } catch {
+        // No metadata file means no update-check for this series either, so
+        // there is nothing a cross-out could apply to. Refuse rather than
+        // creating a stub — save-series-meta is the "adopt this folder" path.
+        return { ok: false, error: "no_metadata" };
+      }
+      if (!meta || typeof meta !== "object") return { ok: false, error: "invalid_metadata" };
+
+      // Module-scope so the folder merge writes the same spelling; see
+      // chapterLabel's header.
+      const label = chapterLabel;
+
+      const next = new Set((meta.chapters_ignored || []).map(label));
+      for (const c of Array.isArray(chapters) ? chapters : [chapters]) {
+        // Skip blanks before labelling: Number("") and Number(null) are both 0,
+        // so an empty entry would be written as a cross-out of chapter 0.
+        if (c === null || c === undefined || String(c).trim() === "") continue;
+        if (ignored) next.add(label(c));
+        else next.delete(label(c));
+      }
+      const chaptersIgnored = [...next].sort(compareChapterLabels);
+
+      // Emptied back out → drop the key entirely, so a series the user fully
+      // un-crossed reads the same on disk as one that never had a cross-out.
+      // aio-dl.py writes it under the same rule (grep merged_ignored).
+      if (chaptersIgnored.length > 0) meta.chapters_ignored = chaptersIgnored;
+      else delete meta.chapters_ignored;
+
+      await fs.promises.writeFile(metaPath, JSON.stringify(meta, null, 2), "utf8");
+      return { ok: true, chaptersIgnored };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  });
+
+  // ── Merge duplicate series folders ──
+  // Two-step by contract: the renderer calls with dryRun:true to render the
+  // plan, then again with dryRun:false once the user confirms it. All the
+  // rules and refusals live in mergeSeriesFolders (see its block header);
+  // this wrapper only guarantees a shaped answer instead of a thrown IPC.
+  ipcMain.handle("merge-series-folders", async (_event, opts = {}) => {
+    try {
+      const settings = history.getSettings();
+      const { workingDir } = resolveSpawnPaths(settings);
+      return await mergeSeriesFolders({
+        ...(opts || {}),
+        // Injected as DATA rather than read inside the module, so the offline
+        // test can drive the whole thing without electron. The renderer never
+        // supplies these — spreading opts first means it cannot override them
+        // either, which is what keeps the containment guard honest.
+        libraryRoot: getConfiguredOutputRoot(workingDir),
+        runningDownloads: downloader?.getRunning?.() || [],
+      });
+    } catch (err) {
+      return { ok: false, error: "merge_failed", message: err?.message || String(err) };
+    }
   });
 
   // ── Save/update series metadata (manual URL entry for old downloads) ──

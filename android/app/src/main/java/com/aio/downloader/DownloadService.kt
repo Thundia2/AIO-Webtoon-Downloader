@@ -17,9 +17,14 @@ import com.aio.downloader.browser.WebViewBridge
 import com.aio.downloader.core.Aio
 import com.aio.downloader.core.DownloadJob
 import com.aio.downloader.core.DownloadRepository
+import com.aio.downloader.core.FinalFileSkip
+import com.aio.downloader.core.LogTail
+import com.aio.downloader.core.finalFileDetail
+import com.aio.downloader.core.finalFileHeadline
 import com.aio.downloader.core.formatEta
 import com.chaquo.python.PyObject
 import org.json.JSONArray
+import org.json.JSONObject
 import kotlin.concurrent.thread
 
 /**
@@ -54,6 +59,26 @@ import kotlin.concurrent.thread
 class DownloadService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    /**
+     * Both process entry points install the same two singletons, because either
+     * can be the first thing to run: the Activity when the user opens the app,
+     * this service when a download is started from a notification action or the
+     * intent harness while no Activity exists.
+     *
+     * [DownloadRepository.attach] restores the saved queue — it must happen
+     * before [onStartCommand] can claim the worker, or the loop would drain an
+     * empty queue and stop before the restore landed. Both calls are idempotent.
+     */
+    override fun onCreate() {
+        super.onCreate()
+        DownloadRepository.attach(this)
+        // Started here, not by the Logs screen: a download running with the app
+        // swiped away is exactly the one whose log a user comes back for, and
+        // the tail follows logcat from "now", so anything not captured live is
+        // gone. See core/LogTail.kt's header.
+        LogTail.start()
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_CANCEL) {
@@ -145,6 +170,12 @@ class DownloadService : Service() {
         notify(buildNotification(job.displayLabel, "Starting…"))
 
         var exit = 1
+        // Terminal wording for a run that never reached the engine. Null on the
+        // normal path, where the exit code decides. It is THREADED to the
+        // `finally` rather than notified from the catch because both post under
+        // NOTIFICATION_ID: anything raised in the catch is overwritten by the
+        // terminal notification milliseconds later and the user never sees it.
+        var abort: RunAbort? = null
         try {
             val aio = Aio.module(this)
 
@@ -172,11 +203,20 @@ class DownloadService : Service() {
             // Chaquopy surfaces the Python traceback as the exception message,
             // so this is usually the entire diagnosis.
             Log.e(TAG, "download failed", t)
-            notify(buildNotification("Download failed", t.message?.take(120), ongoing = false))
+            abort = when (t) {
+                // Not a crash: the engine never started, and build_argv_json's
+                // `message` is already a finished user-facing sentence, so it is
+                // shown verbatim rather than re-worded here.
+                is UnsupportedSiteException -> RunAbort("Can't download this link", t.message)
+                else -> RunAbort("Download failed", t.message?.take(200) ?: "unknown error")
+            }
         } finally {
             val label = DownloadRepository.active.value?.label ?: job.displayLabel
-            DownloadRepository.finishRun(exit)
-            postTerminalNotification(exit, label)
+            // The record, not a re-read of the flow: by the time the next job
+            // starts the flow's head is a different run, and the notification
+            // for THIS one must describe THIS one.
+            val record = DownloadRepository.finishRun(exit)
+            postTerminalNotification(exit, label, record?.finalFileSkip, abort)
         }
     }
 
@@ -190,10 +230,36 @@ class DownloadService : Service() {
      * A RESUME arrives with its argv already built (ResumeRepository), because
      * `--restore-parameters` is a mode rather than a settings dict — there is
      * nothing for build_argv to build from.
+     *
+     * THROWS [UnsupportedSiteException] when the engine refuses the URL
+     * outright (today: comix, which needs a desktop browser).
      */
+    /**
+     * A URL no download in this build can serve. [message] is a finished,
+     * user-facing sentence from aio_android.build_argv_json — never a
+     * diagnostic, because it is rendered as-is.
+     */
+    private class UnsupportedSiteException(override val message: String) : Exception(message)
+
+    /** Terminal notification wording for a run that never reached the engine. */
+    private data class RunAbort(val title: String, val text: String)
+
     private fun buildArgv(aio: PyObject, job: DownloadJob): String {
         job.resumeArgvJson?.let { return it }
-        val built = JSONArray(aio.callAttr("build_argv_json", job.settingsJson).toString())
+        val raw = aio.callAttr("build_argv_json", job.settingsJson).toString()
+        // TWO RETURN SHAPES, discriminated on the first character: `[` is the
+        // argv, `{` is a refusal. build_argv_json's docstring in aio_android.py
+        // prescribes exactly this branch. A bare JSONArray() here (what this
+        // used to do) renders the refusal as "Value {...} cannot be converted to
+        // JSONArray" — so a pasted comix link read as an internal error.
+        if (raw.trimStart().startsWith("{")) {
+            throw UnsupportedSiteException(
+                JSONObject(raw).optString("message").ifEmpty {
+                    "This link cannot be downloaded on Android."
+                },
+            )
+        }
+        val built = JSONArray(raw)
         if (job.extraArgs.isEmpty()) return built.toString()
 
         val merged = JSONArray()
@@ -203,22 +269,60 @@ class DownloadService : Service() {
         return merged.toString()
     }
 
-    private fun postTerminalNotification(exit: Int, label: String) {
+    /**
+     * The last thing a run says.
+     *
+     * ── WHY [skip] IS THE HEADLINE WHEN IT EXISTS ─────────────────────────
+     * This notification used to read "Download cancelled / Finished chapters
+     * kept — resume to continue", which was reassurance about the exact thing
+     * aio-dl.py was destroying at the time: a cancelled run rebuilt the
+     * combined archive from its own partial content and overwrote a complete
+     * one. That is fixed in the engine now — and the fix moved the lie to the
+     * other side, because the wording still said nothing about the archive
+     * having been KEPT.
+     *
+     * `final_file_skipped` is the engine saying which of the three things
+     * happened, and [finalFileHeadline] / [finalFileDetail] are where the
+     * wording lives so this notification and the Queue history card cannot
+     * drift apart. The three console lines the event accompanies are printed
+     * beside its emit site in aio-dl.py; the text agrees with them on purpose,
+     * because the Logs screen is right there.
+     *
+     * A run with NO skip event never reached that branch at all
+     * (`--format none`, `--komikku`, `--no-final-file`, or a failure before the
+     * end), so nothing was overwritten and the old generic wording is still
+     * true — that is what the fallbacks say.
+     */
+    private fun postTerminalNotification(
+        exit: Int,
+        label: String,
+        skip: FinalFileSkip?,
+        /**
+         * Wording for a run that died before the engine ran. When present it
+         * WINS over the exit code, which for those runs is an uninformative 1.
+         */
+        abort: RunAbort? = null,
+    ) {
         val remaining = DownloadRepository.queue.value.size
         val tail = if (remaining > 0) " · $remaining still queued" else ""
-        when (exit) {
-            0 -> notify(buildNotification("Download complete", label + tail, ongoing = false))
-            CANCELLED_EXIT -> notify(
-                buildNotification(
-                    "Download cancelled",
-                    "Finished chapters kept — resume to continue$tail",
-                    ongoing = false,
-                ),
-            )
-            else -> notify(
-                buildNotification("Download stopped", "exit code $exit$tail", ongoing = false),
-            )
+        val headline = skip?.let { finalFileHeadline(it) }
+        val detail = skip?.let { "$label\n\n${finalFileDetail(it)}" }
+
+        val title = abort?.title ?: when (exit) {
+            0 -> "Download complete"
+            CANCELLED_EXIT -> "Download cancelled"
+            else -> "Download stopped"
         }
+        val text = when {
+            abort != null -> abort.text + tail
+            headline != null -> headline + tail
+            exit == 0 -> label + tail
+            exit == CANCELLED_EXIT -> "Finished chapters kept — resume to continue$tail"
+            else -> "exit code $exit$tail"
+        }
+        // A refusal sentence runs ~190 characters and a collapsed notification
+        // shows one line, so it also goes in the expanded body.
+        notify(buildNotification(title, text, ongoing = false, bigText = abort?.text ?: detail))
     }
 
     // ── progress ──────────────────────────────────────────────────────────
@@ -312,6 +416,13 @@ class DownloadService : Service() {
         title: String,
         text: String?,
         ongoing: Boolean = true,
+        /**
+         * The expanded body. A one-line [text] cannot carry "the existing
+         * 50-chapter file was kept and your 3 new chapters are in the temp
+         * folder", and that sentence is the whole point of the terminal
+         * notification when the engine declines a rebuild.
+         */
+        bigText: String? = null,
     ): Notification {
         val manager = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -346,6 +457,7 @@ class DownloadService : Service() {
             .setOngoing(ongoing)
             .setOnlyAlertOnce(true)
             .apply {
+                bigText?.let { setStyle(Notification.BigTextStyle().bigText(it)) }
                 if (ongoing) {
                     addAction(
                         Notification.Action.Builder(

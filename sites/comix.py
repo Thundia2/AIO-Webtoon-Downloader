@@ -69,6 +69,15 @@ print = _stderr_print  # noqa: A001 — intentional shadow of builtins.print
 # cap → all pages.
 _COMIX_PROBE_PAGE_CAP = 8
 
+# Wall-clock budget for the search-time alt-title lookup (one batched in-page
+# fetch of every typeahead row's title page — see _enrich_hits_with_alt_titles).
+# Sized against a measured ~1.7s for two rows on a warm page; 10s leaves room
+# for a full 6-row dropdown on a cold connection while staying well inside
+# search()'s own 28s budget, since this runs INSIDE the orchestrator's fan-out
+# and every second here delays the whole cross-site search. Overrun aborts
+# in-page and keeps whatever rows already landed.
+_COMIX_ALT_TITLE_BUDGET_S = 10.0
+
 # Cadence of the whole-chapter readiness poll in fetch_chapter_images_via_dom.
 # Matches the 250ms the old per-page loop used; the difference is that ONE
 # evaluate now reports every page instead of one page per round-trip.
@@ -1051,6 +1060,23 @@ class ComixSiteHandler(BaseSiteHandler):
         try:
             tag = soup.find("script", id="initial-data")
             raw = (tag.string or tag.get_text()) if tag else None
+        except Exception:
+            return None
+        return self._manga_detail_from_initial_data(raw)
+
+    def _manga_detail_from_initial_data(self, raw: Optional[str]) -> Optional[Dict]:
+        """Walk a raw <script id="initial-data"> JSON string down to the
+        manga-detail dict, or None.
+
+        Split out of _extract_initial_data_manga (2026-08-20) so the search
+        alt-title enrichment can share it. That path receives the blob TEXT
+        from an in-page fetch (ComixSiteHandler.search -> the bridge's
+        fetch_initial_data_blobs) and never builds a soup, but the React-Query
+        key shape it has to walk is identical. Keep this the ONLY place that
+        encodes that shape — duplicating the ["manga","detail"] match in the
+        scrape JS is exactly the drift this split exists to prevent.
+        """
+        try:
             data = json.loads(raw) if raw else None
         except Exception:
             return None
@@ -1711,7 +1737,79 @@ class ComixSiteHandler(BaseSiteHandler):
                     raw_score=raw_score,
                 )
             )
+        self._enrich_hits_with_alt_titles(hits)
         return hits
+
+    def _enrich_hits_with_alt_titles(self, hits: List[SearchHit]) -> None:
+        """Fill alt_titles (and year) on typeahead hits, IN PLACE.
+
+        WHY this is not optional polish: the orchestrator gates every hit on
+        rapidfuzz similarity against ONE query string, and comix lists a great
+        many series under romaji while the query often arrives as the English
+        licensed title. Measured 2026-08-20 — query "The Disastrous Life of
+        Saiki K." vs comix's "Saiki Kusuo no Psi Nan" scores 0.466 against a
+        0.55 floor, so the correct series was dropped while "Disastrous
+        Romance" (0.855) and "The Life of Ichabod" (0.855) were admitted. That
+        series' alt_titles literally begin with the English title, so one
+        lookup turns 0.466 into 1.0. alt_titles ALSO drive the orchestrator's
+        union-find grouping (search_orchestrator.py, grep _union), which is
+        what merges comix into the same candidate as the other sites' hit
+        rather than emitting a lookalike second candidate.
+
+        Best-effort by construction: any failure leaves alt_titles == [], i.e.
+        exactly the previous behavior. Never raises — see search() for why a
+        raise here would blocklist comix.to for an hour.
+        """
+        if not hits:
+            return
+        by_hid: Dict[str, List[SearchHit]] = {}
+        for h in hits:
+            # Same hid rule as fetch_comic_context: last path segment, then the
+            # part before the first '-'. search() builds slug-less /title/{hid}
+            # URLs today, but this keeps the helper correct for any /title/ URL
+            # rather than silently keying on "{hid}-{slug}".
+            slug_part = (h.url or "").rstrip("/").rsplit("/", 1)[-1]
+            hid = slug_part.split("-")[0] if slug_part else ""
+            if hid:
+                by_hid.setdefault(hid, []).append(h)
+        if not by_hid:
+            return
+        try:
+            blobs = _COMIX_BROWSER_BRIDGE.fetch_initial_data_blobs(
+                list(by_hid.keys()), time_budget_s=_COMIX_ALT_TITLE_BUDGET_S,
+            )
+        except Exception:
+            return
+        if not blobs:
+            return
+        enriched = 0
+        for hid, raw in blobs.items():
+            detail = self._manga_detail_from_initial_data(raw)
+            if not detail:
+                continue
+            alts = self._normalize_named_list(
+                detail.get("altTitles")
+                or detail.get("alt_titles")
+                or detail.get("alt_names")
+            )
+            year = detail.get("year")
+            for h in by_hid.get(hid, []):
+                # Drop an alt that merely repeats the primary title — it adds a
+                # duplicate union-find key and a wasted rapidfuzz pair.
+                primary = (h.title or "").strip().casefold()
+                h.alt_titles = [
+                    a for a in alts if a.strip().casefold() != primary
+                ]
+                if isinstance(year, int) and year > 0:
+                    h.year = year
+                if h.alt_titles:
+                    enriched += 1
+        if enriched:
+            print(
+                f"[*] Comix search: alt titles for {enriched}/{len(hits)} "
+                f"result(s).",
+                flush=True,
+            )
 
     # ------------------------------------------------------ image-quality probe
     # comix competes on MEASURED image quality now (2026-07-12), not just the
@@ -3216,6 +3314,106 @@ class _ComixBrowserSession:
             flush=True,
         )
         return rows
+
+    def fetch_initial_data_blobs(
+        self,
+        hids: List[str],
+        time_budget_s: float = 12.0,
+    ) -> Dict[str, str]:
+        """Fetch several title pages IN-PAGE and return {hid: initial-data JSON}.
+
+        Feeds the search alt-title enrichment (ComixSiteHandler.search). The
+        typeahead dropdown carries no alternate titles — verified against the
+        live anchor markup, which holds only thumb / title / type / "Ch.N" /
+        rating — so the only source is each title page's SSR
+        <script id="initial-data"> blob, the same one fetch_comic_context reads.
+
+        WHY a same-origin fetch() rather than plain HTTP or a navigation:
+          - Plain cloudscraper/requests GETs of /title/{hid} are answered with a
+            ~6 KB block page (403, measured 2026-08-20), same barrier that
+            forces every other comix data path through the browser.
+          - page.goto per hid works but costs a full SPA boot each and returns
+            the ~63 KB hydrated document; the fetch returns the ~18 KB raw SSR
+            response, which is all we need, and runs them concurrently. Two
+            title pages: 2.7 s by navigation vs 1.7 s by fetch, and the gap
+            widens with row count.
+        Same idiom as mangafire's fetch_api_json (sites/mangafire.py) — read
+        through the cleared page rather than trying to reproduce its identity.
+
+        Returns only the hids that produced a blob; a 403 (cold profile, WAF
+        not yet cleared) or a page without the script simply drops out, so the
+        caller degrades to no alt titles rather than failing. NEVER raises —
+        search must not poison the orchestrator's ProbeFailureCache. Returns
+        RAW TEXT, deliberately: _manga_detail_from_initial_data owns the
+        React-Query shape, and this method must not learn a second copy of it.
+        """
+        wanted = [h for h in (hids or []) if h]
+        if not wanted:
+            return {}
+        if not self._start():
+            return {}
+        page = self._page
+        if page is None:
+            return {}
+        import time as _time
+
+        deadline = _time.monotonic() + time_budget_s
+        # The page must be ON comix.to for the relative fetch to be same-origin
+        # and carry the clearance cookies. Reuse whatever page the typeahead
+        # left us on when it is already there — search calls this immediately
+        # after fetch_search_via_dom, so the common case is a free check.
+        try:
+            if "comix.to" not in (page.url or ""):
+                page.goto(
+                    "https://comix.to/",
+                    wait_until="domcontentloaded",
+                    timeout=max(1, int((deadline - _time.monotonic()) * 1000)),
+                )
+        except Exception:
+            return {}
+
+        # One evaluate, all rows concurrent. The JS extracts ONLY the script
+        # text — no JSON walking here (see the docstring). Each row is
+        # individually try/caught so one failure can't void the batch.
+        # The budget is enforced INSIDE the page via AbortController rather than
+        # by a Playwright timeout: page.evaluate takes no timeout argument, and
+        # the bridge's outer _comix_call cap would surface a slow batch as a
+        # dead browser instead of "no alt titles this run". Aborting in-page
+        # lets the rows that already landed still be returned.
+        scrape_js = """async ([hids, budgetMs]) => {
+            const out = {};
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), budgetMs);
+            try {
+                await Promise.all(hids.map(async (hid) => {
+                    try {
+                        const r = await fetch('/title/' + hid, {
+                            credentials: 'same-origin', signal: ctrl.signal,
+                        });
+                        if (!r.ok) return;
+                        const txt = await r.text();
+                        const doc = new DOMParser().parseFromString(txt, 'text/html');
+                        const el = doc.querySelector('script#initial-data');
+                        if (el && el.textContent) out[hid] = el.textContent;
+                    } catch (e) { /* this row drops out; batch continues */ }
+                }));
+            } finally { clearTimeout(timer); }
+            return out;
+        }"""
+        budget_ms = max(1, int((deadline - _time.monotonic()) * 1000))
+        try:
+            blobs = page.evaluate(scrape_js, [wanted, budget_ms]) or {}
+        except Exception as e:
+            print(
+                f"[*] Comix search: alt-title lookup skipped "
+                f"({type(e).__name__}: {e}); titles stay as the typeahead gave "
+                f"them.",
+                flush=True,
+            )
+            return {}
+        if not isinstance(blobs, dict):
+            return {}
+        return {str(k): v for k, v in blobs.items() if isinstance(v, str) and v}
 
     def fetch_chapters_via_dom(
         self,
@@ -5090,6 +5288,25 @@ class _ComixBrowserBridge:
             "fetch_search_via_dom",
             query,
             limit,
+            time_budget_s,
+            _timeout_s=time_budget_s + 12.0,
+        )
+
+    def fetch_initial_data_blobs(
+        self,
+        hids: List[str],
+        time_budget_s: float = 12.0,
+    ) -> Dict[str, str]:
+        """Bridge facade for the search alt-title lookup.
+
+        Same tight outer-cap reasoning as fetch_search_via_dom: this runs
+        INSIDE the fan-out, so a slow batch delays the whole cross-site search.
+        The load-bearing bound is the in-page AbortController; this is the net.
+        Cross-file: _ComixBrowserSession.fetch_initial_data_blobs.
+        """
+        return _comix_call(
+            "fetch_initial_data_blobs",
+            hids,
             time_budget_s,
             _timeout_s=time_budget_s + 12.0,
         )

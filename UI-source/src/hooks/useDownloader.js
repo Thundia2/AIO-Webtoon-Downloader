@@ -27,6 +27,7 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { formatDuration } from "@/lib/utils";
+import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 
 // DEFAULT_DOWNLOAD_DEFAULTS / mergeSettings / normalizeDownloadArgs were
 // removed 2026-05-13: SettingsTab.jsx now owns the defaults dict. The
@@ -240,10 +241,21 @@ export function useDownloader() {
   // re-running the manga/ folder walk + cover-cache lookup on every mount.
   // null = not yet loaded; [] = loaded but empty (no series). LibraryTab
   // checks for null on mount and only calls loadLibrary when uninitialized.
-  // The setter is exposed so LibraryTab.handleCheckAll can splice updated
-  // metadata back into entries without round-tripping through the IPC scan.
+  // The setter stays internal: its two writers are the thumbnail-ready
+  // stream below and useUpdateCheck's updatedMeta splice, both of which run
+  // in this hook. No component needs it.
   const [libraryEntries, setLibraryEntries] = useState(null);
   const [libraryLoading, setLibraryLoading] = useState(false);
+
+  // ── "Check All" update-sweep state ──
+  // Also lifted out of LibraryTab, and for a harder reason than the entries
+  // were: the sweep runs in the MAIN process and keeps going after the tab
+  // unmounts, so state owned by the tab was silently diverging from a live
+  // scan. Owning it here keeps the subscription alive across tab switches and
+  // lets a returning Library tab pick the scan back up. See
+  // hooks/useUpdateCheck.js. It writes fresh site metadata back through
+  // setLibraryEntries, hence the injection.
+  const updateCheck = useUpdateCheck({ setLibraryEntries });
 
   // Refs so callbacks always see the latest state without re-subscribing
   const queueRef = useRef(queue);
@@ -1163,6 +1175,10 @@ export function useDownloader() {
     searchSiteHealth,
     libraryEntries,
     libraryLoading,
+    // { rows, scanState, scanStats, newChapterCounts, foundCount,
+    //   start, cancel, resolveRows, setRowIgnored } — see
+    //   hooks/useUpdateCheck.js
+    updateCheck,
 
     // Actions
     queueDownload,
@@ -1179,6 +1195,5 @@ export function useDownloader() {
     cancelSearch,
     clearSearchLogs,
     loadLibrary,
-    setLibraryEntries,
   };
 }

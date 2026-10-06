@@ -333,6 +333,137 @@ def list_saved_books(folder: str) -> List[str]:
     return [path for path, _mtime in books]
 
 
+# ──────────────────────────────────────────────────────────────────
+# SERIES IDENTITY / DUPLICATE GROUPING
+#
+# Two folders are the SAME SERIES when they name the same page on the same
+# site, whatever they happen to be called on disk. This matters because a site
+# RENAMING a series used to fork a second folder (aio-dl.py's allocator keyed on
+# the title string), splitting the chapters and making the update check
+# under-report on both halves — the 59-chapter folder said "5 new" forever while
+# its 5-chapter fork said "59 new".
+#
+# aio-dl.py:allocate_series_output_dir now prevents new forks. These helpers are
+# for the ones already on disk: an update check that treats a group as ONE
+# series diffs against the union of what the members hold, so a forked library
+# reports the truth until the user merges the folders.
+#
+# MIRROR TWINS — three implementations of one rule, because the desktop scans
+# the library in JS and cannot import this:
+#   * UI-source/electron/library.js — seriesIdentityKey / groupEntriesBySeries
+#   * aio-dl.py                     — _series_identity_matches / _series_folder_sort_key
+#   * here                          — the Android + CLI scanner
+# Grep seriesIdentityKey if you change the matching or the primary rule.
+# ──────────────────────────────────────────────────────────────────
+
+
+def normalize_series_url(value: object) -> str:
+    """Comparable form of a stored series URL; "" when there isn't one.
+
+    Twin of aio-dl.py:_normalize_series_url — a list is reduced to its first
+    element (older metadata could hold either shape), scheme/host are case
+    folded, a leading www. and a trailing slash are dropped, and the PATH is
+    left alone because plenty of sites serve case-sensitive slugs.
+    """
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    match = re.match(r"^(https?://)(?:www\.)?([^/]+)(.*)$", text, re.IGNORECASE)
+    if not match:
+        return text.lower()
+    return f"{match.group(1).lower()}{match.group(2).lower()}{match.group(3)}"
+
+
+def series_identity_key(meta: Optional[Dict]) -> Optional[str]:
+    """Grouping key for a series, or None when the metadata can't identify one.
+
+    site+hid first because it survives a URL changing (domain rotation), URL
+    second because it survives a site changing its id scheme. A folder with
+    neither is ungroupable and must stay on its own — never fall back to the
+    title, which is the exact signal that proved untrustworthy.
+    """
+    if not isinstance(meta, dict):
+        return None
+    site = str(meta.get("site") or "").strip()
+    hid = str(meta.get("hid") or "").strip()
+    if site and hid:
+        return f"hid:{site}:{hid}"
+    url = normalize_series_url(meta.get("url"))
+    if url:
+        return f"url:{url}"
+    return None
+
+
+def _series_payload_count(folder: str, entry: Dict) -> int:
+    """Archives at the folder root plus --format none chapter dirs.
+
+    Computed lazily by the grouper — only groups with more than one member need
+    a primary, and those are rare — so the extra listdir is not paid per series.
+    """
+    count = int(entry.get("files") or 0)
+    try:
+        images_dir = os.path.join(folder, "images")
+        count += sum(
+            1
+            for name in os.listdir(images_dir)
+            if name.lower().startswith(("chapter_", "ch_"))
+            and os.path.isdir(os.path.join(images_dir, name))
+        )
+    except OSError:
+        pass
+    return count
+
+
+def _primary_sort_key(entry: Dict) -> tuple:
+    # Richest first: a fork's new chapters belong beside the bulk of the series,
+    # not in the husk, so the fullest folder is the one the update check reports
+    # under and the one a queued download targets. Twin of aio-dl.py's
+    # _series_folder_sort_key — keep the three tiers and their order in step.
+    meta = entry.get("series_meta") or {}
+    n_downloaded = len(meta.get("chapters_downloaded") or [])
+    n_files = _series_payload_count(entry.get("folder") or "", entry)
+    return (
+        -(1 if (n_files or n_downloaded) else 0),
+        -n_downloaded,
+        -n_files,
+        str(entry.get("name") or ""),
+    )
+
+
+def group_entries_by_series(entries: List[Dict]) -> List[Dict]:
+    """Collapse scan_library output into one group per series.
+
+    Returns [{key, primary, members}] in the input's order of first appearance.
+    An entry with no identity key is its own single-member group, so callers can
+    iterate groups uniformly instead of special-casing ungroupable folders.
+    """
+    order: List[Optional[str]] = []
+    buckets: Dict[Optional[str], List[Dict]] = {}
+    for index, entry in enumerate(entries):
+        key = series_identity_key(entry.get("series_meta"))
+        # None is not a shared bucket — every unidentifiable folder gets its own.
+        bucket_key = key if key else f"solo:{index}"
+        if bucket_key not in buckets:
+            buckets[bucket_key] = []
+            order.append(bucket_key)
+        buckets[bucket_key].append(entry)
+
+    groups: List[Dict] = []
+    for bucket_key in order:
+        members = buckets[bucket_key]
+        primary = members[0] if len(members) == 1 else sorted(members, key=_primary_sort_key)[0]
+        groups.append(
+            {
+                "key": bucket_key,
+                "primary": primary,
+                "members": members,
+            }
+        )
+    return groups
+
+
 def scan_library(root: str) -> List[Dict]:
     entries: List[Dict] = []
     if not os.path.isdir(root):
@@ -371,6 +502,12 @@ def scan_library(root: str) -> List[Dict]:
                 "has_params": has_params or has_meta,
                 "params": saved,
                 "series_meta": series_meta,
+                # Duplicate detection, for callers that don't want to re-derive
+                # it: series_key groups forks of the SAME page on the same site
+                # (grep seriesIdentityKey), anilist_id is the weaker cross-site
+                # hint used only to WARN, never to merge automatically.
+                "series_key": series_identity_key(series_meta),
+                "anilist_id": series_meta.get("anilist_id"),
                 "url": saved.get("url", ""),
                 "format": saved.get("format", "?"),
                 "language": saved.get("language", "en"),
