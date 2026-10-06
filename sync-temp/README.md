@@ -30,6 +30,10 @@ contents:
 
 ## Where things stand — read this before the summary you were seeded with
 
+> **Superseded on 2026-10-06 by `STATE.md`**, which the cloud session keeps current. The numbered
+> list below describes the handoff moment. Since then, the review was checked and folded into the
+> non-UI plan as rev 2, and three decisions were made (see STATE.md).
+
 **The summary your session started from is stale.** It says the CompareManga explorer was still
 running and the plan was only a skeleton. The transcripts show more was done:
 
