@@ -29,7 +29,7 @@
 // and devMtime still equal the entry's. Anything else in a recorded slot has
 // changed on the device (a Komikku custom cover.jpg, for one).
 //
-// Read by: planner.js, executor.js and service.js (plan preparation).
+// Read by: planner.js, executor.js, prepare.js.
 // ============================================================
 
 const { slotKey } = require("./naming");
@@ -91,7 +91,16 @@ function adoptMissingDevMtime(entry, devFile) {
  * Resolve a `pending` entry against the listing and, when needed, one RECV
  * of the file hashed on the PC. Rows are checked in the plan's table order.
  *
- * @param {object} entry   {name, size (planned), sha256 (planned), origin:'pending', prev?}
+ * `prevObserved` is the slot as the plan saw it ({size, devMtime} of the
+ * device file the op was replacing; absent for a push into an empty slot).
+ * When the listing still shows exactly that, the write never reached the
+ * slot, and what was recorded before comes back unchanged: the original
+ * entry, or no entry at all. Without it, a replace of a file the app never
+ * wrote (unverified, foreign, changed on the device) interrupted before its
+ * SEND reached adbd resolved as `partial`, i.e. ours, and a later plan could
+ * pre-select its delete (found in P3).
+ *
+ * @param {object} entry   {name, size (planned), sha256 (planned), origin:'pending', prev?, prevObserved?}
  * @param {object|null} devFile  The listing's file at that slot, or null.
  * @param {undefined|{sha:string}|{error:string}} recv  undefined = not read yet.
  * @returns {{outcome:'absent'|'restore-prev'|'pushed'|'partial'|'needs-recv'|'unresolved', entry?:object|null}}
@@ -102,7 +111,11 @@ function adoptMissingDevMtime(entry, devFile) {
  */
 function resolvePending(entry, devFile, recv) {
   const prev = entry.prev || null;
+  const seen = entry.prevObserved || null;
   if (!devFile) return { outcome: "absent", entry: null };
+  if (seen && seen.devMtime != null && devFile.size === seen.size && devFile.devMtime === seen.devMtime) {
+    return { outcome: "restore-prev", entry: prev ? { ...prev } : null };
+  }
   // SEND always unlinks and recreates, so an unchanged (size, devMtime)
   // means it never reached adbd (or a FolderTransport temp never got
   // renamed): the old copy survived untouched.
@@ -294,7 +307,11 @@ function loadRecordView({ header, shards, selection, target, measured }) {
   return {
     epoch,
     header,
-    firstSync: live.length === 0,
+    // First sync lasts until the first apply (executor.js sets firstApplyAt),
+    // not until the first shard: prepare.js's coverage Verify writes shards
+    // on a first sync, and rule 2's "weak matches block too" must not end
+    // before the user applied anything.
+    firstSync: live.length === 0 || !header.firstApplyAt,
     mismatch,
     caseInsensitive: ci,
     shards: live,

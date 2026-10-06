@@ -110,8 +110,18 @@ const DEFAULT_INJECT = Object.freeze({
   pushMtime: "done", // 'done' (lutimes the DONE value, as AOSP) or 'now' (the tablet's push-time behavior)
   lutimesDelayMs: 0, // other sessions see the old mtime this long after OKAY
   legacyCrlf: true, // legacy shell output uses \r\n (old adbd allocated a pty)
-  tools: { sha256sum: true, findPrintf: true },
+  // Each false makes that shell tool missing or the option unknown, as on
+  // an older toybox/busybox.
+  tools: { sha256sum: true, findPrintf: true, findExec: true, realpath: true, statF: true, statC: true, df: true },
+  // {"/sdcard": "/storage/emulated/0"}: what `realpath` resolves (the fake fs
+  // itself has no symlinks; tests build it under the canonical path).
+  symlinks: {},
 });
+
+// What `stat -f` / `df` report when capacityBytes is Infinity.
+const FAKE_FS_BYTES = 64 * 1024 * 1024 * 1024;
+const FAKE_BLOCK = 4096;
+const SHA256_EMPTY = crypto.createHash("sha256").digest("hex");
 
 // --- in-memory filesystem --------------------------------------------------
 
@@ -1218,6 +1228,36 @@ function runShell(d, cmdline) {
   return { stdout: Buffer.concat(out.map(_b)), stderr: Buffer.concat(err.map(_b)), code: rc };
 }
 
+function _shellLocked(d, p) {
+  const L = d.inject.locked;
+  return !!L && String(p).startsWith(L.prefix);
+}
+
+function _statfs(d) {
+  const cap = Number.isFinite(d.inject.capacityBytes) ? d.inject.capacityBytes : FAKE_FS_BYTES;
+  const blocks = Math.floor(cap / FAKE_BLOCK);
+  return { blocks, avail: Math.max(0, Math.floor((cap - d.fs.used) / FAKE_BLOCK)) };
+}
+
+/** A shell glob (* ? [..]) as an anchored RegExp, for find -name. */
+function _globRe(g) {
+  let re = "^";
+  for (let i = 0; i < g.length; i += 1) {
+    const c = g[i];
+    if (c === "*") re += ".*";
+    else if (c === "?") re += ".";
+    else if (c === "[") {
+      const j = g.indexOf("]", i + 1);
+      if (j === -1) re += "\\[";
+      else {
+        re += `[${g.slice(i + 1, j).replace(/^!/, "^").replace(/\\/g, "\\\\")}]`;
+        i = j;
+      }
+    } else re += c.replace(/[.+^${}()|\\\]\\]/g, "\\$&");
+  }
+  return new RegExp(`${re}$`, "s");
+}
+
 function _fmtMtimeAt(sec) {
   return `${sec}.0000000000`;
 }
@@ -1229,11 +1269,15 @@ function runCommand(d, words) {
   const ok = (stdout = "") => ({ stdout, stderr: "", code: 0 });
   const bad = (stderr, code = 1) => ({ stdout: "", stderr, code });
   const notFound = () => bad(`/system/bin/sh: ${cmd}: inaccessible or not found\n`, 127);
+  // Options end at the first operand or at `--` (dropped), as in toybox:
+  // the engine writes `rm -- …`, `mv -- …`, `mkdir -p -- …`.
   const opts = (list) => {
     const flags = new Set();
     const rest = [];
+    let ended = false;
     for (const a of list) {
-      if (/^-[a-zA-Z]+$/.test(a) && !rest.length) for (const ch of a.slice(1)) flags.add(ch);
+      if (!ended && !rest.length && a === "--") ended = true;
+      else if (!ended && /^-[a-zA-Z]+$/.test(a) && !rest.length) for (const ch of a.slice(1)) flags.add(ch);
       else rest.push(a);
     }
     return { flags, rest };
@@ -1265,6 +1309,15 @@ function runCommand(d, words) {
       let e = "";
       let code = 0;
       for (const a of args) {
+        if (a === "/dev/null") {
+          s += `${SHA256_EMPTY}  ${a}\n`;
+          continue;
+        }
+        if (_shellLocked(d, a)) {
+          e += `sha256sum: ${a}: Permission denied\n`;
+          code = 1;
+          continue;
+        }
         const r = fs.lookup(a);
         if (r.error || r.node.type !== "file") {
           e += `sha256sum: ${a}: ${r.error ? "No such file or directory" : "Is a directory"}\n`;
@@ -1276,13 +1329,26 @@ function runCommand(d, words) {
       return { stdout: s, stderr: e, code };
     }
     case "stat": {
+      if (args[0] === "-f") {
+        if (!tools.statF) return bad("stat: Unknown option 'f'\n", 1);
+        if (args[1] !== "-c") return bad("stat: fake supports only -f -c FMT\n", 1);
+        let s = "";
+        for (const a of args.slice(3)) {
+          const st = fs.stat(a);
+          if (st.error || _shellLocked(d, a)) return bad(`stat: '${a}': No such file or directory\n`, 1);
+          const f = _statfs(d);
+          s += `${args[2].replace(/%a/g, String(f.avail)).replace(/%S/g, String(FAKE_BLOCK)).replace(/%b/g, String(f.blocks))}\n`;
+        }
+        return ok(s);
+      }
       if (args[0] !== "-c") return bad("stat: fake supports only -c FMT\n", 1);
+      if (!tools.statC) return bad("stat: Unknown option 'c'\n", 1);
       const fmt = args[1];
       let s = "";
       let e = "";
       let code = 0;
       for (const a of args.slice(2)) {
-        const st = fs.stat(a);
+        const st = _shellLocked(d, a) ? { error: ERRNO.EACCES } : fs.stat(a);
         if (st.error) {
           e += `stat: '${a}': ${STRERROR[st.error]}\n`;
           code = 1;
@@ -1293,7 +1359,7 @@ function runCommand(d, words) {
           .replace(/%s/g, String(st.size))
           .replace(/%Y/g, String(st.mtime))
           .replace(/%n/g, a)
-          .replace(/%F/g, isDir ? "directory" : "regular file")}\n`;
+          .replace(/%F/g, isDir ? "directory" : st.size ? "regular file" : "regular empty file")}\n`;
       }
       return { stdout: s, stderr: e, code };
     }
@@ -1301,32 +1367,51 @@ function runCommand(d, words) {
       const root = args[0];
       let maxdepth = Infinity;
       let mindepth = 0;
-      let type = null;
+      const tests = [];
       let printf = null;
+      let exec = null;
+      let neg = false;
       for (let i = 1; i < args.length; i += 1) {
-        if (args[i] === "-maxdepth") maxdepth = Number(args[++i]);
-        else if (args[i] === "-mindepth") mindepth = Number(args[++i]);
-        else if (args[i] === "-type") type = args[++i];
-        else if (args[i] === "-printf") {
+        const a = args[i];
+        if (a === "!") neg = !neg;
+        else if (a === "-maxdepth") maxdepth = Number(args[++i]);
+        else if (a === "-mindepth") mindepth = Number(args[++i]);
+        else if (a === "-type") {
+          tests.push({ neg, ok: ((v) => (n) => (n.type === "dir" ? "d" : "f") === v)(args[++i]) });
+          neg = false;
+        } else if (a === "-name") {
+          tests.push({ neg, ok: ((re) => (n, base) => re.test(base))(_globRe(args[++i])) });
+          neg = false;
+        } else if (a === "-printf") {
           if (!tools.findPrintf) return bad("find: Unknown option '-printf'\n", 1);
           printf = args[++i];
-        } else return bad(`find: Unknown option '${args[i]}'\n`, 1);
+        } else if (a === "-exec") {
+          if (!tools.findExec) return bad("find: Unknown option '-exec'\n", 1);
+          const argv = [];
+          for (i += 1; i < args.length && args[i] !== "+" && args[i] !== ";"; i += 1) argv.push(args[i]);
+          if (args[i] !== "+" || argv[argv.length - 1] !== "{}") return bad("find: fake supports only -exec CMD ... {} +\n", 1);
+          exec = argv.slice(0, -1);
+        } else return bad(`find: Unknown option '${a}'\n`, 1);
       }
+      if (_shellLocked(d, root)) return bad(`find: ${root}: Permission denied\n`, 1);
       const top = fs.lookup(root);
       if (top.error) return bad(`find: ${root}: No such file or directory\n`, 1);
       let s = "";
+      const hits = [];
       const walk = (node, rel, depth) => {
         const full = rel ? `${root}/${rel}` : root;
         const t = node.type === "dir" ? "d" : "f";
-        if (depth >= mindepth && (!type || type === t)) {
-          if (printf == null) s += `${full}\n`;
+        const base = rel ? rel.split("/").pop() : root.split("/").pop();
+        if (depth >= mindepth && tests.every((x) => x.ok(node, base) !== x.neg)) {
+          if (exec) hits.push(full);
+          else if (printf == null) s += `${full}\n`;
           else {
             s += printf
               .replace(/%s/g, String(node.type === "file" ? node.size : 4096))
               .replace(/%T@/g, _fmtMtimeAt(node.mtime))
               .replace(/%P/g, rel)
               .replace(/%p/g, full)
-              .replace(/%f/g, rel ? rel.split("/").pop() : root.split("/").pop())
+              .replace(/%f/g, base)
               .replace(/%y/g, t)
               .replace(/\\n/g, "\n")
               .replace(/\\0/g, "\0");
@@ -1337,11 +1422,47 @@ function runCommand(d, words) {
         }
       };
       walk(top.node, "", 0);
+      if (!exec) return ok(s);
+      // -exec … {} + runs the command once with every match appended (one
+      // batch here), and find exits non-zero when it did.
+      if (!hits.length) return ok("");
+      const r = runCommand(d, [...exec, ...hits]);
+      return { stdout: r.stdout, stderr: r.stderr, code: r.code ? 1 : 0 };
+    }
+    case "realpath": {
+      if (!tools.realpath) return notFound();
+      let s = "";
+      for (const a of args) {
+        let p = a;
+        for (const [from, to] of Object.entries(d.inject.symlinks || {}).sort((x, y) => y[0].length - x[0].length)) {
+          if (p === from || p.startsWith(`${from}/`)) {
+            p = to + p.slice(from.length);
+            break;
+          }
+        }
+        if (fs.lookup(p).error) return { stdout: s, stderr: `realpath: ${a}: No such file or directory\n`, code: 1 };
+        s += `/${fs._parts(p).map((x) => x.toString("utf8")).join("/")}\n`;
+      }
+      return ok(s);
+    }
+    case "df": {
+      if (!tools.df) return notFound();
+      const { flags, rest } = opts(args);
+      if (!flags.has("P") || !flags.has("k")) return bad("df: fake supports only -P -k\n", 1);
+      const f = _statfs(d);
+      const k = FAKE_BLOCK / 1024;
+      let s = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n";
+      for (const a of rest) {
+        if (fs.lookup(a).error) return { stdout: s, stderr: `df: ${a}: No such file or directory\n`, code: 1 };
+        const used = f.blocks - f.avail;
+        s += `/dev/fuse ${f.blocks * k} ${used * k} ${f.avail * k} ${Math.round((used / Math.max(1, f.blocks)) * 100)}% /storage/emulated\n`;
+      }
       return ok(s);
     }
     case "mv": {
-      if (args.length !== 2) return bad("mv: fake supports exactly SRC DST\n", 1);
-      const [a, b] = args;
+      const mvArgs = opts(args).rest;
+      if (mvArgs.length !== 2) return bad("mv: fake supports exactly SRC DST\n", 1);
+      const [a, b] = mvArgs;
       if (d.inject.readOnly) return bad(`mv: bad '${a}': Read-only file system\n`, 1);
       const src = fs.lookup(a);
       if (src.error) return bad(`mv: bad '${a}': No such file or directory\n`, 1);
@@ -1395,7 +1516,7 @@ function runCommand(d, words) {
     case "rmdir": {
       let code = 0;
       let e = "";
-      for (const a of args) {
+      for (const a of opts(args).rest) {
         const re = fs.rmdir(a);
         if (re) {
           e += `rmdir: '${a}': ${STRERROR[re]}\n`;

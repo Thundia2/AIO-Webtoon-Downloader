@@ -1,7 +1,7 @@
 # Device Sync — non-UI implementation plan
 
 **Status: rev 4, approved 2026-10-06 ("Start with the plan"), cloud session on
-`wip/device-sync-handoff`. P0, P1 and P2 are done; P3 waits for your go-ahead.**
+`wip/device-sync-handoff`. P0 to P3 are done; P4 waits for your go-ahead.**
 - Rev 1 (2026-09-30) got an adversarial review on 2026-10-01: 2 critical, 9 major, 14 minor.
   Rev 2 checked every finding against the code and AOSP and folded in the confirmed ones. Where the
   review was wrong or a better fix exists, it says so.
@@ -15,6 +15,8 @@
 - P2 recorded the calls made while coding the adb layer (deviation 11), moved the adb-test
   items that need later modules to their phases ("Moved at P2" in Verification), and added a P5
   measurement of the wait between a push's last DATA and its OKAY.
+- P3 recorded your four P3 answers and the calls made while coding the engine (deviation 12),
+  added `prepare.js` to P3, and found that the IPC contract has no channel for Link (P4 adds one).
 - The three disposition tables are the last section.
 - Parent plan (behavior rules 1-13, the decisions table, the UI design), approved 2026-09-30:
   `sync-temp/plans/add-this-script-s-features-linked-pumpkin.md`. Rule numbers below refer to it.
@@ -296,6 +298,68 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
       it is `offline`, charged 0 and not retried, and the next operation is `device-lost` once
       the row is gone. A wireless device that stays listed is `offline`, and its binds FAIL
       `device offline`.
+
+12. **Calls made while coding the engine (P3).** Each is pinned by a test in
+    `tools/_test_device_sync_exec.js` or `_test_device_sync_core.js`.
+    - **Your P3 answers.**
+      - Plan preparation is its own module, `prepare.js`. It persists `entryFixes` and
+        `shardNameFixes` (deviation 10 said `service.js`); the service only calls it.
+      - **The case probe writes nothing to the device.** An existing entry is STA2'd under an
+        ASCII-case-flipped name, in the root and then up to 3 of its folders, at most 5 flips
+        each: ENOENT means sensitive, the same object means insensitive. With nothing to flip,
+        the target is assumed case-insensitive (the safe direction) with `caseMeasured: false`,
+        and the next connection probes again. The flag is saved in `header.json`.
+      - **`connecting` during a run** waits up to 60 s for the device, uncharged, then ends the
+        run `disconnected`. Plan preparation waits the same way.
+      - **Prune keeps `adopted-size` files** as leftovers. It deletes only `pushed`, `adopted`
+        and `partial` files that still classify as ours, then `rmdir`s only an empty folder.
+    - **Preparation order.** Input refusals (`library-missing`, `record-mismatch`) come before any
+      device or record write. Then: the root listing (an empty one while the record manages
+      folders refuses `device-listing-suspect`), folder rename intents, gone detection, folder
+      listings and device metadata, file rename intents, pending entries, and **PC hashing last**,
+      so a refused plan never pays for a first-time hash of the whole library. Then the planner's
+      two passes and the coverage Verify.
+    - **`pending` entries carry `prevObserved`**, the slot's (size, devMtime) as the plan saw it.
+      When the listing still shows exactly that, the SEND never reached the slot, and the entry
+      recorded before comes back (or none). This closes a hole in P1's `resolvePending`: a
+      replace of a file the app never wrote (unverified, or changed on the device), interrupted
+      before its SEND, resolved as `partial`, which is ours, so a later plan could pre-select its
+      delete.
+    - **First sync lasts until the first apply** (`header.firstApplyAt`, written at apply start),
+      not until the first shard. Plan preparation's coverage Verify writes shards on a first sync,
+      and rule 2's "weak matches block too" would otherwise have ended before you applied
+      anything.
+    - **GC of stale shards runs only against a valid header.** A missing or corrupt header makes
+      every shard read as stale; the next apply writes a new epoch, and the next plan collects.
+    - **A folder target's volume id is measured** (`fs.stat`'s `dev` at the probe), written into
+      the header and compared against it, instead of being taken from `sync-targets.json`.
+    - **`goneCandidates` ignores rename intents of scope `file`**: they name files inside the
+      folder, not folders.
+    - **Free space that can't be measured** (no `stat -f`, no `df`) proceeds with a warning;
+      ENOSPC still aborts the run. When pushes fit only after the gate-free deletes, those run
+      first (`deletes-first`); otherwise apply refuses `blocked` with the numbers.
+    - **`.nomedia`** is written at apply start when the profile asks for it; a failure is a
+      warning.
+    - **Batched intent is built and tested, and off** (`intentBatch = 1`) until P5 measures the
+      NTFS fsync cost.
+    - **Device metadata is read per file over the sync protocol** (RECV, ≤256 KB):
+      `details.json` in every folder, `.aio_series.json` only in unbound ones. Parent rule 2 says
+      "one batched shell call"; RECV needs no shell parsing of file contents. It costs one small
+      RECV per folder per plan; P5 measures it.
+    - **The quick-verify "truncation artifact" cleanup is dropped**: the wire client sends exact
+      paths, so there is no truncated name to clean.
+    - **A PC hash belongs to its stat.** `hashFiles` returns the (size, mtimeNs) it hashed; a file
+      that changed between the walk and its hash stays unhashed (no op) until the next plan.
+    - **Link has no IPC channel in this plan** (`config-op` lists no `link` op). P3 implements it
+      as `RecordStore.bindFolder` (a gone series' shard is rewritten in place); P4 adds the
+      channel.
+    - **Defects found and fixed in P3:**
+      - the hash pool stalled a lone task when its worker couldn't start (the fallback was set
+        but nothing re-dispatched);
+      - a folder target's Verify and read-back accepted the hash of a file written while it was
+        hashed;
+      - the fake shell treated `--` as an operand, so `mkdir -p -- X` also made a folder named
+        `--`.
 
 ## Repo state and the branch protocol
 
@@ -788,8 +852,11 @@ an op may carry `expectVersion` for optimistic concurrency.
 **`targets/<id>/header.json`.** It holds:
 - `recordEpoch`;
 - kind, serial or folderRoot (plus `volumeId` for a folder target: `fs.stat`'s `dev`, the volume
-  serial on Windows), canonicalRoot, profile, caseInsensitive;
-- caps (lsV2, statV2, shellV2, sha256sum, findPrintf, statF).
+  serial on Windows, measured at the probe), canonicalRoot, profile, caseInsensitive and
+  `caseMeasured` (false while the case was assumed; deviation 12);
+- caps (lsV2, statV2, shellV2, sha256sum, findPrintf, statC, statF, df);
+- `createdAt`, and `firstApplyAt` once an apply has started: until then the target is on its
+  first sync (deviation 12).
 
 On a mismatch with the target, the record is ignored for deletes and orphans until re-verified
 (rule 3).
@@ -999,7 +1066,7 @@ It also injects:
 Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
 
 **P3. Transports and execution.** `store` (shards), `hash-pool`, `pc-inventory`, `transports`,
-`executor`.
+`executor`, `prepare` (plan preparation; deviation 12).
 - Test: `tools/_test_device_sync_exec.js`. The batched-intent path is built and tested here; the
   per-file fsync cost that decides whether it's switched on is measured on your PC in P5
   (deviation 1).
@@ -1249,6 +1316,14 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
 - A hash-while-push mismatch: the observed sha lands in the record and the PC hash cache, and the
   next plan is stable.
 - FolderTransport: temp + rename, its leftover sweep, and the single-flight presence check.
+- **Added at P3** (deviation 12's calls):
+  - an interrupted replace of an unverified or foreign file resolves to what was recorded
+    before, never `partial` (`prevObserved`; core and exec);
+  - a coverage Verify on a first sync doesn't end the first sync (core and exec);
+  - a corrupt header never triggers GC; a measured volume id mismatch is `record-mismatch`;
+  - gate-free deletes run first when the pushes fit only after them;
+  - the hash pool finishes a lone task after a failed worker start, and reports `changed`;
+  - a mutation check: 20 deliberate breaks of the engine's guards, each one fails the suite.
 
 **Monitor, service, contract, hook, searcher and isolation tests**
 - **Monitor.**

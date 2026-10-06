@@ -135,7 +135,7 @@ function view(shards, extra) {
   const x = extra || {};
   const t = x.target || target();
   const ci = x.ci === undefined ? true : x.ci;
-  const header = x.noHeader ? null : { recordEpoch: EPOCH, ...profiles.recordIdentity(t), caseInsensitive: ci, ...(x.header || {}) };
+  const header = x.noHeader ? null : { recordEpoch: EPOCH, ...profiles.recordIdentity(t), caseInsensitive: ci, firstApplyAt: 1, ...(x.header || {}) };
   return prov.loadRecordView({ header, shards, selection: x.selection || null, target: t, measured: { caseInsensitive: ci } });
 }
 
@@ -1156,6 +1156,31 @@ test("absent and not confirmed gone → held folder-unreadable, never guessed", 
   const p = plan({ pc: pc([s]), device: device({}), view: view([shard("sh-alpha", "Alpha", s, entries)]) });
   assert.strictEqual(p.bySeriesKey.get("pc:Alpha").heldReason, "folder-unreadable");
   assert.strictEqual(p.ops.size, 0);
+});
+
+// ── P3 additions ─────────────────────────────────────────────────────────
+
+console.log("P3 additions");
+
+test("resolvePending: an interrupted replace of a file the app never wrote restores what was recorded (prevObserved)", () => {
+  const pending = { name: "Ch.001.cbz", size: 900, sha256: "new", origin: "pending", prev: null, prevObserved: { size: 500, devMtime: 77 } };
+  // The listing still shows exactly the file the op was replacing: the SEND never reached it.
+  assert.deepStrictEqual(prov.resolvePending(pending, { name: "Ch.001.cbz", size: 500, devMtime: 77 }), { outcome: "restore-prev", entry: null });
+  const foreign = e("Ch.001.cbz", 500, "old", 77, "foreign");
+  assert.deepStrictEqual(prov.resolvePending({ ...pending, prev: foreign }, { name: "Ch.001.cbz", size: 500, devMtime: 77 }), { outcome: "restore-prev", entry: foreign });
+  // Without prevObserved the same slot read as the app's partial write: ours.
+  assert.strictEqual(prov.resolvePending({ ...pending, prevObserved: null }, { name: "Ch.001.cbz", size: 500, devMtime: 77 }).outcome, "partial");
+  // Another devMtime: the slot changed after the plan; the size decides as before.
+  assert.strictEqual(prov.resolvePending(pending, { name: "Ch.001.cbz", size: 900, devMtime: 78 }).outcome, "needs-recv");
+});
+
+test("first sync lasts until the first apply, not the first shard (a coverage Verify writes shards)", () => {
+  const s = series("Alpha", [f("Ch.001.cbz", 1)]);
+  const sh = shard("sh-alpha", "Alpha", s, [e("Ch.001.cbz", 1, "sha:Ch.001.cbz:1", 5, "adopted")]);
+  const verifiedOnly = view([sh], { header: { firstApplyAt: undefined } });
+  assert.strictEqual(verifiedOnly.firstSync, true);
+  assert.strictEqual(view([sh]).firstSync, false);
+  assert.strictEqual(view([], {}).firstSync, true, "no shards: still first");
 });
 
 // ── rule 10, rule 13, refusals ───────────────────────────────────────────

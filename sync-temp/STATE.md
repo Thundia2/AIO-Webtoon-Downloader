@@ -15,8 +15,22 @@ log; git history owns the events.
     own review.
   - Every finding of the reviews was checked against the code, AOSP adb and libuv. The plan's last
     section holds the disposition tables.
-- **Now:** P0, P1 and P2 are done and committed; P3 (transports and execution) waits for your
+- **Now:** P0 to P3 are done and committed; P4 (service and integration) waits for your
   go-ahead.
+
+## P3 engine (2026-10-06)
+
+| Item | State |
+|---|---|
+| Modules | `UI-source/electron/sync/`: `store` (atomic writes, write queue, sharded record), `hash-pool` (inline workers, PC hash cache), `pc-inventory` (async library walk), `transports` (`AdbTransport`, `FolderTransport`), `executor` (apply, Verify, prune, folder rename), `prepare` (plan preparation; your P3 answer) |
+| Core edits | `provenance`: `prevObserved` in pending resolution; first sync lasts until `header.firstApplyAt`. `planner`: `inputRefusal` and `isIncluded` exported; file-scope rename intents ignored by gone detection |
+| Fake | `tools/fake-adb-server.js`: `realpath` (injectable symlinks), `sha256sum /dev/null`, `stat -f`, `df -P -k`, `find` with `!`, `-name` and `-exec … {} +`, `--` ending options; each tool can be switched off |
+| Test | `tools/_test_device_sync_exec.js` (force-added): 49 pass under node 22.22.0 and under Electron 40's Node 24.15.0, and 3 repeat runs pass. `TEST_ONLY=<regex>` runs a subset. Core gains 2 tests (87) |
+| Mutation check | 20 deliberate breaks of the engine's guards (runner in the session scratchpad; not kept). The first run missed 2, both test gaps: the `prevObserved` test used a foreign file, which an older rule already restores, and the hash-pool stall only shows with a lone task. Both tests were strengthened; all 20 now fail the suite |
+| Defects fixed | The hash pool stalled a lone task after a failed worker start; a folder target's Verify and read-back accepted the hash of a file written while hashed; P1's `resolvePending` read an interrupted replace of a file the app never wrote as `partial` (ours); a coverage Verify on a first sync would have ended the first sync; the fake's `--` handling |
+| Regression | `_test_device_sync_core.js` 87 and `_test_device_sync_adb.js` 90 pass under both Nodes; the 5 existing `tools/_test_*.js` pass; `npm run build` exit 0 (1269 modules); `node --check` on every sync module, `library.js`, the fake and the three tests |
+| Plan changes | Deviation 12 records your four P3 answers and the calls made in P3; P3 lists `prepare`; the header field list gains `caseMeasured` and `firstApplyAt`; Verification gets "Added at P3" |
+| P4 must add | An IPC channel for Link: the plan's `config-op` has no `link` op. The engine side is `RecordStore.bindFolder` |
 
 ## P2 adb wire client (2026-10-06)
 
@@ -61,6 +75,10 @@ log; git history owns the events.
 | Commits (open decision 6) | **Commit and push at each phase stop**, after its tests are green; no mid-phase checkpoints |
 | A bound folder deleted on the device (open decision 10) | **Re-push it ticked**, under a name you choose that **defaults to the old device folder name**. Gone is derived at each plan (trusted listing absent + STA2 ENOENT), never persisted. A `record` match (≥90% of the gone shard's entries in an unmatched folder) counts as strong and unticks the pushes; ≥50% of ≥10 bound folders gone needs a mass-repush acknowledgment; a decline sticks for later chapters too. Drawing the name choice is the UI pass's job |
 | Large `pending` files (open decision 11) | **RECV at every size** |
+| Plan preparation (P3) | **A new `prepare.js`**; it persists `entryFixes`/`shardNameFixes`, and `service.js` only calls it |
+| Case probe (P3) | **No device writes; the flag is saved in the header.** Flip an existing name's ASCII case and STA2 it; with nothing to flip, assume case-insensitive and probe again at the next connection |
+| `connecting` during a run (P3) | **Wait up to 60 s, then end the run `disconnected`** |
+| Prune and `adopted-size` (P3) | **Keep them as leftovers**; prune deletes only `pushed`, `adopted` and `partial` files proven ours |
 
 ## Open decisions
 

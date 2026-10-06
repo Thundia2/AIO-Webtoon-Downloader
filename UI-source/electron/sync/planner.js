@@ -15,7 +15,7 @@
 // and the gone-folder re-push (decision 10, "Provenance" section).
 //
 // TWO-PASS INPUTS. Two facts need device I/O that depends on this module's
-// own decisions, so the service calls buildPlan, does the I/O, and calls it
+// own decisions, so prepare.js calls buildPlan, does the I/O, and calls it
 // again:
 //   * plan.needsVerify — managed folders without a verified shard (rule 3:
 //     verified before their ops are planned). Until then their files plan
@@ -39,8 +39,9 @@
 // with the device folder name. The selection is keyed by (id, sha), so a
 // newer PC version of a file is proposed again (rule 7).
 //
-// Read by: service.js. Depends on: naming, chapter-labels, profiles,
-// provenance, analysis, contract (refusals), library.js (identity, URLs).
+// Read by: prepare.js, service.js (P4). Depends on: naming, chapter-labels,
+// profiles, provenance, analysis, contract (refusals), library.js (identity,
+// URLs).
 // ============================================================
 
 const { normalizeSeriesUrl, seriesIdentityKey } = require("../library");
@@ -210,13 +211,13 @@ function _jaccard(a, b) {
 }
 
 // ------------------------------------------------------------------
-// Gone detection (decision 10): which shards the service must STA2.
+// Gone detection (decision 10): which shards prepare.js must STA2.
 // ------------------------------------------------------------------
 
 /**
  * Shards whose folder may be gone: bound to an included PC series, and the
  * shard's name plus any leftover renameIntent names all absent from the
- * root listing. The service STA2s every returned name (all must answer
+ * root listing. prepare.js STA2s every returned name (all must answer
  * ENOENT), re-lists the root through the rc-checked shell `find` on adb,
  * and passes the confirmed shardIds to buildPlan as opts.gone. A shard whose
  * series is absent from the PC is never returned (it plans nothing).
@@ -234,8 +235,10 @@ function goneCandidates({ view, pc, target, device }) {
     const s = byShard.get(sh.shardId);
     if (!s || !_isIncluded(s, cfg)) continue;
     const names = [sh.name];
+    // A folder rename's intent names folders; a file rename's (scope 'file',
+    // executor.js) names files inside this folder and says nothing here.
     const ri = sh.renameIntent;
-    if (ri) for (const n of [ri.from, ri.via, ri.to]) if (n && !names.includes(n)) names.push(n);
+    if (ri && ri.scope !== "file") for (const n of [ri.from, ri.via, ri.to]) if (n && !names.includes(n)) names.push(n);
     if (names.some((n) => present.has(slotKey(n, ci)))) continue;
     out.push({ shardId: sh.shardId, names });
   }
@@ -245,6 +248,26 @@ function goneCandidates({ view, pc, target, device }) {
 // ------------------------------------------------------------------
 // buildPlan
 // ------------------------------------------------------------------
+
+/**
+ * The refusals that need no device listing. prepare.js asks first, so a
+ * refused plan makes no device or record write; buildPlan asks again.
+ * @returns {object|null} a refusal, or null
+ */
+function inputRefusal(pc, view) {
+  if (!pc || pc.ok === false) {
+    return refuse("library-missing", "the library folder can't be read", { detail: pc && pc.error });
+  }
+  if (!(pc.series || []).length && view.shards.length) {
+    // D: is removable: an empty walk while the record manages folders would
+    // otherwise orphan every one of them.
+    return refuse("library-missing", "the library looks empty while this target has synced series");
+  }
+  if (view.mismatch && view.mismatch.length) {
+    return refuse("record-mismatch", "the sync record describes a different place", { fields: view.mismatch.slice() });
+  }
+  return null;
+}
 
 /**
  * @param {object} input
@@ -270,17 +293,8 @@ function buildPlan(input) {
   const gone = opts.gone instanceof Set ? opts.gone : new Set(opts.gone || []);
   const nameProbe = opts.nameProbe instanceof Map ? opts.nameProbe : new Map();
 
-  if (!pc || pc.ok === false) {
-    return refuse("library-missing", "the library folder can't be read", { detail: pc && pc.error });
-  }
-  if (!(pc.series || []).length && view.shards.length) {
-    // D: is removable: an empty walk while the record manages folders would
-    // otherwise orphan every one of them.
-    return refuse("library-missing", "the library looks empty while this target has synced series");
-  }
-  if (view.mismatch && view.mismatch.length) {
-    return refuse("record-mismatch", "the sync record describes a different place", { fields: view.mismatch.slice() });
-  }
+  const early = inputRefusal(pc, view);
+  if (early) return early;
   if (device.trusted === false) {
     return refuse("device-listing-suspect", "the device listing looks incomplete");
   }
@@ -429,7 +443,7 @@ function buildPlan(input) {
       sp.deviceFolder = exact;
       sp.state = sh.verifiedAt ? "bound" : "needs-verify";
       // Same slot, other bytes (a case edit on the tablet): the device's
-      // name is the folder's name now; service.js persists it.
+      // name is the folder's name now; prepare.js persists it.
       if (exact !== sh.name) plan.shardNameFixes.push({ shardId: sh.shardId, name: exact });
       claim(exact, sp.seriesKey);
     } else if (gone.has(sh.shardId)) {
@@ -1748,6 +1762,8 @@ module.exports = {
   renameOpId,
   bindShards,
   goneCandidates,
+  isIncluded: _isIncluded,
+  inputRefusal,
   buildPlan,
   effectiveSelection,
   seriesLosses,
