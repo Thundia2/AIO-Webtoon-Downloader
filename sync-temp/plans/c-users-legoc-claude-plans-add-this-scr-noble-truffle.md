@@ -253,8 +253,9 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
       only what it has flushed (`sockets.cpp:148-150`). So after the last DATA the device can
       still be writing up to 32 MiB plus the loopback buffers, and nothing the client sees moves.
       The OKAY wait's idle budget grows by `min(sent, 40 MiB)` at a 1 MiB/s floor (up to 40 s
-      on top of the 60 s). A device slower than 1 MiB/s on that tail still hits the watchdog;
-      P5 measures the real wait.
+      on top of the 60 s). The 60 s alone would time out a device draining 32 MiB slower than
+      about 0.5 MiB/s; with the allowance a full window holds down to about 0.4 MiB/s. P5
+      measures the real wait.
     - **Backpressure is asserted as bounded in-flight bytes** (under 24 MiB across a 256 MiB
       push), not as a heap cap. Buffers live outside the V8 heap, so a heap cap would not catch
       unbounded buffering.

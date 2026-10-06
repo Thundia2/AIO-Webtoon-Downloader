@@ -71,9 +71,11 @@ const READ_LOW_WATER = 256 * 1024;
 // After DONE, adbd may still be writing what the server sent ahead under
 // delayed_ack (INITIAL_DELAYED_ACK_BYTES, 32 MiB, adb.h:38, granted at OPEN,
 // adb.cpp:540-544) plus the loopback buffers, and nothing this side can see
-// moves meanwhile. So the OKAY wait gets that much more time at a 1 MiB/s
-// floor: a device slower than that drains 32 MiB past the 60 s watchdog.
-// P5 measures the real wait on the tablet.
+// moves meanwhile. Under the 60 s watchdog alone, a device draining 32 MiB
+// slower than about 0.5 MiB/s would time out. So the OKAY wait gets
+// min(sent, DRAIN_WINDOW_BYTES) more at DRAIN_FLOOR_BYTES_PER_SEC: a full
+// window (32 MiB + the loopback buffers) then gets 100 s, which holds down to
+// about 0.4 MiB/s. P5 measures the real wait on the tablet.
 const DRAIN_WINDOW_BYTES = 40 * 1024 * 1024;
 const DRAIN_FLOOR_BYTES_PER_SEC = 1024 * 1024;
 
