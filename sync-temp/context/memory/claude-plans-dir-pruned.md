@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: reference
   originSessionId: fc0029e5-4f2f-4bcd-bb1d-49d246ec64cd
-  modified: 2026-10-06T15:04:15.896Z
+  modified: 2026-10-06T15:10:22.584Z
 ---
 
 **Files in `C:\Users\legoc\.claude\plans\` disappear after about 30 days.**
@@ -28,5 +28,7 @@ plan mid-flight, and every pointer to a plan file silently goes dead.
 - Commit a plan that must outlive a month somewhere durable. The device-sync plans live in
   `sync-temp/plans/` for this reason: [[device-sync-feature]].
 - A pruned plan can still be recovered while the session that wrote it is on disk: grep its file
-  name in `~/.claude/projects/<project>/*.jsonl`. The `Write` call and the ExitPlanMode result both
-  carry the full text.
+  name in `~/.claude/projects/<project>/*.jsonl`.
+  - An ExitPlanMode call carries the final text.
+  - A plan that never reached ExitPlanMode has to be rebuilt by replaying its `Write` call and the
+    `Edit` calls after it.

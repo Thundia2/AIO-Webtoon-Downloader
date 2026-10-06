@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: fc0029e5-4f2f-4bcd-bb1d-49d246ec64cd
-  modified: 2026-10-06T15:04:10.580Z
+  modified: 2026-10-06T15:10:20.557Z
 ---
 
 **Task.** Rebuild the CompareManga tablet-sync scripts
@@ -38,8 +38,9 @@ service in `UI-source/electron/sync/`, UI in a later pass.
 **Branch rules.**
 - `wip/device-sync-handoff` is a snapshot of all in-flight local work plus `sync-temp/`. It must
   never become a PR head against zzyil.
-- Before anything ships, run `git rm -r --cached sync-temp` (`.gitignore` already lists
-  `/sync-temp/`), then cut the PR branch fresh off `upstream/main` per CLAUDE.md.
+- The shipping branch must not carry `sync-temp/`, or any `tools/` file force-added on this
+  branch. Either cut it fresh off `upstream/main` and bring over only the code (per CLAUDE.md), or
+  run `git rm -r --cached sync-temp`; `.gitignore` already lists `/sync-temp/`.
 - The cloud session can't write this memory. It keeps its phase state in `sync-temp/` on the branch.
   When the work returns, pull the branch and rewrite this entry from there.
 

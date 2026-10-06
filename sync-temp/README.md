@@ -36,8 +36,8 @@ running and the plan was only a skeleton. The transcripts show more was done:
 1. **The parent plan is approved** (2026-09-30 22:04, UTC+3):
    `plans/add-this-script-s-features-linked-pumpkin.md`.
    - The user then narrowed the work to the non-UI half.
-   - They also said to pause before any UI work, because they will direct the UI edits
-     themselves.
+   - They also said to pause before any UI work, for review. They will decide the course of
+     action for the UI edits later.
 2. **The non-UI plan is drafted** (2026-09-30 23:53):
    `plans/c-users-legoc-claude-plans-add-this-scr-noble-truffle.md`.
    - Its "Decisions this round" table holds the user's four answers.
@@ -104,8 +104,13 @@ No sync code exists yet: `UI-source/electron/sync/` does not exist.
   - library root: `D:\AIO\manga`;
   - Electron userData: `%APPDATA%\aio-downloader-ui`. The dev, test and installed apps share it,
     so back up its JSONs before tests, and never run the NSIS uninstaller.
-- **Line numbers** in the plans were measured against the working tree that this branch's WIP
-  commit captures, so they should still hold. Re-check before relying on any one of them.
+- **Line numbers** in the non-UI plan still match this branch (checked 2026-10-06):
+  - the in-flight diff sizes it recorded are unchanged: 455 changed lines in `main.js`, 56 in
+    `preload.js`, 197 in `library.js`, and `searcher.js` untouched;
+  - five spot-checked anchors sit where it cites them: `library.js:148` and `:1118`, and
+    `main.js:648`, `:1824` and `:1953`.
+
+  Re-check any other line before relying on it.
 - **Live-device steps** (adb against the tablet, serial `A06B4A372090333`) need the user's PC and
   their explicit OK. A cloud container has no device; the plans' fake adb server is the offline
   substitute.
