@@ -15,7 +15,19 @@ log; git history owns the events.
     own review.
   - Every finding of the reviews was checked against the code, AOSP adb and libuv. The plan's last
     section holds the disposition tables.
-- **Now:** P0 and P1 are done and committed; P2 (adb wire client) waits for your go-ahead.
+- **Now:** P0, P1 and P2 are done and committed; P3 (transports and execution) waits for your
+  go-ahead.
+
+## P2 adb wire client (2026-10-06)
+
+| Item | State |
+|---|---|
+| Modules | `UI-source/electron/sync/adb/`: `wire` (pure codecs), `client` (host services, transport binding, shell, `SyncSession`), `locate` (`adb version`, `start-server`). No adb.exe client runs; `kill-server` is never sent |
+| Fake | `tools/fake-adb-server.js` (force-added): server + adbd + an in-memory filesystem, AOSP adb @ `1cf2f01` behaviors plus the plan's injections |
+| Test | `tools/_test_device_sync_adb.js` (force-added): 90 pass under node 22.22.0 and under Electron 40's Node 24.15.0. `TEST_ONLY=<regex>` runs a subset |
+| Mutation check | 43 deliberate breaks across client, wire and the fake (list and runner in the session scratchpad; not kept). 39 fail the suite. The 4 that pass are known: the status checks at the loop top and after the source wait (the races back them up; removing every check fails), the guard on the source wait (equivalent: the pending status read ends with the socket too), and the fake's raised `delayed_ack` window (this container's loopback buffers alone hold enough; the window keeps the test meaningful on smaller buffers). The run found two defects, both fixed with a test: a FAIL landing while DONE waited on drain could come back as a watchdog `timeout` (DATA writes already raced the status), and the fake's read-ahead stalled 1.5 s per cycle under `delayed_ack`, which made the drain test flaky |
+| Regression | `_test_device_sync_core.js` 85 pass under both Nodes; the 5 existing `tools/_test_*.js` pass; `npm run build` exit 0 (1269 modules); `node --check` on the three adb modules, the fake and the test |
+| Plan changes | Deviation 11 records the calls made in P2; Verification gets "Moved at P2" (adb-test items that need later modules) and "Added at P2"; P5 gets a measurement of the wait between a push's last DATA and its OKAY |
 
 ## P1 pure core (2026-10-06)
 

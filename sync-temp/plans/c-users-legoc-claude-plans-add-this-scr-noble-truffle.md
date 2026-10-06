@@ -1,7 +1,7 @@
 # Device Sync — non-UI implementation plan
 
 **Status: rev 4, approved 2026-10-06 ("Start with the plan"), cloud session on
-`wip/device-sync-handoff`. P0 and P1 are done; P2 waits for your go-ahead.**
+`wip/device-sync-handoff`. P0, P1 and P2 are done; P3 waits for your go-ahead.**
 - Rev 1 (2026-09-30) got an adversarial review on 2026-10-01: 2 critical, 9 major, 14 minor.
   Rev 2 checked every finding against the code and AOSP and folded in the confirmed ones. Where the
   review was wrong or a better fix exists, it says so.
@@ -12,6 +12,9 @@
   disposition table).
 - P1 corrected the corrupt-shard rule (deviation 1), recorded the calls made while coding the
   planner (deviation 10), and raised open decisions 12 and 13.
+- P2 recorded the calls made while coding the adb layer (deviation 11), moved the adb-test
+  items that need later modules to their phases ("Moved at P2" in Verification), and added a P5
+  measurement of the wait between a push's last DATA and its OKAY.
 - The three disposition tables are the last section.
 - Parent plan (behavior rules 1-13, the decisions table, the UI design), approved 2026-09-30:
   `sync-temp/plans/add-this-script-s-features-linked-pumpkin.md`. Rule numbers below refer to it.
@@ -227,6 +230,71 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
     - **Outputs for the service:** `entryFixes` (a `pushed` entry adopting a listing's devMtime)
       and `shardNameFixes` (a bound folder's case drifted on the device) are persisted by
       `service.js`; the planner itself writes nothing.
+11. **Calls made while coding the adb layer (P2).** Each is pinned by a test in
+    `tools/_test_device_sync_adb.js`.
+    - **The retry and the charges live in `SyncSession`.** Each operation charges a
+      `session-closed` and retries it once on a fresh session. Every thrown `AdbError` carries
+      `.charges`, the operation's total, so a drop on every SEND of one path costs 2 per file;
+      `onCharge` reports an attempt the retry rescued. The executor only sums `.charges` (P3).
+    - **Charges by kind.** A received FAIL is `remote-fail`, charged 1; ENOSPC and EROFS become
+      `no-space` and `read-only`, charged 0 (they abort the run). The host-FAIL kinds
+      (`device-lost`, `unauthorized`, `connecting`, `offline`) are never charged.
+    - **`list` returns `{entries, errored}`.** LIS2 entries whose lstat failed come back apart,
+      never as files.
+    - **A v1 STAT failure reports `error: -1`.** Mode 0 says only that the lstat failed, not why.
+    - **Server address as the adb CLI resolves it:** `ADB_SERVER_SOCKET`, else
+      `ANDROID_ADB_SERVER_ADDRESS` + `ANDROID_ADB_SERVER_PORT`, else 5037; `127.0.0.1` rather
+      than `localhost`, which can resolve to `::1` first on Windows.
+    - **`start-server` runs with cwd = the adb binary's folder.** The server inherits its
+      starting directory and outlives the app, so the install folder would stay open against an
+      update or uninstall.
+    - **The end-of-file drain gets an allowance on the OKAY wait.** Under `delayed_ack` adbd
+      grants the server 32 MiB of send window at OPEN (`adb.h:38`, `adb.cpp:540-544`) and acks
+      only what it has flushed (`sockets.cpp:148-150`). So after the last DATA the device can
+      still be writing up to 32 MiB plus the loopback buffers, and nothing the client sees moves.
+      The OKAY wait's idle budget grows by `min(sent, 40 MiB)` at a 1 MiB/s floor (up to 40 s
+      on top of the 60 s). A device slower than 1 MiB/s on that tail still hits the watchdog;
+      P5 measures the real wait.
+    - **Backpressure is asserted as bounded in-flight bytes** (under 24 MiB across a 256 MiB
+      push), not as a heap cap. Buffers live outside the V8 heap, so a heap cap would not catch
+      unbounded buffering.
+    - **Caller code is raced against the socket's end.** The PC source's open and reads, and a
+      pull's sink, are awaited through a guard, so a cancel or the watchdog ends a stalled
+      source too. During a push every wait races the status: the source, each DATA write and
+      the DONE write. So an early FAIL (ENOSPC) is reported at once, and a FAIL that lands while
+      a write waits behind adbd's discard of the DATA in flight stays the result instead of
+      turning into a watchdog `timeout`. The races use a one-shot `Latch` whose waiters leave
+      when their own work settles; a `Promise.race` against one long-lived promise per chunk
+      piles up a reaction per call until that promise settles.
+    - **A re-attached device is caught two ways:** at the recheck after an EOF, and at the next
+      bind, where `host:tport:` returns a transport id other than the pinned one. The bind check
+      runs **before the service is sent**, because adbd starts a shell command (`rm`, `mv`) as
+      soon as its service opens. An old server without `tport` gets the pin checked against
+      `devices -l` before `host:transport:`; a replug between the two requests can still slip
+      through there. `host:transport-id:` would close it but isn't used: ids restart from 1
+      after a server restart, so a stale pin could bind a different device.
+    - **Nothing that refuses an open runs after the service is sent.** An abort during the bind
+      is `cancelled` with no service written. Every `AdbError` carries `sent`: `false` means
+      the command never reached the device, `true` means it may have run (the caller re-reads
+      the device before trusting it), `null` means not applicable. A bind that never answers
+      is `timeout`, not `server-unavailable`.
+    - **`SyncSession.destroy()` is terminal.** It aborts the open socket, so the operation in
+      flight ends as `cancelled` (no retry, no charge), a bind in flight drops its fresh socket
+      instead of adopting it, and every later operation is `cancelled`.
+    - **Shell.** shell v2 when the device advertises it. The legacy `shell:` path takes the exit
+      code from a per-call sentinel echoed after a **newline**, not `; `: mksh rejects `;;` as a
+      syntax error and runs nothing, so a command ending in `;` would lose its exit code. CRLF is
+      normalized. A service string over 3,072 bytes is a RangeError, so `transports.js` chunks
+      its `rm`/`mv` batches. Never retried.
+    - **An unplug reads as offline before removal, as AOSP does it.** `HandleError` runs
+      `handle_offline` (marks the transport offline, closes its sockets; `adb.cpp:201-215`), then
+      `transport_destroy`: a USB transport is removed on a later looper turn, and a TCP/wireless
+      one that wasn't kicked stays listed offline while it reconnects
+      (`transport.cpp:833-857`, `:1164-1169`). With a
+      removal faster than the recheck, the push is `device-lost`, charged 0. With a slower one
+      it is `offline`, charged 0 and not retried, and the next operation is `device-lost` once
+      the row is gone. A wireless device that stays listed is `offline`, and its binds FAIL
+      `device offline`.
 
 ## Repo state and the branch protocol
 
@@ -316,7 +384,8 @@ Protocol facts below cite AOSP `packages/modules/adb` at `main` (commit `1cf2f01
 P5 reads the tablet's feature list rather than assuming a version.
 
 **Connection.**
-- TCP `127.0.0.1:5037`, honoring `ANDROID_ADB_SERVER_PORT` and `ADB_SERVER_SOCKET=tcp:host:port`.
+- TCP `127.0.0.1:5037`, honoring `ADB_SERVER_SOCKET=tcp:host:port`, `ANDROID_ADB_SERVER_ADDRESS`
+  and `ANDROID_ADB_SERVER_PORT` (deviation 11).
 - A request is a 4-hex-digit length plus the service string.
 - A reply is `OKAY`, or `FAIL` followed by a hex length and a message.
 
@@ -982,6 +1051,8 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
   - what an interrupted push leaves (expect nothing, since adbd unlinks the partial) and what an
     interrupted update leaves (expect an empty slot);
   - **the device mtime at OKAY, after the listing, after 60 s and after a reconnect** (review #4);
+  - **the wait between the last DATA and OKAY** on large files, against P2's drain allowance
+    (32 MiB of `delayed_ack` window at a 1 MiB/s floor);
   - **a listing after a reboot, before the first unlock** (review #3);
   - throughput versus adb.exe on the same files, and per-file acks versus a pipelined run;
   - byte-exact UTF-8 names, and `realpath /sdcard`;
@@ -1105,6 +1176,33 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
   `device '…' not found`); tracking → polling after 3 failures.
 - **Server.** `start-server` is called only when the server is unreachable, also for explicit
   actions with no target yet. `kill-server` is never sent.
+- **Moved at P2.** These items need a module of a later phase. P2 tests the primitive each one
+  rests on, and the rule itself is tested with its module:
+  - the budget summing to an abort, and ENOSPC/EROFS/`connecting` as run policy → `executor.js`,
+    `_test_device_sync_exec.js` (P2: the kinds and `.charges`);
+  - not trusting a DONE-only listing, the STA2 `error` field driving the case probe and
+    `exists`, locked storage refusing with `device-listing-suspect`, STA2 of each managed folder
+    missing from a truncated listing, and the same-session STA2 before a shell-path listing →
+    `transports.js`, `_test_device_sync_exec.js` (P2: a missing folder lists like an empty one,
+    STA2 errors, the locked root, a truncated listing that STA2 contradicts);
+  - a non-UTF-8 name never planned → `transports.js` feeding the planner, P3 (P2: `name` is
+    null and the raw bytes are kept);
+  - tracking → polling after 3 failures → `monitor.js`, `_test_device_sync_monitor.js` (P4);
+  - when a server start is allowed → `service.js`, `_test_device_sync_service.js` (P4) (P2:
+    `ensureServer` starts it only on `server-unavailable`).
+- **Added at P2** (deviation 11's calls):
+  - nothing that refuses an open runs after the service is sent: a re-attached device and an
+    abort during the bind send no shell and no sync request, and errors carry `sent`;
+  - `destroy()` mid-push and mid-bind is `cancelled`, terminal, and leaves no device socket;
+  - a stalled PC source, source open or pull sink ends by cancel or watchdog;
+  - an early FAIL is reported at once while the source is slow, while a DATA write waits on a
+    slow device, and while DONE waits on drain (where it was a `timeout` before the fix);
+  - the OKAY wait's drain allowance under `delayed_ack`, on a 24 MiB push whose stream also
+    crosses the fake's read-ahead pauses;
+  - an unplug reads offline first: removal faster or slower than the recheck, and a wireless
+    device that stays listed;
+  - the fake's own AOSP behaviors: mksh syntax errors, bytes sent with a transport switch
+    dropped, one `failPaths` match per SEND.
 
 **`_test_device_sync_exec.js`**
 - An interrupted in-place update leaves an empty slot. The entry is dropped and the re-plan
