@@ -5,7 +5,7 @@ metadata:
   node_type: memory
   type: project
   originSessionId: fc0029e5-4f2f-4bcd-bb1d-49d246ec64cd
-  modified: 2026-10-06T15:10:20.557Z
+  modified: 2026-10-06T15:11:47.940Z
 ---
 
 **Task.** Rebuild the CompareManga tablet-sync scripts
@@ -48,4 +48,7 @@ service in `UI-source/electron/sync/`, UI in a later pass.
 - the non-UI plan's own "Open decisions" list: shipping with the in-flight library.js /
   series-merge work, the AIO-for-Android root, the downloader.js tree-kill, the push-in-place
   window, older devices;
-- the review-driven decisions under "Pending" above.
+- the review-driven decisions under "Pending" above;
+- how the cloud keeps its new `tools/` tests across container resets. `sync-temp/README.md`
+  suggests force-adding them on this branch and dropping them before shipping; the alternative is
+  keeping them under `sync-temp/`. The user hasn't ruled.
