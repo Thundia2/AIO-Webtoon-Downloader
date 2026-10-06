@@ -136,5 +136,9 @@ So the feature cannot ship ahead of that work (the plan's open decision 1).
 ## Keeping state across container resets
 
 Your container can be reset, and you cannot write the user's local memory. Keep the phase state
-you would otherwise put in memory in this folder (for example a `STATE.md`), and commit it. The
-user's local session folds it back into `device-sync-feature.md` when the work returns.
+you would otherwise put in memory in this folder (for example a `STATE.md`), and commit it.
+- A **new** file here needs `git add -f`, because `/sync-temp/` is gitignored.
+- Edits to files that are already tracked commit normally.
+
+The user's local session folds this state back into `device-sync-feature.md` when the work
+returns.
