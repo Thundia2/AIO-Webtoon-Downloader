@@ -1116,3 +1116,4 @@ function cleanupOrphanCovers(entries, thumbCacheDir) {
 }
 
 module.exports = { scanLibrary, saveThumbnail, generateMissingThumbnails, downloadMissingCovers, cleanupOrphanCovers, extractChaptersFromFiles, getChaptersOnDevice, getImageChaptersOnDevice, imageChapterToken: _imageChapterToken, seriesIdentityKey, groupEntriesBySeries, findDuplicateSeries, normalizeSeriesUrl };
+module.exports.KOMIKKU_CH_RE = KOMIKKU_CH_RE; // deviceSync (sync/chapter-labels.js recognition parity)

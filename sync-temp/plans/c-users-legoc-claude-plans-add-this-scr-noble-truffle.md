@@ -1,12 +1,18 @@
 # Device Sync — non-UI implementation plan
 
-**Status: draft rev 3 (2026-10-06, cloud session on `wip/device-sync-handoff`), awaiting approval.**
+**Status: rev 4, approved 2026-10-06 ("Start with the plan"), cloud session on
+`wip/device-sync-handoff`. P0 and P1 are done; P2 waits for your go-ahead.**
 - Rev 1 (2026-09-30) got an adversarial review on 2026-10-01: 2 critical, 9 major, 14 minor.
   Rev 2 checked every finding against the code and AOSP and folded in the confirmed ones. Where the
   review was wrong or a better fix exists, it says so.
 - Rev 2's new designs got a second adversarial review the same day: 0 critical, 9 major, 11 minor.
   Rev 3 checks and folds those in.
-- Both disposition tables are the last section.
+- Rev 4 folds in your answers to open decisions 6, 10 and 11 (the rev 4 rows of the Decisions
+  table). Decision 10 reverses rev 3's pick, so its new design got its own review (the third
+  disposition table).
+- P1 corrected the corrupt-shard rule (deviation 1), recorded the calls made while coding the
+  planner (deviation 10), and raised open decisions 12 and 13.
+- The three disposition tables are the last section.
 - Parent plan (behavior rules 1-13, the decisions table, the UI design), approved 2026-09-30:
   `sync-temp/plans/add-this-script-s-features-linked-pumpkin.md`. Rule numbers below refer to it.
   The `~/.claude/plans/` copies are pruned after about 30 days; the `sync-temp/plans/` copies are
@@ -53,6 +59,9 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
 | rev 2 | Instance guard (review #7) | **App-wide single instance** | `app.requestSingleInstanceLock()` in main.js; a second launch focuses the first window. Sync needs no lock file of its own |
 | rev 2 | Weak evidence (review #10) | **RECV + `adopted-size`** | A `pending` slot resolves by reading that one file back over the sync protocol (RECV) and hashing it on the PC. Verify uses the device's `sha256sum`. On a device without it, you choose "read back and hash on the PC" (exact, slow) or "adopt by size" (origin `adopted-size`, which never pre-selects a delete) |
 | rev 2 | Test persistence | **Force-add in `tools/`** on this branch | `git add -f tools/<file>`; before shipping, `git rm -r --cached tools`, the same as `sync-temp/` |
+| rev 4 | Commits (open decision 6) | **Commit and push at each phase stop**, after its tests are green | No mid-phase checkpoints. You first asked for one commit at the end, then chose this once the container-reclaim risk was on the table |
+| rev 4 | A bound folder deleted on the device (open decision 10) | **Re-push it, ticked; you choose the name, defaulting to the old device folder name** | Reverses rev 3's pick. A folder counts as gone when a trusted listing lacks it and a STA2 returns ENOENT. The series then plans as new, with its pushes pre-selected under rule 2's guard (plus a `record` match for tablet-side renames), a mass-gone acknowledgment, and a sticky decline. The shard is rewritten only when the re-push starts. The name choice is plan data plus one selection op; drawing it is the UI pass's job. See "Provenance" |
+| rev 4 | Large `pending` files (open decision 11) | **RECV at every size** | Unchanged from rev 3's pick: a pending slot is always resolved by reading it back and hashing on the PC |
 
 ### Deviations from the parent plan that are my calls (object at review if any is wrong)
 
@@ -92,7 +101,8 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
      3. run the `mv`;
      4. rewrite the shard once, atomically.
 
-     The next plan resolves a leftover intent by STA2-ing both names.
+     The next plan resolves a leftover intent from the parent listing's exact names (see
+     "Provenance"; a STA2 can't tell case variants apart on case-insensitive storage).
    - **Write mechanics** (second review #6).
      - Writes go through an async single-flight queue per path that coalesces to the latest
        content, with unique tmp names `<name>.<pid>.<seq>.tmp`. Overlapping writes can therefore
@@ -110,11 +120,20 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
        foreign, and is never pre-selected for a delete.
      - For the same reason a `.bak` buys nothing: the old or the new shard always survives, and
        either is safe. On POSIX the directory is fsync'd too.
-   - A shard that fails to parse marks its folder unverified, and that folder is re-verified before
-     its ops are planned. This is safe by construction: an unverified folder is never deleted from
-     (rule 3, coverage).
-   - **A shard is dropped only** when its folder is absent from a trusted root listing **and** a
-     STA2 of the folder returns ENOENT. A missing bound folder plans as described under "Provenance".
+   - **A shard that fails to parse is set aside, and its folder plans as unbound** (corrected in
+     P1). A random shard id can't say which folder a corrupt file described.
+     - When the series' derived name equals the folder, the folder is managed by name and verified
+       before its ops are planned (rule 3).
+     - Otherwise the adoption ladder offers Link (identity or content), with the series' pushes
+       unticked until then.
+     - Either way nothing in that folder pre-selects a delete, because its files are unverified.
+     - Residual: a folder bound under a non-derived name (an alias or a retitle) whose old-script
+       file names match no PC name and whose `details.json` is missing gets no strong match. Its
+       series then plans as new, with a second folder pre-selected. That needs a corrupt shard,
+       which atomic writes make a disk-corruption event.
+   - **A folder counts as gone only** when it is absent from a trusted root listing **and** a
+     STA2 of the folder returns ENOENT. Its shard is kept until a re-push starts; "Provenance" says
+     how a gone folder plans.
    - The PC hash cache stays one file, and **main is its only writer**: hash workers return
      results and never touch the disk. That removes review #6b's compaction race. It is flushed
      every 500 hashes, at each job end and in `shutdownNow()`. Losing it costs a re-hash, never a
@@ -180,6 +199,34 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
      settles.
    - The 10 s re-plan debounce stays. Apply's 30 s re-stat age would otherwise skip the newest
      chapters right after planning them.
+10. **Calls made while coding the planner (P1).** Each is pinned by a test in
+    `tools/_test_device_sync_core.js`.
+    - **Two-pass inputs.** `buildPlan` reports `needsVerify` (managed folders without a verified
+      shard) and `needsProbe` (gone-folder candidate names not yet STA2'd). The service does that
+      I/O and plans again. A name is `available` only with a STA2 ENOENT in `opts.nameProbe`.
+    - **Every live shard's name stays reserved until Forget**, not only a gone series'
+      `previous`. A new series taking an orphaned shard's name would leave two shards naming one
+      folder once its own shard is written.
+    - **A held series keeps its existing device folder.** An excluded, image-only or empty series
+      without a shard claims the unbound device folder of its derived name. Otherwise another
+      series resolving to that name would verify it and push into it.
+    - **A fork is the same identity, whatever the names.** Unbound members lose to a bound member,
+      or to the richest; the losers are held with `merge-in-library`. Parent rule 1 lists forks
+      under name collisions; under `as-is` naming the two folders don't collide, and both would
+      otherwise land on the device.
+    - **Losses beyond chapter labels.** Deleting a volume, whole or unknown file is always a loss;
+      a range is covered only when every integer in it stays carried (spans up to 5,000).
+    - **Thresholds.** "With ≥10" in the mass-delete and mass-repush rules is the denominator: the
+      series' device chapter files, and the target's bound folders of included series.
+    - **Kept names need hash evidence.** Only `pushed` and `adopted` copies satisfy a PC file
+      under another name; an `adopted-size` sha is an assumption.
+    - **The slot guard in plan form.** A device file at the slot of any PC file of the series,
+      mirrored or not, is never offered for delete.
+    - **`name-invalid`.** A PC folder name with nothing left after sanitizing holds its series with
+      an error anomaly of that kind; `name-too-long` covers the 255-byte case.
+    - **Outputs for the service:** `entryFixes` (a `pushed` entry adopting a listing's devMtime)
+      and `shardNameFixes` (a bound folder's case drifted on the device) are persisted by
+      `service.js`; the planner itself writes nothing.
 
 ## Repo state and the branch protocol
 
@@ -209,7 +256,7 @@ detail:
 **Commits.**
 - Commit and push (`git push -u origin wip/device-sync-handoff`) at each phase's stop point, after
   its tests are green.
-- Mid-phase checkpoints are open decision 6.
+- No mid-phase checkpoints (your answer to open decision 6).
 
 **State.** The cloud cannot write your memory.
 - Phase state, open decisions and the defect ledger live in `sync-temp/STATE.md`. Your local
@@ -246,7 +293,7 @@ No module requires `electron`. Collaborators are injected, following the `series
 | `chapter-labels.js` | As parent: unit + conservative label, device conventions, custom patterns | Imports `KOMIKKU_CH_RE` (a new export line after `library.js:1118`) |
 | `analysis.js` | As parent: delta-cause tags and anomalies | — |
 | `provenance.js` | Pure: the origin model, "ours", and pending resolution: absent / pushed / restore previous / partial, from a listing plus RECV hashes | New (split out of the planner so the matrix is testable on its own) |
-| `planner.js` | As parent (pure, stable op ids, rules 1-5) | Free space per transport (see `transports.js`); `settling` files; `adopted-size` never pre-selects a delete |
+| `planner.js` | As parent (pure, stable op ids, rules 1-5) | Free space per transport (see `transports.js`); `settling` files; `adopted-size` never pre-selects a delete; gone folders re-push with a name choice (decision 10) |
 | `job-record.js` | As parent: one lane, runId-stamped emits, coalesced progress (≤10/s), snapshot | Adds the FIFO queue for automatic plans, dropped on device removal |
 | `store.js` | `writeJsonAtomic`: a unique tmp, fsync, close, rename; 5 async retries with backoff on EBUSY/EPERM/EACCES, then it throws `record-write-failed`. Also: the per-path single-flight write queue; `writeJsonAtomicSync` for `shutdownNow()` only; the sharded `RecordStore` (random shard ids, `recordEpoch`, epoch GC); the startup sweep of stale `.tmp` files | Deviation 1. `history.js:_saveJson` (102-137) is **not** the model: it falls back to a non-atomic copy and swallows errors |
 | `hash-pool.js` | As parent: `worker_threads` via an inline eval'd worker, main-thread fallback, cache keyed by path → `{size, mtimeNs, sha256}` | Main is the single writer of the cache. Workers use synchronous reads so hashing doesn't occupy the shared fs thread pool. Throttle (deviation 3) |
@@ -487,20 +534,97 @@ checked top to bottom.
 | any | the RECV fails | Stays `pending`, and the folder is flagged. **It plans as a pre-selected update**, because the app was writing that slot and the PC still has the file. Never a delete candidate |
 
 The RECV costs one file's transfer, and only the file that was in flight is ever pending (or N
-files under batched intent). Open decision 11 covers large files.
+files under batched intent). It runs at every size (your answer to open decision 11).
 
 **Every rename carries intent** (deviation 1): folder renames, rename-to-match, and case-only renames
-through a temp name. The next plan finishes or reverts a leftover intent by STA2-ing both names, so a
-dot-temp left by a kill is never an invisible leaked copy (review #15), and a renamed folder never
-loses its shard.
+through a temp name. The next plan finishes or reverts a leftover intent from the parent listing's
+**exact** names, so a dot-temp left by a kill is never an invisible leaked copy (review #15), and a
+renamed folder never loses its shard.
+- Which of `from`, `via` and `to` the listing holds decides the outcome. `to` alone: finished. `from`
+  alone: never ran, revert. `via`: finish with `mv via to`. None: the folder is gone (below).
+- The listing, not STA2, because case-insensitive storage answers a STA2 for both case variants of
+  a case-only rename.
 
-**A bound folder that is gone from the device** (an absent root listing plus a STA2 ENOENT) is not
-silently re-created. Parent rule 1 says a bound folder is never re-created, and a multi-GB re-push
-shouldn't be pre-selected just because you deleted the series on the tablet.
-- Its binding is kept, marked `missing`.
-- Its pushes are listed **unticked**, under an anomaly "Removed on <target>" with Re-push and
-  Exclude actions.
-- Open decision 10 has the alternative.
+**A bound folder that is gone from the device is re-pushed, ticked** (your answer to open decision
+10, 2026-10-06; it reverses rev 3's pick). The third review shaped the details (third disposition
+table).
+- **"Gone" needs every signal.**
+  - The shard's `name`, and its `renameIntent`'s `from`, `via` and `to` when one is left over, are
+    all absent from a trusted root listing, and a STA2 of each returns ENOENT.
+  - When anything reads as gone on an adb target, the root is listed once more with an rc-checked
+    shell `find '<root>' -mindepth 1 -maxdepth 1 -type d`. A folder set that differs from LIS2's
+    refuses the plan with `device-listing-suspect`, because a readdir error ends LIS2 early without
+    an error (quiet failures above), and the hidden folder could be the renamed one.
+  - A failed or suspect listing refuses the plan instead. So a locked or half-mounted storage can
+    never make a folder read as gone.
+- **Plan preparation runs in a fixed order per target:** rename intents, then gone detection, then
+  pending resolution, coverage Verify and the zero-files sanity check. Each later step skips gone
+  folders, which would otherwise misfire: a RECV or `find` of a missing path fails, and a missing
+  folder isn't a folder that lists 0 files.
+- **Gone is derived at each plan, never persisted.** The shard stays as it is until a re-push
+  actually starts. A plan you don't apply loses nothing, and a folder that comes back (restored from
+  a backup) simply binds again.
+- **The series plans as new.** Every PC file of it becomes a `push`, pre-selected, carrying reason
+  `removed-on-device`.
+  - **Pushes reuse the kept names the old shard recorded**: a PC file whose sha matches an old
+    entry is pushed under that entry's name, so Komikku's per-chapter progress, keyed by file name,
+    survives the round trip.
+  - **Rule 2's guard still applies, with one more strong signal.** When an unmatched device folder
+    holds ≥90% of the gone shard's recorded (name, size) entries, that is a `record` match: you
+    renamed the folder on the tablet rather than deleting it. It counts as strong next to identity
+    and content, so the pushes are not pre-selected and Link is offered. The content match alone
+    would miss a folder that holds kept names.
+  - **Link on a gone series rewrites its shard** onto the linked folder (name, empty `files`,
+    unverified), so a series never has two shards on one target.
+- **A mass of gone folders needs an acknowledgment.** When ≥50% of a target's bound folders are gone
+  and it has ≥10 of them (the mass-delete thresholds), Start requires a checked "I reviewed N series
+  to re-push" box and Sync now is hidden; the ticks stay as decided. Folder targets also gain a
+  volume id in the header (`fs.stat`'s `dev`, which is the volume serial on Windows), so a different
+  disk at the same drive letter is a `record-mismatch`, not a mass of gone folders.
+- **You choose the folder name; the default is the old device folder name.** This is an exception to
+  rule 1's "never re-create", but the default keeps that rule's purpose: Komikku identifies a local
+  series by its folder name, and the old scripts' alias tables also kept the tablet name.
+  - `previous` is used **byte-exact**, gated only by `validatePath` and the 255-byte check, never
+    through `sanitizeSegment` (its NFKC and trailing-dot trim would change the name Komikku knows).
+  - `derived` is the name an unbound series would get (alias, then naming policy). It is listed
+    only when it differs from `previous` by slot key.
+  - **Availability.** A gone series' `previous` is reserved like a present folder before any new
+    series resolves its name. A name is `available` when no device folder in the listing, no
+    reserved name and no other planned series holds its slot key, **and** a STA2 of it returns
+    ENOENT (the storage's own case and normalization rules decide, not the JS slot key).
+  - When the default is unavailable, the series falls back to `derived`. When both are, rule 1's
+    collision handling applies (the PC folder name verbatim). When that is taken too, the series is
+    held with the error anomaly `name-taken`.
+  - The plan carries `rebind: {shardId, choices: [{source, name, available}], chosen, fellBack,
+    declined}` on the series.
+  - The choice is stored in `selection.json` as `rebinds[shardId] = {source, name, declined}` and
+    changed through `sync:set-selection`. A stored `name` that no longer equals that source's
+    current candidate (after an alias or naming-policy change) counts as unset. The entry is cleared
+    when the shard is rewritten.
+  - Push op ids contain the folder name, so switching the name re-keys the series' ops, and the new
+    ones start from their default preselection.
+- **Declining the re-push sticks.** `declined: true` makes every push of that series default to
+  unticked, including chapters downloaded later. Otherwise each new chapter's fresh op id would be
+  ticked again, and one Sync now would re-create the folder around a single chapter.
+- **A re-created folder needs a chapter.** For a new or gone folder, apply drops the series' sidecar
+  pushes when none of its chapter pushes is selected, and reports it. A folder holding only
+  `cover.jpg` and `details.json` would show in Komikku as an empty series.
+- **When the series starts,** its first step, before `mkdir`, is a STA2 of the chosen name that must
+  return ENOENT. If the folder reappeared since the plan, the series is skipped with "folder
+  reappeared; re-plan". Then one atomic shard write sets the full field set: `name` (chosen),
+  `identityKey`, `urlKey` and `pcFolder` (current), `files: {}`, `verifiedAt` (now; rule 3: a folder
+  the app creates is verified at creation), `verifyMode: 'created'`, and no `renameIntent`. Rewriting
+  before `mkdir` matters: an empty folder left by a kill after `mkdir` would otherwise fail rule 7's
+  zero-files sanity check against the old entries and block the whole target.
+- **A gone folder whose series no longer exists on the PC** plans nothing and is never STA2'd. Its
+  shard is kept until Forget. Dropping it on the first plan without the series would lose the name
+  for good after a transient inventory gap, and an excluded series is held, not gone.
+- **Library badges show it.** `sync:library-status` takes the last plan's gone set as a device-side
+  fact and reports state `removed` with that plan's "as of" time. Without it, the record's old
+  entries would read as `synced`.
+- **The connect prompt's "Sync now"** stays eligible for a gone series under its `previous` name
+  (rule 10 allows pushes). A fallback name or a mass-gone target disqualifies it. The summary
+  carries `removedOnDevice: [{series, name, fellBack, files, bytes}]`, counting selected pushes only.
 
 **Verify modes** (`sync:verify {mode}`):
 - `device-hash` is the default. It runs
@@ -510,7 +634,7 @@ shouldn't be pre-selected just because you deleted the series on the tablet.
   slow: every byte crosses USB again.
 - `adopt-size` records size matches as `adopted-size`.
 - On a device without `sha256sum`, the service offers `read-back` or `adopt-size`. A plan that
-  needs an automatic Verify on such a device (a newly linked folder, an unparsable shard) answers
+  needs an automatic Verify on such a device (a newly linked folder, a folder whose shard didn't parse) answers
   `needs-mode` instead of choosing for you.
 - **Timeout:** `sha256sum` prints nothing while it hashes one file, so a flat 60 s idle watchdog
   would fail a multi-GB volume on every attempt (review #19). Verify's idle budget is
@@ -593,7 +717,8 @@ an op may carry `expectVersion` for optimistic concurrency.
 
 **`targets/<id>/header.json`.** It holds:
 - `recordEpoch`;
-- kind, serial or folderRoot, canonicalRoot, profile, caseInsensitive;
+- kind, serial or folderRoot (plus `volumeId` for a folder target: `fs.stat`'s `dev`, the volume
+  serial on Windows), canonicalRoot, profile, caseInsensitive;
 - caps (lsV2, statV2, shellV2, sha256sum, findPrintf, statF).
 
 On a mismatch with the target, the record is ignored for deletes and orphans until re-verified
@@ -601,15 +726,20 @@ On a mismatch with the target, the record is ignored for deletes and orphans unt
 
 **`targets/<id>/folders/<shardId>.json`.** One shard per managed device folder (deviation 1). The
 `shardId` is random and stable.
-- The folder fields: `{recordEpoch, name, identityKey, pcFolder, state: bound / missing,
-  verifiedAt, verifyMode, renameIntent?, files}`.
+- The folder fields: `{recordEpoch, name, identityKey, urlKey, pcFolder, verifiedAt, verifyMode,
+  renameIntent?, files}`. There is no state field: a gone folder is derived at each plan (see
+  "Provenance").
+- **Binding matches** `identityKey` (site + hid), then `urlKey` (the normalized series URL), then
+  `pcFolder`. A hid change alone then keeps the binding, as rule 1 requires; `seriesIdentityKey`
+  prefers the hid key whenever both exist, so a shard holding only that key would lose its series.
 - `files` is keyed by the file's slot key. Each entry is
   `{name, size, sha256, devMtime, origin, prev?}`.
 - A shard whose `recordEpoch` differs from the header's is ignored and garbage-collected.
 
-**`targets/<id>/selection.json`.** `{recordEpoch, ops}`. `ops` maps an op id to `{sha, selected}`
-(rule 7: a newer PC version is proposed again). It is written on every `sync:set-selection`, and a
-forget invalidates it through the epoch.
+**`targets/<id>/selection.json`.** `{recordEpoch, ops, rebinds}`. `ops` maps an op id to
+`{sha, selected}` (rule 7: a newer PC version is proposed again). `rebinds` maps a gone folder's
+`shardId` to `{source, name, declined}` (decision 10; see "Provenance"). It is written on every
+`sync:set-selection`, and a forget invalidates it through the epoch.
 
 **`targets/<id>/find-sources.json`.** Holds rows of `{folder, query, include, state,
 candidates[≤5], pick, pinnedUrl, skip, error}`, written per row.
@@ -673,14 +803,14 @@ detail per series.
 | `sync:list-devices` | → `{ok, devices:[{serial, state, model, product, transportId}]}`; may start the server (review #8) |
 | `sync:browse-remote` | `{serial, path?}` → `{ok, path (canonical), parent, entries:[{name, isDir}], presets:[{label, path, exists}]}` |
 | `sync:plan` | `{targetId, overrides?:{hashMode, deletePolicy, verifyFirst, verifyMode}}` → `{ok, runId}` or a refusal: `busy`, `disabled`, `disconnected`, `library-missing`, `record-mismatch`, `device-listing-suspect`, or `needs-mode` (an automatic Verify on a device without `sha256sum`) |
-| `sync:series-detail` | `{targetId, seriesKey}` → per-file rows `{opId, kind, name, label, unit, size, origin, preselected, selected, reason, loss, settling}`, plus anomalies and suggestions |
-| `sync:set-selection` | `{targetId, changes:[{opId, selected}]}` or `{bulk:'covered-extras'/'split-parts'/'group', …}` → `{ok, totals, losses, massDelete:{required, count}, changedSeries}` |
+| `sync:series-detail` | `{targetId, seriesKey}` → per-file rows `{opId, kind, name, label, unit, size, origin, preselected, selected, reason, loss, settling}`, plus anomalies, suggestions and the series' `rebind` (decision 10) |
+| `sync:set-selection` | `{targetId, changes:[{opId, selected}]}`, `{bulk:'covered-extras'/'split-parts'/'group', …}` or `{rebind:{shardId, source?:'previous'/'derived', declined?}}` → `{ok, totals, losses, massDelete:{required, count}, massRepush:{required, count}, changedSeries}`. A `source` that isn't `available` is refused with `invalid` |
 | `sync:verify` | `{targetId, mode?: 'device-hash' / 'read-back' / 'adopt-size', folders?}` → `{ok, runId}`, or the `needs-mode` refusal when the device has no `sha256sum` and no mode was given |
 | `sync:prune` / `sync:rename-device-folder` | → `{ok, runId}`. Both run as jobs (phases `prune` and `rename`), and both are in the quit-ask set |
-| `sync:apply` | `{targetId, overrides, ackMassDelete, ackLosses:[opId]}` → `{ok, runId}` or the `blocked` refusal with `{blocking, dropped}`. Main re-lists, re-plans and re-checks losses first (rule 6) |
+| `sync:apply` | `{targetId, overrides, ackMassDelete, ackMassRepush, ackLosses:[opId]}` → `{ok, runId}` or the `blocked` refusal with `{blocking, dropped}`. Main re-lists, re-plans and re-checks losses first (rule 6) |
 | `sync:cancel` | → `{ok, wasRunning}` |
 | `sync:prompt-response` | `{promptId, action: review / sync-now / not-now}` → `{ok}` |
-| `sync:library-status` | → `{asOf, bySeries:{[folderPath]: [{targetId, state: synced / pending / absent, pending}]}}` |
+| `sync:library-status` | → `{asOf, bySeries:{[folderPath]: [{targetId, state: synced / pending / absent / removed, pending, asOf?}]}}`. `removed` comes from the last plan's gone set, with that plan's time |
 | `sync:label-preview` | `{name, folderName, patterns?}` → `{unit, label, start?, end?}` or `{error}` |
 | `sync:export-report` | `{targetId}` → `{ok, path}`. main shows the save dialog through an injected `showSaveDialog` |
 | `sync:device-cover` | `{targetId, folder}` → `{ok, path}` (cached under `covers/` by hashed name) |
@@ -737,6 +867,8 @@ dry and a real merge.
   still running" (`ConfirmQuitDialog.jsx:44,101`);
 - mount `useDeviceSync` in App.jsx;
 - choose which presets to expose;
+- draw the name choice for a series re-pushed after its folder was deleted on the device
+  (`rebind`, `removedOnDevice`; decision 10);
 - **add the sync keys to `get-settings` together with `DEFAULT_SETTINGS`**, plus the settings-twin
   test;
 - the second-instance behavior means your memory `electron-app-local-e2e-testing` must say that dev
@@ -896,8 +1028,21 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
   - A `pushed` entry without devMtime adopts the next listing's devMtime at an equal size.
 - **`adopted-size`.** It stores the PC sha. Its delete is never pre-selected. It never covers a
   label for another file's delete. A size-verified folder never makes "Sync now" eligible.
-- **Missing bound folder.** Its pushes are listed unticked under the "Removed on <target>"
-  anomaly, and the binding is kept as `missing`.
+- **Gone bound folder** (decision 10).
+  - Every PC file plans as a pre-selected push with reason `removed-on-device`, under the old name
+    byte-exact by default, and under the old shard's kept names where the sha matches.
+  - `rebind.choices` lists `derived` only when its slot key differs. An unavailable default falls
+    back to `derived`, then to the verbatim PC folder name, then to a held series with `name-taken`.
+    A reserved `previous` can't be taken by a new series.
+  - A `rebind` switch re-keys the series' op ids; a stored name that no longer matches its source
+    counts as unset; `declined` unticks every push, including ones for later chapters.
+  - A `record` match (≥90% of the gone shard's entries in an unmatched folder), and identity or
+    content matches, leave the pushes unticked and offer Link.
+  - ≥50% of ≥10 bound folders gone requires `massRepush` and hides Sync now; a fallback name hides
+    it too.
+  - A gone folder whose PC series is absent plans nothing. Planning writes nothing for a gone
+    folder.
+  - Binding survives a hid change through `urlKey`, and a URL change through `pcFolder`.
 - **Per-slot planning.** In sync, update, replace (unticked group), kept name, rename toggle, push,
   `settling`.
 - **Preselection.** Guarded vs add-only; every rule-5 case.
@@ -970,15 +1115,22 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
   - **a kill after `pushed` writes but before the post-series listing, and a cancel mid-series**:
     the resumed plan shows those files in sync;
   - a leftover `.tmp`;
-  - a zero-length or unparsable shard, which leaves that folder unverified;
+  - a zero-length or unparsable shard, which leaves that folder unbound (managed by name and
+    verified again, or offered for Link);
   - a shard with a stale `recordEpoch` after a half-finished forget: ignored and collected.
 - **Renames.** A folder rename and a case-only rename, each killed before and after the `mv`, are
   finished or reverted from `renameIntent`. A rename onto an existing destination is refused before
   `mv` runs.
 - **Writes.** Overlapping writes to one shard coalesce, and their tmp files never collide.
   `record-write-failed` aborts the run, and a failed `pending` write stops that file's SEND.
-- **Folder-shard drop rule.** A folder absent from a truncated listing keeps its shard; one absent
-  from a trusted listing and STA2 ENOENT goes `missing`.
+- **Gone-folder rule.**
+  - A folder absent from a truncated listing is never gone, and neither is one whose rename intent
+    left it under `via`. On adb, a gone folder triggers the rc-checked shell re-listing.
+  - The series' first step STA2s the chosen name: a folder that reappeared skips the series. Then
+    the shard is rewritten before `mkdir`. A kill between that write and `mkdir`, and one between
+    `mkdir` and the first push, both recover at the next plan without a sanity-check refusal.
+  - A selection with only sidecar pushes for a new or gone folder creates no folder.
+  - Link on a gone series rewrites its shard instead of adding a second one.
 - The delete gate: a failed replacement keeps its delete.
 - The slot guard: a case-only rename on a case-insensitive target never deletes the new file.
 - Device loss aborts once, not per series.
@@ -1079,12 +1231,8 @@ names over 255 bytes and paths over 1,018 bytes are rejected or safely quoted, i
    android-port memory's test tablet runs Android 15, which has both. Whether that is the sync
    tablet (serial `A06B4A372090333`) is unverified, and P5 reads its feature list. Until then the
    fallback is exercised only by the fake server.
-6. **Mid-phase checkpoint commits on this branch.**
-   - Pick: commit and push only at each phase's stop point, after its tests. That follows your
-     standing "never mid-fix" rule.
-   - Otherwise: also allow `wip(sync):` checkpoint commits mid-phase. A container reset could then
-     never lose half a phase, and the branch never ships, so the rule's reason (a clean PR) doesn't
-     apply here.
+6. **Mid-phase checkpoint commits on this branch.** **Decided 2026-10-06: commit and push at each
+   phase stop only** (Decisions table, rev 4).
 7. **Sharded record instead of the journal** (deviation 1).
    - Pick: shards.
    - Otherwise: the journal, with all five of review #6's fixes plus a test for each crash window.
@@ -1096,22 +1244,26 @@ names over 255 bytes and paths over 1,018 bytes are rejected or safely quoted, i
    - Pick: keep persisted marks, honored for 30 minutes. A prompt can then be skipped only when the
      server restarts, hands out the same id, and the device reconnects within that window.
    - Otherwise: drop persistence, so every app restart re-prompts a still-connected device.
-10. **A bound folder deleted on the tablet.**
-    - Pick: keep the binding as `missing`, and list its pushes unticked under a "Removed on
-      <target>" anomaly with Re-push and Exclude actions. Deleting a series on the tablet usually
-      means "done reading", and a pre-selected multi-GB re-push would fight that.
-    - Otherwise: drop the binding and plan the series as new, so its pushes are pre-selected (the
-      old scripts' behavior).
-11. **Large `pending` files under your RECV decision.**
-    - Context: resolving a pending file reads it back over USB inside a plan, including the
-      automatic plan behind the connect prompt. One 3 GB volume adds about a minute and a half at
-      30 MB/s.
-    - The `prev` (size, devMtime) shortcut skips the RECV when the SEND never ran. Only the one file
-      that was in flight is ever pending, or N files under batched intent.
-    - Pick: keep RECV as decided, for all sizes.
-    - Otherwise: above 256 MiB, use the device's `sha256sum` when the header reports it, and RECV
-      only without it. Faster, but it leans on the shell for that case, which your decision chose
-      to avoid.
+10. **A bound folder deleted on the tablet.** **Decided 2026-10-06: re-push it ticked, under a
+    name you choose that defaults to the old device folder name** (Decisions table, rev 4;
+    design under "Provenance"). Rev 3's pick (keep the binding, list the pushes unticked) was
+    declined.
+11. **Large `pending` files under your RECV decision.** **Decided 2026-10-06: RECV at every
+    size.** One 3 GB pending volume adds about a minute and a half to that plan at 30 MB/s; the
+    `prev` (size, devMtime) shortcut skips the RECV when the SEND never ran.
+12. **Weak adoption matches after the first sync** (raised in P1).
+    - Pick, implemented: parent rule 2 as written. `name` and `similar` matches block a series'
+      new-folder pushes only on a target's first sync; identity, content and `record` always do.
+      Later, a new PC series whose name matches an unmatched device folder (`SPY x FAMILY` against
+      `SPY_x_FAMILY`) gets its pushes pre-selected into a new folder. The Link suggestion is still
+      shown, and an unresolved suggestion hides Sync now, so the review has to be opened.
+    - Otherwise weak matches always block. No duplicate folder can then appear without a click,
+      but every new series that merely resembles a device-only folder waits for Link or Not the
+      same.
+13. **A fork regardless of names** (deviation 10).
+    - Pick, implemented: same identity is a fork even when the derived names differ.
+    - Otherwise forks count only on a name collision, and under `as-is` naming both fork folders
+      are synced as two series.
 
 ## Adversarial review disposition (review of rev 1, 2026-10-01)
 
@@ -1160,7 +1312,7 @@ delete-safety hole: each failure it built ends in "foreign" or "unverified".
 | 1 | `initDeviceSync` deps name identifiers main.js lacks | Confirmed | `rg -c` on main.js: `userDataDir`, `getLibraryRoot`, `getRunningDownloads`, `showSaveDialog` all 0 | Integration init row; isolation test |
 | 2 | The merge hook reads `args`; the parameter is `opts` | Confirmed | `main.js:1759`; `series-merge.js:372` (default `true`), `:455`, `:493` | Merge row tests `r.dryRun === false`; metadata:update reshaped |
 | 3 | The `require` isn't isolated | Confirmed | Logic | Integration require row |
-| 4 | Shards keyed by name; no rename protocol | Confirmed | Rev 2 text; shell `mv` semantics | Deviation 1 (random ids, rename intent, drop rule); missing-folder rule |
+| 4 | Shards keyed by name; no rename protocol | Confirmed | Rev 2 text; shell `mv` semantics | Deviation 1 (random ids, rename intent); rev 4 replaced its drop rule with the gone-folder design |
 | 5 | Header and shards can disagree after a partial clear | Confirmed | Rev 2 text | `recordEpoch` |
 | 6 | Write mechanics under-specified | Confirmed | Rev 2 text | Deviation 1 write mechanics; `record-write-failed` |
 | 7 | `pushed` without devMtime breaks resume | Confirmed | Rev 2 text | devMtime adoption rule; exec test; P5 check |
@@ -1177,6 +1329,30 @@ delete-safety hole: each failure it built ends in "foreign" or "unverified".
 | 18 | Contract and lifecycle inconsistencies | Confirmed | Rev 2 text | IPC rules; the rename job |
 | 19 | Single-instance edge cases | Confirmed | Logic; the review read Electron's `OnQuit` and lock code (not re-checked) | Integration lock row; P5 |
 | 20 | Gaps in the first disposition table | Confirmed | This section | #6, #16 and #23 rows; open decision 1 |
+
+### Third review (of rev 4's gone-folder design, 2026-10-06)
+
+An Opus reviewer read both plans and the rev 3 → rev 4 diff. Every finding was checked against the
+plan text it cites. None needed AOSP. The volume-id fix was checked in libuv `src/win/fs.c:1863`,
+`:1915` (`st_dev` = `VolumeSerialNumber`).
+
+| # | Finding | Verdict | Evidence checked | Where it landed |
+|---|---|---|---|---|
+| 1 | The folder is created before its shard is rewritten | Confirmed | Parent's per-series order (mkdir → cleanup → renames → pushes) vs rev 4's "first intent write" | Shard rewrite is the series' first step, before `mkdir`; exec test for both kill windows |
+| 2 | Nothing re-checks absence before writing | Confirmed | Rev 4 text; SEND unlinks an existing file | STA2 ENOENT at plan time (availability) and right before the rewrite |
+| 3 | Per-folder step order unspecified; a leftover rename intent can fake "gone" | Confirmed | Rev 4 text; dot-names are invisible to the listing | Fixed prep order; gone requires `name`, `from`, `via`, `to` all absent |
+| 4 | Content match misses renamed folders with kept names | Confirmed | Parent rule 2 compares with PC names; kept names are rule 4's default | `record` match strength; rc-checked shell re-listing when anything is gone |
+| 5 | Link on a gone series undefined | Confirmed | Rev 4 text | Link rewrites the gone shard; one shard per series per target |
+| 6 | Unticking a gone series doesn't stick | Confirmed | Selection keyed by (op id, sha); new ops default to their preselection | `declined`; no folder without a chapter push |
+| 7 | A mass of gone folders; no volume identity for folder targets | Confirmed | Header fields in rev 4 | `massRepush` acknowledgment; header `volumeId` |
+| 8 | Name availability circular, no terminal case, old names altered by sanitize | Confirmed | Rev 4 text; `sanitizeSegment`'s NFKC and trailing-dot trim | `previous` reserved and byte-exact; `name-taken` hold |
+| 9 | `names` stores a choice, not a name | Confirmed | Rev 4 text | `rebinds[shardId] = {source, name, declined}`, cleared at the rewrite |
+| 10 | Badges say "synced" for a gone series | Confirmed | Parent rule 13 computes badges from the record | `removed` state from the last plan's gone set |
+| 11 | Shard rewrite's field set incomplete | Confirmed | Rev 4 text | Full field set listed |
+| 12 | Shards dropped when the PC series is absent | Confirmed | Transient inventory gaps; excluded series are held | Kept until Forget; never STA2'd |
+| 13 | Sync now data thin | Confirmed | Rev 4 text | `removedOnDevice` fields; a fallback name hides Sync now |
+| 14 | A re-push loses per-chapter Komikku progress | Confirmed | `komikkuspec.md` keys progress by chapter file name | Pushes reuse the old shard's kept names |
+| 15 | Stale text | Confirmed | Status block; second table's #4 row | Both fixed |
 
 ## Figures
 
