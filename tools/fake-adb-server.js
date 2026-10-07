@@ -479,8 +479,9 @@ class FakeAdbServer {
     this.sockets = new Set();
     this.server = null;
     this.port = null;
-    // noTport: FAIL host:tport: as unknown; bindDelayMs: answer a bind this late.
-    this.inject = { noTport: false, bindDelayMs: 0, ...(opts.inject || {}) };
+    // noTport: FAIL host:tport: as unknown; bindDelayMs: answer a bind this late;
+    // trackFail: FAIL host:track-devices-l.
+    this.inject = { noTport: false, bindDelayMs: 0, trackFail: false, ...(opts.inject || {}) };
     this.now = opts.now || (() => Math.floor(Date.now() / 1000));
     this.version = opts.version != null ? opts.version : 41;
   }
@@ -728,6 +729,8 @@ class FakeAdbServer {
       return socket.end();
     }
     if (svc === "track-devices-l") {
+      // trackFail: an old or broken server (monitor tests' polling fallback).
+      if (this.inject.trackFail) return this._fail(socket, `unknown host service '${svc}'`);
       this._okay(socket);
       this.trackers.add(socket);
       _write(socket, wire.encodeProtocolString(this._listText()));

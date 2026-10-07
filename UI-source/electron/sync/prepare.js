@@ -77,7 +77,7 @@ const PROBE_PASSES = 4;
  * @param {object} [c.executorDeps]   extra Executor deps for the coverage Verify (tests: hooks)
  * @param {number} [c.connectWaitMs]
  * @returns {Promise<object>} {ok:true, plan, device, pc, view, probe, target,
- *   verify, warnings} or a refusal
+ *   verify, warnings, planOpts} or a refusal
  */
 async function preparePlan(c) {
   const transport = c.transport;
@@ -123,6 +123,11 @@ async function preparePlan(c) {
     const h = loaded.header;
     if (probe.caseMeasured && (h.caseInsensitive !== !!probe.caseInsensitive || !h.caseMeasured)) {
       await store.updateHeader({ caseInsensitive: !!probe.caseInsensitive, caseMeasured: true });
+    }
+    // A header from forget-record or rule 12's clear (service.js) pins the
+    // identity only: the first probe after it fills the measured fields.
+    if (!h.canonicalRoot && probe.canonicalRoot) {
+      await store.updateHeader({ canonicalRoot: probe.canonicalRoot, caps: probe.caps || {} });
     }
     if (view.staleShardIds.length) await store.gc(view.staleShardIds);
   }
@@ -295,7 +300,9 @@ async function preparePlan(c) {
   // 12. what the plan read off the listing becomes the record's
   await _persistFixes(plan, view, store);
   if (c.hashPool) await c.hashPool.flush().catch(() => {});
-  return { ok: true, plan, device, pc, view, probe, target, verify, warnings };
+  // planOpts: service.js re-plans from this cached input after an inline
+  // edit (a rebind), without device I/O.
+  return { ok: true, plan, device, pc, view, probe, target, verify, warnings, planOpts };
 }
 
 // ------------------------------------------------------------------ steps

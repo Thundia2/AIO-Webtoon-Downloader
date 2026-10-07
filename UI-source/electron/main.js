@@ -47,6 +47,26 @@ const { createUpdateCheckRecord, resultRow: updateCheckResultRow } = require("./
 // the single place the default lives.
 const appUpdater = require("./updater");
 
+// ── Device Sync (electron/sync/service.js; off unless settings.syncEnabled) ──
+// The require is isolated so a load-time throw anywhere in sync/ can't abort
+// this file; every hook below is also wrapped, on top of the facade's own
+// never-throw contract, so a sync defect can't break a path every user runs
+// with sync off. grep: deviceSync
+let initDeviceSync = null;
+try {
+  ({ initDeviceSync } = require("./sync/service"));
+} catch (e) {
+  console.error("[deviceSync] load failed", e);
+}
+let deviceSync = null;
+
+// Single-instance lock (app-wide, for Device Sync: two instances would both
+// own port-5037 sessions and the same userData/sync record). Electron keys
+// the lock on the userData directory AT CALL TIME, so anything that moves
+// userData must run before this line.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) app.quit();
+
 // ── DEV MODE DEFAULTS ──
 // When running from source (npm run electron:dev), the app uses
 // your system Python and the aio-dl.py / project root that ship in
@@ -416,6 +436,16 @@ function sendToUI(channel, data) {
   sendToWindow(mainWindow, channel, data);
 }
 
+// Device Sync library hook: debounced re-plan of connected targets. Never
+// throws, so it's safe inside handlers whose answer must not change.
+function notifySyncLibraryChanged(reason) {
+  try {
+    deviceSync?.notifyLibraryChanged(reason);
+  } catch (e) {
+    console.error("[deviceSync] notifyLibraryChanged", e);
+  }
+}
+
 // ============================================================
 // SETUP WIZARD (first-run only)
 // ============================================================
@@ -552,10 +582,24 @@ function createWindow() {
   // prompt, and prompting on it would fire on nearly every close while a queue
   // drains. See the quitConfirmed declaration for why this is a renderer
   // dialog rather than dialog.showMessageBox.
+  // Device Sync asks only while an apply, prune or rename runs; a plan or
+  // verify is just cancelled by the quit (sync/contract.js QUIT_ASK_PHASES).
+  // payload.sync is {target, phase, done, total} or null; `running` keeps its
+  // shape so ConfirmQuitDialog works unchanged.
   mainWindow.on("close", (e) => {
-    if (quitConfirmed || !downloader || downloader.runningCount() === 0) return;
+    if (quitConfirmed) return;
+    const downloadsRunning = !!downloader && downloader.runningCount() > 0;
+    let syncAsk = false;
+    try {
+      syncAsk = !!deviceSync?.needsQuitAsk();
+    } catch {}
+    if (!downloadsRunning && !syncAsk) return;
     e.preventDefault();
-    sendToUI("confirm-quit", { running: downloader.getRunning() });
+    let sync = null;
+    try {
+      sync = syncAsk ? deviceSync.quitInfo() : null;
+    } catch {}
+    sendToUI("confirm-quit", { running: downloader?.getRunning?.() ?? [], sync });
     // Safety valve: a wedged renderer (crashed React tree, blocked main thread)
     // must never leave the window un-closable. 15s is far longer than the
     // dialog needs to paint, and "quit:cancel" clears it the moment the user
@@ -603,6 +647,8 @@ function initDownloader() {
     onComplete: (downloadId, result) => {
       history.updateEntry(downloadId, result);
       sendToUI("download-complete", { downloadId, result });
+      // Must not throw: downloader.js resolves the close wait after this.
+      notifySyncLibraryChanged("download");
     },
   });
 
@@ -706,6 +752,14 @@ function setupIPC() {
       enabled: merged.appAutoUpdate !== false,
       delayDays: merged.appUpdateDelayDays,
     });
+    // Fire-and-forget with its own catch: a sync defect never turns a
+    // successful save into a rejected IPC call. Starts or stops the monitor
+    // and pre-warm; turning sync off cancels a running job first.
+    try {
+      Promise.resolve(deviceSync?.applySettings(merged)).catch((e) => console.error("[deviceSync] applySettings", e));
+    } catch (e) {
+      console.error("[deviceSync] applySettings", e);
+    }
     return { ok: true };
   });
 
@@ -908,10 +962,12 @@ function setupIPC() {
   });
 
   ipcMain.handle("metadata:update", async (_event, filePath, data, coverPath) => {
-    return runMetadataCli(
+    const r = await runMetadataCli(
       ["update", filePath, ...(coverPath ? ["--cover-path", coverPath] : [])],
       JSON.stringify(data || {})
     );
+    notifySyncLibraryChanged("metadata");
+    return r;
   });
 
   // ── comix.to sign-in ──
@@ -1045,6 +1101,7 @@ function setupIPC() {
       console.error("Thumbnail pipeline error:", err);
     }
 
+    notifySyncLibraryChanged("scan");
     return entries;
   });
 
@@ -1061,6 +1118,7 @@ function setupIPC() {
       if (fs.existsSync(folderPath)) {
         fs.rmSync(folderPath, { recursive: true, force: true });
       }
+      notifySyncLibraryChanged("delete");
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err.message };
@@ -1760,7 +1818,7 @@ function setupIPC() {
     try {
       const settings = history.getSettings();
       const { workingDir } = resolveSpawnPaths(settings);
-      return await mergeSeriesFolders({
+      const r = await mergeSeriesFolders({
         ...(opts || {}),
         // Injected as DATA rather than read inside the module, so the offline
         // test can drive the whole thing without electron. The renderer never
@@ -1769,6 +1827,10 @@ function setupIPC() {
         libraryRoot: getConfiguredOutputRoot(workingDir),
         runningDownloads: downloader?.getRunning?.() || [],
       });
+      // The RESULT's dryRun: the module defaults to a dry run when the
+      // caller omits the flag (series-merge.js).
+      if (r?.ok && r.dryRun === false) notifySyncLibraryChanged("merge");
+      return r;
     } catch (err) {
       return { ok: false, error: "merge_failed", message: err?.message || String(err) };
     }
@@ -1801,6 +1863,7 @@ function setupIPC() {
       };
 
       fs.writeFileSync(metaPath, JSON.stringify(merged, null, 2), "utf8");
+      notifySyncLibraryChanged("series-meta");
       return { ok: true, meta: merged };
     } catch (err) {
       return { ok: false, error: err.message };
@@ -1825,6 +1888,17 @@ function setupIPC() {
     if (!IS_PACKAGED || !pythonEnvDir) {
       return { ok: false, error: "Only available in installed mode" };
     }
+
+    // Device Sync: refuse during a job; stop find-sources' search tree and
+    // wait for it (≤5 s), or rmSync would throw EBUSY on a dying python.exe.
+    let syncJob = false;
+    try {
+      syncJob = !!deviceSync?.isJobRunning();
+    } catch {}
+    if (syncJob) return { ok: false, error: "A device sync job is running. Cancel it first." };
+    try {
+      await deviceSync?.cancelFindSources();
+    } catch {}
 
     // Delete the entire Python environment
     deleteEnv(pythonEnvDir);
@@ -1868,7 +1942,12 @@ function setupIPC() {
     // the close listener would answer a user-initiated update with a quit
     // prompt. Explicit here rather than relying on runningCount() hitting 0.
     quitConfirmed = true;
-    if (downloader) await downloader.cancelAll();
+    try {
+      await Promise.allSettled([downloader?.cancelAll(), deviceSync?.shutdown({ timeoutMs: 5000 })]);
+    } catch (e) {
+      // only a synchronous throw building the array lands here
+      console.error("[apply-now] pre-quit cleanup", e);
+    }
     return appUpdater.applyNow();
   });
 }
@@ -1877,7 +1956,38 @@ function setupIPC() {
 // APP LIFECYCLE
 // ============================================================
 
+// Set once the app is on its way out (window-all-closed or any quit path), so
+// a second launch arriving during the ≤5 s shutdown wait can't open a window
+// that the pending app.quit() would then tear down.
+let appQuitting = false;
+app.on("before-quit", () => {
+  appQuitting = true;
+});
+
+// A second launch focuses this instance instead of starting another (see the
+// gotSingleInstanceLock declaration). During first-run setup the only window
+// is the setup wizard; once startup is done and no window is left (the user
+// closed it but the quit is still pending) it re-creates the main window, so
+// a second launch never just vanishes.
+app.on("second-instance", () => {
+  try {
+    const win = (mainWindow && !mainWindow.isDestroyed() ? mainWindow : null) || BrowserWindow.getAllWindows()[0] || null;
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+      return;
+    }
+    if (app.isReady() && downloader && !appQuitting) createWindow();
+  } catch (e) {
+    console.error("[second-instance]", e);
+  }
+});
+
 app.whenReady().then(async () => {
+  // An app.quit() before ready only defers shutdown; ready still resolves.
+  if (!gotSingleInstanceLock) return;
+
   if (process.platform === "darwin" && APP_ICON_PATH && app.dock) {
     app.dock.setIcon(APP_ICON_PATH);
   }
@@ -1932,6 +2042,31 @@ app.whenReady().then(async () => {
   // the app install path can change on updates.
   ensurePythonSrcInPth();
   initDownloader();
+  // Device Sync. Window-dependent deps read lazily: the window doesn't exist
+  // yet. initDeviceSync throws on a missing/mistyped dep (logged; sync stays
+  // off). getLibraryRoot is the merge handler's own expression.
+  if (initDeviceSync) {
+    try {
+      deviceSync = initDeviceSync({
+        ipcMain,
+        send: sendToUI,
+        userDataDir: path.join(app.getPath("userData"), "sync"),
+        getSettings: () => history.getSettings(),
+        getLibraryRoot: () => getConfiguredOutputRoot(resolveSpawnPaths(history.getSettings()).workingDir),
+        getRunningDownloads: () => downloader?.getRunning?.() ?? [],
+        isCheckAllRunning: () => _updateCheck.isRunning(),
+        isSearchRunning: () => searcher?.isRunning?.() ?? false,
+        resolveSpawnPaths,
+        extraEnv: buildPythonEnv(),
+        onFocus: (cb) => app.on("browser-window-focus", cb),
+        isFocused: () => !!BrowserWindow.getFocusedWindow(),
+        getWindow: () => mainWindow,
+        showSaveDialog: (o) => dialog.showSaveDialog(mainWindow, o),
+      });
+    } catch (e) {
+      console.error("[deviceSync] init failed", e);
+    }
+  }
   createWindow();
 
   // App self-update — armed unless the user opted OUT (Settings →
@@ -1956,6 +2091,25 @@ app.on("window-all-closed", async () => {
   // outlive Electron — if the user immediately relaunches, the orphan
   // children may still hold tmp_<hid>/ lockfiles (resume detection bug).
   // cancelAll() bounds itself at 5s so a stuck child can't trap quit.
-  if (downloader) await downloader.cancelAll();
+  // Device Sync's shutdown (cancel the job, wait ≤5 s, flush) runs in
+  // parallel; allSettled so neither can keep the other from quitting.
+  appQuitting = true;
+  try {
+    await Promise.allSettled([downloader?.cancelAll(), deviceSync?.shutdown({ timeoutMs: 5000 })]);
+  } catch (e) {
+    // only a synchronous throw building the array lands here
+    console.error("[window-all-closed] pre-quit cleanup", e);
+  }
   app.quit();
+});
+
+// Every quit path ends here, including app.quit() from quit-app / the updater
+// and app.exit() from reinstall-python, neither of which emits
+// window-all-closed. shutdownNow is synchronous and idempotent.
+app.on("quit", () => {
+  try {
+    deviceSync?.shutdownNow();
+  } catch (e) {
+    console.error("[deviceSync] shutdownNow", e);
+  }
 });

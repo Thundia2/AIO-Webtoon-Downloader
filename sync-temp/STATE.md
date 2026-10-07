@@ -4,7 +4,7 @@ The cloud session's stand-in for your memory entry `device-sync-feature.md`, whi
 Your local session folds this file back into that entry when the work returns. It is a map, not a
 log; git history owns the events.
 
-## Where it stands (2026-10-06)
+## Where it stands (2026-10-07)
 
 - **Parent plan:** `plans/add-this-script-s-features-linked-pumpkin.md`, approved 2026-09-30.
 - **Non-UI plan:** `plans/c-users-legoc-claude-plans-add-this-scr-noble-truffle.md`, **rev 4,
@@ -15,8 +15,21 @@ log; git history owns the events.
     own review.
   - Every finding of the reviews was checked against the code, AOSP adb and libuv. The plan's last
     section holds the disposition tables.
-- **Now:** P0 to P3 are done and committed; P4 (service and integration) waits for your
-  go-ahead.
+- **Now:** P0 to P4 are done and committed. P5 (packaged smoke, live tablet) needs your PC.
+
+## P4 service and integration (2026-10-07)
+
+| Item | State |
+|---|---|
+| Modules | `UI-source/electron/sync/`: `service` (entry point: deps validation, every `sync:*` handler, the job lane, the facade main.js calls), `monitor` (`DeviceTracker`, `FolderWatcher`, `PromptMarks`, `PromptMachine`), `find-sources` (the search runner). `UI-source/electron/proc-kill.js` (tree kill; searcher.js uses it). `UI-source/src/hooks/useDeviceSync.js` (written and tested, **not mounted**) |
+| Integration | `main.js`: guarded require, single-instance lock + `second-instance`, `whenReady` early return, `initDeviceSync` with all 14 deps, the close listener's sync term, library hooks (download, scan, delete, series-meta, metadata, real merge only), `applySettings` in save-settings, reinstall-python refusal + find-sources stop, `allSettled` in apply-now and window-all-closed, the `quit` hook. `preload.js`: 23 `sync*` wrappers + `onSyncEvent`. `searcher.js`: per-process cancel set, `cancelAndWait`, `cancelNow`, group kill |
+| Engine edits | `contract`: `link` (23 channels). `executor`: public `ensureHeader()`. `prepare`: fills `canonicalRoot`/`caps` when the header lacks them, returns `planOpts`. Fake: `inject.trackFail` |
+| Tests (force-added) | `_test_device_sync_service.js` 21, `_monitor` 23, `_contract` 57 checks, `_hook` 50 checks, `_main_isolation` 6 scenarios (194 checks), `_test_searcher_cancel.js` 8. All pass under node 22.22.0 and Electron 40's Node 24.15.0 |
+| Dev-app smoke | `tools/_smoke_device_sync_dev.js` (Playwright `_electron`, xvfb, sync off), 3 runs on P4 and 3 on the P3 tree (`--baseline`): all pass. Quit after "Quit anyway": 320 / 403 / 376 ms on P4, 335 / 266 / 349 ms on P3. A fresh profile shows "55 changed" before its first Save on both trees (by design, `countDirtySettings`), so the smoke saves once through the UI before checking "Up to date". Minimize isn't observable under xvfb without a window manager, so restore-on-second-launch wasn't checked |
+| Mutation check | 17 deliberate breaks of the new tests' subjects (hook 5, preload/hook literals 3, main.js hooks 8, service refusal keeping 1): each one fails its test. One main.js break was first written as a syntax error and was redone |
+| Defects fixed | Pre-warm never ran for a target added after start; Forget-record refused `record-mismatch` (the cleared header's volume id); browse presets STA2'd through the `/sdcard` symlink; the hook dropped buffered events when the first get-state rejected |
+| Regression | All 14 `tools/_test_*.js` pass on both Nodes (28 runs), the 5 pre-existing ones included; `node --check` on main.js and preload.js; `npm run build` exit 0 (1269 modules); esbuild transforms `useDeviceSync.js` (Vite doesn't compile it while unmounted) |
+| Plan changes | Deviation 13 records your three P4 answers and the calls made in P4; the contract table gains `sync:link`; the channel count is 23 (P6's PARITY rows, the Figures row); Verification gets "Added at P4" |
 
 ## P3 engine (2026-10-06)
 
@@ -75,6 +88,9 @@ log; git history owns the events.
 | Commits (open decision 6) | **Commit and push at each phase stop**, after its tests are green; no mid-phase checkpoints |
 | A bound folder deleted on the device (open decision 10) | **Re-push it ticked**, under a name you choose that **defaults to the old device folder name**. Gone is derived at each plan (trusted listing absent + STA2 ENOENT), never persisted. A `record` match (≥90% of the gone shard's entries in an unmatched folder) counts as strong and unticks the pushes; ≥50% of ≥10 bound folders gone needs a mass-repush acknowledgment; a decline sticks for later chapters too. Drawing the name choice is the UI pass's job |
 | Large `pending` files (open decision 11) | **RECV at every size** |
+| Link (P4) | **Its own channel**, `sync:link {targetId, suggestionIds}` → `{ok, linked}`; refused `busy` during a job; queues a re-plan. 23 invoke channels |
+| Pre-warm (P4) | **30 s after launch, or at once on enable**, at the Resource Limits CPU level; pauses while a download, Check All, a search or a sync job runs |
+| Find-sources' "Queue N downloads" (P4) | **The UI pass's job**, through the download IPC plus `config-op add-alias`; main only stores and runs rows |
 | Plan preparation (P3) | **A new `prepare.js`**; it persists `entryFixes`/`shardNameFixes`, and `service.js` only calls it |
 | Case probe (P3) | **No device writes; the flag is saved in the header.** Flip an existing name's ASCII case and STA2 it; with nothing to flip, assume case-insensitive and probe again at the next connection |
 | `connecting` during a run (P3) | **Wait up to 60 s, then end the run `disconnected`** |
@@ -99,6 +115,27 @@ log; git history owns the events.
    test: ask first.
 4. P5's `AIO_SEARCH_PROBE_DEADLINE`, only if measurement shows the probe phase dominates: ask first
    (it touches the in-flight `search_orchestrator.py`).
+5. Calls made in P4 with my pick (plan deviation 13), for your confirmation:
+   - a job's device refusals arrive in its end (`summary.refusal`, kept in `plans[id].refusal`),
+     not as the invoke's answer;
+   - a target never applied to keeps its selection in memory for the session only;
+   - the executor's `isPathBusy` stays unwired (`getRunning()` has no folder paths); `settling`
+     covers a file a download is writing;
+   - a second launch during the ≤5 s quit wait opens no window (`appQuitting`).
+
+## Handoff obligations for the UI pass
+
+Also in the `service.js` header.
+- Render `payload.sync` (`{target, phase, done, total}`) in ConfirmQuitDialog; a sync-only close
+  would say "0 downloads are still running".
+- Mount `useDeviceSync` in App.jsx, and call its `refresh()` after a save that flips
+  `syncEnabled`.
+- Choose which presets to expose.
+- Draw the name choice for a re-pushed gone folder (`rebind`, `removedOnDevice`; decision 10).
+- Add the sync keys to `get-settings` together with `DEFAULT_SETTINGS`, plus the settings-twin
+  test.
+- "Queue N downloads" for find-sources rows: the download IPC plus `config-op add-alias` per
+  accepted row.
 
 ## Defect ledger (shipped defects found while exploring; outside this feature)
 
@@ -115,7 +152,7 @@ entries.
 ## Memory rewrites owed when the work returns
 
 - `device-sync-feature.md`: rewrite from this file.
-- `electron-app-local-e2e-testing.md`: once the single-instance lock lands, the dev app and the
+- `electron-app-local-e2e-testing.md`: the single-instance lock landed in P4, so the dev app and the
   installed app can't run at the same time. Close one before launching the other; this applies to
   P5's packaged smoke too.
 

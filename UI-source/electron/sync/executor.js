@@ -246,6 +246,14 @@ class Executor {
     });
   }
 
+  /**
+   * Write the record header when the target has none yet (the first write
+   * to a target). service.js calls it before sync:link binds a folder.
+   */
+  ensureHeader() {
+    return this._ensureHeader();
+  }
+
   async _writeShard(sh) {
     await this._ensureHeader();
     await this.store.writeShard(sh);

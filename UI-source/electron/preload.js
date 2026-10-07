@@ -91,6 +91,42 @@ contextBridge.exposeInMainWorld("electronAPI", {
   confirmQuit: () => ipcRenderer.invoke("quit:confirm"),
   cancelQuit: () => ipcRenderer.invoke("quit:cancel"),
 
+  // ── Device Sync (main: electron/sync/service.js) ──
+  // One wrapper per invoke channel, each taking one payload object and
+  // resolving {ok:true, …} or the refusal {ok:false, code, message}. The
+  // channel literals duplicate sync/contract.js CHANNELS (this sandboxed
+  // preload can't require it); tools/_test_device_sync_contract.js keeps
+  // them equal. Push events arrive on "sync-event" as {kind, …}; the
+  // renderer mirror is src/hooks/useDeviceSync.js. grep: deviceSync
+  syncGetState: (p) => ipcRenderer.invoke("sync:get-state", p),
+  syncConfigOp: (p) => ipcRenderer.invoke("sync:config-op", p),
+  syncLocateAdb: (p) => ipcRenderer.invoke("sync:locate-adb", p),
+  syncListDevices: (p) => ipcRenderer.invoke("sync:list-devices", p),
+  syncBrowseRemote: (p) => ipcRenderer.invoke("sync:browse-remote", p),
+  syncPlan: (p) => ipcRenderer.invoke("sync:plan", p),
+  syncSeriesDetail: (p) => ipcRenderer.invoke("sync:series-detail", p),
+  syncSetSelection: (p) => ipcRenderer.invoke("sync:set-selection", p),
+  syncVerify: (p) => ipcRenderer.invoke("sync:verify", p),
+  syncApply: (p) => ipcRenderer.invoke("sync:apply", p),
+  syncPrune: (p) => ipcRenderer.invoke("sync:prune", p),
+  syncRenameDeviceFolder: (p) => ipcRenderer.invoke("sync:rename-device-folder", p),
+  syncCancel: (p) => ipcRenderer.invoke("sync:cancel", p),
+  syncPromptResponse: (p) => ipcRenderer.invoke("sync:prompt-response", p),
+  syncLibraryStatus: (p) => ipcRenderer.invoke("sync:library-status", p),
+  syncLabelPreview: (p) => ipcRenderer.invoke("sync:label-preview", p),
+  syncExportReport: (p) => ipcRenderer.invoke("sync:export-report", p),
+  syncDeviceCover: (p) => ipcRenderer.invoke("sync:device-cover", p),
+  syncFindSourcesStart: (p) => ipcRenderer.invoke("sync:find-sources:start", p),
+  syncFindSourcesCancel: (p) => ipcRenderer.invoke("sync:find-sources:cancel", p),
+  syncFindSourcesGet: (p) => ipcRenderer.invoke("sync:find-sources:get", p),
+  syncFindSourcesUpdateRow: (p) => ipcRenderer.invoke("sync:find-sources:update-row", p),
+  syncLink: (p) => ipcRenderer.invoke("sync:link", p),
+  onSyncEvent: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on("sync-event", handler);
+    return () => ipcRenderer.removeListener("sync-event", handler);
+  },
+
   // ── Cross-site search ──
   // runSearch resolves with the parsed JSON result (candidate list +
   // optional winner_chapter_map). UI shows live progress via the log

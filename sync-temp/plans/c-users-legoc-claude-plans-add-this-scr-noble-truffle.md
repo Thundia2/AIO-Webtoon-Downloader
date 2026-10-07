@@ -1,7 +1,7 @@
 # Device Sync — non-UI implementation plan
 
 **Status: rev 4, approved 2026-10-06 ("Start with the plan"), cloud session on
-`wip/device-sync-handoff`. P0 to P3 are done; P4 waits for your go-ahead.**
+`wip/device-sync-handoff`. P0 to P4 are done; P5 needs your PC.**
 - Rev 1 (2026-09-30) got an adversarial review on 2026-10-01: 2 critical, 9 major, 14 minor.
   Rev 2 checked every finding against the code and AOSP and folded in the confirmed ones. Where the
   review was wrong or a better fix exists, it says so.
@@ -17,6 +17,9 @@
   measurement of the wait between a push's last DATA and its OKAY.
 - P3 recorded your four P3 answers and the calls made while coding the engine (deviation 12),
   added `prepare.js` to P3, and found that the IPC contract has no channel for Link (P4 adds one).
+- P4 recorded your three P4 answers and the calls made while coding the service and the
+  integration (deviation 13), added `sync:link` (23 invoke channels), and added "Added at P4" to
+  Verification.
 - The three disposition tables are the last section.
 - Parent plan (behavior rules 1-13, the decisions table, the UI design), approved 2026-09-30:
   `sync-temp/plans/add-this-script-s-features-linked-pumpkin.md`. Rule numbers below refer to it.
@@ -352,7 +355,7 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
       that changed between the walk and its hash stays unhashed (no op) until the next plan.
     - **Link has no IPC channel in this plan** (`config-op` lists no `link` op). P3 implements it
       as `RecordStore.bindFolder` (a gone series' shard is rewritten in place); P4 adds the
-      channel.
+      channel (deviation 13).
     - **Defects found and fixed in P3:**
       - the hash pool stalled a lone task when its worker couldn't start (the fallback was set
         but nothing re-dispatched);
@@ -361,6 +364,51 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
       - the fake shell treated `--` as an operand, so `mkdir -p -- X` also made a folder named
         `--`.
 
+13. **Calls made while coding the service and the integration (P4).** Each is pinned by a test in
+    `tools/_test_device_sync_service.js`, `_monitor`, `_contract`, `_hook`, `_main_isolation` or
+    `_test_searcher_cancel.js`.
+    - **Your P4 answers.**
+      - **Link is its own channel**, `sync:link {targetId, suggestionIds}` → `{ok, linked}`. It is
+        refused `busy` while any job runs, marks the plan stale and queues a re-plan. The
+        contract has 23 invoke channels; the PARITY rows follow.
+      - **Pre-warm** starts 30 s after launch, or at once when sync is switched on, at the
+        Resource Limits CPU level. It pauses while a download, Check All, a Search-tab search or a
+        sync job runs.
+      - **Find-sources' "Queue N downloads"** is the UI pass's job, through existing channels: the
+        download IPC plus `config-op add-alias`. The main side only stores and runs rows
+        (`targets/<id>/find-sources.json`).
+    - **A job's device refusals arrive in its end.** A job-starting channel answers `{ok, runId}`
+      at once, or a refusal it can decide without the device (`busy`, `disconnected`,
+      `library-missing`, `blocked` against the reviewed plan, `invalid`). `record-mismatch`,
+      `device-listing-suspect`, `needs-mode` and a `blocked` found on the fresh re-plan end the
+      job `failed` with `summary.refusal`, and `get-state`'s `plans[id].refusal` keeps it. A plan
+      can take minutes, so it can't be the invoke's answer.
+    - **The selection of a target never applied to stays in memory.** It is written to
+      `selection.json` once the target has a record header; before that it lasts the session.
+    - **The executor's `isPathBusy` is not wired.** `downloader.getRunning()` carries no folder
+      paths. A file a running download is writing is younger than the settle age, so it plans as
+      `settling` and is never offered.
+    - **Plan preparation fills `canonicalRoot` and `caps`** when the header lacks them (after a
+      Forget or a cleared record), and an identity change of a folder target re-probes its volume
+      id, so the next plan doesn't refuse `record-mismatch` against a null.
+    - **`browse-remote` canonicalizes the presets** (`realpath /sdcard`), so a preset never
+      STA2s through the symlink.
+    - **The hook re-reads `plans` from `get-state`** after a job ends and after a `config` event
+      (latest request wins). Plans aren't pushed, and edits mark a target stale without an event.
+    - **A second launch during the quit wait opens no window.** main.js sets `appQuitting` in
+      `before-quit` and at the top of `window-all-closed`, so `second-instance` doesn't re-create
+      a window that the pending `app.quit()` would tear down.
+    - **The close listener** asks when downloads run or a sync apply, prune or rename runs. The
+      payload is `{running, sync}`; `running` is unchanged, and `sync` is `quitInfo()` (or `null`
+      when it throws).
+    - **downloader.js keeps its inline kill.** `proc-kill.js` is the shared module, and
+      searcher.js uses it; moving downloader.js onto it is open decision 3.
+    - **The isolation test also covers** an `initDeviceSync` that throws and an `ask` scenario
+      (`needsQuitAsk()` true, `quitInfo()` throwing). `reinstall-python` and `app-update:apply-now`
+      return before their hooks in dev mode, so neither is driven there.
+    - **The dev-app smoke saves once through the UI first.** A fresh `settings.json` shows
+      "55 changed" before the first Save, on the P3 tree too (`SettingsTab.jsx`
+      `countDirtySettings` counts backfilled defaults by design).
 ## Repo state and the branch protocol
 
 **Where this executes.** This plan runs on branch `wip/device-sync-handoff` of the fork
@@ -952,6 +1000,7 @@ detail per series.
 | `sync:export-report` | `{targetId}` → `{ok, path}`. main shows the save dialog through an injected `showSaveDialog` |
 | `sync:device-cover` | `{targetId, folder}` → `{ok, path}` (cached under `covers/` by hashed name) |
 | `sync:find-sources:start` / `:cancel` / `:get` / `:update-row` | Runner control. `update-row` patches `{query, pick, pinnedUrl, skip, include}` |
+| `sync:link` (added at P4) | `{targetId, suggestionIds:[…]}` → `{ok, linked}`, or `busy` while any job runs, or `invalid` (no plan, unknown suggestion, a series already bound, two links on one folder or series). Binds each suggestion's device folder to its series (rule 2's Link) and queues a re-plan |
 
 `sync-event` kinds (each carries `kind`, and job-bound ones carry `runId`):
 - `device`
@@ -1145,7 +1194,7 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
 - The repo CLAUDE.md is git-excluded on your PC, so the edits land in
   `sync-temp/context/CLAUDE.project.md`, and your local session copies them back.
 - `android/PARITY.md` gets N/A-DESKTOP-ONLY rows for the 7 global sync settings and every `sync:*`
-  channel (22 invoke channels plus `sync-event`).
+  channel (23 invoke channels plus `sync-event`; `sync:link` was added at P4).
 - STATE.md is rewritten at the phase boundary.
 - A forced re-read of every changed file, then the report. The ship decision follows.
 
@@ -1324,6 +1373,16 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
   - gate-free deletes run first when the pushes fit only after them;
   - the hash pool finishes a lone task after a failed worker start, and reports `changed`;
   - a mutation check: 20 deliberate breaks of the engine's guards, each one fails the suite.
+- **Added at P4** (deviation 13's calls):
+  - `sync:link`: binds, refuses `busy` during a job, re-plans (service);
+  - a device refusal ends the job `failed` with `summary.refusal` and stays in
+    `plans[id].refusal` (service);
+  - pre-warm pauses while a download runs and resumes after (service);
+  - the hook: buffering, snapshot adoption, a stale runId, the plans re-read (latest wins), find
+    rows, inert without `electronAPI`, a refused or rejected first get-state (hook);
+  - main.js under six scenarios, including `initfail` and `ask` (isolation);
+  - a mutation check of the new tests: 5 breaks of the hook, 3 of the preload/hook literals, 8 of
+    the main.js hooks and 1 of the service's refusal keeping; each one fails its test.
 
 **Monitor, service, contract, hook, searcher and isolation tests**
 - **Monitor.**
@@ -1543,7 +1602,7 @@ plan text it cites. None needed AOSP. The volume-id fix was checked in libuv `sr
 | 3,371,594 B record, 4,545,524 B hash cache | Why whole-record rewrites per file were rejected | read: `ls -la` of the CompareManga state files in `CompareManga.zip` |
 | ~250 KB | Estimated largest shard (One Piece, 1,197 chapters × ~200 B per entry) | derived; the 1,197 is from the parent plan (doc) |
 | 3,072 B shell cap vs 4 KiB legacy payload | Keeps chunked commands valid on every adbd | recall: adb `MAX_PAYLOAD_V1`, not re-checked; the review called it conservative |
-| 22 invoke channels + 1 event channel | The IPC surface this pass ships | derived: the contract table |
+| 23 invoke channels + 1 event channel | The IPC surface this pass ships (`sync:link` added at P4) | derived: the contract table; read: `contract.js` `CHANNEL_NAMES` |
 | `GetTickCount64()/1000`; `MoveFileExW(…, MOVEFILE_REPLACE_EXISTING)`; kill-on-close job | Why the boot epoch survives Fast Startup; why a rename is atomic but not durable; why a quit-time taskkill must be detached | read: libuv v1.x `src/win/util.c:502-503`, `fs.c:2341`, `process.c:93-96,1149-1152` |
 | 30 min | How long a prompt mark is honored | this plan's choice: covers crash, update and reinstall relaunches |
 | ~90 s | RECV of a 3 GB pending volume at 30 MB/s | derived; the 30 MB/s USB rate is an assumption, which P5 measures |

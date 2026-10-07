@@ -40,6 +40,9 @@ const CHANNEL_NAMES = Object.freeze([
   "find-sources:cancel",
   "find-sources:get",
   "find-sources:update-row",
+  // P4 decision: Link (rule 2) writes the record, not sync-targets.json, so
+  // it is its own channel rather than a config-op op.
+  "link",
 ]);
 
 const CHANNELS = Object.freeze(

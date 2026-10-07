@@ -360,7 +360,9 @@ test("validateTarget: folder root may not be inside or contain the library or us
 test("contract: refuse() has one shape and rejects unknown codes", () => {
   assert.deepStrictEqual(contract.refuse("busy", "x", { job: 1 }), { job: 1, ok: false, code: "busy", message: "x" });
   assert.throws(() => contract.refuse("nope", "x"));
-  assert.strictEqual(contract.CHANNEL_NAMES.length, 22);
+  // 22 from the plan plus sync:link (P4 decision).
+  assert.strictEqual(contract.CHANNEL_NAMES.length, 23);
+  assert.ok(contract.CHANNEL_NAMES.includes("link"));
   assert.ok(contract.CHANNELS_WHILE_DISABLED.has("sync:get-state"));
   assert.strictEqual(contract.CHANNELS_WHILE_DISABLED.size, 4);
 });
