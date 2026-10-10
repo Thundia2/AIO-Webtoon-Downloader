@@ -16,6 +16,7 @@ log; git history owns the events.
   - Every finding of the reviews was checked against the code, AOSP adb and libuv. The plan's last
     section holds the disposition tables.
 - **Now:** P0 to P4 are done and committed. P5 (packaged smoke, live tablet) needs your PC.
+  The local session starts from `sync-temp/HANDOFF-TO-LOCAL.md`.
 
 ## P4 service and integration (2026-10-07)
 
