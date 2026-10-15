@@ -17,9 +17,21 @@
 //   others: the child must be spawned `detached: true` so it leads its own
 //           process group; process.kill(-pid) then reaches the whole group.
 //           A child that isn't a group leader falls back to child.kill().
+//
+// killTreeNow (shutdownNow, app.on("quit")) is SYNCHRONOUS on win32: it
+// waits for taskkill (≤ NOW_TIMEOUT_MS). libuv puts every non-detached child
+// in a kill-on-close job object with SILENT_BREAKAWAY_OK, so when the app
+// exits the job kills the python at once while its own children (Playwright,
+// Chromium) are outside the job and live on. A detached taskkill fired just
+// before the exit was tried and killed: it lost that race 3/3 on Windows 11
+// (the python is gone before taskkill lists its children), orphaning the
+// grandchild exactly as no kill at all would (P5, deviation 15).
 // ============================================================
 
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
+
+// killTreeNow's cap on the synchronous taskkill (measured ~150-350 ms).
+const NOW_TIMEOUT_MS = 2000;
 
 // child → Promise that resolves on its "close" event. Filled by trackChild()
 // at spawn time, so killTree can tell "already closed" from "exited, close
@@ -51,20 +63,16 @@ function _exited(child) {
   return child.exitCode !== null || child.signalCode !== null;
 }
 
-// Fire the platform kill. `detached` (win32) spawns taskkill outside libuv's
-// kill-on-close job object and unrefs it, so it outlives an app.exit() that
-// follows immediately (shutdownNow; plan deviation 8).
-function _signalTree(child, signal, detached) {
+// Fire the platform kill (async on win32: killTree awaits the child's close).
+function _signalTree(child, signal) {
   if (child.pid == null) return;
   if (process.platform === "win32") {
     try {
       const tk = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
         windowsHide: true,
         stdio: "ignore",
-        detached: !!detached,
       });
       tk.on("error", () => {});
-      if (detached) tk.unref();
     } catch {
       /* taskkill missing: nothing better to try */
     }
@@ -90,16 +98,16 @@ function _signalTree(child, signal, detached) {
  * (its PID may be recycled), only awaited.
  *
  * @param {import('child_process').ChildProcess} child
- * @param {{timeoutMs?: number, detached?: boolean}} [opts]
+ * @param {{timeoutMs?: number}} [opts]
  */
-function killTree(child, { timeoutMs = 5000, detached = false } = {}) {
+function killTree(child, { timeoutMs = 5000 } = {}) {
   if (!child) return Promise.resolve({ closed: true });
   const tracked = _closed.has(child);
   const closeP = trackChild(child);
   // Untracked and already exited: we can't know whether close already fired,
   // so don't wait on it.
   if (!tracked && _exited(child)) return Promise.resolve({ closed: true });
-  if (!_exited(child)) _signalTree(child, "SIGTERM", detached);
+  if (!_exited(child)) _signalTree(child, "SIGTERM");
 
   return new Promise((resolve) => {
     let done = false;
@@ -112,7 +120,7 @@ function killTree(child, { timeoutMs = 5000, detached = false } = {}) {
     };
     let t2 = null;
     const t1 = setTimeout(() => {
-      if (process.platform !== "win32" && !_exited(child)) _signalTree(child, "SIGKILL", false);
+      if (process.platform !== "win32" && !_exited(child)) _signalTree(child, "SIGKILL");
       t2 = setTimeout(() => finish(false), 1000);
     }, timeoutMs);
     closeP.then(() => finish(true));
@@ -120,18 +128,24 @@ function killTree(child, { timeoutMs = 5000, detached = false } = {}) {
 }
 
 /**
- * Synchronous best effort for shutdownNow(): fire the kill and return.
- * win32 spawns a detached, unref'd taskkill; elsewhere SIGKILLs the group.
- * Contract: never throws; returns true when a signal was sent.
+ * Synchronous kill for shutdownNow(): the tree is dead (or taskkill timed
+ * out) when this returns, so an app exit right after can't orphan it (see
+ * the header). win32 waits for `taskkill /t /f` up to NOW_TIMEOUT_MS;
+ * elsewhere SIGKILLs the group (already synchronous).
+ * Contract: never throws; returns true when a kill was sent.
  */
 function killTreeNow(child) {
   try {
     if (!child || child.pid == null || _exited(child)) return false;
-    _signalTree(child, process.platform === "win32" ? "SIGTERM" : "SIGKILL", true);
+    if (process.platform === "win32") {
+      spawnSync("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore", timeout: NOW_TIMEOUT_MS });
+      return true;
+    }
+    _signalTree(child, "SIGKILL");
     return true;
   } catch {
     return false;
   }
 }
 
-module.exports = { killTree, killTreeNow, trackChild };
+module.exports = { killTree, killTreeNow, trackChild, NOW_TIMEOUT_MS };

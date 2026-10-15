@@ -50,6 +50,13 @@
 // download, Check All, a Search-tab search or a sync job runs.
 // Throttle (deviation 3): one hash worker while a download or Check All runs.
 //
+// SERVICE LOG (deviation 15; diag-log.js): userData/sync/logs/service.log
+// gets a `start`, `prewarm` (done / error), `stop` or `quit-now` line and a
+// copy of every [deviceSync] stderr line, while sync is on and
+// syncDiagnosticLog is true. The installed app has no console; this is
+// where its sync faults can be read, and P5's packaged smoke reads it as
+// its marker. grep: slog
+//
 // SELECTION. The op choices live in memory per target and are written to
 // selection.json on every change. A target never applied to gets its
 // identity-only record header written first, so the selection has an epoch
@@ -95,6 +102,7 @@ const mon = require("./monitor");
 const { FindSources } = require("./find-sources");
 const { AdbClient } = require("./adb/client");
 const locate = require("./adb/locate");
+const { ServiceLog, insideAsar } = require("./diag-log");
 
 const PREWARM_DELAY_MS = 30 * 1000;
 const REPLAN_DEBOUNCE_MS = 10 * 1000;
@@ -159,7 +167,7 @@ function _isObj(v) {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }
 
-function _log(...a) {
+function _stderr(...a) {
   try {
     console.error("[deviceSync]", ...a);
   } catch (_) {
@@ -205,6 +213,16 @@ function initDeviceSync(deps) {
   let stopP = null;
   let shut = false;
 
+  // The service log (diag-log.js): open from the start's mkdir to the end of
+  // a stop or shutdownNow, so nothing is written while sync is off; the
+  // closing line is written before it shuts. syncDiagnosticLog gates every
+  // line. _log mirrors each stderr line into it.
+  let slogOpen = false;
+  const slog = new ServiceLog({ dir: path.join(root, "logs"), now, active: () => slogOpen && settings.syncDiagnosticLog !== false });
+  function _log(...a) {
+    _stderr(...a);
+    slog.error(a);
+  }
   // Live only while started:
   let queue = null;
   let config = null;
@@ -309,6 +327,7 @@ function initDeviceSync(deps) {
     if (stopP) await stopP;
     queue = new WriteQueue();
     await fs.promises.mkdir(root, { recursive: true });
+    slogOpen = true;
     await sweepTmp(root).catch(() => 0);
     config = await _loadConfig();
     hashPool = new HashPool({ cachePath: path.join(root, HASH_CACHE_FILE), workers: _workers(), queue });
@@ -335,9 +354,21 @@ function initDeviceSync(deps) {
     started = true;
     if (!enabled || shut) {
       // Switched off (or quitting) while starting: undo at once.
-      await _stop();
+      await _stop({ reason: shut ? "shutdown" : "disabled" });
       return;
     }
+    // P5's marker reads `module` / `inAsar` (the packaged build loads sync/
+    // from inside app.asar) and `workers` (the pre-warm's pool size).
+    slog.event("start", {
+      module: __filename,
+      inAsar: insideAsar(__filename),
+      electron: process.versions.electron || null,
+      node: process.versions.node,
+      platform: process.platform,
+      pid: process.pid,
+      workers: hashPool.limit,
+      targets: _targets().length,
+    });
     _syncWatchers();
     const busyMs = T.busyPollMs || BUSY_POLL_MS;
     busyTimer = setInterval(() => _busyTick(), busyMs);
@@ -356,17 +387,23 @@ function initDeviceSync(deps) {
     }
   }
 
-  /** Stop everything; the job and find-sources are cancelled FIRST. */
-  async function _stop({ timeoutMs = SHUTDOWN_MS } = {}) {
+  /**
+   * Stop everything; the job and find-sources are cancelled FIRST.
+   * `reason` ('disabled' | 'shutdown') goes into the service log's stop line.
+   */
+  async function _stop({ timeoutMs = SHUTDOWN_MS, reason = "disabled" } = {}) {
     if (!started) return;
     started = false;
+    const t0 = now();
+    const hadJob = current ? current.phase : null;
+    const hadFind = !!(findSources && _safe(() => findSources.isRunning(), false));
     const waits = [];
     if (current) {
       current.ac.abort();
       waits.push(current.promise);
     }
     if (findSources) waits.push(findSources.cancelAndWait());
-    await _within(Promise.allSettled(waits), timeoutMs);
+    const settled = await _within(Promise.allSettled(waits).then(() => true), timeoutMs);
     if (tracker) tracker.stop();
     tracker = null;
     if (watcher) watcher.stop();
@@ -387,9 +424,13 @@ function initDeviceSync(deps) {
       await hashPool.flush().catch(() => {});
       hashPool.close();
     }
-    if (queue) await _within(queue.whenIdle(), timeoutMs);
+    const flushed = queue ? !!(await _within(queue.whenIdle().then(() => true), timeoutMs)) : true;
     hashPool = null;
     emit("device", _devicePayload());
+    // The clean-quit evidence P5 reads: the job and the search ended inside
+    // the wait (`settled`) and every record write landed (`flushed`).
+    slog.event("stop", { reason, ms: now() - t0, hadJob, hadFind, settled: !!settled, flushed });
+    slogOpen = false;
   }
 
   function _within(p, ms) {
@@ -558,9 +599,23 @@ function initDeviceSync(deps) {
     }
     const ac = new AbortController();
     prewarmAc = ac;
+    const t0 = now();
+    const s0 = { ...hashPool.stats };
+    // P5's marker. `run` is THIS pre-warm's share of the pool's counters (a
+    // plan may have hashed before it): run.hashed − run.mainThread ran in the
+    // eval'd workers. `spawned` is the pool's lifetime worker count.
+    const logEnd = (state, files, reason) => {
+      const s = hashPool ? hashPool.stats : s0;
+      const run = {};
+      for (const k of ["hashed", "hits", "mainThread", "workerDeaths"]) run[k] = s[k] - s0[k];
+      slog.event("prewarm", { state, files, ms: now() - t0, reason: reason || null, workers: hashPool ? hashPool.limit : null, fallback: hashPool ? hashPool.fallback : null, spawned: s.spawned, run });
+    };
     try {
       const pc = await walkLibrary(deps.getLibraryRoot());
-      if (!pc.ok) return _prewarmEmit({ state: "error", reason: pc.error });
+      if (!pc.ok) {
+        logEnd("error", 0, pc.error);
+        return _prewarmEmit({ state: "error", reason: pc.error });
+      }
       const files = [];
       const seen = new Set();
       for (const s of pc.series) {
@@ -584,12 +639,17 @@ function initDeviceSync(deps) {
         },
       });
       await hashPool.flush().catch(() => {});
+      logEnd("done", files.length);
       _prewarmEmit({ state: "done" });
     } catch (e) {
+      // A pause isn't logged: it repeats every busy poll while a download runs.
       if (ac.signal.aborted) {
         _prewarmEmit({ state: "paused", reason: _externallyBusy().why || "sync-job" });
         _schedulePrewarm(T.busyPollMs || BUSY_POLL_MS);
-      } else _prewarmEmit({ state: "error", reason: String((e && e.message) || e) });
+      } else {
+        logEnd("error", null, String((e && e.message) || e));
+        _prewarmEmit({ state: "error", reason: String((e && e.message) || e) });
+      }
     } finally {
       if (prewarmAc === ac) prewarmAc = null;
     }
@@ -1613,7 +1673,7 @@ function initDeviceSync(deps) {
     shutdown({ timeoutMs = SHUTDOWN_MS } = {}) {
       try {
         if (shut) return Promise.resolve();
-        const p = _within(_stop({ timeoutMs }), timeoutMs + 500).catch((e) => _log("shutdown", e && e.stack));
+        const p = _within(_stop({ timeoutMs, reason: "shutdown" }), timeoutMs + 500).catch((e) => _log("shutdown", e && e.stack));
         return p.then(() => {
           shut = true;
         });
@@ -1625,13 +1685,25 @@ function initDeviceSync(deps) {
 
     /**
      * app.on("quit") / app.exit(): synchronous and idempotent. Aborts the
-     * job, fires a detached tree kill at the search, abandons queued record
+     * job, kills the search's tree synchronously (proc-kill.js
+     * killTreeNow; ≤2 s on win32), abandons queued record
      * writes (each file on disk is whole: atomic renames) and flushes the PC
      * hash cache synchronously.
      */
     shutdownNow() {
       if (shut && !started) return;
       shut = true;
+      // Reached with the service still up only when shutdown() didn't run
+      // first: app.exit() (reinstall-python) or a quit that skipped
+      // window-all-closed. hadJob: the job this kill aborts. hadFind: a
+      // find-sources run is still registered (reinstall-python's awaited
+      // cancel can leave it registered while its last save settles);
+      // searchProc: its search process is still attached, i.e. this kill
+      // is the one that has to end the tree.
+      if (started) {
+        const s = findSources && findSources.searcher;
+        slog.event("quit-now", { hadJob: current ? current.phase : null, hadFind: !!(findSources && _safe(() => findSources.isRunning(), false)), searchProc: !!(s && _safe(() => s.isRunning(), false)) });
+      }
       try {
         if (current) current.ac.abort();
         if (current && current.transport) current.transport.destroy();
@@ -1661,6 +1733,7 @@ function initDeviceSync(deps) {
         _log("shutdownNow flush", e && e.message);
       }
       started = false;
+      slogOpen = false;
     },
 
     // For tools/ tests: the state get-state reports, without IPC.

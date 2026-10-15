@@ -178,6 +178,34 @@ test("cancelNow fires a synchronous tree kill", async () => {
   await waitFor(() => !alive(child) && !alive(grand), 5000, "tree gone");
 });
 
+test("cancelNow then an immediate process exit still kills the grandchild (the app.exit race)", async () => {
+  // A separate Node process stands in for Electron: start the tree, call
+  // cancelNow, exit at once. On win32 the exit closes libuv's job object,
+  // which kills the python but not its grandchild (silent breakaway), so a
+  // fire-and-forget taskkill loses the race (P5, deviation 15).
+  const pidfile = path.join(TMP, `pids-exit-${++seq}.txt`);
+  const src = `
+    const { Searcher } = require(${JSON.stringify(path.join(__dirname, "..", "UI-source", "electron", "searcher.js"))});
+    const fs = require("fs");
+    const s = new Searcher({ extraEnv: { FAKE_PIDFILE: ${JSON.stringify(pidfile)} } });
+    s.runSearch({ pythonCmd: ${JSON.stringify(PY)}, scriptPath: ${JSON.stringify(SCRIPT)}, workingDir: ${JSON.stringify(TMP)}, query: "tree", opts: {} }).catch(() => {});
+    const t = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(pidfile)}) || !fs.readFileSync(${JSON.stringify(pidfile)}, "utf8").includes(" ")) return;
+      clearInterval(t);
+      s.cancelNow();
+      process.exit(0);
+    }, 25);`;
+  const { spawnSync } = require("child_process");
+  const r = spawnSync(process.execPath, ["-e", src], { stdio: "inherit", timeout: 20000 });
+  assert.strictEqual(r.status, 0, `the stand-in exited ${r.status} ${r.error || ""}`);
+  const [child, grand] = fs.readFileSync(pidfile, "utf8").trim().split(" ").map(Number);
+  try {
+    await waitFor(() => !alive(child) && !alive(grand), 4000, "tree gone after the parent exited");
+  } finally {
+    for (const pid of [child, grand]) if (alive(pid)) try { process.kill(pid, "SIGKILL"); } catch {}
+  }
+});
+
 test("killTree on a child that ignores SIGTERM escalates and still resolves", async () => {
   if (process.platform === "win32") return; // taskkill /f is already forceful
   const { spawn } = require("child_process");

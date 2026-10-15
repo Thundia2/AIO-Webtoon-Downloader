@@ -1,7 +1,7 @@
 // ============================================================
 // DEVICE SYNC — GLOBAL SETTINGS (pure)
 //
-// Owns the seven global sync settings: their defaults, the presets the UI may
+// Owns the eight global sync settings: their defaults, the presets the UI may
 // offer (SYNC_SETTING_SPECS), and resolveSyncSettings(saved), which turns
 // whatever settings.json holds into a complete, valid set. Per-target fields
 // live in sync-targets.json and resolve in profiles.js.
@@ -35,6 +35,9 @@ const SYNC_SETTING_SPECS = Object.freeze({
   syncSizeWarnPct: { type: "enum", default: 30, presets: Object.freeze([0, 15, 30, 50]) },
   // One regex per line with a named group `ch` (chapter-labels.js).
   syncChapterPatterns: { type: "patterns", default: "" },
+  // userData/sync/logs/service.log (diag-log.js). On by default: the installed
+  // app has no console, so this is where sync faults can be read back.
+  syncDiagnosticLog: { type: "boolean", default: true },
 });
 
 const SYNC_SETTING_KEYS = Object.freeze(Object.keys(SYNC_SETTING_SPECS));

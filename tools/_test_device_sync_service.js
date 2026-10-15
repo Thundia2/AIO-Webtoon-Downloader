@@ -1053,6 +1053,166 @@ test("pre-warm hashes what targets mirror, pauses while a download runs, then fi
   }
 });
 
+// ---------------------------------------------------------------- service log (deviation 15)
+
+const diagLog = require(path.join(SYNC, "diag-log.js"));
+function slogLines(a) {
+  try {
+    return fs
+      .readFileSync(path.join(a.userData, "logs", diagLog.FILE), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+  } catch (e) {
+    if (e && e.code === "ENOENT") return [];
+    throw e;
+  }
+}
+
+test("service log: start (module path, not in asar), pre-warm in workers, clean stop; closed afterwards", async () => {
+  const a = await app({ prewarmDelayMs: 0, tag: "slog" });
+  series(a.lib, "Rho", { "Ch.001.cbz": 3000, "Ch.002.cbz": 3000 });
+  await a.addFolderTarget();
+  await a.waitEvent((e) => e.kind === "prewarm" && e.prewarm.state === "done", 8000, 0, "prewarm done");
+  await a.idle();
+  await a.svc.shutdown({ timeoutMs: 2000 });
+  const lines = slogLines(a);
+  const evs = lines.map((l) => l.ev);
+  assert.strictEqual(evs[0], "start", evs.join(","));
+  assert.strictEqual(lines[0].module, path.join(SYNC, "service.js"));
+  assert.strictEqual(lines[0].inAsar, false);
+  assert.strictEqual(lines[0].node, process.versions.node);
+  assert.ok(lines[0].workers >= 1);
+  const pw = lines.find((l) => l.ev === "prewarm");
+  assert.ok(pw, evs.join(","));
+  assert.strictEqual(pw.state, "done");
+  assert.strictEqual(pw.files, 2);
+  assert.ok(pw.spawned >= 1, JSON.stringify(pw));
+  // The connect plan may hash first; the pre-warm's own share is hashed + hits.
+  assert.strictEqual(pw.run.hashed + pw.run.hits, 2, JSON.stringify(pw.run));
+  assert.strictEqual(pw.run.mainThread, 0, "nothing on the main thread");
+  assert.strictEqual(pw.fallback, false);
+  const stop = lines[lines.length - 1];
+  assert.deepStrictEqual([stop.ev, stop.reason, stop.settled, stop.flushed, stop.hadJob, stop.hadFind], ["stop", "shutdown", true, true, null, false]);
+  for (const l of lines) assert.ok(!Number.isNaN(Date.parse(l.t)), l.t);
+  // Closed: a later quit adds nothing.
+  const n = lines.length;
+  a.svc.shutdownNow();
+  assert.strictEqual(slogLines(a).length, n);
+});
+
+test("service log: a [deviceSync] error line while on lands in the log; nothing while off", async () => {
+  const a = await app({ enabled: false, tag: "slog-err" });
+  try {
+    // Off: an unreadable sync-targets.json is never even read.
+    fs.mkdirSync(a.userData, { recursive: true });
+    fs.writeFileSync(path.join(a.userData, "sync-targets.json"), "{not json");
+    a.svc.notifyLibraryChanged("download");
+    await sleep(50);
+    assert.strictEqual(fs.existsSync(path.join(a.userData, "logs")), false, "nothing while off");
+    a.settings = { ...a.settings, syncEnabled: true };
+    await a.svc.applySettings(a.settings);
+    const errs = slogLines(a).filter((l) => l.ev === "error");
+    assert.strictEqual(errs.length, 1, JSON.stringify(slogLines(a)));
+    assert.match(errs[0].text, /^sync-targets\.json unreadable; starting empty:/);
+    a.settings = { ...a.settings, syncEnabled: false };
+    await a.svc.applySettings(a.settings);
+    const last = slogLines(a).pop();
+    assert.deepStrictEqual([last.ev, last.reason], ["stop", "disabled"]);
+    const n = slogLines(a).length;
+    // Off again: facade faults go to stderr only.
+    a.svc.notifyLibraryChanged("download");
+    await a.call("plan", { targetId: "x" });
+    assert.strictEqual(slogLines(a).length, n, "nothing after the stop line");
+  } finally {
+    await a.close();
+  }
+});
+
+test("service log: syncDiagnosticLog false writes no file at all, and switching it on mid-run starts logging", async () => {
+  const a = await app({ prewarmDelayMs: 0, tag: "slog-off", settings: { syncDiagnosticLog: false } });
+  try {
+    series(a.lib, "Sigma", { "Ch.001.cbz": 1000 });
+    await a.addFolderTarget();
+    await a.waitEvent((e) => e.kind === "prewarm" && e.prewarm.state === "done", 8000, 0, "prewarm done");
+    assert.ok(fs.existsSync(a.userData), "sync itself runs");
+    assert.strictEqual(fs.existsSync(path.join(a.userData, "logs")), false, "no log dir");
+    a.settings = { ...a.settings, syncDiagnosticLog: true };
+    await a.svc.applySettings(a.settings);
+    await a.svc.shutdown({ timeoutMs: 2000 });
+    assert.deepStrictEqual(slogLines(a).map((l) => l.ev), ["stop"]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("service log: shutdownNow with the service up writes quit-now naming the running job", async () => {
+  const g = gate();
+  const a = await app({ tag: "slog-now", executorDeps: { hooks: (pt) => (pt === "rename-before-mv" ? (g._hit(), new Promise(() => {})) : undefined) } });
+  series(a.lib, "Tau", { "Ch.001.cbz": 1000 });
+  const id = await a.addFolderTarget();
+  await a.idle();
+  assert.strictEqual((await a.job((await a.call("apply", { targetId: id })).runId)).status, "completed");
+  await a.idle();
+  const sk = (await a.state()).plans[id].summary.series[0].seriesKey;
+  await a.call("rename-device-folder", { targetId: id, seriesKey: sk, to: "Tau 2" });
+  await g.reached;
+  a.svc.shutdownNow();
+  const last = slogLines(a).pop();
+  assert.deepStrictEqual([last.ev, last.hadJob, last.hadFind, last.searchProc], ["quit-now", "rename", false, false]);
+  const n = slogLines(a).length;
+  a.svc.shutdownNow();
+  await a.svc.shutdown();
+  assert.strictEqual(slogLines(a).length, n, "idempotent, and closed");
+});
+
+test("diag-log: rotates past maxBytes into one old file, truncates long lines, never throws", async () => {
+  const dir = path.join(mkdir("diag"), "logs");
+  let on = true;
+  const log = new diagLog.ServiceLog({ dir, active: () => on, maxBytes: 2000 });
+  for (let i = 0; i < 60; i += 1) assert.strictEqual(log.event("x", { i, pad: "p".repeat(40) }), true);
+  const cur = fs.readFileSync(path.join(dir, diagLog.FILE), "utf8");
+  const old = fs.readFileSync(path.join(dir, diagLog.OLD_FILE), "utf8");
+  assert.ok(cur.length <= 2000 && old.length <= 2000, `${cur.length} / ${old.length}`);
+  const lastI = JSON.parse(cur.trim().split("\n").pop()).i;
+  assert.strictEqual(lastI, 59, "newest line in the current file");
+  assert.strictEqual(fs.readdirSync(dir).length, 2, "at most two files");
+  // A huge error is truncated, not dropped.
+  log.error(["boom", "x".repeat(20000)]);
+  const big = JSON.parse(fs.readFileSync(path.join(dir, diagLog.FILE), "utf8").trim().split("\n").pop());
+  assert.strictEqual(big.ev, "error");
+  assert.ok(big.text.startsWith("boom x") && big.text.length <= 8 * 1024);
+  // Escaping can double a stack's length; the line still keeps the start.
+  log.error(["stack", "at f\n".repeat(4000)]);
+  const esc = JSON.parse(fs.readFileSync(path.join(dir, diagLog.FILE), "utf8").trim().split("\n").pop());
+  assert.deepStrictEqual([esc.ev, esc.truncated, esc.text.slice(0, 10)], ["error", undefined, "stack at f"]);
+  on = false;
+  assert.strictEqual(log.event("y"), false);
+  // An unwritable dir (a file in its place) only loses lines.
+  const blocked = path.join(mkdir("diag2"), "logs");
+  fs.writeFileSync(blocked, "a file");
+  const bad = new diagLog.ServiceLog({ dir: blocked, active: () => true });
+  assert.strictEqual(bad.event("z"), false);
+  assert.strictEqual(bad.error(["e"]), false);
+  assert.strictEqual(bad.event("z", { cyc: (() => { const c = {}; c.c = c; return c; })() }), false, "unserializable fields");
+  // Deleted while running. The file: the rotation check that finds it gone
+  // resets the size, so the fresh file isn't rotated one line later. The
+  // folder: recreated, instead of every later line being lost.
+  const hd = path.join(mkdir("diag3"), "logs");
+  const heal = new diagLog.ServiceLog({ dir: hd, active: () => true, maxBytes: 300 });
+  for (let i = 0; i < 2; i += 1) heal.event("a", { pad: "p".repeat(60) }); // ~240 B, under the cap
+  fs.rmSync(path.join(hd, diagLog.FILE));
+  for (let i = 0; i < 2; i += 1) assert.strictEqual(heal.event("b", { i, pad: "p".repeat(60) }), true);
+  const healed = fs.readFileSync(path.join(hd, diagLog.FILE), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.deepStrictEqual(healed.map((l) => `${l.ev}${l.i}`), ["b0", "b1"], "both lines in the fresh file");
+  fs.rmSync(hd, { recursive: true, force: true });
+  assert.strictEqual(heal.event("c"), true, "folder recreated");
+  assert.deepStrictEqual(fs.readFileSync(path.join(hd, diagLog.FILE), "utf8").trim().split("\n").map((l) => JSON.parse(l).ev), ["c"]);
+  assert.strictEqual(diagLog.insideAsar("C:\\Program Files\\AIO\\resources\\app.asar\\electron\\sync\\service.js"), true);
+  assert.strictEqual(diagLog.insideAsar("/opt/AIO/resources/app.asar.unpacked/x.js"), false);
+  assert.strictEqual(diagLog.insideAsar(path.join(SYNC, "service.js")), false);
+});
+
 test("forget-record clears through a new epoch; the next plan is a first sync again", async () => {
   const a = await app();
   try {

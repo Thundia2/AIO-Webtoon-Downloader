@@ -15,10 +15,27 @@ log; git history owns the events.
     own review.
   - Every finding of the reviews was checked against the code, AOSP adb and libuv. The plan's last
     section holds the disposition tables.
-- **Now:** P0 to P4 are done and committed. The work is back on your PC (2026-10-10): the suite
-  passed on Windows, deviation 14 changed two P4 calls, and memory is folded in. Next: adapt the
-  dev-app smoke for Windows (your pick), then P5 (packaged smoke, live tablet).
+- **Now:** P0 to P4 are done and committed, and P5 is done except the live tablet (2026-10-15,
+  deviation 15). **You moved the tablet run to after the UI pass** (2026-10-15). Next: P6 and the
+  UI pass, which start only when you say so; then the tablet run, still with your OK and your
+  hands on the cable.
   `sync-temp/HANDOFF-TO-LOCAL.md` is the handoff that brought it back.
+
+## P5 on the PC (2026-10-15)
+
+| Item | State |
+|---|---|
+| Dev-app smoke | Adapted for Windows: `electron.exe`, a `--user-data-dir` profile, real python running a sleep script. **Passes**, including restore-a-minimized-window on second launch; settings JSONs unchanged (sha256 vs backup) |
+| Isolation | `--user-data-dir` moves userData and the lock; **no `AIO_USER_DATA_DIR` hook** (open decision 3 closed). `<ud>/python-env/.setup-complete` skips first-run setup |
+| Marker → service log | Your pick: a standing `userData/sync/logs/service.log` (`sync/diag-log.js`), with a new global setting `syncDiagnosticLog` (default on) so the UI can switch it off. Eight global settings now |
+| Packaged smoke | `tools/_smoke_device_sync_packaged.js`; three quit paths (close, reinstall-python, bare `app.exit`). **Passes**: asar load, pre-warm in workers, no surviving search tree |
+| Quit-time kill | **Found and fixed:** the detached taskkill lost to the job object's kill 3/3, orphaning the search's grandchild. Your pick: synchronous taskkill (≤2 s cap, ~140-350 ms measured) |
+| NTFS fsync | ~4-5 ms per shard write (`tools/_bench_device_sync_fsync.js`); batched intent stays off |
+| Live script | `tools/_live_device_sync.js` written, and its `--self-test` passes against the fake adb server. **Not run on the tablet** |
+| Search timing | `tools/_bench_find_sources_search.js`: 57-137 s per query; probe 50%, fan-out 39%, T3 11%; comix alone sets the probe's length (38-74 s, in 4 of 5). Probe deadline declined (open decision 4) |
+| Live tablet | **Deferred by you until the UI is complete.** `node tools/_live_device_sync.js auto` (about 10-15 min unattended), then `unplug reboot` with you at the cable, then `cleanup`; `checklist` prints the two manual checks |
+| Live-script safety | `transportAt` checks the parent and every existing level before `mkdir`, and refuses a device without `realpath`; self-test 21 checks, both refusals mutation-checked |
+| Suite | 14 `tools/_test_*.js` × node 24.13.0 and Electron 40's node 24.15.0, all pass (service 31, searcher 9, exec 50) |
 
 ## Back on the PC (2026-10-10)
 
@@ -124,10 +141,11 @@ log; git history owns the events.
    - weak (`name`/`similar`) adoption matches block pushes only on a first sync (parent rule 2 as
      written);
    - a fork is the same identity whatever the derived names.
-3. P5's `AIO_USER_DATA_DIR` hook, if Chromium's `--user-data-dir` doesn't isolate the packaged
-   test: ask first.
-4. P5's `AIO_SEARCH_PROBE_DEADLINE`, only if measurement shows the probe phase dominates: ask first
-   (it touches the in-flight `search_orchestrator.py`).
+3. ~~P5's `AIO_USER_DATA_DIR` hook~~ **Closed 2026-10-15**: `--user-data-dir` isolates the
+   unpacked exe, so no hook is needed.
+4. ~~P5's `AIO_SEARCH_PROBE_DEADLINE`~~ **Declined 2026-10-15**: the probe is 50% of search time
+   and comix's probe alone sets its length; a cap would mostly cost comix its measured rating, and
+   find-sources runs in the background. `search_orchestrator.py` is untouched.
 5. ~~Calls made in P4 for your confirmation~~ **Answered 2026-10-10** (deviation 14): job-end
    refusals kept plus an early `device-ready` line; selection persisted always; `isPathBusy`
    unwired and no window during the quit wait both kept.
@@ -140,6 +158,9 @@ Also in the `service.js` header.
 - Mount `useDeviceSync` in App.jsx, and call its `refresh()` after a save that flips
   `syncEnabled`.
 - Choose which presets to expose.
+- Expose `syncDiagnosticLog` (default on) as a toggle; you asked for the log to be switchable
+  from the UI (P5, deviation 15). Optionally an "open log folder" action
+  (`userData/sync/logs/`).
 - Draw the name choice for a re-pushed gone folder (`rebind`, `removedOnDevice`; decision 10).
 - Add the sync keys to `get-settings` together with `DEFAULT_SETTINGS`, plus the settings-twin
   test.

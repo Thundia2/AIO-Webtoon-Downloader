@@ -1,9 +1,11 @@
 // Dev-app smoke for the Device Sync integration, with sync OFF (plan P4).
-// Run (Linux container): xvfb-run -a node tools/_smoke_device_sync_dev.js [--app <UI-source dir>] [--baseline]
-//   PLAYWRIGHT_PATH overrides where `playwright` is required from.
+// Run: node tools/_smoke_device_sync_dev.js [--app <UI-source dir>] [--baseline] [--python <exe>]
+//   Linux without a display: prefix with `xvfb-run -a`. Needs UI-source/dist (npm run build).
+//   PLAYWRIGHT_PATH overrides where `playwright` is required from (on the
+//   Windows PC it lives only in the npx cache: %LOCALAPPDATA%\npm-cache\_npx\<hash>\node_modules\playwright).
 //
 // Launches the real dev app (electron + UI-source, renderer from dist/) with
-// an isolated userData (XDG_CONFIG_HOME) and library (AIO_OUTPUT_DIR), then:
+// an isolated userData and library (AIO_OUTPUT_DIR), then:
 //   1. after one UI Save on the fresh profile, settings load with 0 changed
 //      ("Up to date") and Save round-trips;
 //   2. a series merge works, dry run then real;
@@ -13,8 +15,16 @@
 //      measured from "Quit anyway" to process exit (compare against
 //      --baseline on the previous tree);
 //   5. no userData/sync/ folder appears, and main logs no [deviceSync] line.
-// The "download" is a fake python (sh: exec sleep), so no network or Python.
-// Linux/macOS only (the fake python is an sh script).
+// userData isolation is Chromium's --user-data-dir switch: Electron honors it
+// for app.getPath("userData") from the first line of main, and the
+// single-instance lock is keyed on it (measured on Windows, Electron 40).
+// XDG_CONFIG_HOME is set as well for Linux. The real
+// %APPDATA%\aio-downloader-ui is never opened.
+// The "download" never reaches aio-dl: the app spawns
+// `<pythonCmd> -u <scriptPath> ...` and the smoke points scriptPath at a
+// sleep script. pythonCmd is an sh script that execs sleep on Linux/macOS, and
+// real python (--python, default "python") on Windows, which has no sh;
+// node.exe can't stand in there because it rejects `-u`.
 
 const fs = require("fs");
 const os = require("os");
@@ -29,7 +39,8 @@ const opt = (k) => {
 const BASELINE = argv.includes("--baseline");
 const REPO = path.resolve(__dirname, "..");
 const APP = path.resolve(opt("--app") || path.join(REPO, "UI-source"));
-const ELECTRON = path.join(APP, "node_modules", "electron", "dist", process.platform === "darwin" ? "Electron.app/Contents/MacOS/Electron" : "electron");
+const WIN = process.platform === "win32";
+const ELECTRON = path.join(APP, "node_modules", "electron", "dist", process.platform === "darwin" ? "Electron.app/Contents/MacOS/Electron" : WIN ? "electron.exe" : "electron");
 const { _electron } = require(process.env.PLAYWRIGHT_PATH || "playwright");
 
 let failures = 0;
@@ -48,9 +59,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const LIB = path.join(TMP, "library");
   fs.mkdirSync(CFG, { recursive: true });
   fs.mkdirSync(LIB, { recursive: true });
-  const fakePy = path.join(TMP, "fakepy.sh");
-  fs.writeFileSync(fakePy, "#!/bin/sh\nexec sleep 120\n");
-  fs.chmodSync(fakePy, 0o755);
+  const sleepScript = path.join(TMP, "sleep.py");
+  fs.writeFileSync(sleepScript, "import time\ntime.sleep(120)\n");
+  let fakePy = opt("--python") || "python";
+  if (!WIN) {
+    fakePy = path.join(TMP, "fakepy.sh");
+    fs.writeFileSync(fakePy, "#!/bin/sh\nexec sleep 120\n");
+    fs.chmodSync(fakePy, 0o755);
+  }
   const A = path.join(LIB, "Alpha");
   const B = path.join(LIB, "Alpha (2)");
   for (const [dir, ch] of [[A, "1"], [B, "2"]]) {
@@ -62,7 +78,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const env = { ...process.env, XDG_CONFIG_HOME: CFG, AIO_OUTPUT_DIR: LIB };
   delete env.ELECTRON_RUN_AS_NODE;
   delete env.NODE_ENV;
-  const args = ["--no-sandbox", APP];
+  const args = ["--no-sandbox", `--user-data-dir=${CFG}`, APP];
   console.log(`app: ${APP}${BASELINE ? " (baseline)" : ""}`);
 
   const app = await _electron.launch({ executablePath: ELECTRON, args, env, timeout: 60_000 });
@@ -150,7 +166,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   }
 
   // 4. close with a running download
-  await win.evaluate((p) => window.electronAPI.saveSettings({ ...p.s, pythonCmd: p.py }), { s: after, py: fakePy });
+  // workingDir too: the app creates it on download start, and its default can
+  // sit outside the temp dir (Documents\AIO Downloader when packaged).
+  await win.evaluate((p) => window.electronAPI.saveSettings({ ...p.s, pythonCmd: p.py, scriptPath: p.script, workingDir: p.wd }), { s: after, py: fakePy, script: sleepScript, wd: TMP });
   const started = await win.evaluate(() => window.electronAPI.startDownload({ url: "https://example.test/series/alpha", args: [] }));
   check("fake download started", !!started, JSON.stringify(started));
   await sleep(1000);

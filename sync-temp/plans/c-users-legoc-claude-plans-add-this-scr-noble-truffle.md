@@ -2,7 +2,8 @@
 
 **Status: rev 4, approved 2026-10-06 ("Start with the plan"), cloud session on
 `wip/device-sync-handoff`. P0 to P4 are done; back on your PC since 2026-10-10, where deviation 14
-changed two P4 calls; P5 is next.**
+changed two P4 calls. P5 is done on 2026-10-15 except the live tablet run, which you moved to after
+the UI pass (deviation 15).**
 - Rev 1 (2026-09-30) got an adversarial review on 2026-10-01: 2 critical, 9 major, 14 minor.
   Rev 2 checked every finding against the code and AOSP and folded in the confirmed ones. Where the
   review was wrong or a better fix exists, it says so.
@@ -187,11 +188,12 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
      - the PC hash cache at each job end and in `shutdownNow()`.
    - So `shutdownNow()` is synchronous and idempotent (it runs again after `window-all-closed`'s
      awaited `shutdown()`). Its steps:
-     1. **First**, while the root PID is still alive, spawn the find-sources taskkill with
-        `{detached: true, stdio: "ignore", windowsHide: true}` plus `unref()`. libuv puts every
-        non-detached child in a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
-        (`src/win/process.c:93-96`, `:1149-1152`). A plain spawn would therefore die with Electron
-        (second review #11).
+     1. **First**, while the root PID is still alive, kill the find-sources tree **synchronously**
+        (`spawnSync` taskkill, ≤2 s). libuv puts every non-detached child in a job object with
+        `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`src/win/process.c:93-96`, `:1149-1152`), so a
+        fire-and-forget taskkill can't outlive the exit (second review #11). **Corrected at P5
+        (deviation 15):** rev 4's detached, unref'd taskkill lost the race to the job's own kill
+        of the root, which orphaned the grandchild.
      2. Destroy the sockets; adbd then unlinks the partial file.
      3. Stop the hash workers.
      4. Write the job's cancelled status and the PC hash cache through the synchronous writer.
@@ -347,8 +349,8 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
       first (`deletes-first`); otherwise apply refuses `blocked` with the numbers.
     - **`.nomedia`** is written at apply start when the profile asks for it; a failure is a
       warning.
-    - **Batched intent is built and tested, and off** (`intentBatch = 1`) until P5 measures the
-      NTFS fsync cost.
+    - **Batched intent is built and tested, and off** (`intentBatch = 1`). P5 measured the NTFS
+      fsync cost at about 4-5 ms per shard write and kept it off (deviation 15).
     - **Device metadata is read per file over the sync protocol** (RECV, ≤256 KB):
       `details.json` in every folder, `.aio_series.json` only in unbound ones. Parent rule 2 says
       "one batched shell call"; RECV needs no shell parsing of file contents. It costs one small
@@ -446,6 +448,81 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
       refusal path ×2, `mayNeedMode`, the header write, the deferral, the deferred flush, single
       flight); each one fails its test. The first run missed the once-per-job guard because the
       test used apply, which prepares once; it now uses verify.
+15. **P5 on your PC: the service log, the quit-time kill, and what was measured (2026-10-15).**
+    Pinned by `tools/_test_device_sync_service.js` (5 tests), `_test_searcher_cancel.js` (1),
+    `_smoke_device_sync_packaged.js` and `_live_device_sync.js --self-test`.
+    - **Isolation needs no main.js hook.** Electron 40 takes `--user-data-dir=<dir>` as
+      `app.getPath("userData")` before ready, and the single-instance lock keys on it (checked
+      on a minimal app and on the unpacked exe). So the `AIO_USER_DATA_DIR` hook (open decision
+      3 in STATE.md) is not added. A fresh profile runs the first-run Python setup; creating
+      `<userData>/python-env/.setup-complete` skips it.
+    - **The marker became a persistent service log** (your pick: a standing log, with a
+      setting to switch it off later). `sync/diag-log.js` `ServiceLog` appends JSON lines to
+      `userData/sync/logs/service.log`: `start` (module path, `inAsar`, versions, pool size,
+      target count), `prewarm` at done or error (this run's share of the pool counters, plus
+      `spawned` and `fallback`), `stop` (`reason`, `ms`, `hadJob`, `hadFind`, `settled`,
+      `flushed`) or `quit-now` (`hadJob`, `hadFind`, `searchProc`), and a copy of every
+      `[deviceSync]` stderr line. Writes are synchronous, never throw, are capped per line, and
+      rotate to `service.1.log` at 256 KB. Nothing is written while sync is off: the log
+      opens at the start's mkdir and closes after the stop or quit-now line.
+      - **A new global setting, `syncDiagnosticLog`** (boolean, default on), gates every line.
+        That makes eight global sync settings; P6's PARITY rows count it.
+      - `HashPool.stats.spawned` was added, so the log can show that the workers actually
+        started.
+    - **`killTreeNow` is now synchronous on win32; this corrects deviation 8 step 1.** The
+      detached, unref'd taskkill lost its race in 3 of 3 runs on Windows 11. When the app
+      exits, the kill-on-close job ends the python at once, and its children are outside that
+      job (`SILENT_BREAKAWAY_OK`), so by the time taskkill lists the tree, the root is gone
+      and the grandchild (Playwright's Chromium in real use) is orphaned. `spawnSync("taskkill
+      /t /f")` capped at `NOW_TIMEOUT_MS` = 2 s finishes before the exit: about 140-350 ms
+      measured. Elsewhere it is still a synchronous SIGKILL of the group. The `detached`
+      option is gone from `killTree`.
+      - The packaged smoke found this. A bare `app.exit(0)` with a search running left the
+        grandchild alive. The new searcher test reproduces it with a Node stand-in that calls
+        `cancelNow()` and exits at once: it fails on the old code and passes on the new.
+    - **Batched intent stays off** (`intentBatch = 1`). One atomic shard write (write, fsync,
+      rename) costs 3.6-4.7 ms p50 on C: in temp, and 4.3-5.3 ms under `%APPDATA%`, for shards
+      of 20, 200 and 1,000 entries. Without the fsync it is 1.5-2.5 ms. Two writes per pushed
+      file (intent, then done) add about 10 ms against a chapter's push time of a second or
+      more, so batching would buy little and widen the window an interruption can lose. One
+      outlier of 1.16 s at 1,000 entries under `%APPDATA%` was an indexer or AV spike, not a
+      trend. Re-measure with `tools/_bench_device_sync_fsync.js`.
+    - **`adb/client.js` exports `drainAllowanceMs`**, so the live script compares the tablet's
+      measured DATA→OKAY wait against the client's own allowance instead of a copy of it.
+    - **Packaged smoke** (`tools/_smoke_device_sync_packaged.js`): `electron-builder --dir`
+      from the local Electron (`-c.electronDist`, so nothing is downloaded), into a scratch
+      output directory so `release/` is untouched. Three quit paths, each with a temp profile,
+      a temp library, a folder target and a fake search whose grandchild stands in for
+      Chromium:
+      - (A) a normal window close;
+      - (B) the real `reinstall-python` handler, with `app.relaunch` stubbed;
+      - (C) a bare `app.exit(0)`.
+      Every path showed the module loading from inside `app.asar` and the pre-warm hashing in
+      the workers (`mainThread` 0). No search process survived any path, and no path wrote an
+      error line. A ends with a clean `stop` (`settled`, `flushed`); C ends with a `quit-now`
+      that had a live search to kill.
+    - **The live script exists and is self-tested, and has not been run on the tablet.**
+      `tools/_live_device_sync.js` covers probe, names, mtime, drain, interrupt, throughput,
+      e2e, unplug and reboot. It refuses any path outside the scratch root, and
+      `--self-test` runs every step against the fake adb server.
+    - **The live script checks every level before it creates anything.** `transportAt` resolves
+      SCRATCH's parent and each existing level of the target before its `mkdir`, and refuses
+      when `realpath` doesn't work. The transport's own probe falls back to the configured root
+      when `realpath` fails, so on its own it can't prove anything. The self-test covers a
+      symlinked scratch folder and a device without `realpath`.
+    - **Search timing** (`tools/_bench_find_sources_search.js`, 5 library-style folder names
+      through the real FindSources + Searcher, 2026-10-15). 57-137 s per query, 572 s wall.
+      Phase share: fan-out 39%, **probe 50%**, T3 11%. The probe is the largest phase, but not a
+      majority, and its length is one site's: **comix's browser-rendered probe was the slowest
+      in 4 of 5 queries (38-74 s)**; every other site's probe finished in ≤14 s, apart from one
+      mangadex outlier at 54 s. Fan-out was bounded by its 60 s barrier (dead hosts at about
+      40 s). `PROBE_PHASE_DEADLINE_S` (240 s) is hardcoded in `search_orchestrator.py` (the
+      fan-out's deadline already reads `AIO_SEARCH_FANOUT_DEADLINE`). So
+      `AIO_SEARCH_PROBE_DEADLINE` would edit that in-flight file, and a deadline short enough to
+      matter mostly drops comix to its seed rating. **Not added: you declined it on 2026-10-15**
+      (STATE.md open decision 4).
+    - **The live tablet run is deferred until the UI pass is complete** (your call, 2026-10-15).
+      P5 stays open on that item only.
 ## Repo state and the branch protocol
 
 **Where this executes.** This plan runs on branch `wip/device-sync-handoff` of the fork
@@ -524,7 +601,7 @@ No module requires `electron`. Collaborators are injected, following the `series
 | `monitor.js` | `host:track-devices-l` on a persistent socket (backoff 2→60 s, polling `host:devices-l` every 5 s after 3 straight failures), folder presence, focus-aware prompt state machine (rule 10) | No CLI child process; prompt marks keyed with a boot epoch and honored for 30 min only |
 | `find-sources.js` | Runner: sequential searches on its own `Searcher`, top 5 candidates, resumable, retry with an edited query; waits while Check All or the Search tab's search runs | Unchanged scope |
 | `service.js` | `initDeviceSync(deps)`, every `sync:*` handler, settings hooks, quit hooks, library-change notifications, badge computation. It validates `deps` and throws loudly at init if any is missing or has the wrong type. The returned facade **never throws and never rejects**: every method catches, logs and resolves | Failure isolation (review #2; second review #1, #18) |
-| `electron/proc-kill.js` | `killTree(child, {timeoutMs, detached})` → a Promise that resolves when the child closes (or on timeout). win32: `taskkill /pid N /t /f` with `windowsHide`; `detached: true` (only `shutdownNow()` uses it) spawns taskkill outside libuv's kill-on-close job and `unref()`s it. Elsewhere: `process.kill(-pid)` on a detached group, then SIGKILL on timeout | New shared helper. `downloader.js:952` keeps its inline copy because that file is in-flight |
+| `electron/proc-kill.js` | `killTree(child, {timeoutMs})` → a Promise that resolves when the child closes (or on timeout). win32: `taskkill /pid N /t /f` with `windowsHide`. Elsewhere: `process.kill(-pid)` on a detached group, then SIGKILL on timeout. `killTreeNow(child)` (only `shutdownNow()` uses it) is synchronous: `spawnSync` taskkill capped at 2 s on win32, a group SIGKILL elsewhere (deviation 15) | New shared helper. `downloader.js:952` keeps its inline copy because that file is in-flight |
 | `src/hooks/useDeviceSync.js` | Renderer mirror: buffers events until the snapshot lands, adopts the snapshot, applies events by kind, exposes state and action wrappers. Opens with exactly one `import {…} from "react";` line, which the tools harness strips | Written and tested, **not mounted** (mounting in App.jsx is the UI pass's job) |
 
 ## The adb wire client
@@ -1230,7 +1307,7 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
   - the single-instance lock.
 - The repo CLAUDE.md is git-excluded on your PC, so the edits land in
   `sync-temp/context/CLAUDE.project.md`, and your local session copies them back.
-- `android/PARITY.md` gets N/A-DESKTOP-ONLY rows for the 7 global sync settings and every `sync:*`
+- `android/PARITY.md` gets N/A-DESKTOP-ONLY rows for the 8 global sync settings (`syncDiagnosticLog` added at P5) and every `sync:*`
   channel (23 invoke channels plus `sync-event`; `sync:link` was added at P4).
 - STATE.md is rewritten at the phase boundary.
 - A forced re-read of every changed file, then the report. The ship decision follows.
@@ -1430,6 +1507,18 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
     (service);
   - `RecordStore.ensureHeader` shares one write among concurrent callers (exec);
   - a mutation check: 9 breaks, each one fails its test.
+- **Added at P5** (deviation 15):
+  - the service log: a `start` → `prewarm` → `stop` lifecycle; an error line while on and none
+    while off; nothing when `syncDiagnosticLog` is false; `shutdownNow` writes `quit-now` with
+    the job it aborts (service);
+  - `diag-log.js` alone: rotation, line truncation (including an escape-heavy stack), never
+    throws, `insideAsar` (service);
+  - `cancelNow()` and then an immediate process exit still kill the grandchild (searcher; fails
+    on the pre-P5 detached kill);
+  - the packaged smoke's three quit paths (`tools/_smoke_device_sync_packaged.js`), and the
+    Windows dev-app smoke (`tools/_smoke_device_sync_dev.js`);
+  - the live script's self-test against the fake adb server (`_live_device_sync.js
+    --self-test`); the tablet run itself waits for your OK.
 
 **Monitor, service, contract, hook, searcher and isolation tests**
 - **Monitor.**
@@ -1452,8 +1541,8 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
   - The main flow: plan → selection → apply → modify / rename / delete on the PC → re-plan (kept
     name) → both delete policies → verify → prune → library root unplugged (refusal).
   - Quit: `shutdown()` finishes within 5 s. `shutdownNow()` is synchronous and idempotent (called
-    twice), leaves a consistent record, flushes the PC hash cache, and spawns its taskkill
-    detached.
+    twice), leaves a consistent record, flushes the PC hash cache, and kills the search tree
+    synchronously (deviation 15; it was "spawns its taskkill detached" before P5).
   - find-sources with a fake Searcher.
 - **Contract.** Preload `sync:*` literals equal `contract.CHANNELS`; the hook's event kinds equal
   `EVENT_KINDS`.
@@ -1599,7 +1688,7 @@ delete-safety hole: each failure it built ends in "foreign" or "unverified".
 | 8 | Free reopen allows endless or unaborted runs | Confirmed | Rev 2 text | Session lifecycle; error table; fake injection |
 | 9 | Fast Startup keeps the boot epoch | Confirmed | libuv `src/win/util.c:502-503` (`GetTickCount64`); Fast Startup is hibernation (recall) | 30-minute mark limit; P5 check |
 | 10 | Durability overstated | Confirmed | libuv `src/win/fs.c:2341` (`MoveFileExW`, no write-through) | Deviation 1 wording |
-| 11 | taskkill spawned at `quit` dies with Electron | Confirmed | libuv `src/win/process.c:93-96`, `:1149-1152` (kill-on-close job) | Deviation 8; proc-kill `detached` |
+| 11 | taskkill spawned at `quit` dies with Electron | Confirmed | libuv `src/win/process.c:93-96`, `:1149-1152` (kill-on-close job) | Deviation 8; proc-kill `detached`, which P5 found still loses the race; now a synchronous taskkill (deviation 15) |
 | 12 | State still waiting in memory | Confirmed | Rev 2 text | Deviation 8 write points |
 | 13 | Pending-resolution gaps | Confirmed; one part left to you | The RECV cost is real, but replacing RECV with device hashing would change your decision | Pending table; `needs-mode`; open decision 11 |
 | 14 | `adopted-size` unpinned | Confirmed | Rev 2 text | The `adopted-size` rules |
@@ -1650,7 +1739,7 @@ plan text it cites. None needed AOSP. The volume-id fix was checked in libuv `sr
 | ~250 KB | Estimated largest shard (One Piece, 1,197 chapters × ~200 B per entry) | derived; the 1,197 is from the parent plan (doc) |
 | 3,072 B shell cap vs 4 KiB legacy payload | Keeps chunked commands valid on every adbd | recall: adb `MAX_PAYLOAD_V1`, not re-checked; the review called it conservative |
 | 23 invoke channels + 1 event channel | The IPC surface this pass ships (`sync:link` added at P4) | derived: the contract table; read: `contract.js` `CHANNEL_NAMES` |
-| `GetTickCount64()/1000`; `MoveFileExW(…, MOVEFILE_REPLACE_EXISTING)`; kill-on-close job | Why the boot epoch survives Fast Startup; why a rename is atomic but not durable; why a quit-time taskkill must be detached | read: libuv v1.x `src/win/util.c:502-503`, `fs.c:2341`, `process.c:93-96,1149-1152` |
+| `GetTickCount64()/1000`; `MoveFileExW(…, MOVEFILE_REPLACE_EXISTING)`; kill-on-close job | Why the boot epoch survives Fast Startup; why a rename is atomic but not durable; why a quit-time taskkill can't be fire-and-forget (deviation 15) | read: libuv v1.x `src/win/util.c:502-503`, `fs.c:2341`, `process.c:93-96,1149-1152` |
 | 30 min | How long a prompt mark is honored | this plan's choice: covers crash, update and reinstall relaunches |
 | ~90 s | RECV of a 3 GB pending volume at 30 MB/s | derived; the 30 MB/s USB rate is an assumption, which P5 measures |
 | 30 s settling / re-stat, 10 s debounce, 60 s idle, 8 MiB/s Verify rate, 1 s recheck, 5 s polling, 5 s quit wait, 1 GiB reserve, ≤10 events/s, ≤4 workers, 500-hash flush | Engine constants | this plan's choices (the 8 MiB/s is a deliberately low floor for slow flash, not a measurement) |

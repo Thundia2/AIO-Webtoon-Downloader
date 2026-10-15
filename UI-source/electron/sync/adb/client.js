@@ -1406,6 +1406,9 @@ module.exports = {
   classifySyncFail,
   isUnknownServiceFail,
   resolveServerAddress,
+  // The OKAY wait's extra allowance; tools/_live_device_sync.js compares
+  // the tablet's measured wait against it (P5).
+  drainAllowanceMs: _drainAllowanceMs,
   // Exported for tools/_test_device_sync_adb.js only (the watchdog's
   // flushed-bytes rule is tested on a bare socket pair; Latch's waiter
   // accounting directly).

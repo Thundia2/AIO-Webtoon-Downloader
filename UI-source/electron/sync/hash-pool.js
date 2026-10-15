@@ -140,7 +140,9 @@ class HashPool {
     this.tasks = [];
     this.seq = 0;
     this.closed = false;
-    this.stats = { hashed: 0, hits: 0, mainThread: 0, workerDeaths: 0 };
+    // spawned: workers that started; hashed − mainThread ran in a worker
+    // (service.js logs these at each pre-warm end, P5's marker).
+    this.stats = { hashed: 0, hits: 0, mainThread: 0, workerDeaths: 0, spawned: 0 };
   }
 
   /** Read the cache file once. A missing or unreadable cache is just empty. */
@@ -313,6 +315,7 @@ class HashPool {
       this.fallback = true;
       return null;
     }
+    this.stats.spawned += 1;
     const slot = { w, busy: null };
     w.on("message", (m) => {
       const task = slot.busy;
