@@ -27,7 +27,12 @@
 // (record-mismatch, device-listing-suspect, needs-mode, a `blocked` found
 // on the fresh re-plan) end the job `failed` with summary.refusal set, and
 // get-state's plans[targetId].refusal keeps it (P4 call: a plan can take
-// minutes, so its device refusals can't be the invoke's answer).
+// minutes, so its device refusals can't be the invoke's answer). Earlier
+// than that, every job that prepares a plan sends ONE immediate progress
+// line once the device checks are done: progress.step 'device-ready' with
+// progress.preflight {kind, caps, canonicalRoot, caseInsensitive,
+// caseMeasured, canHash, mayNeedMode, refusal|null} (deviation 14; grep
+// preflightSent, prepare.js deviceReady).
 //
 // CONNECT FLOW (rule 10): a device or folder appearing → PromptMachine →
 // one automatic plan per target, queued FIFO behind any running job
@@ -46,8 +51,9 @@
 // Throttle (deviation 3): one hash worker while a download or Check All runs.
 //
 // SELECTION. The op choices live in memory per target and are written to
-// selection.json whenever the target has a record header; a target that
-// was never applied to (no header) keeps them for the session only.
+// selection.json on every change. A target never applied to gets its
+// identity-only record header written first, so the selection has an epoch
+// to belong to (deviation 14; grep _persistSelection).
 //
 // HANDOFF OBLIGATIONS FOR THE UI PASS (non-UI plan, Integration edits):
 //   * render payload.sync in ConfirmQuitDialog (a sync-only close would say
@@ -248,7 +254,7 @@ function initDeviceSync(deps) {
   function _rt(id) {
     let r = rts.get(id);
     if (!r) {
-      r = { store: new RecordStore({ root, targetId: id, queue, now }), prep: null, plan: null, selOps: null, selRebinds: {}, selEpoch: null, summary: null, refusal: null, stale: false };
+      r = { store: new RecordStore({ root, targetId: id, queue, now }), prep: null, plan: null, selOps: null, selRebinds: {}, selEpoch: null, selDeferred: false, summary: null, refusal: null, stale: false };
       rts.set(id, r);
     }
     return r;
@@ -657,6 +663,9 @@ function initDeviceSync(deps) {
       }
       _refreshLibraryStatus();
     }
+    // A selection change made during this job on a header-less target.
+    const srt = rts.get(job.targetId);
+    if (srt && srt.selDeferred) _persistSelection(srt, job.targetId).catch((e) => _log("selection write", e && e.message));
     // A pre-warm that a job paused resumes once the lane is free.
     if (prewarm.state === "paused") _schedulePrewarm(0);
     setImmediate(_pump);
@@ -678,15 +687,47 @@ function initDeviceSync(deps) {
     return planner.effectiveSelection(rt.plan, rt.selOps || {});
   }
 
-  async function _persistSelection(rt) {
+  // PERSIST ALWAYS (deviation 14, user decision 2026-10-10). selection.json
+  // is tied to the record's epoch, and a target never applied to has no
+  // header, so the first selection change writes the identity-only header
+  // (sync:link does the same before binding). First-sync rules key on
+  // header.firstApplyAt, not on the header existing, so this changes nothing
+  // else. While a job runs on this target the header write is deferred
+  // (selDeferred, flushed by _afterJob): that job's prepare reloads the store,
+  // and a load racing the header write could drop the new epoch.
+  async function _persistSelection(rt, targetId) {
     if (!rt.store.epoch) await rt.store.load();
-    if (!rt.store.epoch) return false;
+    if (!rt.store.epoch) {
+      if (current && current.targetId === targetId) {
+        rt.selDeferred = true;
+        return false;
+      }
+      const t = _target(targetId);
+      if (!t || !rt.prep) return false;
+      const ex = new Executor({ transport: { kind: t.kind }, store: rt.store, target: rt.prep.target, settings, probe: rt.prep.probe, view: rt.prep.view, now });
+      await ex.ensureHeader();
+      rt.selEpoch = rt.store.epoch;
+    }
+    rt.selDeferred = false;
     await rt.store.writeSelection({ ops: rt.selOps || {}, rebinds: rt.selRebinds || {} });
     return true;
   }
 
+  // The device-ready line (prepare.js deviceReady; deviation 14) goes out
+  // once per job, immediately, as progress.preflight. A job can prepare
+  // twice (a verify job, a plan with verifyFirst); only the first counts.
+  // It stays in job.progress, so a renderer re-adopting the job through
+  // get-state still sees it.
+  let preflightSent = 0; // runId
+
   function _progressOf(runId) {
     return (ev) => {
+      if (ev.phase === "device-ready") {
+        if (preflightSent === runId) return;
+        preflightSent = runId;
+        jobs.progress(runId, { step: "device-ready", preflight: ev.preflight || null }, { immediate: true });
+        return;
+      }
       const p = { step: ev.phase || null };
       if (ev.filesDone != null) Object.assign(p, { filesDone: ev.filesDone, filesTotal: ev.filesTotal, bytesDone: ev.bytesDone, bytesTotal: ev.bytesTotal, current: ev.current || null });
       else if (ev.done != null) Object.assign(p, { filesDone: ev.done, filesTotal: ev.total, bytesDone: ev.bytesDone || 0, bytesTotal: ev.bytesTotal || 0, current: ev.folder || null });
@@ -1188,7 +1229,7 @@ function initDeviceSync(deps) {
       const r = planner.applyRebind(rt.plan, rt.selRebinds, p.rebind);
       if (!r.ok) return r;
       rt.selRebinds = r.rebinds;
-      await _persistSelection(rt);
+      await _persistSelection(rt, p.targetId);
       // Re-plan from the cached input: the folder name is part of every op id.
       const prep = rt.prep;
       const view = { ...prep.view, selection: { ops: rt.selOps || {}, rebinds: rt.selRebinds } };
@@ -1205,7 +1246,7 @@ function initDeviceSync(deps) {
       const r = planner.changeSelection(rt.plan, rt.selOps, p);
       if (!r.ok) return r;
       rt.selOps = r.ops;
-      await _persistSelection(rt).catch((e) => _log("selection write", e && e.message));
+      await _persistSelection(rt, p.targetId).catch((e) => _log("selection write", e && e.message));
       rt.summary = planner.planSummary(rt.plan, _selection(rt));
       changedSeries = r.changedSeries;
     }

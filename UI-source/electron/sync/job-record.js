@@ -119,7 +119,8 @@ function createJobRecord(deps) {
         state: "running",
         startedAt: now(),
         finishedAt: null,
-        progress: { bytesDone: 0, bytesTotal: 0, filesDone: 0, filesTotal: 0, current: null, ...(spec.total || {}) },
+        // preflight: plan preparation's device-ready line, null until it arrives
+        progress: { bytesDone: 0, bytesTotal: 0, filesDone: 0, filesTotal: 0, current: null, preflight: null, ...(spec.total || {}) },
         status: null,
         summary: null,
       };
@@ -131,13 +132,15 @@ function createJobRecord(deps) {
     /**
      * Fold progress into the live job; coalesced to ≤1 event per
      * COALESCE_MS. Returns false (and drops it) for a stale runId.
+     * `opts.immediate` sends it now instead (plan preparation's one
+     * device-ready line, service.js grep preflightSent).
      */
-    progress(runId, patch) {
+    progress(runId, patch, opts) {
       if (!job || job.runId !== runId || job.state !== "running") return false;
       Object.assign(job.progress, patch || {});
       pending = { runId, state: "running", progress: { ...job.progress } };
       const wait = COALESCE_MS - (now() - lastProgressAt);
-      if (wait <= 0) _flush();
+      if (wait <= 0 || (opts && opts.immediate)) _flush();
       else if (!timer) timer = timers.setTimeout(_flush, wait);
       return true;
     },

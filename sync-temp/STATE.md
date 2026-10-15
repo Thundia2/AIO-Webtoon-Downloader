@@ -4,7 +4,7 @@ The cloud session's stand-in for your memory entry `device-sync-feature.md`, whi
 Your local session folds this file back into that entry when the work returns. It is a map, not a
 log; git history owns the events.
 
-## Where it stands (2026-10-07)
+## Where it stands (2026-10-10)
 
 - **Parent plan:** `plans/add-this-script-s-features-linked-pumpkin.md`, approved 2026-09-30.
 - **Non-UI plan:** `plans/c-users-legoc-claude-plans-add-this-scr-noble-truffle.md`, **rev 4,
@@ -15,8 +15,20 @@ log; git history owns the events.
     own review.
   - Every finding of the reviews was checked against the code, AOSP adb and libuv. The plan's last
     section holds the disposition tables.
-- **Now:** P0 to P4 are done and committed. P5 (packaged smoke, live tablet) needs your PC.
-  The local session starts from `sync-temp/HANDOFF-TO-LOCAL.md`.
+- **Now:** P0 to P4 are done and committed. The work is back on your PC (2026-10-10): the suite
+  passed on Windows, deviation 14 changed two P4 calls, and memory is folded in. Next: adapt the
+  dev-app smoke for Windows (your pick), then P5 (packaged smoke, live tablet).
+  `sync-temp/HANDOFF-TO-LOCAL.md` is the handoff that brought it back.
+
+## Back on the PC (2026-10-10)
+
+| Item | State |
+|---|---|
+| Checkout | The main tree was fast-forwarded to the branch (you asked for it as the working tree; the tree was clean and no incoming file existed locally, so the handoff's separate worktree wasn't needed). Electron 40.10.0 already installed; no `package.json` change since `a27aaf4`, so no `npm ci` |
+| Windows re-verify | `node --check` main.js/preload.js exit 0; `npm run build` exit 0; all 14 `tools/_test_*.js` pass under node 24.13.0 and Electron 40's Node 24.15.0 (28 runs). Counts as on Linux (core 87, adb 90, exec 49, monitor 23, service 21, searcher_cancel 8), so the taskkill tree kill, NTFS renames and Windows paths held. main_isolation runs 188 checks (Linux 194): it skips `metadata:update` on win32 by design |
+| Deviation 14 | Your answers to deviation 13's calls: an immediate `device-ready` progress line per job once device checks pass (carries any refusal; `mayNeedMode` hint); selection persisted always (identity-only header on first change, deferred under a running job); `RecordStore.ensureHeader` single-flight. Tests: service +5, exec +1 (exec 50, service 26); 9-break mutation check, all caught |
+| Memory | `device-sync-feature.md` rewritten from this file; `electron-app-local-e2e-testing.md` gained the lock, the "55 changed" note and the smoke script; the 4 ledger items are `electron-main-shipped-defects.md` (re-checked present 2026-10-10) |
+| Dev-app smoke | Your pick: **adapt** `tools/_smoke_device_sync_dev.js` for Windows (`electron.exe`, a node.exe fake python, no xvfb), plus restore-a-minimized-window on second launch. Not done yet |
 
 ## P4 service and integration (2026-10-07)
 
@@ -116,13 +128,9 @@ log; git history owns the events.
    test: ask first.
 4. P5's `AIO_SEARCH_PROBE_DEADLINE`, only if measurement shows the probe phase dominates: ask first
    (it touches the in-flight `search_orchestrator.py`).
-5. Calls made in P4 with my pick (plan deviation 13), for your confirmation:
-   - a job's device refusals arrive in its end (`summary.refusal`, kept in `plans[id].refusal`),
-     not as the invoke's answer;
-   - a target never applied to keeps its selection in memory for the session only;
-   - the executor's `isPathBusy` stays unwired (`getRunning()` has no folder paths); `settling`
-     covers a file a download is writing;
-   - a second launch during the ≤5 s quit wait opens no window (`appQuitting`).
+5. ~~Calls made in P4 for your confirmation~~ **Answered 2026-10-10** (deviation 14): job-end
+   refusals kept plus an early `device-ready` line; selection persisted always; `isPathBusy`
+   unwired and no window during the quit wait both kept.
 
 ## Handoff obligations for the UI pass
 
@@ -150,12 +158,9 @@ entries.
 - `comix:login` spawns with only `{...process.env, PYTHONUNBUFFERED}`, without `extraEnv`
   (`main.js:937-941`). So Playwright can miss its browsers in packaged builds.
 
-## Memory rewrites owed when the work returns
+## Memory
 
-- `device-sync-feature.md`: rewrite from this file.
-- `electron-app-local-e2e-testing.md`: the single-instance lock landed in P4, so the dev app and the
-  installed app can't run at the same time. Close one before launching the other; this applies to
-  P5's packaged smoke too.
+Folded in 2026-10-10 (see "Back on the PC"). Rewrite `device-sync-feature.md` at each phase stop.
 
 ## Branch facts this state relies on
 

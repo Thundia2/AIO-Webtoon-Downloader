@@ -234,7 +234,9 @@ class Executor {
     // A folder target's volume is the one measured now (fs.stat's dev), so a
     // different disk at the same drive letter reads as record-mismatch.
     if (id.kind === "folder" && p.volumeId != null) id.volumeId = String(p.volumeId);
-    await this.store.writeHeader({
+    // store.ensureHeader is single-flight: one epoch however many first
+    // writers race (service.js _persistSelection, sync:link, apply).
+    await this.store.ensureHeader(() => ({
       recordEpoch: newEpoch(),
       version: 1,
       ...id,
@@ -243,7 +245,7 @@ class Executor {
       caseMeasured: !!p.caseMeasured,
       caps: p.caps || {},
       createdAt: this.now(),
-    });
+    }));
   }
 
   /**

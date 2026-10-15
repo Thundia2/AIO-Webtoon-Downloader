@@ -519,6 +519,160 @@ test("a device refusal ends the plan job `failed` with summary.refusal, and get-
   }
 });
 
+// ---------------------------------------------------------------- deviation 14
+
+/** This run's device-ready progress events, in order. */
+function readyEvents(a, runId, from = 0) {
+  return a.events.slice(from).filter((e) => e.kind === "job" && e.runId === runId && e.progress && e.progress.step === "device-ready");
+}
+
+test("device-ready: one immediate line per job once the device checks pass, before the listings; a verify's second preparation doesn't repeat it", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Alpha", { "Ch.001.cbz": 3000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const from = a.since();
+    const r = await a.call("plan", { targetId: id });
+    assert.ok(r.ok);
+    const done = await a.job(r.runId);
+    assert.strictEqual(done.status, "completed");
+    const ready = readyEvents(a, r.runId, from);
+    assert.strictEqual(ready.length, 1, "exactly one device-ready line");
+    const pf = ready[0].progress.preflight;
+    assert.deepStrictEqual(
+      { kind: pf.kind, canHash: pf.canHash, mayNeedMode: pf.mayNeedMode, refusal: pf.refusal },
+      { kind: "folder", canHash: true, mayNeedMode: false, refusal: null },
+    );
+    assert.strictEqual(typeof pf.caseInsensitive, "boolean");
+    // Before any later preparation step of this run.
+    const runEvents = a.events.slice(from).filter((e) => e.kind === "job" && e.runId === r.runId);
+    const at = runEvents.indexOf(ready[0]);
+    assert.ok(!runEvents.slice(0, at).some((e) => e.progress && ["planning", "hashing"].includes(e.progress.step)), "nothing past step 6 came first");
+    assert.deepStrictEqual(done.job.progress.preflight, pf, "it stays in the job's progress for a re-adopting renderer");
+    // Verify prepares twice (before and after verifying): still one line.
+    await a.idle();
+    assert.strictEqual((await a.job((await a.call("apply", { targetId: id })).runId)).status, "completed");
+    await a.idle();
+    const from2 = a.since();
+    const vr = await a.call("verify", { targetId: id });
+    assert.ok(vr.ok, JSON.stringify(vr));
+    assert.strictEqual((await a.job(vr.runId)).status, "completed");
+    assert.strictEqual(readyEvents(a, vr.runId, from2).length, 1, "verify sends one line");
+  } finally {
+    await a.close();
+  }
+});
+
+test("device-ready carries a device refusal at once; the job still ends failed with summary.refusal", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Alpha", { "Ch.001.cbz": 3000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    assert.strictEqual((await a.job((await a.call("apply", { targetId: id })).runId)).status, "completed");
+    await a.idle();
+    for (const n of fs.readdirSync(a.target)) fs.rmSync(path.join(a.target, n), { recursive: true, force: true });
+    const from = a.since();
+    const r = await a.call("plan", { targetId: id });
+    const done = await a.job(r.runId);
+    assert.strictEqual(done.status, "failed");
+    const ready = readyEvents(a, r.runId, from);
+    assert.strictEqual(ready.length, 1);
+    assert.strictEqual(ready[0].progress.preflight.refusal.code, "device-listing-suspect");
+    assert.ok(a.events.indexOf(ready[0]) < a.events.indexOf(done), "the line precedes the job end");
+    assert.strictEqual(done.summary.refusal.code, "device-listing-suspect");
+  } finally {
+    await a.close();
+  }
+});
+
+test("device-ready on a device without sha256sum flags mayNeedMode", async () => {
+  const a = await app({ adb: true });
+  try {
+    a.dev = a.srv.addDevice({ serial: SERIAL, inject: { symlinks: { "/sdcard": "/storage/emulated/0" }, tools: { sha256sum: false } } });
+    a.dev.fs.mkdirs(CANON);
+    a.dev.fs.writeFile(`${CANON}/Old/Ch.001.cbz`, bytes("Ch.001.cbz", 900), { mtime: OLD_S });
+    series(a.lib, "Mu", { "Ch.001.cbz": 1500 });
+    const t = await a.call("config-op", { op: "add-target", target: { name: "Tab", kind: "adb", serial: SERIAL, root: "/sdcard/Komikku/local", profile: "komikku" } });
+    assert.ok(t.ok, JSON.stringify(t));
+    const auto = await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, 0, "auto plan");
+    const pf = readyEvents(a, auto.runId)[0].progress.preflight;
+    assert.deepStrictEqual({ kind: pf.kind, canHash: pf.canHash, mayNeedMode: pf.mayNeedMode, sha: pf.caps.sha256sum }, { kind: "adb", canHash: false, mayNeedMode: true, sha: false });
+  } finally {
+    await a.close();
+  }
+});
+
+test("selection persists on a never-applied target: the first change writes the header, survives a restart, keeps first sync", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Alpha", { "Ch.001.cbz": 3000 });
+    series(a.lib, "Beta", { "Ch.001.cbz": 2000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const tdir = path.join(a.userData, "targets", id);
+    assert.ok(!fs.existsSync(path.join(tdir, "header.json")), "a plan alone writes no header");
+    const sum = await a.summary(id);
+    const det = await a.call("series-detail", { targetId: id, seriesKey: sum.series.find((s) => s.folder === "Beta").seriesKey });
+    const betaPush = det.rows.find((r) => r.opId && r.opId.startsWith("push:"));
+    assert.ok((await a.call("set-selection", { targetId: id, changes: [{ opId: betaPush.opId, selected: false }] })).ok);
+    await waitFor(() => fs.existsSync(path.join(tdir, "selection.json")), 3000, "selection.json");
+    const header = JSON.parse(fs.readFileSync(path.join(tdir, "header.json"), "utf8"));
+    const sel = JSON.parse(fs.readFileSync(path.join(tdir, "selection.json"), "utf8"));
+    assert.strictEqual(sel.recordEpoch, header.recordEpoch);
+    assert.ok(!header.firstApplyAt, "no apply happened");
+    // Restart the service on the same userData: the choice is still there.
+    await a.svc.shutdown({ timeoutMs: 2000 });
+    a.svc = service.initDeviceSync(a.deps);
+    await a.idle();
+    // runIds restart at 1 in the new service: only look at its own events.
+    const from = a.since();
+    const r = await a.call("plan", { targetId: id });
+    assert.ok(r.ok, JSON.stringify(r));
+    const plan = await a.waitEvent((e) => e.kind === "job" && e.runId === r.runId && e.state === "done", 15000, from, "plan after restart");
+    assert.strictEqual(plan.status, "completed", JSON.stringify(plan.summary));
+    assert.strictEqual(plan.summary.plan.firstSync, true, "still a first sync");
+    assert.strictEqual(plan.summary.plan.totals.push.count, 1, "Beta's push stays unticked");
+  } finally {
+    await a.close();
+  }
+});
+
+test("selection on a header-less target while its job runs is written when the job ends", async () => {
+  const a = await app({ adb: true });
+  try {
+    a.dev = a.srv.addDevice({ serial: SERIAL, inject: { symlinks: { "/sdcard": "/storage/emulated/0" } } });
+    a.dev.fs.mkdirs(CANON);
+    series(a.lib, "Mu", { "Ch.001.cbz": 1500 });
+    series(a.lib, "Nu", { "Ch.001.cbz": 1200 });
+    const t = await a.call("config-op", { op: "add-target", target: { name: "Tab", kind: "adb", serial: SERIAL, root: "/sdcard/Komikku/local", profile: "komikku" } });
+    const id = t.targetId;
+    await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, 0, "auto plan");
+    await a.idle();
+    const tdir = path.join(a.userData, "targets", id);
+    const sum = await a.summary(id);
+    const det = await a.call("series-detail", { targetId: id, seriesKey: sum.series.find((s) => s.folder === "Nu").seriesKey });
+    const nuPush = det.rows.find((r) => r.opId && r.opId.startsWith("push:"));
+    // Slow the device so the next plan is still running when the selection changes.
+    a.dev.inject.shellDelayMs = 150;
+    const r = await a.call("plan", { targetId: id });
+    assert.ok(r.ok);
+    assert.strictEqual(a.svc.isJobRunning(), true);
+    assert.ok((await a.call("set-selection", { targetId: id, changes: [{ opId: nuPush.opId, selected: false }] })).ok);
+    assert.ok(!fs.existsSync(path.join(tdir, "header.json")), "no header written under a running job");
+    await a.job(r.runId);
+    a.dev.inject.shellDelayMs = 0;
+    await waitFor(() => fs.existsSync(path.join(tdir, "selection.json")), 3000, "deferred selection.json");
+    const header = JSON.parse(fs.readFileSync(path.join(tdir, "header.json"), "utf8"));
+    const sel = JSON.parse(fs.readFileSync(path.join(tdir, "selection.json"), "utf8"));
+    assert.strictEqual(sel.recordEpoch, header.recordEpoch);
+    assert.ok(Object.keys(sel.ops).length >= 1, JSON.stringify(sel));
+  } finally {
+    await a.close();
+  }
+});
+
 test("apply re-checks: an unacknowledged loss blocks with the one refusal shape", async () => {
   const a = await app();
   try {

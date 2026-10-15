@@ -389,6 +389,19 @@ test("RecordStore: zero-length and unparsable shards set aside; no epoch, no sha
   assert.deepStrictEqual(JSON.parse(fs.readFileSync(s.headerPath, "utf8")), { recordEpoch: "E1", kind: "adb", firstApplyAt: 5 });
 });
 
+test("RecordStore.ensureHeader: concurrent first writers share one write and one epoch (deviation 14)", async () => {
+  const d = mkdir("ensure-header");
+  const s = new store.RecordStore({ root: d, targetId: "t1" });
+  let made = 0;
+  const make = () => ({ recordEpoch: `E${++made}`, kind: "folder" });
+  await Promise.all([s.ensureHeader(make), s.ensureHeader(make), s.ensureHeader(make)]);
+  assert.strictEqual(made, 1, "one header built");
+  assert.strictEqual(s.epoch, "E1");
+  assert.strictEqual(JSON.parse(fs.readFileSync(s.headerPath, "utf8")).recordEpoch, "E1");
+  await s.ensureHeader(make);
+  assert.strictEqual(made, 1, "an existing header is kept");
+});
+
 // =====================================================================
 // hash-pool.js
 // =====================================================================

@@ -1,7 +1,8 @@
 # Device Sync — non-UI implementation plan
 
 **Status: rev 4, approved 2026-10-06 ("Start with the plan"), cloud session on
-`wip/device-sync-handoff`. P0 to P4 are done; P5 needs your PC.**
+`wip/device-sync-handoff`. P0 to P4 are done; back on your PC since 2026-10-10, where deviation 14
+changed two P4 calls; P5 is next.**
 - Rev 1 (2026-09-30) got an adversarial review on 2026-10-01: 2 critical, 9 major, 14 minor.
   Rev 2 checked every finding against the code and AOSP and folded in the confirmed ones. Where the
   review was wrong or a better fix exists, it says so.
@@ -20,6 +21,9 @@
 - P4 recorded your three P4 answers and the calls made while coding the service and the
   integration (deviation 13), added `sync:link` (23 invoke channels), and added "Added at P4" to
   Verification.
+- Back on your PC (2026-10-10), the suite passed on Windows unchanged; your answers to deviation
+  13's calls became deviation 14 (an early `device-ready` line; selection persisted always) and
+  "Added after P4" in Verification.
 - The three disposition tables are the last section.
 - Parent plan (behavior rules 1-13, the decisions table, the UI design), approved 2026-09-30:
   `sync-temp/plans/add-this-script-s-features-linked-pumpkin.md`. Rule numbers below refer to it.
@@ -409,6 +413,39 @@ So every tunable lives in one table of defaults and presets, and the UI can expo
     - **The dev-app smoke saves once through the UI first.** A fresh `settings.json` shows
       "55 changed" before the first Save, on the P3 tree too (`SettingsTab.jsx`
       `countDirtySettings` counts backfilled defaults by design).
+
+14. **Your answers to deviation 13's calls, and the P5-session changes they made (2026-10-10).**
+    Pinned by `tools/_test_device_sync_service.js` (5 tests) and `_test_device_sync_exec.js` (1).
+    - **Kept as picked:** `isPathBusy` stays unwired; a second launch during the quit wait opens
+      no window.
+    - **Device refusals: keep the job-end delivery, plus one early line.** Every job that
+      prepares a plan sends ONE progress event, immediately (not coalesced), once the device
+      checks are done: the end of step 6 (probe, record check, root listing, folder rename
+      intents, gone detection), so every `record-mismatch` and `device-listing-suspect` is
+      already decided. Shape: `progress.step = 'device-ready'`, `progress.preflight =
+      {kind, caps, canonicalRoot, caseInsensitive, caseMeasured, canHash, mayNeedMode,
+      refusal|null}`. A refusal at steps 2-6 sends it with that refusal; the job still ends
+      `failed` with `summary.refusal`. It stays in `job.progress`, so a renderer re-adopting
+      the job sees it. A job that prepares twice (verify, `verifyFirst`) sends it once.
+      - `mayNeedMode` is a hint (the device can't hash, no verify mode was given, and the root
+        has folders), not the planner's `needsVerify`: that is only known after PC hashing.
+        It lets the UI ask read-back vs adopt-by-size before the hashing instead of after.
+        `needs-mode` itself still ends the job as before.
+      - Mechanism: `prepare.js` `deviceReady`; `service.js` `preflightSent`;
+        `job-record.progress(…, {immediate:true})`.
+    - **Selection: persist always.** The first selection change on a target never applied to
+      writes the identity-only record header (the same header `sync:link` writes before
+      binding), so `selection.json` has an epoch to belong to. First-sync rules are unaffected:
+      they key on `header.firstApplyAt`. While a job runs on that target the header write is
+      deferred (`selDeferred`) and flushed by `_afterJob`, because that job's prepare reloads
+      the store and a load racing the header write could drop the new epoch.
+    - **`RecordStore.ensureHeader` is single-flight.** Concurrent first writers (apply's first
+      shard, a selection change, Link) now share one write, so they can't mint two epochs.
+      `Executor._ensureHeader` goes through it.
+    - **Mutation check:** 9 deliberate breaks of the above (once-per-job, immediate, the
+      refusal path ×2, `mayNeedMode`, the header write, the deferral, the deferred flush, single
+      flight); each one fails its test. The first run missed the once-per-job guard because the
+      test used apply, which prepares once; it now uses verify.
 ## Repo state and the branch protocol
 
 **Where this executes.** This plan runs on branch `wip/device-sync-handoff` of the fork
@@ -1383,6 +1420,16 @@ Test: `tools/_test_device_sync_adb.js`. **Stop:** green.
   - main.js under six scenarios, including `initfail` and `ask` (isolation);
   - a mutation check of the new tests: 5 breaks of the hook, 3 of the preload/hook literals, 8 of
     the main.js hooks and 1 of the service's refusal keeping; each one fails its test.
+- **Added after P4** (deviation 14):
+  - one immediate `device-ready` line per job, before any later preparation step, kept in
+    `job.progress`; a verify's second preparation doesn't repeat it (service);
+  - a refusal at steps 2-6 rides that line and still ends the job `failed` (service);
+  - `mayNeedMode` on a device without `sha256sum` (service, fake adb);
+  - a never-applied target's selection writes the header, survives a service restart, and
+    leaves first sync on; under a running job on that target it's written when the job ends
+    (service);
+  - `RecordStore.ensureHeader` shares one write among concurrent callers (exec);
+  - a mutation check: 9 breaks, each one fails its test.
 
 **Monitor, service, contract, hook, searcher and isolation tests**
 - **Monitor.**

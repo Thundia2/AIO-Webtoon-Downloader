@@ -476,6 +476,24 @@ class RecordStore {
     this.epoch = header.recordEpoch;
   }
 
+  /**
+   * Write the header built by `make()` when the target has none yet.
+   * Single flight: concurrent first writers (an apply's first shard, a
+   * selection change, sync:link) share ONE write, so they can't mint two
+   * epochs and leave each other's shards or selection stale.
+   */
+  async ensureHeader(make) {
+    if (this.epoch) return;
+    if (!this._headerInit) {
+      this._headerInit = (async () => {
+        if (!this.epoch) await this.writeHeader(make());
+      })().finally(() => {
+        this._headerInit = null;
+      });
+    }
+    await this._headerInit;
+  }
+
   /** Merge fields into the current header (same epoch). */
   async updateHeader(fields) {
     this._needEpoch();

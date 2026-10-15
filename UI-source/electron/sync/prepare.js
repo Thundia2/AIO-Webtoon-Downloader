@@ -19,6 +19,8 @@
 //    6. gone detection: planner.goneCandidates → STA2 of every name (all
 //       ENOENT) → on adb, the rc-checked `find -type d` must list the same
 //       directories as LIS2; anything else refuses device-listing-suspect
+//       → every device refusal is decided: the `device-ready` progress line
+//         (also sent by a refusal at steps 2-6; grep deviceReady)
 //    7. list every root folder (FolderTransport sweeps its dot-temps first);
 //       read details.json / .aio_series.json for adoption
 //    8. file rename intents, then `pending` entries (listing, then one RECV)
@@ -114,8 +116,42 @@ async function preparePlan(c) {
   if (probe.caseMeasured || !loaded.header) measured.caseInsensitive = !!probe.caseInsensitive;
   const viewOf = (l) => loadRecordView({ header: l.header, shards: l.shards, selection: l.selection, target, measured });
   let view = viewOf(loaded);
+
+  // DEVICE-READY (deviation 14, user decision 2026-10-10): one progress line
+  // as soon as every device-side refusal is decided (end of step 6), so the
+  // UI can act before the listings and the PC hashing finish. A refusal at
+  // steps 2-6 sends it too, carrying that refusal; the job still ends
+  // `failed` with summary.refusal (service.js _refused). `mayNeedMode` is a
+  // conservative hint, not the planner's needsVerify: the device can't hash
+  // and has folders a coverage Verify might need, so the UI can ask
+  // read-back vs adopt-size up front. service.js forwards only the first one
+  // per job (grep preflightSent).
+  let readySent = false;
+  const deviceReady = (refusal, dirCount) => {
+    if (readySent) return;
+    readySent = true;
+    const canHash = transport.kind === "folder" || !!(probe.caps && probe.caps.sha256sum);
+    progress({
+      phase: "device-ready",
+      preflight: {
+        kind: transport.kind,
+        caps: { ...(probe.caps || {}) },
+        canonicalRoot: probe.canonicalRoot || null,
+        caseInsensitive: !!view.caseInsensitive,
+        caseMeasured: !!probe.caseMeasured,
+        canHash,
+        mayNeedMode: !canHash && !opts.verifyMode && dirCount > 0,
+        refusal: refusal ? { ...refusal } : null,
+      },
+    });
+  };
+  const refused = (r) => {
+    deviceReady(r, 0);
+    return { ...r, warnings };
+  };
+
   const early = planner.inputRefusal(pc, view);
-  if (early) return { ...early, warnings };
+  if (early) return refused(early);
   if (pc.warnings && pc.warnings.length) warnings.push(...pc.warnings);
 
   // 3. record upkeep (only against a valid header)
@@ -135,20 +171,17 @@ async function preparePlan(c) {
   // 4. root listing
   progress({ phase: "listing", done: 0, total: null });
   let root = await dev(() => transport.listRoot());
-  if (!root.ok) return { ...refuse("device-listing-suspect", "the target folder can't be listed", { detail: root.error }), warnings };
+  if (!root.ok) return refused(refuse("device-listing-suspect", "the target folder can't be listed", { detail: root.error }));
   if (root.undecodable.length) warnings.push({ kind: "undecodable-names", folder: null, names: root.undecodable.map((u) => u.display) });
   const visibleDirs = (l) => l.dirs.filter((d) => !d.name.startsWith("."));
   if (view.shards.length && !visibleDirs(root).length) {
-    return {
-      ...refuse("device-listing-suspect", "the device lists no folders while this target has synced series (locked or not mounted?)", { detail: "empty-root" }),
-      warnings,
-    };
+    return refused(refuse("device-listing-suspect", "the device lists no folders while this target has synced series (locked or not mounted?)", { detail: "empty-root" }));
   }
 
   // 5. folder rename intents
   if (await _folderIntents(view, root, { dev, transport, store, warnings })) {
     root = await dev(() => transport.listRoot());
-    if (!root.ok) return { ...refuse("device-listing-suspect", "the target folder can't be listed", { detail: root.error }), warnings };
+    if (!root.ok) return refused(refuse("device-listing-suspect", "the target folder can't be listed", { detail: root.error }));
   }
   checkCancel();
 
@@ -164,14 +197,14 @@ async function preparePlan(c) {
       }
       const st = await dev(() => transport.stat(name));
       if (st.exists && st.type === "dir") {
-        return { ...refuse("device-listing-suspect", "a folder the device listing left out exists", { detail: "listing-missed-folder", folder: name }), warnings };
+        return refused(refuse("device-listing-suspect", "a folder the device listing left out exists", { detail: "listing-missed-folder", folder: name }));
       }
       if (st.exists) {
         absent = false; // something else holds the name: not gone, held
         break;
       }
       if (st.error !== ENOENT) {
-        return { ...refuse("device-listing-suspect", "a folder's state can't be read", { detail: `stat-errno-${st.error}`, folder: name }), warnings };
+        return refused(refuse("device-listing-suspect", "a folder's state can't be read", { detail: `stat-errno-${st.error}`, folder: name }));
       }
     }
     if (absent) gone.add(cand.shardId);
@@ -187,9 +220,11 @@ async function preparePlan(c) {
       alt = { ok: false, error: "find-failed" };
     }
     if (!alt.ok || !_sameKeys(alt.keys, root.dirKeys)) {
-      return { ...refuse("device-listing-suspect", "two listings of the device disagree", { detail: alt.ok ? "listings-differ" : alt.error }), warnings };
+      return refused(refuse("device-listing-suspect", "two listings of the device disagree", { detail: alt.ok ? "listings-differ" : alt.error }));
     }
   }
+
+  deviceReady(null, visibleDirs(root).length);
 
   // 7. folder listings and device metadata
   const device = { trusted: true, dirs: root.dirs, rootFiles: root.files, folders: new Map(), meta: new Map() };
