@@ -459,6 +459,12 @@ async function startService() {
       : {}),
   });
   a.call = (name, p) => a.handlers.get(`sync:${name}`)({}, p);
+  // apply sends the gen of the plan just reviewed (service.js _genMismatch).
+  a.apply = async (id) => {
+    await sleep(0);
+    const st = await a.call("get-state");
+    return a.call("apply", { targetId: id, gen: st.plans && st.plans[id] ? st.plans[id].gen : null });
+  };
   a.waitJob = async (runId, ms = 30 * 60_000) => {
     const end = Date.now() + ms;
     for (;;) {
@@ -528,7 +534,7 @@ steps.e2e = async () => {
     record("e2e.plan", { status: p1.done.status, ms: p1.ms, deviceReadyMs: p1.readyMs, preflight: p1.preflight, counts: countsOf(p1.summary), firstSync: p1.summary && p1.summary.firstSync, refusal: p1.refusal });
     if (p1.done.status !== "completed") throw new Error("the first plan didn't complete");
     const t0 = Date.now();
-    const ap = await a.call("apply", { targetId: id });
+    const ap = await a.apply(id);
     if (!ap.ok) throw new Error(`apply refused: ${JSON.stringify(ap)}`);
     const done = await a.waitJob(ap.runId);
     const sec = (Date.now() - t0) / 1000;
@@ -560,7 +566,7 @@ steps.unplug = async () => {
     const id = await a.target();
     const p1 = await a.plan(id);
     if (p1.done.status !== "completed") throw new Error(`plan ${p1.done.status}: ${JSON.stringify(p1.refusal)}`);
-    const ap = await a.call("apply", { targetId: id });
+    const ap = await a.apply(id);
     if (!ap.ok) throw new Error(`apply refused: ${JSON.stringify(ap)}`);
     for (;;) {
       const ev = [...a.events].reverse().find((e) => e.kind === "job" && e.runId === ap.runId && e.progress);
@@ -583,7 +589,7 @@ steps.unplug = async () => {
     const p2 = await a.plan(id);
     const c2 = countsOf(p2.summary);
     record("unplug.resume-plan", { status: p2.done.status, counts: c2, filesOnDevice, ok: p2.done.status === "completed" && c2.replace === 0 && c2.update === 0 && c2.push > 0 });
-    const ap2 = await a.call("apply", { targetId: id });
+    const ap2 = await a.apply(id);
     const d2 = ap2.ok ? await a.waitJob(ap2.runId) : null;
     const p3 = await a.plan(id);
     const c3 = countsOf(p3.summary);

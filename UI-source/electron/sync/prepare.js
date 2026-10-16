@@ -21,6 +21,7 @@
 //       directories as LIS2; anything else refuses device-listing-suspect
 //       → every device refusal is decided: the `device-ready` progress line
 //         (also sent by a refusal at steps 2-6; grep deviceReady)
+//       → free space, read once for the capacity gauge (grep _readFreeSpace)
 //    7. list every root folder (FolderTransport sweeps its dot-temps first);
 //       read details.json / .aio_series.json for adoption
 //    8. file rename intents, then `pending` entries (listing, then one RECV)
@@ -71,7 +72,6 @@ const PROBE_PASSES = 4;
  * @param {object} [c.opts]
  * @param {'read-back'|'adopt-size'} [c.opts.verifyMode]  for a device without sha256sum
  * @param {'cached'|'rehash'} [c.opts.hashMode]           default settings.syncHashMode
- * @param {string} [c.opts.deletePolicy]
  * @param {AbortSignal} [c.signal]
  * @param {(ev:object)=>void} [c.onProgress]  {phase:'probe'|'hashing'|'listing'|'verify'|'planning', ...}
  * @param {() => number} [c.now]
@@ -79,7 +79,7 @@ const PROBE_PASSES = 4;
  * @param {object} [c.executorDeps]   extra Executor deps for the coverage Verify (tests: hooks)
  * @param {number} [c.connectWaitMs]
  * @returns {Promise<object>} {ok:true, plan, device, pc, view, probe, target,
- *   verify, warnings, planOpts} or a refusal
+ *   verify, warnings, planOpts, freeSpace:{bytes|null, asOf}} or a refusal
  */
 async function preparePlan(c) {
   const transport = c.transport;
@@ -226,6 +226,12 @@ async function preparePlan(c) {
 
   deviceReady(null, visibleDirs(root).length);
 
+  // Free space, read once per prepare for the Sync tab's capacity gauge
+  // (UI pass, user decision 2). service.js recomputes `needed` on every
+  // selection change against this one reading; the executor still measures
+  // again at apply time and is the one that refuses. Unknown is null, never 0.
+  const freeSpace = await _readFreeSpace(transport, { dev, signal, now, warnings });
+
   // 7. folder listings and device metadata
   const device = { trusted: true, dirs: root.dirs, rootFiles: root.files, folders: new Map(), meta: new Map() };
   const ci = view.caseInsensitive;
@@ -279,7 +285,7 @@ async function preparePlan(c) {
 
   // 10-11. plan, name probes, coverage Verify, plan again
   const nameProbe = new Map();
-  const planOpts = { now: now(), deletePolicy: opts.deletePolicy, gone, nameProbe };
+  const planOpts = { now: now(), gone, nameProbe };
   progress({ phase: "planning" });
   let plan = await _planWithProbes({ target, settings, pc, device, view, opts: planOpts }, { dev, transport });
   if (plan.ok === false) return { ...plan, warnings };
@@ -337,10 +343,26 @@ async function preparePlan(c) {
   if (c.hashPool) await c.hashPool.flush().catch(() => {});
   // planOpts: service.js re-plans from this cached input after an inline
   // edit (a rebind), without device I/O.
-  return { ok: true, plan, device, pc, view, probe, target, verify, warnings, planOpts };
+  return { ok: true, plan, device, pc, view, probe, target, verify, warnings, planOpts, freeSpace };
 }
 
 // ------------------------------------------------------------------ steps
+
+/** {bytes|null, asOf}: unknown is null, never 0 (a 0 would read as "full"). */
+async function _readFreeSpace(transport, { dev, signal, now, warnings }) {
+  if (typeof transport.freeSpace !== "function") return { bytes: null, asOf: now() };
+  try {
+    const b = await dev(() => transport.freeSpace());
+    return { bytes: Number.isFinite(b) ? b : null, asOf: now() };
+  } catch (e) {
+    if (e instanceof RunStop || (signal && signal.aborted)) throw e;
+    // A device that drops here fails the next listing anyway; anything
+    // else only costs the gauge.
+    if (e && ["device-lost", "offline", "unauthorized"].includes(e.kind)) throw e;
+    warnings.push({ kind: "free-space-unknown", message: e && e.message });
+    return { bytes: null, asOf: now() };
+  }
+}
 
 async function _hashPc(hashPool, pc, target, { mode, signal, progress, warnings }) {
   if (!hashPool) return;

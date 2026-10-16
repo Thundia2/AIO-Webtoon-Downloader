@@ -6,14 +6,15 @@
 // whatever settings.json holds into a complete, valid set. Per-target fields
 // live in sync-targets.json and resolve in profiles.js.
 //
-// NOT IN get-settings YET: service.js reads history.getSettings() and resolves
-// here. The UI pass adds these keys to main.js's get-settings together with
-// SettingsTab.jsx's DEFAULT_SETTINGS and a twin test; adding them earlier
-// would let every Settings Save persist defaults the UI pass may still
-// change (non-UI plan, "Settings and presets"; history.js's
-// appAutoUpdate migration is that cost paid once already).
+// get-settings (main.js) spreads syncSettingsForRenderer(saved), so the
+// renderer's draft and the hydrated prop agree on resolved values and a first
+// launch shows no phantom "8 changed" (the appAutoUpdate precedent). The
+// renderer keeps its own copy of the defaults and presets
+// (src/lib/syncSettings.js) because it can't import this file; the twin test
+// tools/_test_device_sync_settings_twin.js keeps the two equal.
 //
-// Read by: service.js, planner.js (deletePolicy, sizeWarnPct, patterns).
+// Read by: service.js, planner.js (deletePolicy, sizeWarnPct, patterns),
+// main.js get-settings.
 // ============================================================
 
 const { parseChapterPatterns } = require("./chapter-labels");
@@ -73,4 +74,16 @@ function resolveSyncSettings(saved) {
   return out;
 }
 
-module.exports = { SYNC_SETTING_SPECS, SYNC_SETTING_KEYS, resolveSyncSettings };
+/**
+ * The eight keys alone, resolved: what get-settings hands the renderer.
+ * Never the parsed chapterPatterns (RegExps don't survive IPC) or their
+ * errors (label-preview reports those).
+ */
+function syncSettingsForRenderer(saved) {
+  const r = resolveSyncSettings(saved);
+  const out = {};
+  for (const key of SYNC_SETTING_KEYS) out[key] = r[key];
+  return out;
+}
+
+module.exports = { SYNC_SETTING_SPECS, SYNC_SETTING_KEYS, resolveSyncSettings, syncSettingsForRenderer };

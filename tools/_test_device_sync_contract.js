@@ -41,7 +41,7 @@ const want = Object.values(contract.CHANNELS).slice().sort();
 eq("preload wrappers cover exactly contract.CHANNELS", [...wrappers.values()].sort(), want);
 eq("no other sync:* literal in preload", allSyncLiterals.slice().sort(), want);
 eq("one wrapper per channel", wrappers.size, contract.CHANNEL_NAMES.length);
-check("23 channels, link included", contract.CHANNEL_NAMES.length === 23 && contract.CHANNEL_NAMES.includes("link"));
+check("24 channels, link and review included", contract.CHANNEL_NAMES.length === 24 && contract.CHANNEL_NAMES.includes("link") && contract.CHANNEL_NAMES.includes("review"));
 
 // Wrapper naming: sync + PascalCase of the channel name, ':' and '-' as word breaks.
 const pascal = (n) => n.split(/[:-]/).map((w) => w[0].toUpperCase() + w.slice(1)).join("");

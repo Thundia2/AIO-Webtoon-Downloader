@@ -176,6 +176,22 @@ function _growth(ops) {
   return n;
 }
 
+/**
+ * What an apply of `ops` needs free on a target of this kind. The ONE
+ * formula: each transport's freeSpaceNeeded (the executor's pre-flight) and
+ * service.js's plan capacity (the Sync tab's gauge) both call it, so the
+ * gauge can't promise a fit the executor then refuses. grep: spaceNeeded
+ * Folder targets add the largest update: its temp sits beside the old copy
+ * (FolderTransport writes temp-then-rename; adb pushes in place).
+ */
+function spaceNeeded(kind, ops) {
+  let largest = 0;
+  if (kind === "folder") {
+    for (const op of ops || []) if ((op.kind === "update" || op.kind === "replace") && (op.size || 0) > largest) largest = op.size;
+  }
+  return _growth(ops) + largest;
+}
+
 function _emptyListing(method) {
   return { ok: true, method, dirs: [], files: [], errored: [], undecodable: [], other: 0, keys: new Set(), dirKeys: new Set() };
 }
@@ -607,7 +623,7 @@ class AdbTransport {
 
   /** adb writes in place (SEND unlinks the old file first): growth only. */
   freeSpaceNeeded(ops) {
-    return _growth(ops);
+    return spaceNeeded("adb", ops);
   }
 
   /**
@@ -1054,11 +1070,9 @@ class FolderTransport {
     }
   }
 
-  /** Growth, plus the largest updated file: its temp sits beside the old copy. */
+  /** Growth, plus the largest updated file (spaceNeeded). */
   freeSpaceNeeded(ops) {
-    let largest = 0;
-    for (const op of ops || []) if ((op.kind === "update" || op.kind === "replace") && (op.size || 0) > largest) largest = op.size;
-    return _growth(ops) + largest;
+    return spaceNeeded("folder", ops);
   }
 
   /**
@@ -1119,6 +1133,7 @@ module.exports = {
   FOLDER_TMP_PREFIX,
   validatePath,
   segmentProblem,
+  spaceNeeded,
   shq,
   flipAsciiCase,
   AdbTransport,

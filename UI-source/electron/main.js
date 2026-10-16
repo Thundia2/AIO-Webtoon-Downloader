@@ -53,8 +53,12 @@ const appUpdater = require("./updater");
 // never-throw contract, so a sync defect can't break a path every user runs
 // with sync off. grep: deviceSync
 let initDeviceSync = null;
+// get-settings' resolved sync keys (sync/sync-settings.js). A load failure
+// leaves the keys out; the renderer then shows its own defaults.
+let syncSettingsForRenderer = () => ({});
 try {
   ({ initDeviceSync } = require("./sync/service"));
+  ({ syncSettingsForRenderer } = require("./sync/sync-settings"));
 } catch (e) {
   console.error("[deviceSync] load failed", e);
 }
@@ -693,8 +697,18 @@ function setupIPC() {
   // path back.
   ipcMain.handle("get-settings", async () => {
     const saved = history.getSettings();
+    let syncKeys = {};
+    try {
+      syncKeys = syncSettingsForRenderer(saved);
+    } catch (e) {
+      console.error("[deviceSync] get-settings", e);
+    }
     return {
       ...saved,
+      // Device Sync's eight global keys, resolved like appAutoUpdate below
+      // and for the same reason (no phantom dirty count on first launch).
+      // Owner: sync/sync-settings.js SYNC_SETTING_SPECS.
+      ...syncKeys,
       // Genuine user-pref defaults — these have meaningful "missing →
       // assume default" semantics and stay merged here. SettingsTab.jsx
       // owns the DEFAULT_DOWNLOAD_DEFAULTS dict; we just pass through

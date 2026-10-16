@@ -350,7 +350,9 @@ async function settle() {
     check("getWindow() reads the window lazily", deps.getWindow() === windows[0]);
     check("getSettings() returns the saved settings", deps.getSettings() && typeof deps.getSettings() === "object");
     check("resolveSpawnPaths() resolves a workingDir", typeof deps.resolveSpawnPaths({}).workingDir === "string");
-    eq("23 sync:* handlers registered", syncHandlers.length, 23);
+    // One per contract channel (contract.js CHANNELS is the list's owner).
+    const nChannels = Object.values(require(path.join(ELECTRON_DIR, "sync", "contract.js")).CHANNELS).length;
+    eq(`${nChannels} sync:* handlers registered`, syncHandlers.length, nChannels);
     const gs = await invoke("sync:get-state");
     eq("sync:get-state answers enabled:false while off", [gs.ok, gs.enabled], [true, false]);
     const off = await invoke("sync:plan", { targetId: "x" });

@@ -121,6 +121,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   syncFindSourcesGet: (p) => ipcRenderer.invoke("sync:find-sources:get", p),
   syncFindSourcesUpdateRow: (p) => ipcRenderer.invoke("sync:find-sources:update-row", p),
   syncLink: (p) => ipcRenderer.invoke("sync:link", p),
+  syncReview: (p) => ipcRenderer.invoke("sync:review", p),
   onSyncEvent: (callback) => {
     const handler = (_event, data) => callback(data);
     ipcRenderer.on("sync-event", handler);

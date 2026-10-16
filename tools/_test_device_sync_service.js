@@ -228,6 +228,18 @@ async function app(o = {}) {
     return done;
   };
   a.state = () => a.call("get-state");
+  /**
+   * apply with the gen the target's current summary carries (the review
+   * contract: service.js _genMismatch). The contract itself is tested by
+   * calling a.call("apply") directly. One tick first, so a `plans` push
+   * already queued has landed.
+   */
+  a.apply = async (payload) => {
+    await new Promise((r) => setImmediate(r));
+    const st = await a.state();
+    const v = st.plans[payload.targetId];
+    return a.call("apply", { gen: v ? v.gen : null, ...payload });
+  };
   a.summary = async (targetId) => (await a.state()).plans[targetId].summary;
   a.close = async () => {
     await a.svc.shutdown({ timeoutMs: 2000 });
@@ -393,7 +405,7 @@ test("main flow on a folder target: connect prompt → plan → apply → PC edi
     const shown = await a.waitEvent((e) => e.kind === "prompt" && e.action === "show", 15000, 0, "connect prompt");
     assert.deepStrictEqual(shown.prompt.targetIds, [id]);
     assert.strictEqual(shown.prompt.card.targets[0].firstSync, true);
-    assert.strictEqual(shown.prompt.card.syncNow, false, "a first sync is never one click");
+    assert.ok(!("syncNow" in shown.prompt.card), "design D2: the prompt never offers a one-click apply");
     assert.ok((await a.call("prompt-response", { promptId: shown.prompt.promptId, action: "review" })).ok);
     await a.idle();
     let sum = await a.summary(id);
@@ -404,7 +416,7 @@ test("main flow on a folder target: connect prompt → plan → apply → PC edi
     const sel = await a.call("set-selection", { targetId: id, changes: [{ opId: betaPush.opId, selected: false }] });
     assert.ok(sel.ok);
     assert.strictEqual(sel.totals.push.count, 3);
-    const ap = await a.call("apply", { targetId: id });
+    const ap = await a.apply({ targetId: id });
     assert.ok(ap.ok, JSON.stringify(ap));
     const done = await a.job(ap.runId);
     assert.strictEqual(done.status, "completed", JSON.stringify(done.summary));
@@ -438,14 +450,16 @@ test("main flow on a folder target: connect prompt → plan → apply → PC edi
     assert.ok(kinds.includes("update:true"), `update pre-selected: ${kinds}`);
     assert.ok(kinds.includes("push:true"));
     assert.ok(kinds.includes("delete:true"), `guarded: the covered old Ch.002 delete is pre-selected: ${kinds}`);
-    // add-only pre-selects no delete.
-    const addOnly = await a.plan(id, { deletePolicy: "add-only" });
+    // add-only (the target's Removals field, design D5) pre-selects no delete.
+    assert.ok((await a.call("config-op", { op: "update-target", targetId: id, patch: { deletePolicy: "add-only" } })).ok);
+    const addOnly = await a.plan(id);
     const det3 = await a.call("series-detail", { targetId: id, seriesKey: alpha.seriesKey });
     assert.ok(!det3.rows.some((r) => r.opId && r.opId.startsWith("delete:") && r.preselected), "add-only");
     assert.ok(addOnly.summary.plan.totals.update.count === 1);
-    // Back to guarded and apply.
+    assert.strictEqual(addOnly.summary.plan.policy.deletePolicy, "add-only");
+    assert.ok((await a.call("config-op", { op: "update-target", targetId: id, patch: { deletePolicy: "guarded" } })).ok);
     await a.plan(id);
-    const ap2 = await a.call("apply", { targetId: id });
+    const ap2 = await a.apply({ targetId: id });
     assert.ok(ap2.ok, JSON.stringify(ap2));
     const d2 = await a.job(ap2.runId);
     assert.strictEqual(d2.status, "completed", JSON.stringify(d2.summary));
@@ -467,7 +481,9 @@ test("main flow on a folder target: connect prompt → plan → apply → PC edi
     const orphan = plan.summary.plan.deviceOnly.find((d) => d.name === "Alpha");
     assert.strictEqual(orphan.state, "orphaned");
     fs.writeFileSync(path.join(a.target, "Alpha", "notes.txt"), "mine");
-    const pr = await a.call("prune", { targetId: id });
+    assertRefusal(await a.call("prune", { targetId: id }), "invalid");
+    assertRefusal(await a.call("prune", { targetId: id, folders: [] }), "invalid");
+    const pr = await a.call("prune", { targetId: id, folders: ["Alpha"] });
     assert.ok(pr.ok);
     const pd = await a.job(pr.runId);
     assert.strictEqual(pd.status, "completed");
@@ -494,7 +510,7 @@ test("a device refusal ends the plan job `failed` with summary.refusal, and get-
     const id = await a.addFolderTarget();
     await a.waitEvent((e) => e.kind === "prompt" && e.action === "show", 15000, 0, "connect prompt");
     await a.idle();
-    const ap = await a.call("apply", { targetId: id });
+    const ap = await a.apply({ targetId: id });
     assert.ok(ap.ok, JSON.stringify(ap));
     assert.strictEqual((await a.job(ap.runId)).status, "completed");
     await a.idle();
@@ -552,7 +568,7 @@ test("device-ready: one immediate line per job once the device checks pass, befo
     assert.deepStrictEqual(done.job.progress.preflight, pf, "it stays in the job's progress for a re-adopting renderer");
     // Verify prepares twice (before and after verifying): still one line.
     await a.idle();
-    assert.strictEqual((await a.job((await a.call("apply", { targetId: id })).runId)).status, "completed");
+    assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
     await a.idle();
     const from2 = a.since();
     const vr = await a.call("verify", { targetId: id });
@@ -570,7 +586,7 @@ test("device-ready carries a device refusal at once; the job still ends failed w
     series(a.lib, "Alpha", { "Ch.001.cbz": 3000 });
     const id = await a.addFolderTarget();
     await a.idle();
-    assert.strictEqual((await a.job((await a.call("apply", { targetId: id })).runId)).status, "completed");
+    assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
     await a.idle();
     for (const n of fs.readdirSync(a.target)) fs.rmSync(path.join(a.target, n), { recursive: true, force: true });
     const from = a.since();
@@ -679,7 +695,7 @@ test("apply re-checks: an unacknowledged loss blocks with the one refusal shape"
     series(a.lib, "Gamma", { "Ch.001.cbz": 1000, "Ch.002.cbz": 1000 });
     const id = await a.addFolderTarget();
     await a.idle();
-    let done = await a.job((await a.call("apply", { targetId: id })).runId);
+    let done = await a.job((await a.apply({ targetId: id })).runId);
     assert.strictEqual(done.status, "completed");
     // Ch.002 disappears from the PC and its device copy is selected for delete → loss.
     fs.rmSync(path.join(a.lib, "Gamma", "Ch.002.cbz"));
@@ -691,10 +707,10 @@ test("apply re-checks: an unacknowledged loss blocks with the one refusal shape"
     assert.strictEqual(del.preselected, false, "an uncovered chapter is never pre-selected");
     const sel = await a.call("set-selection", { targetId: id, changes: [{ opId: del.opId, selected: true }] });
     assert.deepStrictEqual(sel.losses, [del.opId]);
-    const r = await a.call("apply", { targetId: id });
+    const r = await a.apply({ targetId: id });
     assertRefusal(r, "blocked");
     assert.strictEqual(r.blocking[0].kind, "loss");
-    const ok = await a.call("apply", { targetId: id, ackLosses: [del.opId] });
+    const ok = await a.apply({ targetId: id, ackLosses: [del.opId] });
     assert.ok(ok.ok);
     done = await a.job(ok.runId);
     assert.strictEqual(done.status, "completed");
@@ -722,7 +738,7 @@ test("rename-device-folder runs as a `rename` job in the quit-ask set; identity 
     series(a.lib, "Delta", { "Ch.001.cbz": 1000 });
     const id = await a.addFolderTarget();
     await a.idle();
-    const ap = await a.call("apply", { targetId: id });
+    const ap = await a.apply({ targetId: id });
     assert.strictEqual((await a.job(ap.runId)).status, "completed");
     await a.idle();
     const st = await a.state();
@@ -732,7 +748,7 @@ test("rename-device-folder runs as a `rename` job in the quit-ask set; identity 
     await g.reached;
     assert.strictEqual(a.svc.needsQuitAsk(), true);
     const qi = a.svc.quitInfo();
-    assert.deepStrictEqual([qi.target, qi.phase], ["Folder", "rename"]);
+    assert.deepStrictEqual([qi.target, qi.phase, qi.unit, qi.done, qi.total], ["Folder", "rename", "folders", 0, 1]);
     assert.strictEqual(a.svc.isJobRunning(), true);
     assertRefusal(await a.call("config-op", { op: "forget-record", targetId: id }), "busy");
     assertRefusal(await a.call("config-op", { op: "update-target", targetId: id, patch: { root: path.join(a.dir, "elsewhere") } }), "busy");
@@ -792,7 +808,7 @@ test("turning sync off mid-job cancels the job and find-sources first; both canc
     assert.ok(fsr.ok && fsr.started, JSON.stringify(fsr));
     await waitFor(() => a.search.calls.length === 1, 3000, "search started");
     // A held job: the apply's executor waits in a hook we never open... use cancel path instead.
-    const ap = await a.call("apply", { targetId: id });
+    const ap = await a.apply({ targetId: id });
     assert.ok(ap.ok);
     await g.reached;
     a.settings = { ...a.settings, syncEnabled: false };
@@ -820,7 +836,7 @@ test("quit: shutdown() finishes within 5 s with a job held; shutdownNow is synch
   series(a.lib, "Eta", { "Ch.001.cbz": 1000 });
   const id = await a.addFolderTarget();
   await a.idle();
-  assert.strictEqual((await a.job((await a.call("apply", { targetId: id })).runId)).status, "completed");
+  assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
   await a.idle();
   const sk = (await a.state()).plans[id].summary.series[0].seriesKey;
   const r = await a.call("rename-device-folder", { targetId: id, seriesKey: sk, to: "Eta 2" });
@@ -972,7 +988,7 @@ test("adb: attached device → automatic plan → prompt; list/browse; Link a co
     assert.strictEqual(after.counts.push || 0, 0, JSON.stringify(after.counts));
     assert.strictEqual(after.counts.inSync, 2, JSON.stringify(after.counts));
     // Apply pushes Nu; then unplug withdraws nothing open, and a re-plug prompts again.
-    const ap = await a.call("apply", { targetId: id });
+    const ap = await a.apply({ targetId: id });
     assert.ok(ap.ok, JSON.stringify(ap));
     const d = await a.job(ap.runId);
     assert.strictEqual(d.status, "completed", JSON.stringify(d.summary));
@@ -1001,33 +1017,6 @@ test("adb: an unplug while a prompt is shown withdraws it", async () => {
     const w = await a.waitEvent((e) => e.kind === "prompt" && e.action === "withdraw", 3000, 0, "withdraw");
     assert.strictEqual(w.prompt.promptId, shown.prompt.promptId);
     assert.strictEqual((await a.state()).prompt, null);
-  } finally {
-    await a.close();
-  }
-});
-
-test("sync-now from the prompt applies an eligible target in one click", async () => {
-  const a = await app();
-  try {
-    series(a.lib, "Omi", { "Ch.001.cbz": 1000 });
-    const id = await a.addFolderTarget();
-    let shown = await a.waitEvent((e) => e.kind === "prompt" && e.action === "show", 15000, 0, "prompt");
-    await a.call("prompt-response", { promptId: shown.prompt.promptId, action: "review" });
-    await a.idle();
-    assert.strictEqual((await a.job((await a.call("apply", { targetId: id })).runId)).status, "completed");
-    await a.idle();
-    // A new chapter, then the folder reconnects: the prompt offers Sync now.
-    writeOld(path.join(a.lib, "Omi", "Ch.002.cbz"), bytes("Ch.002.cbz", 1000));
-    const tgt = a.target;
-    fs.renameSync(tgt, `${tgt}.off`);
-    await waitFor(() => a.events.some((e) => e.kind === "device" && e.folderPresence[id] === false), 3000, "folder gone");
-    const from = a.since();
-    fs.renameSync(`${tgt}.off`, tgt);
-    shown = await a.waitEvent((e) => e.kind === "prompt" && e.action === "show", 15000, from, "second prompt");
-    assert.strictEqual(shown.prompt.card.syncNow, true, JSON.stringify(shown.prompt.card));
-    assert.ok((await a.call("prompt-response", { promptId: shown.prompt.promptId, action: "sync-now" })).ok);
-    await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "apply", 15000, from, "sync-now apply");
-    assert.deepStrictEqual(devNames(a, "Omi"), ["Ch.001.cbz", "Ch.002.cbz"]);
   } finally {
     await a.close();
   }
@@ -1152,7 +1141,7 @@ test("service log: shutdownNow with the service up writes quit-now naming the ru
   series(a.lib, "Tau", { "Ch.001.cbz": 1000 });
   const id = await a.addFolderTarget();
   await a.idle();
-  assert.strictEqual((await a.job((await a.call("apply", { targetId: id })).runId)).status, "completed");
+  assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
   await a.idle();
   const sk = (await a.state()).plans[id].summary.series[0].seriesKey;
   await a.call("rename-device-folder", { targetId: id, seriesKey: sk, to: "Tau 2" });
@@ -1219,7 +1208,7 @@ test("forget-record clears through a new epoch; the next plan is a first sync ag
     series(a.lib, "Rho", { "Ch.001.cbz": 1000 });
     const id = await a.addFolderTarget();
     await a.idle();
-    assert.strictEqual((await a.job((await a.call("apply", { targetId: id })).runId)).status, "completed");
+    assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
     await a.idle();
     const before = JSON.parse(fs.readFileSync(path.join(a.userData, "targets", id, "header.json"), "utf8"));
     assert.ok((await a.call("config-op", { op: "forget-record", targetId: id })).ok);
@@ -1249,6 +1238,397 @@ test("enable at runtime starts the service; applySettings(off) stops the monitor
     a.settings = { ...a.settings, syncEnabled: false };
     await a.svc.applySettings(a.settings);
     assert.strictEqual(a.svc._debug().started, false);
+  } finally {
+    await a.close();
+  }
+});
+
+// ---------------------------------------------------------------- UI pass U0
+
+/** The latest `plans` event for a target, after one tick (they coalesce). */
+async function lastPlans(a, id, from = 0) {
+  await sleep(5);
+  return [...a.events.slice(from)].reverse().find((e) => e.kind === "plans" && e.targetId === id) || null;
+}
+
+test("U0 gen: apply needs the reviewed gen; a re-plan between review and Start refuses plan-changed", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Kappa", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const reviewed = (await a.state()).plans[id];
+    assert.ok(Number.isInteger(reviewed.gen), JSON.stringify(reviewed));
+    assert.strictEqual(reviewed.summary.gen, reviewed.gen, "the summary carries its gen");
+    assertRefusal(await a.call("apply", { targetId: id }), "invalid");
+    // An automatic re-plan lands while the review is open (a download ended).
+    writeOld(path.join(a.lib, "Kappa", "Ch.002.cbz"), bytes("Ch.002.cbz", 1000));
+    a.svc.notifyLibraryChanged("download");
+    await waitFor(() => a.events.some((e) => e.kind === "plans" && e.targetId === id && e.gen > reviewed.gen), 15000, "re-plan's plans event");
+    await a.idle();
+    const r = await a.call("apply", { targetId: id, gen: reviewed.gen });
+    assertRefusal(r, "blocked");
+    assert.strictEqual(r.blocking[0].kind, "plan-changed");
+    assert.ok(r.blocking[0].gen > reviewed.gen);
+    assert.strictEqual(devNames(a, "Kappa"), null, "nothing ran");
+    // Start against the new review works.
+    const ok = await a.call("apply", { targetId: id, gen: r.blocking[0].gen });
+    assert.ok(ok.ok, JSON.stringify(ok));
+    assert.strictEqual((await a.job(ok.runId)).status, "completed");
+    assert.deepStrictEqual(devNames(a, "Kappa"), ["Ch.001.cbz", "Ch.002.cbz"]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("U0 push model: plans events carry summary, gen, stale and lastRun; forget-record and remove-target announce themselves", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Lambda", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    let ev = await lastPlans(a, id);
+    assert.ok(ev && ev.summary && Number.isInteger(ev.gen) && ev.stale === false, JSON.stringify(ev && { gen: ev.gen, stale: ev.stale }));
+    const from = a.since();
+    const ap = await a.apply({ targetId: id });
+    const done = await a.job(ap.runId);
+    await a.idle();
+    ev = await lastPlans(a, id, from);
+    assert.strictEqual(ev.lastRun.phase, "apply");
+    assert.strictEqual(ev.lastRun.status, "completed");
+    assert.strictEqual(ev.lastRun.runId, done.runId);
+    assert.strictEqual(ev.lastRun.summary.filesDone, 1, "the run's result survives the re-plan it queued");
+    assert.ok(a.events.slice(from).some((e) => e.kind === "plans" && e.targetId === id && e.stale === true), "the queued re-plan marked it stale first");
+    assert.strictEqual((await a.state()).plans[id].lastRun.runId, done.runId, "get-state agrees");
+    // forget-record: the clear is pushed (summary gone, gen gone); config isn't changed.
+    const f2 = a.since();
+    assert.ok((await a.call("config-op", { op: "forget-record", targetId: id })).ok);
+    ev = await waitFor(() => a.events.slice(f2).find((e) => e.kind === "plans" && e.targetId === id && e.summary === null), 3000, "forget plans event");
+    assert.strictEqual(ev.gen, null);
+    await a.idle();
+    const f3 = a.since();
+    assert.ok((await a.call("config-op", { op: "remove-target", targetId: id })).ok);
+    ev = await waitFor(() => a.events.slice(f3).find((e) => e.kind === "plans" && e.targetId === id && e.removed), 3000, "removed plans event");
+    assert.ok(a.events.slice(f3).some((e) => e.kind === "config" && e.config.targets.length === 0));
+  } finally {
+    await a.close();
+  }
+});
+
+test("U0b removals are a target field: add-target stamps the global, a later global change doesn't move it, plan overrides are refused", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Mu", { "Ch.001.cbz": 1000, "Ch.002.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    assert.strictEqual((await a.state()).config.targets[0].deletePolicy, "guarded", "stamped from the global default");
+    await a.idle();
+    assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
+    await a.idle();
+    a.settings = { ...a.settings, syncDeletePolicy: "add-only" };
+    await a.svc.applySettings(a.settings);
+    await a.idle();
+    assert.strictEqual((await a.state()).config.targets[0].deletePolicy, "guarded", "the global is only for NEW targets");
+    assert.strictEqual((await a.summary(id)).policy.deletePolicy, "guarded");
+    assertRefusal(await a.call("plan", { targetId: id, overrides: { deletePolicy: "add-only" } }), "invalid");
+    assertRefusal(await a.call("plan", { targetId: id, overrides: { clearOverrides: true } }), "invalid");
+    assertRefusal(await a.call("config-op", { op: "update-target", targetId: id, patch: { deletePolicy: "bogus" } }), "invalid");
+    // add-only on the target: a covered extra stays, through an automatic
+    // re-plan and apply's own re-plan alike.
+    assert.ok((await a.call("config-op", { op: "update-target", targetId: id, patch: { deletePolicy: "add-only" } })).ok);
+    writeOld(path.join(a.target, "Mu", "Ch.002 (old).cbz"), bytes("x", 900));
+    const p = await a.plan(id);
+    assert.strictEqual(p.summary.plan.totals.delete.count, 0);
+    const gen0 = p.summary.plan.gen;
+    a.svc.notifyLibraryChanged("scan");
+    await waitFor(() => a.events.some((e) => e.kind === "plans" && e.targetId === id && e.gen > gen0), 15000, "auto re-plan");
+    await a.idle();
+    assert.strictEqual((await a.summary(id)).policy.deletePolicy, "add-only");
+    const ap = await a.apply({ targetId: id });
+    assert.ok(ap.ok, JSON.stringify(ap));
+    assert.strictEqual((await a.job(ap.runId)).status, "completed");
+    assert.ok(devNames(a, "Mu").includes("Ch.002 (old).cbz"));
+    // Re-check's Re-hash is one-shot (design D4): on its own plan only.
+    await a.idle();
+    const rh = await a.plan(id, { hashMode: "rehash" });
+    assert.strictEqual(rh.summary.plan.policy.hashMode, "rehash");
+    const next = await a.plan(id);
+    assert.strictEqual(next.summary.plan.policy.hashMode, "cached");
+    assert.ok(!("overrides" in next.summary.plan.policy));
+    const t2 = await a.call("config-op", { op: "add-target", target: { name: "Second", kind: "folder", root: path.join(a.dir, "device2"), profile: "generic" } });
+    assert.strictEqual(t2.config.targets.find((t) => t.id === t2.targetId).deletePolicy, "add-only", "a new target takes the changed global");
+  } finally {
+    await a.close();
+  }
+});
+
+test("U0b remove from target: a saved mark survives re-plans, goes through Review, removes the folder and its record; Include starts fresh", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Rho", { "Ch.001.cbz": 1000, "Ch.002.cbz": 1000, "Ch.003.cbz": 1000, "cover.jpg": 100 });
+    series(a.lib, "Sigma", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
+    await a.idle();
+    assert.deepStrictEqual(devNames(a, "Rho"), ["Ch.001.cbz", "Ch.002.cbz", "Ch.003.cbz", "cover.jpg"]);
+    const rhoKey = (await a.summary(id)).series.find((s) => s.folder === "Rho").seriesKey;
+    assertRefusal(await a.call("config-op", { op: "remove-series", targetId: id, seriesKey: "pc:nope" }), "invalid");
+    let from = a.since();
+    const rm = await a.call("config-op", { op: "remove-series", targetId: id, seriesKey: rhoKey });
+    assert.ok(rm.ok, JSON.stringify(rm));
+    const ex = rm.config.targets[0].excludes;
+    assert.strictEqual(ex.length, 1);
+    assert.strictEqual(ex[0].removeFiles, true);
+    await waitFor(() => a.events.slice(from).some((e) => e.kind === "plans" && e.targetId === id && e.summary), 15000, "re-plan after remove");
+    await a.idle();
+    // An automatic re-plan (a library change) keeps the pending removal.
+    const gen0 = (await a.state()).plans[id].gen;
+    a.svc.notifyLibraryChanged("scan");
+    await waitFor(() => a.events.some((e) => e.kind === "plans" && e.targetId === id && e.gen > gen0), 15000, "auto re-plan");
+    await a.idle();
+    const sum = await a.summary(id);
+    const rho = sum.series.find((s) => s.seriesKey === rhoKey);
+    assert.deepStrictEqual([rho.state, rho.heldReason, rho.removing], ["held", "excluded", true]);
+    assert.strictEqual(sum.totals.delete.count, 4);
+    const rv = await a.call("review", { targetId: id });
+    const g = rv.groups.find((x) => x.kind === "delete" && x.reason === "removed-from-target");
+    assert.deepStrictEqual([g.count, g.selectedCount], [4, 4]);
+    assert.deepStrictEqual(rv.losses, [], "the PC keeps every chapter: no loss");
+    // Start: the folder and its record go, the mark is cleared, the series stays off.
+    from = a.since();
+    const ap = await a.apply({ targetId: id });
+    assert.ok(ap.ok, JSON.stringify(ap));
+    const done = await a.job(ap.runId);
+    assert.strictEqual(done.status, "completed", JSON.stringify(done.summary));
+    assert.deepStrictEqual(done.summary.evictions, [{ seriesKey: rhoKey, folder: "Rho", removed: true }]);
+    assert.strictEqual(devNames(a, "Rho"), null, "the folder is gone");
+    assert.deepStrictEqual(devNames(a, "Sigma"), ["Ch.001.cbz"], "other series untouched");
+    assert.ok(fs.existsSync(path.join(a.lib, "Rho", "Ch.001.cbz")), "the PC keeps its copy");
+    const cfg = (await a.state()).config.targets[0];
+    assert.deepStrictEqual(cfg.excludes.map((e) => e.removeFiles), [undefined], "the mark is cleared; the exclude stays");
+    const shards = fs.readdirSync(path.join(a.userData, "targets", id, "folders")).filter((n) => n.endsWith(".json"));
+    assert.strictEqual(shards.length, 1, `only Sigma's shard is left: ${shards}`);
+    await a.idle();
+    const after = (await a.summary(id)).series.find((s) => s.seriesKey === rhoKey);
+    assert.deepStrictEqual([after.state, after.removing, after.counts.delete || 0], ["held", false, 0]);
+    // Include: a new series again (no shard), not a gone folder asking for a name.
+    from = a.since();
+    assert.ok((await a.call("config-op", { op: "include-series", targetId: id, seriesKey: rhoKey })).ok);
+    assert.deepStrictEqual((await a.state()).config.targets[0].excludes, []);
+    await waitFor(() => a.events.slice(from).some((e) => e.kind === "plans" && e.targetId === id && e.summary), 15000, "re-plan after include");
+    await a.idle();
+    const back = (await a.summary(id)).series.find((s) => s.seriesKey === rhoKey);
+    assert.deepStrictEqual([back.state, back.counts.push], ["new", 4]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("U0 needs-mode: a stored verifyMode lets automatic plans of a non-hashing device complete", async () => {
+  const a = await app({ adb: true });
+  try {
+    a.dev = a.srv.addDevice({ serial: SERIAL, inject: { symlinks: { "/sdcard": "/storage/emulated/0" }, tools: { sha256sum: false } } });
+    a.dev.fs.mkdirs(CANON);
+    a.dev.fs.writeFile(`${CANON}/Nu/Ch.001.cbz`, bytes("Ch.001.cbz", 1500), { mtime: OLD_S });
+    series(a.lib, "Nu", { "Ch.001.cbz": 1500 });
+    const t = await a.call("config-op", { op: "add-target", target: { name: "Tab", kind: "adb", serial: SERIAL, root: "/sdcard/Komikku/local", profile: "komikku" } });
+    const id = t.targetId;
+    const auto = await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, 0, "auto plan");
+    assert.strictEqual(auto.summary.refusal && auto.summary.refusal.code, "needs-mode", JSON.stringify(auto.summary));
+    await a.idle();
+    assertRefusal(await a.call("config-op", { op: "update-target", targetId: id, patch: { verifyMode: "bogus" } }), "invalid");
+    const from = a.since();
+    const up = await a.call("config-op", { op: "update-target", targetId: id, patch: { verifyMode: "adopt-size" } });
+    assert.ok(up.ok, JSON.stringify(up));
+    assert.strictEqual(up.config.targets[0].verifyMode, "adopt-size");
+    // The edit queues an automatic re-plan; it completes now.
+    const again = await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 30000, from, "re-plan");
+    assert.strictEqual(again.status, "completed", JSON.stringify(again.summary));
+    const st = await a.state();
+    assert.strictEqual(st.plans[id].refusal, null);
+    assert.strictEqual(st.plans[id].summary.policy.verifyMode, "adopt-size");
+    const ld = await a.call("list-devices");
+    assert.ok(ld.ok && ld.devices[0].stateKind != null, JSON.stringify(ld));
+  } finally {
+    await a.close();
+  }
+});
+
+test("U0b prompt: Review or Not now only (design D2); anything else is refused and leaves the prompt open", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Xi", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    let shown = await a.waitEvent((e) => e.kind === "prompt" && e.action === "show", 15000, 0, "prompt");
+    assertRefusal(await a.call("prompt-response", { promptId: shown.prompt.promptId, action: "sync-now", gens: { [id]: 1 } }), "invalid");
+    assert.ok(!a.events.some((e) => e.kind === "prompt" && e.action === "answered"), "not consumed");
+    assert.strictEqual((await a.state()).prompts.length, 1);
+    assert.ok((await a.call("prompt-response", { promptId: shown.prompt.promptId, action: "review" })).ok);
+    await a.idle();
+    assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
+    await a.idle();
+    // Reconnect with a new chapter: the prompt shows it, and Not now starts nothing.
+    writeOld(path.join(a.lib, "Xi", "Ch.002.cbz"), bytes("Ch.002.cbz", 1000));
+    const tgt = a.target;
+    fs.renameSync(tgt, `${tgt}.off`);
+    await waitFor(() => a.events.some((e) => e.kind === "device" && e.folderPresence[id] === false), 3000, "folder gone");
+    const from = a.since();
+    fs.renameSync(`${tgt}.off`, tgt);
+    shown = await a.waitEvent((e) => e.kind === "prompt" && e.action === "show", 15000, from, "second prompt");
+    assert.strictEqual(shown.prompt.card.targets[0].files, 1);
+    assert.ok((await a.call("prompt-response", { promptId: shown.prompt.promptId, action: "not-now" })).ok);
+    await a.idle();
+    assert.ok(!a.events.slice(from).some((e) => e.kind === "job" && e.job && e.job.phase === "apply"), "no apply without Review");
+    assert.deepStrictEqual(devNames(a, "Xi"), ["Ch.001.cbz"]);
+    assertRefusal(await a.call("prompt-response", { promptId: shown.prompt.promptId, action: "review" }), "invalid");
+  } finally {
+    await a.close();
+  }
+});
+
+test("U0 download guard: a running download's folder is skipped with reason `downloading` (series-dir, then url)", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Omicron", { "Ch.001.cbz": 1000 }, "https://mangafire.to/manga/omicron.x9");
+    series(a.lib, "Pi", { "Ch.001.cbz": 1000 }, "https://mangafire.to/manga/pi.x7");
+    const id = await a.addFolderTarget();
+    await a.idle();
+    // Omicron by its folder (an update-check download), Pi by its URL (www. and a trailing slash differ).
+    a.downloads = [
+      { downloadId: "d1", url: "https://elsewhere.example/x", seriesDir: path.join(a.lib, "Omicron") },
+      { downloadId: "d2", url: "https://www.MANGAFIRE.to/manga/pi.x7/", seriesDir: null },
+    ];
+    const ap = await a.apply({ targetId: id });
+    const done = await a.job(ap.runId);
+    assert.strictEqual(done.status, "completed", JSON.stringify(done.summary));
+    assert.deepStrictEqual(devNames(a, "Omicron") || [], [], "nothing of Omicron landed");
+    assert.deepStrictEqual(devNames(a, "Pi") || [], []);
+    assert.strictEqual(done.summary.skippedReasons.downloading, 2, JSON.stringify(done.summary.skipped));
+    assert.ok(done.summary.skipped.every((s) => s.reason === "downloading"));
+    a.downloads = [];
+    await a.idle();
+    const ap2 = await a.apply({ targetId: id });
+    assert.strictEqual((await a.job(ap2.runId)).status, "completed");
+    assert.deepStrictEqual(devNames(a, "Pi"), ["Ch.001.cbz"]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("U0 selection lock: set-selection is busy while an apply runs on that target; the review answers meanwhile", async () => {
+  const g = gate();
+  const a = await app({ executorDeps: { hooks: (pt) => (pt === "before-send" ? (g._hit(), g.wait) : undefined) } });
+  try {
+    series(a.lib, "Rho", { "Ch.001.cbz": 1000, "Ch.002.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const rv = await a.call("review", { targetId: id });
+    const push = rv.groups.find((x) => x.kind === "push").ops[0];
+    const ap = await a.apply({ targetId: id });
+    await g.reached;
+    assertRefusal(await a.call("set-selection", { targetId: id, changes: [{ opId: push.opId, selected: false }] }), "busy");
+    const during = await a.call("review", { targetId: id });
+    assert.strictEqual(during.busy, true);
+    g.open();
+    assert.strictEqual((await a.job(ap.runId)).status, "completed");
+  } finally {
+    await a.close();
+  }
+});
+
+test("U0 review: groups by (kind, reason), bulk by reason, push rows name their reason, capacity follows the selection", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Sigma", { "Ch.001.cbz": 1000, "Ch.002.cbz": 2000, "cover.jpg": 300 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const rv = await a.call("review", { targetId: id });
+    assert.ok(rv.ok, JSON.stringify(rv));
+    const sum = await a.summary(id);
+    assert.strictEqual(rv.gen, sum.gen);
+    const g = rv.groups.find((x) => x.kind === "push" && x.reason === "new");
+    assert.ok(g, JSON.stringify(rv.groups.map((x) => [x.kind, x.reason])));
+    assert.strictEqual(g.count, 3);
+    assert.strictEqual(g.selectedBytes, 3300);
+    // Capacity: needed = the selected pushes; free measured on the folder's volume.
+    assert.strictEqual(rv.capacity.needed, 3300);
+    assert.ok(rv.capacity.free == null || rv.capacity.free > 0, JSON.stringify(rv.capacity));
+    assert.strictEqual(rv.capacity.reserve, 1024 * 1024 * 1024);
+    assert.ok(Array.isArray(sum.warnings));
+    const det = await a.call("series-detail", { targetId: id, seriesKey: sum.series[0].seriesKey });
+    assert.ok(det.rows.filter((r) => r.kind === "push").every((r) => r.reason === "new"), "push rows carry the op's reason");
+    // Untick the whole (push, new) group; a reason that matches nothing touches nothing.
+    const none = await a.call("set-selection", { targetId: id, bulk: "group", group: "push", reason: "missing", selected: false });
+    assert.strictEqual(none.totals.push.count, 3);
+    const off = await a.call("set-selection", { targetId: id, bulk: "group", group: "push", reason: "new", selected: false });
+    assert.strictEqual(off.totals.push.count, 0);
+    assert.strictEqual(off.gen, sum.gen, "a selection change keeps the gen");
+    const rv2 = await a.call("review", { targetId: id });
+    assert.strictEqual(rv2.capacity.needed, 0);
+    assert.strictEqual(rv2.groups.find((x) => x.kind === "push").selectedCount, 0);
+    assertRefusal(await a.call("review", { targetId: "nope" }), "invalid");
+  } finally {
+    await a.close();
+  }
+});
+
+test("U0 prune and rename report progress: quitInfo counts folders", async () => {
+  const g = gate();
+  const a = await app({ executorDeps: { hooks: (pt) => (pt === "prune-before-folder" ? (g._hit(), g.wait) : undefined) } });
+  try {
+    series(a.lib, "Tau", { "Ch.001.cbz": 1000 });
+    series(a.lib, "Upsilon", { "Ch.001.cbz": 1000 });
+    series(a.lib, "Chi", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
+    fs.rmSync(path.join(a.lib, "Tau"), { recursive: true });
+    fs.rmSync(path.join(a.lib, "Upsilon"), { recursive: true });
+    await a.idle();
+    const pl = await a.plan(id);
+    const orphans = pl.summary.plan.deviceOnly.filter((d) => d.state === "orphaned").map((d) => d.name).sort();
+    assert.deepStrictEqual(orphans, ["Tau", "Upsilon"], JSON.stringify(pl.summary.plan.deviceOnly));
+    const pr = await a.call("prune", { targetId: id, folders: ["Tau", "Upsilon", "Nope"] });
+    assert.ok(pr.ok, JSON.stringify(pr));
+    await waitFor(() => a.svc.quitInfo() && a.svc.quitInfo().total === 2, 5000, "prune progress");
+    const qi = a.svc.quitInfo();
+    assert.deepStrictEqual([qi.phase, qi.unit, qi.done, qi.total], ["prune", "folders", 0, 2]);
+    g.open();
+    const d = await a.job(pr.runId);
+    assert.strictEqual(d.status, "completed", JSON.stringify(d.summary));
+    assert.deepStrictEqual(d.summary.notOrphaned, ["Nope"]);
+    assert.strictEqual(d.summary.filesDone, 2);
+  } finally {
+    await a.close();
+  }
+});
+
+test("U0 settings: applySettings pushes `settings`; a planning setting change re-plans; get-state while off has specs", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Phi", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const gen0 = (await a.summary(id)).gen;
+    const from = a.since();
+    a.settings = { ...a.settings, syncSizeWarnPct: 15 };
+    await a.svc.applySettings(a.settings);
+    const ev = a.events.slice(from).find((e) => e.kind === "settings");
+    assert.ok(ev && ev.enabled === true && ev.settings.syncSizeWarnPct === 15, JSON.stringify(ev));
+    assert.ok(!("chapterPatterns" in ev.settings), "no RegExps over IPC");
+    await waitFor(() => a.events.slice(from).some((e) => e.kind === "plans" && e.targetId === id && e.gen > gen0), 15000, "re-plan after a planning setting");
+    await a.idle();
+    const f2 = a.since();
+    a.settings = { ...a.settings, syncErrorBudget: 5 };
+    await a.svc.applySettings(a.settings);
+    await sleep(50);
+    assert.ok(!a.events.slice(f2).some((e) => e.kind === "plans" && e.stale), "a non-planning setting doesn't re-plan");
+    a.settings = { ...a.settings, syncEnabled: false };
+    await a.svc.applySettings(a.settings);
+    const off = await a.state();
+    assert.strictEqual(off.enabled, false);
+    assert.ok(off.specs && off.specs.syncEnabled, "specs while off");
+    assert.ok(a.events.some((e) => e.kind === "settings" && e.enabled === false));
   } finally {
     await a.close();
   }

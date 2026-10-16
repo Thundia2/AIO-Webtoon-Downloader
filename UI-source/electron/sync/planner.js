@@ -10,7 +10,8 @@
 // Parent plan rules implemented here (add-this-script-s-features-linked-
 // pumpkin.md): 1 names and binding, 2 adoption, 4 per-slot planning,
 // 5 guarded delete preselection and losses, 6's re-plan reconcile, 10's
-// Sync-now eligibility, 13's library status. Non-UI plan additions:
+// prompt summary (its one-click Sync now was removed by approved design D2),
+// 13's library status. Non-UI plan additions:
 // `settling` files, `adopted-size` never pre-selecting or covering a delete,
 // and the gone-folder re-push (decision 10, "Provenance" section).
 //
@@ -71,6 +72,9 @@ const MASS_TOTAL_DELETES = 200;
 // A range's integers are expanded for loss checks only up to this span;
 // a wider one is never "covered" (it is a loss when deleted).
 const RANGE_EXPAND_MAX = 5000;
+// The delete reason of "Remove from <target>" (approved design D7; grep
+// _planEvict). executor.js lifts the PC-slot guard for it alone.
+const EVICT_REASON = "removed-from-target";
 
 const STRONG_TIERS = Object.freeze(new Set(["identity", "content", "record"]));
 const TIER_ORDER = Object.freeze(["identity", "content", "record", "name", "similar"]);
@@ -276,8 +280,10 @@ function inputRefusal(pc, view) {
  * @param {object} input.pc
  * @param {object} input.device
  * @param {object} input.view      loadRecordView() result.
- * @param {object} [input.opts]    {now, deletePolicy, gone:Set<shardId>,
- *   nameProbe:Map<name, boolean absent>}
+ * @param {object} [input.opts]    {now, gone:Set<shardId>,
+ *   nameProbe:Map<name, boolean absent>}. The removal policy is the
+ *   target's own (cfg.deletePolicy, profiles.js DELETE_POLICIES), else the
+ *   global syncDeletePolicy for a target saved before that field existed.
  * @returns {object} the plan, or a refusal ({ok:false, code, ...}).
  */
 function buildPlan(input) {
@@ -288,7 +294,7 @@ function buildPlan(input) {
   const view = input.view;
   const opts = input.opts || {};
   const now = Number.isFinite(opts.now) ? opts.now : Date.now();
-  const policy = opts.deletePolicy || settings.syncDeletePolicy || "guarded";
+  const policy = cfg.deletePolicy || settings.syncDeletePolicy || "guarded";
   const patterns = settings.chapterPatterns || [];
   const gone = opts.gone instanceof Set ? opts.gone : new Set(opts.gone || []);
   const nameProbe = opts.nameProbe instanceof Map ? opts.nameProbe : new Map();
@@ -631,6 +637,19 @@ function buildPlan(input) {
     }
   }
 
+  // 8b. "Remove from <target>" (approved design D7): an exclude entry with
+  // removeFiles keeps offering its series' files there as deletes, plan after
+  // plan, until they are gone or unticked (the mark is saved, so an automatic
+  // re-plan can't drop them). Only an excluded series, so nothing pushes back.
+  for (const sp of sps) {
+    if (sp.heldReason !== "excluded") continue;
+    const s = sp._s;
+    const entry = naming.findSeriesEntry({ identityKey: s.identityKey, url: s.url, folder: s.folder }, cfg.excludes);
+    if (!entry || entry.removeFiles !== true) continue;
+    const folder = sp._shard ? dirSlots.get(slotKey(sp._shard.name, ci)) : sp.heldFolder;
+    if (folder != null) _planEvict(plan, sp, cfg, device, folder, settings);
+  }
+
   // 9. Device-only rows and their suggestions.
   for (const u of unmatched) {
     const files = u.listing.files;
@@ -875,7 +894,7 @@ function _planCreate(plan, sp, cfg, now, ack, settings) {
     });
     if (!op) continue;
     _brings(sp, op, lab);
-    sp.rows.push(_row("push", { opId: op.id, pcName: f.name, name, size: f.size, lab }));
+    sp.rows.push(_row("push", { opId: op.id, pcName: f.name, name, size: f.size, lab, reason: op.reason }));
   }
 }
 
@@ -1131,6 +1150,64 @@ function _planExisting(plan, sp, cfg, device, now, ack, settings) {
   }
 }
 
+/**
+ * Delete ops for every chapter file and sidecar of an excluded series' folder
+ * on the target (8b). Files the record proves ours are pre-selected; anything
+ * else (a file the app never wrote) is offered unticked, the same caution as
+ * an extra. Other file types stay, as everywhere (unmanaged). A delete is a
+ * LOSS only when the PC lacks that chapter too (sp.evict, read by
+ * seriesLosses): removing what the PC keeps loses nothing. sp.deviceFolder
+ * is set so the executor finds the folder; the state stays `held`.
+ */
+function _planEvict(plan, sp, cfg, device, folder, settings) {
+  const listing = _deviceFiles(device, folder);
+  if (!listing.ok) return;
+  const ci = plan.caseInsensitive;
+  const patterns = settings.chapterPatterns || [];
+  const entries = sp._shard ? sp._shard.files : new Map();
+  const pcLabels = new Set();
+  for (const f of sp._s.labeled) {
+    if (f.unit === "chapter") pcLabels.add(f.label);
+    else if (f.unit === "range") for (const l of _rangeInts(f.start, f.end) || []) pcLabels.add(l);
+  }
+  sp.deviceFolder = folder;
+  // pcNames covers what labels can't compare (volumes, whole files): the
+  // same file name on the PC.
+  sp.evict = { folder, pcLabels, pcNames: new Set(sp._s.files.map((f) => slotKey(f.name, ci))) };
+  for (const d of listing.files) {
+    const lab = _labelInfo(d.name, folder, patterns);
+    const chapterFmt = isChapterFormat(d.name);
+    const sidecar = isSidecar(d.name, cfg);
+    const e = entries.get(slotKey(d.name, ci)) || null;
+    if (!chapterFmt && !sidecar) {
+      sp.counts.unmanaged += 1;
+      sp.rows.push(_row("unmanaged", { name: d.name, deviceName: d.name, size: d.size, lab, origin: e ? e.origin : null, reason: "type" }));
+      continue;
+    }
+    const ours = classifyDeviceFile(e, d) === "ours";
+    const op = _addOp(plan, sp, {
+      id: opId("delete", folder, d.name),
+      kind: "delete",
+      name: d.name,
+      sha: e && e.sha256 ? e.sha256 : `${d.size}@${d.devMtime}`,
+      devFile: { size: d.size, devMtime: d.devMtime },
+      unit: sidecar ? "sidecar" : lab.unit,
+      label: lab.label,
+      reason: EVICT_REASON,
+      sidecar,
+      origin: e ? e.origin : null,
+      ours,
+      preselected: ours,
+    });
+    if (!op) continue;
+    sp.rows.push(_row("delete", { opId: op.id, name: d.name, deviceName: d.name, size: d.size, lab, origin: e ? e.origin : null, reason: EVICT_REASON }));
+    if (chapterFmt) {
+      sp.deviceChapterFiles += 1;
+      sp.devFiles.push({ name: d.name, unit: lab.unit, label: lab.label, start: lab.start, end: lab.end, deleteOpId: op.id });
+    }
+  }
+}
+
 function _devFile(x) {
   return {
     name: x.d.name,
@@ -1212,7 +1289,10 @@ function seriesLosses(plan, sp, selected) {
   }
   const brought = new Set();
   for (const b of sp.brings) if (isSel(b.opId)) for (const l of labelsOf(b)) brought.add(l);
-  const carried = (label, minus) => (carriers.get(label) || 0) - minus > 0 || brought.has(label);
+  // A series being removed from the target (8b) keeps its chapters on the
+  // PC, so a label the PC holds is carried there.
+  const onPc = sp.evict ? sp.evict.pcLabels : null;
+  const carried = (label, minus) => (carriers.get(label) || 0) - minus > 0 || brought.has(label) || (!!onPc && onPc.has(label));
   for (const f of sp.devFiles) {
     if (!f.deleteOpId) continue;
     const op = plan.ops.get(f.deleteOpId);
@@ -1226,7 +1306,7 @@ function seriesLosses(plan, sp, selected) {
     else if (f.unit === "range") {
       const ints = _rangeInts(f.start, f.end);
       lost = !ints || ints.some((l) => !carried(l, minus));
-    } else lost = true;
+    } else lost = !(sp.evict && sp.evict.pcNames.has(slotKey(f.name, plan.caseInsensitive)));
     if (!lost) continue;
     if (sel) loss.add(f.deleteOpId);
     else lossIfSelected.add(f.deleteOpId);
@@ -1303,7 +1383,10 @@ function evaluateSelection(plan, selected) {
  * the series whose ops changed; rebind changes go through applyRebind.
  * @param {object} plan
  * @param {object} storedOps
- * @param {object} req  {changes:[{opId, selected}]} or {bulk:'covered-extras'|'split-parts'|'group', seriesKey?, group?, selected?}
+ * @param {object} req  {changes:[{opId, selected}]} or {bulk:'covered-extras'|'split-parts'|'group', seriesKey?, group?, reason?, selected?}
+ *   A `group` bulk with `reason` touches only that kind's ops with that
+ *   reason: the review's group checkboxes are per (kind, reason)
+ *   (planReview), so "untick every sidecar delete" leaves extras alone.
  */
 function changeSelection(plan, storedOps, req) {
   const ops = { ...(storedOps || {}) };
@@ -1324,11 +1407,12 @@ function changeSelection(plan, storedOps, req) {
   const inScope = (sp) => !req.seriesKey || sp.seriesKey === req.seriesKey;
   if (req.bulk === "group") {
     if (!["push", "update", "replace", "rename", "delete"].includes(req.group)) return refuse("invalid", "unknown group");
+    if (req.reason != null && typeof req.reason !== "string") return refuse("invalid", "reason must be a string");
     for (const sp of plan.series) {
       if (!inScope(sp)) continue;
       for (const id of sp.opIds) {
         const op = plan.ops.get(id);
-        if (op.kind === req.group) set(op, req.selected !== false);
+        if (op.kind === req.group && (req.reason == null || op.reason === req.reason)) set(op, req.selected !== false);
       }
     }
   } else if (req.bulk === "covered-extras") {
@@ -1462,41 +1546,6 @@ function reconcileForApply(a) {
 }
 
 /**
- * Rule 10: when the connect prompt may offer one-click "Sync now".
- * @returns {{eligible:boolean, reasons:string[]}}
- */
-function syncNowEligibility(plan, selected) {
-  const reasons = [];
-  if (plan.firstSync) reasons.push("first-sync");
-  if (plan.needsVerify.length) reasons.push("needs-verify");
-  if (plan.sanity.length) reasons.push("listing-sanity");
-  let any = false;
-  for (const op of plan.ops.values()) {
-    if (!selected.get(op.id)) continue;
-    any = true;
-    if (op.kind === "delete" || op.kind === "replace" || op.kind === "rename") {
-      if (!reasons.includes(`selected-${op.kind}`)) reasons.push(`selected-${op.kind}`);
-    }
-  }
-  for (const sp of plan.series) {
-    // One click must never overwrite files matched by size alone.
-    if (sp.verifyMode === "adopt-size" && sp.opIds.some((id) => selected.get(id))) {
-      if (!reasons.includes("adopt-size-folder")) reasons.push("adopt-size-folder");
-    }
-    if (sp.state === "gone" && sp.rebind && sp.rebind.fellBack && sp.opIds.some((id) => selected.get(id))) {
-      if (!reasons.includes("fallback-name")) reasons.push("fallback-name");
-    }
-  }
-  if (plan.suggestions.some((g) => !g.ignored)) reasons.push("suggestions");
-  if (plan.anomalies.some((x) => x.severity === "error" && !x.acknowledged)) reasons.push("error-anomalies");
-  const ev = evaluateSelection(plan, selected);
-  if (ev.massRepush.required) reasons.push("mass-repush");
-  if (ev.massDelete.required) reasons.push("mass-delete");
-  if (!any) reasons.push("nothing-to-do");
-  return { eligible: reasons.length === 0, reasons };
-}
-
-/**
  * The connect prompt's line for one target (rule 10), plus what Set up
  * would verify on a first sync.
  */
@@ -1536,21 +1585,19 @@ function promptSummary(plan, selected, device) {
     verifyFolders: plan.needsVerify.length,
     verifyBytes,
     removedOnDevice,
-    syncNow: syncNowEligibility(plan, selected),
     nothingToDo: t.files === 0 && t.delete.count === 0 && t.rename.count === 0 && !plan.needsVerify.length,
   };
 }
 
 /**
- * One prompt per device listing each of its targets (rule 10). Sync now is
- * offered only when every listed target is eligible.
+ * One prompt per device listing each of its targets (rule 10). The prompt
+ * offers Review, never a one-click apply (approved design D2).
  */
 function promptCard(serial, summaries) {
   const targets = (summaries || []).filter((s) => s && !s.nothingToDo);
   return {
     serial,
     targets,
-    syncNow: targets.length > 0 && targets.every((s) => s.syncNow.eligible),
     empty: targets.length === 0,
   };
 }
@@ -1702,6 +1749,7 @@ function seriesDetail(plan, seriesKey, selected) {
     deviceFolder: sp.deviceFolder,
     state: sp.state,
     heldReason: sp.heldReason,
+    removing: !!sp.evict,
     tags: sp.tags,
     rows,
     anomalies: plan.anomalies.filter((a) => a.seriesKey === seriesKey),
@@ -1732,6 +1780,7 @@ function planSummary(plan, selected) {
       deviceFolder: sp.deviceFolder,
       state: sp.state,
       heldReason: sp.heldReason,
+      removing: !!sp.evict,
       counts: { ...sp.counts, ...ev.perSeries.get(sp.seriesKey) },
       tags: sp.tags,
       anomalies: sp.anomalyIds.length,
@@ -1743,7 +1792,90 @@ function planSummary(plan, selected) {
     deviceOnly: plan.deviceOnly,
     anomalies: plan.anomalies.length,
     suggestions: plan.suggestions.filter((g) => !g.ignored).length,
-    syncNow: syncNowEligibility(plan, selected),
+  };
+}
+
+/** The selected ops, in plan order (service.js's capacity: spaceNeeded). */
+function selectedOps(plan, selected) {
+  const out = [];
+  for (const op of plan.ops.values()) if (selected.get(op.id) === true) out.push(op);
+  return out;
+}
+
+const REVIEW_KIND_ORDER = Object.freeze(["push", "update", "replace", "rename", "delete"]);
+
+/**
+ * sync:review — everything the Start review shows, in one payload: every
+ * offered op grouped by (kind, reason) with its selection and loss markers,
+ * the per-series loss list the user acknowledges one tick per series (UI
+ * decision 5: a tick adds that series' `lossOpIds` to apply's ackLosses), the
+ * mass flags, and the gone folders whose re-push name is a choice. service.js
+ * adds gen, capacity and the planning policy. Group checkboxes call
+ * set-selection {bulk:'group', group: kind, reason}.
+ */
+function planReview(plan, selected) {
+  const ev = evaluateSelection(plan, selected);
+  const groups = new Map();
+  const losses = [];
+  const rebinds = [];
+  for (const sp of plan.series) {
+    const l = seriesLosses(plan, sp, selected);
+    const series = sp.title || sp.folder;
+    if (l.loss.size) {
+      const ids = [...l.loss];
+      losses.push({ seriesKey: sp.seriesKey, series, lossOpIds: ids, labels: ids.map((id) => plan.ops.get(id).label).filter((x) => x != null) });
+    }
+    if (sp.state === "gone" && sp.rebind) rebinds.push({ seriesKey: sp.seriesKey, series, rebind: sp.rebind });
+    for (const id of sp.opIds) {
+      const op = plan.ops.get(id);
+      const key = `${op.kind}\0${op.reason || ""}`;
+      let g = groups.get(key);
+      if (!g) groups.set(key, (g = { kind: op.kind, reason: op.reason || null, count: 0, selectedCount: 0, bytes: 0, selectedBytes: 0, ops: [] }));
+      const sel = selected.get(id) === true;
+      const bytes = op.kind === "delete" ? (op.devFile ? op.devFile.size : 0) : op.kind === "rename" ? 0 : op.size || 0;
+      g.count += 1;
+      g.bytes += bytes;
+      if (sel) {
+        g.selectedCount += 1;
+        g.selectedBytes += bytes;
+      }
+      g.ops.push({
+        opId: id,
+        seriesKey: sp.seriesKey,
+        series,
+        folder: op.folder,
+        name: op.name,
+        from: op.from,
+        to: op.to,
+        unit: op.unit,
+        label: op.label,
+        size: bytes,
+        sidecar: !!op.sidecar,
+        selected: sel,
+        preselected: !!op.preselected,
+        loss: l.loss.has(id),
+        lossIfSelected: l.lossIfSelected.has(id),
+        blockedBy: op.blockedBy || [],
+      });
+    }
+  }
+  const list = [...groups.values()].sort(
+    (a, b) => REVIEW_KIND_ORDER.indexOf(a.kind) - REVIEW_KIND_ORDER.indexOf(b.kind) || String(a.reason).localeCompare(String(b.reason)),
+  );
+  return {
+    ok: true,
+    targetId: plan.targetId,
+    asOf: plan.asOf,
+    firstSync: plan.firstSync,
+    deletePolicy: plan.deletePolicy,
+    totals: ev.totals,
+    groups: list,
+    losses,
+    massDelete: ev.massDelete,
+    massRepush: ev.massRepush,
+    rebinds,
+    sanity: plan.sanity.map((x) => x.folder),
+    needsVerify: plan.needsVerify.length,
   };
 }
 
@@ -1753,6 +1885,7 @@ module.exports = {
   MASS_RATIO,
   MASS_MIN,
   MASS_TOTAL_DELETES,
+  EVICT_REASON,
   SERIES_STATES,
   HELD_REASONS,
   STRONG_TIERS,
@@ -1771,11 +1904,12 @@ module.exports = {
   changeSelection,
   applyRebind,
   reconcileForApply,
-  syncNowEligibility,
   promptSummary,
   promptCard,
   libraryStatus,
   chapterStrip,
   seriesDetail,
   planSummary,
+  selectedOps,
+  planReview,
 };

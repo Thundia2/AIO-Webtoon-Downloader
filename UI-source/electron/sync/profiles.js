@@ -61,6 +61,20 @@ const PROFILES = Object.freeze({
 
 const TARGET_KINDS = Object.freeze(["adb", "folder"]);
 const SELECTION_MODES = Object.freeze(["all-except", "only"]);
+// A stored verifyMode is the user's answer to a needs-mode refusal (a device
+// without sha256sum): every later prepare of the target uses it, automatic
+// connect plans included, so they don't refuse again. Not part of the record
+// identity: changing it changes how folders are checked, not which record
+// they belong to. device-hash isn't storable; it is the default when the
+// device can hash. Consumers: service.js _planOpts, contract.js VERIFY_MODES.
+const STORED_VERIFY_MODES = Object.freeze(["read-back", "adopt-size"]);
+// A target's removal policy (approved design D5): guarded offers and
+// pre-selects proven removals, add-only never pre-selects one. A permanent
+// per-target field; the global syncDeletePolicy is only the value a NEW
+// target starts with (service.js add-target stamps it). A target saved before
+// the field existed resolves null here and the planner falls back to the
+// global (planner.js buildPlan, grep `cfg.deletePolicy`).
+const DELETE_POLICIES = Object.freeze(["guarded", "add-only"]);
 
 function _arr(v) {
   return Array.isArray(v) ? v.slice() : [];
@@ -92,6 +106,8 @@ function resolveTargetConfig(target) {
     renameToMatch: t.renameToMatch === true,
     cleanupNames: Array.isArray(t.cleanupNames) ? t.cleanupNames.slice() : DEFAULT_CLEANUP_NAMES.slice(),
     selection: SELECTION_MODES.includes(t.selection) ? t.selection : "all-except",
+    verifyMode: STORED_VERIFY_MODES.includes(t.verifyMode) ? t.verifyMode : null,
+    deletePolicy: DELETE_POLICIES.includes(t.deletePolicy) ? t.deletePolicy : null,
     only: _arr(t.only),
     excludes: _arr(t.excludes),
     aliases: _arr(t.aliases),
@@ -193,6 +209,15 @@ function validateTarget(target, ctx) {
   if (t.selection != null && !SELECTION_MODES.includes(t.selection)) {
     errors.push({ field: "selection", message: "unknown series selection mode" });
   }
+  if (t.verifyMode != null && !STORED_VERIFY_MODES.includes(t.verifyMode)) {
+    errors.push({ field: "verifyMode", message: "verify mode must be read-back or adopt-size" });
+  }
+  if (t.deletePolicy != null && !DELETE_POLICIES.includes(t.deletePolicy)) {
+    errors.push({ field: "deletePolicy", message: "removals must be guarded or add-only" });
+  }
+  if (Array.isArray(t.excludes) && t.excludes.some((e) => e && e.removeFiles != null && typeof e.removeFiles !== "boolean")) {
+    errors.push({ field: "excludes", message: "removeFiles must be true or false" });
+  }
   return errors;
 }
 
@@ -227,6 +252,8 @@ module.exports = {
   PROFILES,
   TARGET_KINDS,
   SELECTION_MODES,
+  STORED_VERIFY_MODES,
+  DELETE_POLICIES,
   resolveTargetConfig,
   isChapterFormat,
   isSidecar,

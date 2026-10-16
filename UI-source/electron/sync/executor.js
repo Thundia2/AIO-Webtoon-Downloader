@@ -9,6 +9,8 @@
 //                    cleanup names → renames → pushes/updates/replaces →
 //                    the post-series listing (devMtime, quick verify) →
 //                    deletes (delete gate, slot guard) → a confirming listing
+//                    [series being removed from the target, planner 8b]
+//                    rmdir if empty → drop its shard (result.evictions)
 //   verify()       rule 8 / "Verify modes": device-hash, read-back, adopt-size
 //   prune()        orphan removal: delete hash-proven files of ours, then
 //                  rmdir only if empty; report leftovers
@@ -58,7 +60,7 @@ const { slotKey } = require("./naming");
 const { labelFile } = require("./chapter-labels");
 const { isChapterFormat, recordIdentity } = require("./profiles");
 const { classifyDeviceFile, resolvePending, mergeVerify, verifyFailed } = require("./provenance");
-const { pcSeriesKey } = require("./planner");
+const { pcSeriesKey, EVICT_REASON } = require("./planner");
 const { newEpoch, newShardId } = require("./store");
 const { segmentProblem } = require("./transports");
 const { refuse } = require("./contract");
@@ -309,6 +311,7 @@ class Executor {
       deletes: [],
       renames: [],
       skippedSeries: [],
+      evictions: [],
       mismatches: [],
       warnings: [],
     };
@@ -517,6 +520,25 @@ class Executor {
 
     const late = deletesFirst ? deletes.filter((o) => o.gate) : deletes;
     if (late.length) await this._deletes(sp, shard, late, { ack, pcSeries, pushedSlots, listing: listing.ok ? listing : null });
+    if (sp.evict) await this._finishEviction(sp, shard);
+  }
+
+  /**
+   * "Remove from <target>" (approved design D7): once its deletes ran, the
+   * series' folder goes if it is empty, and its shard with it, so a later
+   * Include starts it as a new series instead of a gone folder asking for a
+   * re-push name. rmdir refuses a non-empty folder on both transports, so a
+   * leftover (an unticked file, a type the app doesn't manage) keeps the
+   * folder and the shard's remaining entries.
+   */
+  async _finishEviction(sp, shard) {
+    const row = { seriesKey: sp.seriesKey, folder: sp.deviceFolder, removed: false };
+    this.result.evictions.push(row);
+    const rm = await this._dev(() => this.transport.rmdirIfEmpty(sp.deviceFolder, { signal: this.signal }));
+    row.removed = !!rm.removed;
+    if (!row.removed) return;
+    this.shards.delete(shard.shardId);
+    await this.store.deleteShard(shard.shardId);
   }
 
   /** Remove the target's cleanup names (AIO bookkeeping dot-files) from a folder. */
@@ -598,9 +620,11 @@ class Executor {
    * @returns {Promise<object>} the run result
    */
   async renameFolder({ shardId, to, runId }) {
-    const result = { runId: runId || null, phase: "rename", status: "completed", reason: null, startedAt: this.now(), endedAt: null, filesTotal: 0, bytesTotal: 0, filesDone: 0, bytesDone: 0, charged: 0, files: [], deletes: [], renames: [], warnings: [] };
+    // One folder: filesTotal 1, done once the move landed (quitInfo's count).
+    const result = { runId: runId || null, phase: "rename", status: "completed", reason: null, startedAt: this.now(), endedAt: null, filesTotal: 1, bytesTotal: 0, filesDone: 0, bytesDone: 0, charged: 0, files: [], deletes: [], renames: [], warnings: [] };
     this.result = result;
     const shard = this.shards.get(shardId);
+    this._progress(shard ? shard.name : null);
     try {
       if (!shard) throw new RunStop("failed", "unknown-shard");
       const why = segmentProblem(to);
@@ -631,6 +655,8 @@ class Executor {
       shard.name = to;
       shard.renameIntent = null;
       await this._writeShard(shard);
+      result.filesDone = 1;
+      this._progress(to);
     } catch (e) {
       if (shard && e instanceof RunStop && /^rename-refused|^invalid-name|^unknown-shard/.test(e.reason)) {
         shard.renameIntent = null;
@@ -814,7 +840,8 @@ class Executor {
   /**
    * Deletes for one series, each passing (in this order): the file still is
    * what the plan saw (size, devMtime); the slot guard (rule 6: never a slot
-   * of any PC file of the series, nor one pushed this run); the delete gate
+   * of any PC file of the series, nor one pushed this run; a removal from
+   * the target, EVICT_REASON, is exempt from the PC half); the delete gate
    * (a replacement delete runs only when the post-push listing shows its
    * label at an exact PC size, unless the user accepted it as a loss). The
    * run log is written before and after the batch.
@@ -842,7 +869,9 @@ class Executor {
         rec.reason = f ? "changed-since-plan" : "already-gone";
         continue;
       }
-      if (pcSlots.has(slot) || pushedSlots.has(slot)) {
+      // Rule 6's slot guard. A removal from the target lifts the PC half:
+      // its series is excluded, so the PC copy is meant to stay off it.
+      if ((pcSlots.has(slot) && op.reason !== EVICT_REASON) || pushedSlots.has(slot)) {
         rec.outcome = "skipped";
         rec.reason = "slot-guard";
         continue;
@@ -1012,12 +1041,19 @@ class Executor {
    * @param {Array<{name:string, shardId:string}>} a.folders  orphaned folders of the plan
    */
   async prune({ folders, runId }) {
-    const result = { runId: runId || null, phase: "prune", status: "completed", reason: null, startedAt: this.now(), endedAt: null, filesTotal: 0, bytesTotal: 0, filesDone: 0, bytesDone: 0, charged: 0, files: [], deletes: [], renames: [], warnings: [], prune: [] };
+    // filesTotal/filesDone count FOLDERS here: the progress line (and so the
+    // quit dialog's "N of M", service.js quitInfo) is per folder.
+    const list = folders || [];
+    const result = { runId: runId || null, phase: "prune", status: "completed", reason: null, startedAt: this.now(), endedAt: null, filesTotal: list.length, bytesTotal: 0, filesDone: 0, bytesDone: 0, charged: 0, files: [], deletes: [], renames: [], warnings: [], prune: [] };
     this.result = result;
     try {
-      for (const f of folders || []) {
+      this._progress(null);
+      for (const f of list) {
         this._checkCancel();
+        await this._hook("prune-before-folder", { folder: f.name });
         await this._pruneFolder(f, result);
+        result.filesDone += 1;
+        this._progress(f.name);
       }
     } catch (e) {
       return this._finish(result, e);

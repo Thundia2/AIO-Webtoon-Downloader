@@ -329,7 +329,7 @@ async function machine({ focused = true, dir = mkdir(), bootEpoch = 1, c = clock
   const pm = new mon.PromptMachine({ marks, isFocused: () => st.focused, onPrompt: (e) => ev.push(e), now: c.now });
   return { pm, ev, st, marks, dir, c };
 }
-const CARD = { serial: "SER1", targets: [{ targetId: "t1", files: 3 }], syncNow: false, empty: false };
+const CARD = { serial: "SER1", targets: [{ targetId: "t1", files: 3 }], empty: false };
 
 test("prompt: connect → plan → shown at once when focused, and marked", async () => {
   const { pm, ev, marks } = await machine();
@@ -384,7 +384,7 @@ test("prompt: a plan that finishes after the disconnect shows nothing", async ()
 test("prompt: nothing to report is quiet, and marked for this connection", async () => {
   const { pm, ev, marks } = await machine();
   pm.connected({ connKey: "SER1#1", targetIds: ["t1"] });
-  assert.strictEqual(pm.planned("SER1#1", { serial: "SER1", targets: [], syncNow: false, empty: true }), null);
+  assert.strictEqual(pm.planned("SER1#1", { serial: "SER1", targets: [], empty: true }), null);
   assert.deepStrictEqual(ev, []);
   assert.strictEqual(pm.pendingConn("SER1#1"), "quiet");
   assert.strictEqual(marks.honored("SER1#1"), true);

@@ -975,7 +975,8 @@ class Downloader {
 
   /**
    * Identifying details for each live download, for the quit-confirmation
-   * dialog's "these are still running" list. `title` is empty until the
+   * dialog's "these are still running" list and Device Sync's busy-folder
+   * guard. `title` is empty until the
    * "Title (hid=…)" line lands, so the renderer falls back to the URL.
    */
   getRunning() {
@@ -987,6 +988,10 @@ class Downloader {
         title: entry.progress?.title || "",
         url: url || "",
         startedAt: entry.startTime,
+        // The series folder an update-check download writes (--series-dir);
+        // null for a search/URL download. Device Sync's busy-folder guard
+        // reads it (sync/service.js _busyCheck) and falls back to the url.
+        seriesDir: entry.meta?.args?.seriesDir || null,
       });
     }
     return out;

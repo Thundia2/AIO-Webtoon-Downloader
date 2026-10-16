@@ -17,6 +17,9 @@ import {
   NETWORK_LEVELS, CPU_LEVELS, isNetworkManaged, networkEffective,
   networkPreviewText, cpuPreviewText, levelLabel,
 } from "@/lib/resourceLimits";
+// Device Sync's eight global keys (owner: electron/sync/sync-settings.js;
+// drift guard: tools/_test_device_sync_settings_twin.js).
+import { SYNC_DEFAULTS } from "@/lib/syncSettings";
 
 // Default values for settings.searchOpts. Mirrors DEFAULT_OPTS in
 // SearchTab.jsx. Both surfaces (Settings + Search) read/write this
@@ -190,6 +193,10 @@ const DEFAULT_SETTINGS = {
   // Clamped [0, 60] in electron/updater.js (_clampDelayDays — keep the
   // IntInput bounds below in sync with MAX_DELAY_DAYS there).
   appUpdateDelayDays: 5,
+  // Device Sync (syncEnabled, syncDeletePolicy, …). Top-level like
+  // appAutoUpdate; main.js get-settings resolves the saved values the same
+  // way (syncSettingsForRenderer), so a first launch shows no phantom changes.
+  ...SYNC_DEFAULTS,
   // Global chapter-collapse toggle. Affects:
   //   - Search-display "X main / Y entries" diagnostic counts.
   //   - Actual download behavior — split clusters (e.g. 1.1/1.2/1.3/1.4)

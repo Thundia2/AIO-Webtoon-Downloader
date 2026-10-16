@@ -13,9 +13,7 @@
 //     defined in one table (ANOMALY_KINDS).
 //
 // Anomaly ids are `${kind}:${seriesKey}`: stable across plans, which is what
-// a target's `acknowledged` list stores (sync:config-op ack-anomaly). An
-// unacknowledged `error` anomaly disqualifies the connect prompt's Sync now
-// (parent rule 10).
+// a target's `acknowledged` list stores (sync:config-op ack-anomaly).
 //
 // The tag heuristics replace CompareManga _delta_findings' hand reading; each
 // is commented with the case it exists for. They only ever REMOVE
@@ -42,8 +40,9 @@ const TAG_KINDS = Object.freeze([
   "mixed",
 ]);
 
-// severity: error = blocks Sync now until acknowledged; warning = shown
-// prominently; info = shown in the series sheet only.
+// severity: error = shown as needing attention until acknowledged (it used to
+// block the prompt's Sync now, removed by approved design D2); warning =
+// shown prominently; info = shown in the series sheet only.
 const ANOMALY_KINDS = Object.freeze({
   "fork-collision": { severity: "info" },
   "merge-in-library": { severity: "warning" },

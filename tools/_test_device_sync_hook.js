@@ -11,7 +11,9 @@
 //   - events that race the get-state snapshot are buffered and applied after it
 //   - snapshot adoption maps every field (job + queue from jobs.snapshot())
 //   - a stale runId's begin/finish/progress is dropped; the live run's applies
-//   - a finished job and a config event re-read plans (latest request wins)
+//   - plans / adb / settings are PUSHED: a plans event overwrites one target
+//     (removed:true drops it), a job end or config event re-reads nothing,
+//     and only a settings event that flips `enabled` re-reads the snapshot
 //   - find events: batch status vs a row-only edit; findSourcesGet keeps rows
 //   - prompt / device / prewarm / library-status / config by kind; unknown kinds ignored
 //   - without electronAPI the hook is inert and actions answer `disabled`
@@ -278,25 +280,38 @@ function deferred(value) {
     eq("a newer run's begin adopted", [h.mounted.state.job.runId, h.mounted.state.job.phase], [6, "plan"]);
   }
 
-  console.log("\n[4] plans re-read on job finish and config (latest wins)");
+  console.log("\n[4] plans, adb and settings are pushed; nothing re-reads get-state");
   {
     const h = makeHarness();
     await h.mounted.actAsync(() => {});
-    const slow = deferred(snapshot({ plans: { t1: { summary: { ops: 111 }, refusal: null, stale: false } } }));
-    const fast = deferred(snapshot({ plans: { t1: { summary: { ops: 222 }, refusal: null, stale: true } } }));
-    h.nextStates.push(slow, fast);
     h.mounted.act(() => h.emit({ kind: "job", runId: 5, state: "done", status: "completed", job: { runId: 5, state: "done", progress: {} } }));
     h.mounted.act(() => h.emit({ kind: "config", config: { version: 4, targets: [] } }));
-    eq("two refreshes requested", h.calls.getState, 3);
+    eq("a job end and a config event re-read nothing", h.calls.getState, 1);
     eq("config applied at once", h.mounted.state.config.version, 4);
-    fast.resolve();
+    const lastRun = { runId: 5, phase: "apply", status: "completed", summary: { files: { done: 3 } } };
+    h.mounted.act(() => h.emit({ kind: "plans", targetId: "t1", summary: { ops: 7 }, refusal: null, stale: false, lastRun, gen: 12 }));
+    eq("plans overwrites the target's view", h.mounted.state.plans.t1, { summary: { ops: 7 }, refusal: null, stale: false, lastRun, gen: 12 });
+    h.mounted.act(() => h.emit({ kind: "plans", targetId: "t2", summary: null, refusal: { ok: false, code: "needs-mode" }, stale: true, lastRun: null, gen: null }));
+    eq("another target is added beside it", Object.keys(h.mounted.state.plans).sort(), ["t1", "t2"]);
+    eq("a refusal rides the event", h.mounted.state.plans.t2.refusal.code, "needs-mode");
+    h.mounted.act(() => h.emit({ kind: "plans", targetId: "t2", removed: true }));
+    eq("removed drops the target", Object.keys(h.mounted.state.plans), ["t1"]);
+    h.mounted.act(() => h.emit({ kind: "plans", summary: {} }));
+    eq("a plans event without targetId is ignored", Object.keys(h.mounted.state.plans), ["t1"]);
+    h.mounted.act(() => h.emit({ kind: "adb", adb: { tracking: "polling", error: null } }));
+    eq("adb", h.mounted.state.adb, { tracking: "polling", error: null });
+    h.mounted.act(() => h.emit({ kind: "settings", enabled: true, settings: { syncEnabled: true, syncErrorBudget: 5 } }));
+    eq("settings without an enabled flip: applied, no re-read", [h.mounted.state.settings.syncErrorBudget, h.calls.getState], [5, 1]);
+    const off = deferred({ ok: true, enabled: false, settings: { syncEnabled: false }, config: null, adb: null, devices: [], folderPresence: {}, job: { job: null, queue: [] }, plans: {}, prompt: null, prompts: [], find: null, prewarm: null });
+    h.nextStates.push(off);
+    h.mounted.act(() => h.emit({ kind: "settings", enabled: false, settings: { syncEnabled: false } }));
+    eq("enabled flips at once from the event", h.mounted.state.enabled, false);
+    eq("an enabled flip re-reads the snapshot", h.calls.getState, 2);
+    off.resolve();
     await h.mounted.actAsync(() => {});
-    slow.resolve();
-    await h.mounted.actAsync(() => {});
-    eq("the later request's plans kept", h.mounted.state.plans.t1, { summary: { ops: 222 }, refusal: null, stale: true });
-    eq("a plans refresh leaves the job alone", h.mounted.state.job.state, "done");
-    h.mounted.act(() => h.emit({ kind: "job", runId: 5, state: "running", progress: { filesDone: 1 } }));
-    eq("progress triggers no refresh", h.calls.getState, 3);
+    eq("the off snapshot replaces every field", [h.mounted.state.config, Object.keys(h.mounted.state.plans).length], [null, 0]);
+    h.mounted.act(() => h.emit({ kind: "settings", enabled: false, settings: { syncEnabled: false } }));
+    eq("a repeat of the same enabled re-reads nothing", h.calls.getState, 2);
   }
 
   console.log("\n[5] find-sources");

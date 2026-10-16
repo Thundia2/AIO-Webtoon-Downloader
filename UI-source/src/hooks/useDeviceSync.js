@@ -14,10 +14,13 @@
 // than the mirrored job, or a progress for any other runId, is dropped (a
 // stale run's late event after the snapshot).
 //
-// PLANS are not pushed: a plan's summary rides on its job's finish, and a
-// target is marked stale by edits main doesn't announce. So a finished job
-// and a config event re-read `plans` alone from get-state (latest request
-// wins). After a save-settings that flips syncEnabled, call refresh().
+// PLANS ARE PUSHED (UI pass U0): a `plans` event carries one target's whole
+// view {summary, refusal, stale, lastRun, gen} whenever any of it changes,
+// and `removed:true` once the target is gone. The hook only overwrites; it
+// never re-reads get-state to catch up (that re-read raced main's identity
+// clear and lost job results). `adb` and `settings` events likewise. The one
+// re-read left: a `settings` event that flips `enabled` adopts a fresh
+// snapshot, since turning sync on or off replaces every field at once.
 //
 // Read by: nothing yet (UI pass). Depends on: preload.js sync* wrappers and
 // onSyncEvent. The event kinds below duplicate sync/contract.js EVENT_KINDS;
@@ -27,7 +30,7 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 
-const EVENT_KINDS = ["device", "job", "config", "prompt", "find", "prewarm", "library-status"];
+const EVENT_KINDS = ["device", "job", "config", "prompt", "find", "prewarm", "library-status", "plans", "adb", "settings"];
 
 const api = () => (typeof window !== "undefined" && window.electronAPI && typeof window.electronAPI.syncGetState === "function" ? window.electronAPI : null);
 
@@ -76,6 +79,7 @@ const ACTIONS = {
   findSourcesGet: "syncFindSourcesGet",
   findSourcesUpdateRow: "syncFindSourcesUpdateRow",
   link: "syncLink",
+  review: "syncReview",
 };
 
 function rowsByFolder(rows) {
@@ -121,6 +125,17 @@ function applySyncEvent(s, ev) {
       return { ...s, prewarm: ev.prewarm || null };
     case "library-status":
       return { ...s, libraryStatus: ev.status || null };
+    case "plans": {
+      if (typeof ev.targetId !== "string") return s;
+      const plans = { ...s.plans };
+      if (ev.removed) delete plans[ev.targetId];
+      else plans[ev.targetId] = { summary: ev.summary || null, refusal: ev.refusal || null, stale: !!ev.stale, lastRun: ev.lastRun || null, gen: ev.gen == null ? null : ev.gen };
+      return { ...s, plans };
+    }
+    case "adb":
+      return { ...s, adb: ev.adb || null };
+    case "settings":
+      return { ...s, enabled: !!ev.enabled, settings: ev.settings || s.settings };
     default:
       return s;
   }
@@ -152,18 +167,24 @@ export function useDeviceSync() {
   const [state, setState] = useState(INITIAL);
   const hydratedRef = useRef(false);
   const bufferRef = useRef([]);
-  const plansSeqRef = useRef(0);
+  // The last `enabled` the hook adopted, read by onEvent without a render.
+  const enabledRef = useRef(false);
+  const refreshSeqRef = useRef(0);
 
-  const refreshPlans = useCallback(() => {
+  /** Re-read the whole snapshot (latest request wins). */
+  const refresh = useCallback(() => {
     const a = api();
-    if (!a) return Promise.resolve();
-    const seq = ++plansSeqRef.current;
+    if (!a) return Promise.resolve(null);
+    const seq = ++refreshSeqRef.current;
     return Promise.resolve(a.syncGetState())
       .then((snap) => {
-        if (seq !== plansSeqRef.current || !snap || snap.ok === false) return;
-        setState((s) => ({ ...s, plans: snap.plans || {} }));
+        if (seq === refreshSeqRef.current && snap && snap.ok !== false) {
+          enabledRef.current = !!snap.enabled;
+          setState((s) => ({ ...fromSnapshot(snap), findRows: s.findRows, libraryStatus: s.libraryStatus }));
+        }
+        return snap;
       })
-      .catch(() => {});
+      .catch(() => null);
   }, []);
 
   const onEvent = useCallback(
@@ -173,24 +194,13 @@ export function useDeviceSync() {
         return;
       }
       setState((s) => applySyncEvent(s, ev));
-      if (ev && (ev.kind === "config" || (ev.kind === "job" && ev.state === "done"))) refreshPlans();
+      if (ev && ev.kind === "settings" && !!ev.enabled !== enabledRef.current) {
+        enabledRef.current = !!ev.enabled;
+        refresh();
+      }
     },
-    [refreshPlans],
+    [refresh],
   );
-
-  /** Re-read the whole snapshot (e.g. after syncEnabled changed). */
-  const refresh = useCallback(() => {
-    const a = api();
-    if (!a) return Promise.resolve(null);
-    return Promise.resolve(a.syncGetState())
-      .then((snap) => {
-        if (snap && snap.ok !== false) {
-          setState((s) => ({ ...fromSnapshot(snap), findRows: s.findRows, libraryStatus: s.libraryStatus }));
-        }
-        return snap;
-      })
-      .catch(() => null);
-  }, []);
 
   useEffect(() => {
     const a = api();
@@ -206,11 +216,10 @@ export function useDeviceSync() {
       const buffered = bufferRef.current;
       bufferRef.current = [];
       hydratedRef.current = true;
-      setState(() => {
-        let s = snap && snap.ok !== false ? fromSnapshot(snap) : { ...INITIAL, loaded: true };
-        for (const ev of buffered) s = applySyncEvent(s, ev);
-        return s;
-      });
+      let s = snap && snap.ok !== false ? fromSnapshot(snap) : { ...INITIAL, loaded: true };
+      for (const ev of buffered) s = applySyncEvent(s, ev);
+      enabledRef.current = s.enabled;
+      setState(() => s);
     };
     Promise.resolve()
       .then(() => a.syncGetState())

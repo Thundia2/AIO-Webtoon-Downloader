@@ -361,7 +361,7 @@ test("contract: refuse() has one shape and rejects unknown codes", () => {
   assert.deepStrictEqual(contract.refuse("busy", "x", { job: 1 }), { job: 1, ok: false, code: "busy", message: "x" });
   assert.throws(() => contract.refuse("nope", "x"));
   // 22 from the plan plus sync:link (P4 decision).
-  assert.strictEqual(contract.CHANNEL_NAMES.length, 23);
+  assert.strictEqual(contract.CHANNEL_NAMES.length, 24);
   assert.ok(contract.CHANNEL_NAMES.includes("link"));
   assert.ok(contract.CHANNELS_WHILE_DISABLED.has("sync:get-state"));
   assert.strictEqual(contract.CHANNELS_WHILE_DISABLED.size, 4);
@@ -634,8 +634,18 @@ test("ours mirrored sidecar the PC no longer has → pre-selected; add-only pre-
     c.extra.name = "details.json";
   });
   assert.deepStrictEqual([sc.d.reason, sc.d.preselected], ["sidecar", true]);
-  const addOnly = deleteFixture(null, { opts: { deletePolicy: "add-only" } });
+  const addOnly = deleteFixture(null, { target: target({ deletePolicy: "add-only" }) });
   assert.strictEqual(addOnly.d.preselected, false);
+});
+
+test("U0b removals: the target's own policy wins; the global only fills a target saved without one", () => {
+  const addOnlySettings = resolveSyncSettings({ syncDeletePolicy: "add-only" });
+  const run = (tg, st) => plan({ target: tg, settings: st, pc: pc([series("Alpha", [f("Ch.001.cbz", 1)])]), device: device({}), view: view([], { target: tg }) }).deletePolicy;
+  assert.strictEqual(run(target({ deletePolicy: "guarded" }), addOnlySettings), "guarded", "a guarded target stays guarded under an add-only global");
+  assert.strictEqual(run(target({ deletePolicy: "add-only" }), SETTINGS), "add-only");
+  assert.strictEqual(run(target({}), addOnlySettings), "add-only", "no stored field: the global");
+  assert.strictEqual(target({ deletePolicy: "bogus" }).deletePolicy, null);
+  assert.ok(profiles.validateTarget({ kind: "adb", serial: "S1", root: "/sdcard/x", profile: "komikku", deletePolicy: "bogus" }, {}).some((x) => x.field === "deletePolicy"));
 });
 
 test("volume, range, whole and unknown units are never pre-selected", () => {
@@ -1111,14 +1121,13 @@ test("record / identity / content matches leave the pushes unticked and offer Li
   assert.strictEqual(p2.suggestions[0].tier, "record");
 });
 
-test("mass repush: ≥50% of ≥10 bound folders gone needs an ack and hides Sync now", () => {
+test("mass repush: ≥50% of ≥10 bound folders gone needs an ack", () => {
   const { p } = goneFixture({ otherBound: 9, goneOthers: 4 });
   assert.strictEqual(p.goneTotal.bound, 10);
   assert.strictEqual(p.goneTotal.gone, 5);
   const s = sel(p);
   const ev = planner.evaluateSelection(p, s);
   assert.deepStrictEqual([ev.massRepush.required, ev.massRepush.count], [true, 5]);
-  assert.ok(planner.syncNowEligibility(p, s).reasons.includes("mass-repush"));
   const r = planner.reconcileForApply({ reviewed: p, fresh: p, storedOps: {} });
   assert.ok(r.blocking.some((b) => b.kind === "mass-repush"));
   assert.ok(planner.reconcileForApply({ reviewed: p, fresh: p, storedOps: {}, ackMassRepush: true }).ok);
@@ -1126,14 +1135,14 @@ test("mass repush: ≥50% of ≥10 bound folders gone needs an ack and hides Syn
   assert.strictEqual(planner.evaluateSelection(few, sel(few)).massRepush.required, false);
 });
 
-test("Sync now: eligible under the previous name, not after a fallback", () => {
+test("prompt summary names a re-pushed gone folder and whether its name fell back", () => {
   const ok = goneFixture({ otherBound: 1 }).p;
-  assert.deepStrictEqual(planner.syncNowEligibility(ok, sel(ok)), { eligible: true, reasons: [] });
   const summary = planner.promptSummary(ok, sel(ok));
   assert.deepStrictEqual(summary.removedOnDevice, [{ series: "Alpha", name: "Alpha", fellBack: false, files: 3, bytes: 1001 + 1002 + 1003 }]);
+  assert.ok(!("syncNow" in summary), "design D2: the prompt never offers a one-click apply");
   const aliasT = target({ aliases: [{ pcFolder: "Alpha", deviceFolder: "Alpha Alias" }] });
   const fb = goneFixture({ target: aliasT, probe: { Alpha: false, "Alpha Alias": true }, otherBound: 1 }).p;
-  assert.ok(planner.syncNowEligibility(fb, sel(fb)).reasons.includes("fallback-name"));
+  assert.strictEqual(planner.promptSummary(fb, sel(fb)).removedOnDevice[0].fellBack, true);
 });
 
 test("a gone folder whose PC series is absent plans nothing", () => {
@@ -1189,37 +1198,13 @@ test("first sync lasts until the first apply, not the first shard (a coverage Ve
 
 console.log("rule 10, rule 13, refusals");
 
-test("Sync now: pushes only, verified record, no suggestions or error anomalies", () => {
-  const { s, entries, devFiles, sh } = boundAlpha(2);
-  s.files.push(f("Ch.003.cbz", 3));
-  const p = plan({ pc: pc([s]), device: device({ Alpha: devFiles }), view: view([sh]) });
-  assert.strictEqual(planner.syncNowEligibility(p, sel(p)).eligible, true);
-  const first = plan({ pc: pc([s]), device: device({}), view: view([], { noHeader: true }) });
-  assert.ok(planner.syncNowEligibility(first, sel(first)).reasons.includes("first-sync"));
-  const del = deleteFixture();
-  assert.ok(planner.syncNowEligibility(del.p, sel(del.p)).reasons.includes("selected-delete"));
-  const sizeV = plan({ pc: pc([s]), device: device({ Alpha: devFiles }), view: view([shard("sh-alpha", "Alpha", s, entries, { verifyMode: "adopt-size" })]) });
-  assert.ok(planner.syncNowEligibility(sizeV, sel(sizeV)).reasons.includes("adopt-size-folder"));
-  const nv = plan({ pc: pc([s]), device: device({ Alpha: devFiles }), view: view([shard("sh-alpha", "Alpha", s, entries, { verifiedAt: null })]) });
-  assert.ok(planner.syncNowEligibility(nv, sel(nv)).reasons.includes("needs-verify"));
-  const spy = series("SPY x FAMILY", [f("Ch.001.cbz", 1)]);
-  const sug = plan({ pc: pc([s, spy]), device: device({ Alpha: devFiles, SPY_x_FAMILY: [] }), view: view([sh]) });
-  assert.ok(planner.syncNowEligibility(sug, sel(sug)).reasons.includes("suggestions"));
-  const longName = series("あ".repeat(90), [f("Ch.001.cbz", 1)]);
-  const err = plan({ pc: pc([s, longName]), device: device({ Alpha: devFiles }), view: view([sh]) });
-  assert.ok(planner.syncNowEligibility(err, sel(err)).reasons.includes("error-anomalies"));
-  const acked = plan({ target: target({ acknowledged: [`name-too-long:pc:${"あ".repeat(90)}`] }), pc: pc([s, longName]), device: device({ Alpha: devFiles }), view: view([sh]) });
-  assert.strictEqual(planner.syncNowEligibility(acked, sel(acked)).eligible, true);
-});
-
 test("one prompt covers several targets on one device", () => {
-  const a = { targetId: "a", nothingToDo: false, syncNow: { eligible: true } };
-  const b = { targetId: "b", nothingToDo: false, syncNow: { eligible: false } };
-  const c = { targetId: "c", nothingToDo: true, syncNow: { eligible: true } };
+  const a = { targetId: "a", nothingToDo: false };
+  const b = { targetId: "b", nothingToDo: false };
+  const c = { targetId: "c", nothingToDo: true };
   const card = planner.promptCard("S1", [a, b, c]);
   assert.deepStrictEqual(card.targets.map((t) => t.targetId), ["a", "b"]);
-  assert.strictEqual(card.syncNow, false);
-  assert.strictEqual(planner.promptCard("S1", [a]).syncNow, true);
+  assert.ok(!("syncNow" in card));
   assert.strictEqual(planner.promptCard("S1", [c]).empty, true);
 });
 
@@ -1293,6 +1278,69 @@ test("series detail rows carry selection and loss; device-only detail", () => {
 });
 
 // ── job record ───────────────────────────────────────────────────────────
+
+// ── U0b: remove a series from a target (approved design D7) ─────────────
+
+console.log("U0b remove from target");
+
+/** Alpha bound with n chapters, excluded on the target; `mark` = removeFiles. */
+function evictFixture({ n = 3, mark = true, extraDev = [], extraEntries = [] } = {}) {
+  const { s, entries, devFiles } = boundAlpha(n);
+  for (const x of extraEntries) entries.push(x);
+  for (const x of extraDev) devFiles.push(x);
+  const tg = target({ excludes: [{ identityKey: s.identityKey, ...(mark ? { removeFiles: true } : {}) }] });
+  return planner.buildPlan({
+    target: tg,
+    settings: SETTINGS,
+    pc: pc([s]),
+    device: device({ Alpha: devFiles }),
+    view: view([shard("sh-alpha", "Alpha", s, entries)], { target: tg }),
+    opts: { now: NOW },
+  });
+}
+
+test("U0b evict: an excluded series without the mark is held and plans nothing", () => {
+  const p = evictFixture({ mark: false });
+  const sp = p.bySeriesKey.get("pc:Alpha");
+  assert.deepStrictEqual([sp.state, sp.heldReason, sp.opIds.length, !!sp.evict], ["held", "excluded", 0, false]);
+});
+
+test("U0b evict: the mark offers every chapter and sidecar there; ours pre-selected, foreign not, other types kept", () => {
+  const p = evictFixture({
+    extraDev: [["cover.jpg", 50, 9], ["Ch.004.cbz", 1004, 9], ["notes.txt", 5, 9]],
+    extraEntries: [e("cover.jpg", 50, "sha:cover", 9, "pushed")],
+  });
+  const sp = p.bySeriesKey.get("pc:Alpha");
+  assert.deepStrictEqual([sp.state, sp.heldReason, sp.deviceFolder], ["held", "excluded", "Alpha"]);
+  const ops = opsOf(p, "pc:Alpha");
+  assert.deepStrictEqual(ops.map((o) => [o.name, o.kind, o.reason, o.preselected]).sort(), [
+    ["Ch.001.cbz", "delete", "removed-from-target", true],
+    ["Ch.002.cbz", "delete", "removed-from-target", true],
+    ["Ch.003.cbz", "delete", "removed-from-target", true],
+    ["Ch.004.cbz", "delete", "removed-from-target", false],
+    ["cover.jpg", "delete", "removed-from-target", true],
+  ]);
+  assert.strictEqual(sp.counts.unmanaged, 1, "notes.txt is not the app's to remove");
+  const sum = planner.planSummary(p, sel(p)).series.find((x) => x.seriesKey === "pc:Alpha");
+  assert.strictEqual(sum.removing, true);
+  assert.deepStrictEqual(sum.strip.map((x) => x.state), ["delete", "warn"], "selected deletes red; the unticked foreign Ch.004 warns");
+});
+
+test("U0b evict: a chapter the PC keeps is no loss; one only on the target is", () => {
+  const p = evictFixture({ extraDev: [["Ch.009.cbz", 9, 9]], extraEntries: [e("Ch.009.cbz", 9, "sha:9", 9, "pushed")] });
+  const s = sel(p);
+  assert.deepStrictEqual(planner.evaluateSelection(p, s).losses, ["delete:Alpha/Ch.009.cbz"]);
+  assert.deepStrictEqual(planner.planReview(p, s).losses.map((x) => x.labels), [["9"]]);
+});
+
+test("U0b evict: removing a whole series trips the mass-delete acknowledgement", () => {
+  const p = evictFixture({ n: 12 });
+  const ev = planner.evaluateSelection(p, sel(p));
+  assert.deepStrictEqual([ev.massDelete.required, ev.massDelete.count, ev.massDelete.series], [true, 12, 1]);
+  const r = planner.reconcileForApply({ reviewed: p, fresh: p, storedOps: {} });
+  assert.ok(r.blocking.some((b) => b.kind === "mass-delete"));
+  assert.ok(planner.reconcileForApply({ reviewed: p, fresh: p, storedOps: {}, ackMassDelete: true }).ok);
+});
 
 console.log("job record");
 

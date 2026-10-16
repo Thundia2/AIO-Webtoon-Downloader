@@ -43,6 +43,9 @@ const CHANNEL_NAMES = Object.freeze([
   // P4 decision: Link (rule 2) writes the record, not sync-targets.json, so
   // it is its own channel rather than a config-op op.
   "link",
+  // UI pass U0: the Start review's one payload (planner.planReview + gen,
+  // capacity, policy), so the review never assembles itself from ledger rows.
+  "review",
 ]);
 
 const CHANNELS = Object.freeze(
@@ -59,6 +62,13 @@ const CHANNELS_WHILE_DISABLED = Object.freeze(
 // The one push channel. Kebab-case like every other push channel in main.js.
 const EVENT_CHANNEL = "sync-event";
 
+// UI pass U0, "ask the system, don't copy it": every piece of state the Sync
+// UI shows is pushed when it changes, so the renderer never re-reads
+// get-state to catch up (the re-read raced the identity clear and lost job
+// results). `plans` {targetId, summary, refusal, stale, lastRun, gen,
+// removed?} is per target and coalesced to one event per tick; `adb`
+// {adb} carries the binary, server and tracking state; `settings`
+// {enabled, settings} follows every applySettings.
 const EVENT_KINDS = Object.freeze([
   "device",
   "job",
@@ -67,6 +77,9 @@ const EVENT_KINDS = Object.freeze([
   "find",
   "prewarm",
   "library-status",
+  "plans",
+  "adb",
+  "settings",
 ]);
 
 const OP_KINDS = Object.freeze(["push", "update", "replace", "rename", "delete"]);
