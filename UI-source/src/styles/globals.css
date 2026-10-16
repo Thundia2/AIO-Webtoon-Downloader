@@ -44,6 +44,11 @@
     --success: 142 60% 40%;
     --warning: 38 92% 50%;
     --info: 200 80% 50%;
+
+    /* Device Sync (approved design spec §2, sync-temp/design/approved/spec.md):
+       the 1px inset edge on `warn` chapter-strip segments only. Light
+       --warning on white is 2.14:1; with the edge the segment reaches 4.51:1. */
+    --warn-edge: 32 95% 36%;
   }
 
   /* ── Dark mode ── */
@@ -73,6 +78,8 @@
     --success: 142 55% 48%;
     --warning: 38 92% 55%;
     --info: 200 75% 55%;
+
+    --warn-edge: 38 92% 55%; /* = --warning: dark already has the contrast */
   }
 
   /* ── Base element styles ── */
@@ -149,6 +156,15 @@
     backdrop-filter: blur(12px);
     border: 1px solid hsl(var(--border) / 0.5);
   }
+
+  /* Warning / info as TEXT. The raw --warning / --info tokens are too light
+     for text on white (spec §2), so light theme darkens them; dark theme
+     uses the tokens as-is. Used by Badge token-warning / token-info and by
+     Device Sync's callouts. Not new colour tokens: shades of the existing ones. */
+  .text-warn-fg { color: hsl(32 90% 34%); }
+  .dark .text-warn-fg { color: hsl(var(--warning)); }
+  .text-info-fg { color: hsl(200 85% 34%); }
+  .dark .text-info-fg { color: hsl(var(--info)); }
 
   /* The log panel monospace text style */
   .log-text {

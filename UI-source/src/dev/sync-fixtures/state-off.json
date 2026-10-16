@@ -1,0 +1,129 @@
+{
+  "__aioSyncFixture": "state-off.json",
+  "generatedBy": "tools/_gen_sync_fixtures.js",
+  "data": {
+    "ok": true,
+    "enabled": false,
+    "settings": {
+      "syncEnabled": false,
+      "syncPromptOnConnect": true,
+      "syncDeletePolicy": "guarded",
+      "syncHashMode": "cached",
+      "syncErrorBudget": 3,
+      "syncSizeWarnPct": 30,
+      "syncChapterPatterns": "Episode\\s*(?<ch>\\d+(?:\\.\\d+)?)",
+      "syncDiagnosticLog": true,
+      "chapterPatternErrors": []
+    },
+    "specs": {
+      "syncEnabled": {
+        "type": "boolean",
+        "default": false
+      },
+      "syncPromptOnConnect": {
+        "type": "boolean",
+        "default": true
+      },
+      "syncDeletePolicy": {
+        "type": "enum",
+        "default": "guarded",
+        "presets": [
+          "guarded",
+          "add-only"
+        ]
+      },
+      "syncHashMode": {
+        "type": "enum",
+        "default": "cached",
+        "presets": [
+          "cached",
+          "rehash"
+        ]
+      },
+      "syncErrorBudget": {
+        "type": "enum",
+        "default": 3,
+        "presets": [
+          1,
+          3,
+          5,
+          10
+        ]
+      },
+      "syncSizeWarnPct": {
+        "type": "enum",
+        "default": 30,
+        "presets": [
+          0,
+          15,
+          30,
+          50
+        ]
+      },
+      "syncChapterPatterns": {
+        "type": "patterns",
+        "default": ""
+      },
+      "syncDiagnosticLog": {
+        "type": "boolean",
+        "default": true
+      }
+    },
+    "config": null,
+    "adb": null,
+    "devices": [],
+    "folderPresence": {},
+    "job": {
+      "job": {
+        "runId": 1,
+        "phase": "plan",
+        "targetId": "t536c8b07d4",
+        "serial": "R5CW71ABCDE",
+        "auto": true,
+        "state": "done",
+        "startedAt": 1792177153799,
+        "finishedAt": 1792177153948,
+        "progress": {
+          "bytesDone": 0,
+          "bytesTotal": 0,
+          "filesDone": 0,
+          "filesTotal": 0,
+          "current": {
+            "folder": "Dungeon Meshi"
+          },
+          "preflight": {
+            "kind": "adb",
+            "caps": {
+              "lsV2": true,
+              "statV2": true,
+              "shellV2": true,
+              "sha256sum": true,
+              "findPrintf": false,
+              "statC": false,
+              "statF": true,
+              "df": false
+            },
+            "canonicalRoot": "/storage/emulated/0/Komikku/local",
+            "caseInsensitive": false,
+            "caseMeasured": true,
+            "canHash": true,
+            "mayNeedMode": false,
+            "refusal": null
+          },
+          "step": "verify"
+        },
+        "status": "cancelled",
+        "summary": {
+          "reason": "cancelled",
+          "message": "cancelled"
+        }
+      },
+      "queue": []
+    },
+    "plans": {},
+    "prompt": null,
+    "prompts": [],
+    "find": null,
+    "prewarm": null
+  }
+}

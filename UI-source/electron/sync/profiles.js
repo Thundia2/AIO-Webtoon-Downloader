@@ -2,17 +2,23 @@
 // DEVICE SYNC — READER PROFILES AND TARGET CONFIG (pure)
 //
 // Owns what a target mirrors and how its fields default:
-//   * PROFILES — which chapter formats and sidecars a reader reads;
-//   * resolveTargetConfig(target) — every per-target field filled in. A null
-//     field means "profile default", so switching a target's profile
-//     propagates instead of freezing the old profile's values;
+//   * PROFILES — the reader presets (everything, komikku, pdf) and custom.
+//     A preset FIXES formats, sidecars, .nomedia and the name options
+//     (CUSTOM_FIELDS); only a custom target stores its own. validateTarget
+//     refuses a stored custom field on a preset, so a preset target can't
+//     carry dormant overrides (user decision 2026-10-16: "custom allows for
+//     the customization of everything including .nomedia");
+//   * resolveTargetConfig(target) — every per-target field filled in;
 //   * isMirrored / isChapterFormat / isSidecar — the per-file questions the
 //     planner asks;
 //   * validateTarget — what sync:config-op refuses (root containment, field
 //     sets);
 //   * recordIdentity / recordIdentityChanged — parent rule 12: a record
-//     describes one place, so a device, root, volume or profile change clears
-//     it (service.js writes a new recordEpoch).
+//     describes one place, so a device, root or volume change clears it
+//     (service.js writes a new recordEpoch). The PROFILE is not part of it
+//     (user decision 2026-10-16): a preset only filters which files mirror,
+//     and editing a custom target's formats never cleared history either.
+//     Headers written before that still carry a `profile` key; nothing reads it.
 //
 // Read by: planner.js, service.js (config ops), pc-inventory.js.
 // The Komikku facts come from sync-temp/plans/komikkuspec.md (LocalSource).
@@ -33,31 +39,50 @@ const SIDECAR_NAMES = Object.freeze(["cover.jpg", "details.json"]);
 // a mirrored name here would be deleted and re-pushed on every sync.
 const DEFAULT_CLEANUP_NAMES = Object.freeze([".aio_series.json", ".mangafire_hid", ".series_hid", ".cover.webp"]);
 
+// Order is the editor's order (TargetEditor reads PROFILE_IDS via copy.js).
 const PROFILES = Object.freeze({
+  // Every chapter format, both sidecars, .nomedia. The default: on a library
+  // of one format it copies exactly what the komikku preset would.
+  everything: Object.freeze({
+    formats: CHAPTER_FORMATS,
+    sidecars: SIDECAR_NAMES,
+    nomedia: true,
+    flags: Object.freeze({}),
+  }),
   // Komikku/Mihon LocalSource: archives plus cover.jpg and details.json; PDF
   // isn't a LocalSource format, a "~" decimal breaks its ChapterRecognition,
-  // and a series without cover.jpg shows no cover.
+  // and a series without cover.jpg shows no cover. The flags WARN; nothing is
+  // renamed (user decision 2026-10-16: device names always equal PC names).
   komikku: Object.freeze({
     formats: Object.freeze(["cbz", "zip", "cbr", "rar", "epub"]),
-    sidecars: Object.freeze(["cover.jpg", "details.json"]),
+    sidecars: SIDECAR_NAMES,
     nomedia: true,
     flags: Object.freeze({ pdf: true, tilde: true, missingCover: true }),
   }),
-  // Perfect Viewer and other folder readers: every chapter format, cover only.
-  generic: Object.freeze({
-    formats: CHAPTER_FORMATS,
+  // PDF readers: PDFs and the folder cover; .nomedia keeps the covers out of
+  // the gallery.
+  pdf: Object.freeze({
+    formats: Object.freeze(["pdf"]),
     sidecars: Object.freeze(["cover.jpg"]),
-    nomedia: false,
+    nomedia: true,
     flags: Object.freeze({}),
   }),
-  // Formats and sidecars come from the target itself.
+  // The target's own values; these are only the defaults of a field it
+  // leaves null (service.js update-target seeds them from the preset it
+  // leaves, so switching to custom changes no file).
   custom: Object.freeze({
-    formats: Object.freeze([]),
-    sidecars: Object.freeze([]),
-    nomedia: false,
+    formats: CHAPTER_FORMATS,
+    sidecars: SIDECAR_NAMES,
+    nomedia: true,
     flags: Object.freeze({}),
   }),
 });
+const PROFILE_IDS = Object.freeze(Object.keys(PROFILES));
+const DEFAULT_PROFILE = "everything";
+// Fields only a custom target stores. A preset resolves them to its own
+// values (formats/sidecars/nomedia) or to the fixed name options below.
+const CUSTOM_FIELDS = Object.freeze(["formats", "sidecars", "nomedia", "namingPolicy", "renameToMatch", "cleanupNames"]);
+const FIXED_NAMING_POLICY = "strip-hid";
 
 const TARGET_KINDS = Object.freeze(["adb", "folder"]);
 const SELECTION_MODES = Object.freeze(["all-except", "only"]);
@@ -86,10 +111,13 @@ function _arr(v) {
  */
 function resolveTargetConfig(target) {
   const t = target && typeof target === "object" ? target : {};
-  const profileId = PROFILES[t.profile] ? t.profile : "generic";
+  const profileId = PROFILES[t.profile] ? t.profile : DEFAULT_PROFILE;
   const p = PROFILES[profileId];
-  const formats = Array.isArray(t.formats) && t.formats.length ? t.formats : p.formats;
-  const sidecars = Array.isArray(t.sidecars) ? t.sidecars : p.sidecars;
+  // A preset ignores any stored custom field (validateTarget refuses one; this
+  // covers a hand-edited sync-targets.json).
+  const own = profileId === "custom" ? t : {};
+  const formats = Array.isArray(own.formats) && own.formats.length ? own.formats : p.formats;
+  const sidecars = Array.isArray(own.sidecars) ? own.sidecars : p.sidecars;
   return {
     id: t.id,
     name: t.name || "",
@@ -101,10 +129,10 @@ function resolveTargetConfig(target) {
     formats: formats.map((f) => String(f).toLowerCase()),
     sidecars: sidecars.slice(),
     flags: p.flags,
-    nomedia: typeof t.nomedia === "boolean" ? t.nomedia : p.nomedia,
-    namingPolicy: NAMING_POLICIES.includes(t.namingPolicy) ? t.namingPolicy : "strip-hid",
-    renameToMatch: t.renameToMatch === true,
-    cleanupNames: Array.isArray(t.cleanupNames) ? t.cleanupNames.slice() : DEFAULT_CLEANUP_NAMES.slice(),
+    nomedia: typeof own.nomedia === "boolean" ? own.nomedia : p.nomedia,
+    namingPolicy: NAMING_POLICIES.includes(own.namingPolicy) ? own.namingPolicy : FIXED_NAMING_POLICY,
+    renameToMatch: own.renameToMatch === true,
+    cleanupNames: Array.isArray(own.cleanupNames) ? own.cleanupNames.slice() : DEFAULT_CLEANUP_NAMES.slice(),
     selection: SELECTION_MODES.includes(t.selection) ? t.selection : "all-except",
     verifyMode: STORED_VERIFY_MODES.includes(t.verifyMode) ? t.verifyMode : null,
     deletePolicy: DELETE_POLICIES.includes(t.deletePolicy) ? t.deletePolicy : null,
@@ -171,7 +199,7 @@ function validateTarget(target, ctx) {
   const c = ctx || {};
   const platform = c.platform || process.platform;
   if (!TARGET_KINDS.includes(t.kind)) errors.push({ field: "kind", message: "kind must be adb or folder" });
-  if (!PROFILES[t.profile]) errors.push({ field: "profile", message: "pick a reader profile" });
+  if (!PROFILES[t.profile]) errors.push({ field: "profile", message: "pick a reader" });
   if (!t.root || typeof t.root !== "string") {
     errors.push({ field: "root", message: "pick the folder to sync into" });
   } else if (t.kind === "adb") {
@@ -188,8 +216,17 @@ function validateTarget(target, ctx) {
     }
   }
   if (t.profile === "custom") {
-    const f = Array.isArray(t.formats) ? t.formats : [];
-    if (!f.length) errors.push({ field: "formats", message: "a custom profile needs at least one chapter format" });
+    if (Array.isArray(t.formats) && !t.formats.length) {
+      errors.push({ field: "formats", message: "a custom reader needs at least one chapter format" });
+    }
+  } else if (PROFILES[t.profile]) {
+    for (const f of CUSTOM_FIELDS) {
+      if (t[f] != null) errors.push({ field: f, message: "only a Custom reader can change this" });
+    }
+  }
+  if (t.nomedia != null && typeof t.nomedia !== "boolean") errors.push({ field: "nomedia", message: ".nomedia must be on or off" });
+  if (t.renameToMatch != null && typeof t.renameToMatch !== "boolean") {
+    errors.push({ field: "renameToMatch", message: "rename to match must be on or off" });
   }
   if (Array.isArray(t.formats) && t.formats.some((f) => !CHAPTER_FORMATS.includes(String(f).toLowerCase()))) {
     errors.push({ field: "formats", message: `formats must be among ${CHAPTER_FORMATS.join(", ")}` });
@@ -223,10 +260,13 @@ function validateTarget(target, ctx) {
 
 /**
  * The fields a record header pins (parent rule 3 / rule 12): a record is
- * only meaningful for this kind, device or folder (and its volume), root and
- * profile. canonicalRoot is measured by the transport and compared
- * separately.
+ * only meaningful for this kind, device or folder (and its volume) and root.
+ * canonicalRoot is measured by the transport and compared separately.
+ * Consumers: provenance.js loadRecordView (grep RECORD_IDENTITY_FIELDS),
+ * executor.js _ensureHeader, service.js _identityClear.
  */
+const RECORD_IDENTITY_FIELDS = Object.freeze(["kind", "serial", "root", "volumeId"]);
+
 function recordIdentity(target) {
   const t = target || {};
   return {
@@ -234,15 +274,15 @@ function recordIdentity(target) {
     serial: t.kind === "adb" ? t.serial || null : null,
     root: t.root || null,
     volumeId: t.kind === "folder" && t.volumeId != null ? String(t.volumeId) : null,
-    profile: t.profile || null,
   };
 }
 
-/** Rule 12: true when an edit moves the target to another place or reader. */
+/** Rule 12: true when an edit moves the target to another place. The volume
+ * is measured, not edited, so it isn't compared here. */
 function recordIdentityChanged(before, after) {
   const a = recordIdentity(before);
   const b = recordIdentity(after);
-  return a.kind !== b.kind || a.serial !== b.serial || a.root !== b.root || a.profile !== b.profile;
+  return a.kind !== b.kind || a.serial !== b.serial || a.root !== b.root;
 }
 
 module.exports = {
@@ -250,6 +290,9 @@ module.exports = {
   SIDECAR_NAMES,
   DEFAULT_CLEANUP_NAMES,
   PROFILES,
+  PROFILE_IDS,
+  DEFAULT_PROFILE,
+  CUSTOM_FIELDS,
   TARGET_KINDS,
   SELECTION_MODES,
   STORED_VERIFY_MODES,
@@ -260,6 +303,7 @@ module.exports = {
   isMirrored,
   pathContains,
   validateTarget,
+  RECORD_IDENTITY_FIELDS,
   recordIdentity,
   recordIdentityChanged,
 };

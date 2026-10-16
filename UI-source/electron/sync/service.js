@@ -1219,6 +1219,9 @@ function initDeviceSync(deps) {
       prompts: shown,
       find: findSources.status(),
       prewarm,
+      // Settings → Sync → Advanced "Open log folder" (openFolder IPC). Only
+      // while on: the folder isn't created while sync is off.
+      logDir: path.join(root, "logs"),
     };
   };
 
@@ -1314,6 +1317,17 @@ function initDeviceSync(deps) {
     if (!t) return refuse("invalid", "unknown target");
     if (!_isObj(p.patch)) return refuse("invalid", "patch required");
     const next = _cleanTarget(p.patch, t);
+    // A reader switch carries the custom-only fields (profiles.js
+    // CUSTOM_FIELDS) the patch leaves out: into custom, seeded from what the
+    // old preset resolved, so the switch itself changes no file; out of
+    // custom, cleared, since a preset stores none (validateTarget refuses).
+    if ("profile" in p.patch && next.profile !== _cfg(t).profile) {
+      const prev = _cfg(t);
+      for (const f of profiles.CUSTOM_FIELDS) {
+        if (f in p.patch) continue;
+        next[f] = next.profile === "custom" ? (Array.isArray(prev[f]) ? prev[f].slice() : prev[f]) : null;
+      }
+    }
     const errors = _validate(next);
     if (errors.length) return refuse("invalid", errors[0].message, { errors });
     const identity = profiles.recordIdentityChanged(_cfg(t), _cfg(next));

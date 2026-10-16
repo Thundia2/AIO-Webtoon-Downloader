@@ -153,11 +153,10 @@ log; git history owns the events.
 ## Handoff obligations for the UI pass
 
 Also in the `service.js` header.
-- Render `payload.sync` (`{target, phase, done, total}`) in ConfirmQuitDialog; a sync-only close
-  would say "0 downloads are still running".
-- Mount `useDeviceSync` in App.jsx, and call its `refresh()` after a save that flips
-  `syncEnabled`.
-- Choose which presets to expose.
+- ~~Render `payload.sync` in ConfirmQuitDialog~~ **Done in U1** (sync line, sync-only title).
+- ~~Mount `useDeviceSync` in App.jsx + refresh after an enable flip~~ **Done in U1**; the hook's
+  `settings` event re-read covers the refresh (UI plan U1-6).
+- ~~Choose which presets to expose~~ **Done in U0** (all of them, plan decision 6).
 - Expose `syncDiagnosticLog` (default on) as a toggle; you asked for the log to be switchable
   from the UI (P5, deviation 15). Optionally an "open log folder" action
   (`userData/sync/logs/`).

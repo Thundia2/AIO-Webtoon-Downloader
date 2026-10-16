@@ -1036,7 +1036,7 @@ test("case-only folder rename on case-insensitive storage goes through a temp; k
 });
 
 test("rename-to-match: intent first; a kill before or mid-way (case-only via temp) resolves from the folder listing", async () => {
-  const w = await world({ ci: true, lib: LIB, target: { renameToMatch: true } });
+  const w = await world({ ci: true, lib: LIB, target: { profile: "custom", renameToMatch: true } });
   try {
     await w.sync();
     // A PC-side rename keeping the content: the device copy is kept under its old name.

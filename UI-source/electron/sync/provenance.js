@@ -33,7 +33,7 @@
 // ============================================================
 
 const { slotKey } = require("./naming");
-const { recordIdentity } = require("./profiles");
+const { recordIdentity, RECORD_IDENTITY_FIELDS } = require("./profiles");
 
 const ORIGINS_OURS = Object.freeze(new Set(["pushed", "adopted", "adopted-size", "partial"]));
 
@@ -270,7 +270,7 @@ function loadRecordView({ header, shards, selection, target, measured }) {
   const ci = typeof m.caseInsensitive === "boolean" ? m.caseInsensitive : !!header.caseInsensitive;
   const want = recordIdentity(target);
   const mismatch = [];
-  for (const f of ["kind", "serial", "root", "volumeId", "profile"]) {
+  for (const f of RECORD_IDENTITY_FIELDS) {
     const have = header[f] == null ? null : String(header[f]);
     const now = want[f] == null ? null : String(want[f]);
     if (have !== now) mismatch.push(f);

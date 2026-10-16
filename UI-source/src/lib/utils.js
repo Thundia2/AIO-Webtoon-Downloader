@@ -64,6 +64,25 @@ export function formatEta(ms) {
   return m ? `${h}h ${m}m` : `${h}h`;
 }
 
+// Decimal bytes for Device Sync's sizes and capacity ("6.8 GB", "412 MB",
+// "57 GB"): one decimal below 10 GB, none above, as in the approved mockup
+// (sync-temp/design/approved, fmtBytes). Decimal because the capacity gauge
+// sits beside the tablet's own storage screen, which Android shows in
+// decimal units. LibraryTab's local formatSize is binary and left alone, so
+// the same folder can read slightly differently on the two tabs.
+// Returns "" for null / non-finite so callers can conditional-render; a
+// negative value (an "after sync" that doesn't fit) keeps its sign.
+export function formatBytes(b) {
+  if (b == null || !Number.isFinite(b)) return "";
+  const sign = b < 0 ? "−" : "";
+  const n = Math.abs(b);
+  if (n >= 1e12) return `${sign}${(n / 1e12).toFixed(n >= 10e12 ? 0 : 1)} TB`;
+  if (n >= 1e9) return `${sign}${(n / 1e9).toFixed(n >= 10e9 ? 0 : 1)} GB`;
+  if (n >= 1e6) return `${sign}${Math.round(n / 1e6)} MB`;
+  if (n >= 1e3) return `${sign}${Math.round(n / 1e3)} KB`;
+  return `${sign}${Math.round(n)} B`;
+}
+
 // Collapse a list of chapter numbers into a compact human range string:
 // ["51","52","53","55","60"] → "51-53, 55, 60". Consecutive runs (gap ≤ 1.001,
 // so decimals like 60.1 join their neighbor) collapse to "start-end"; isolated

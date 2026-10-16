@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { useDownloader } from "@/hooks/useDownloader";
+import { useDeviceSync } from "@/hooks/useDeviceSync";
 import DownloadTab from "@/components/DownloadTab";
 import SearchTab from "@/components/SearchTab";
 import QueueTab from "@/components/QueueTab";
@@ -8,6 +9,7 @@ import SettingsTab from "@/components/SettingsTab";
 import LibraryTab from "@/components/LibraryTab";
 import ResumeBar from "@/components/ResumeBar";
 import ConfirmQuitDialog from "@/components/ConfirmQuitDialog";
+import SyncTab from "@/components/sync/SyncTab";
 import appIcon from "../build-resources/icon.png";
 import {
   Download,
@@ -15,6 +17,7 @@ import {
   ListOrdered,
   Terminal,
   Settings,
+  FolderSync,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -22,13 +25,16 @@ import { cn } from "@/lib/utils";
 // Search sits between New and Queue: cross-site discovery feeds the same
 // queue the New tab does, so the visual order matches the user's flow:
 //   Search (find URL) → New (configure if needed) → Queue (running)
-const TABS = [
+// Sync is inserted just above Settings, and only while Device Sync is on
+// (App's `tabs` memo below).
+const BASE_TABS = [
   { id: "new", label: "New", icon: Download },
   { id: "search", label: "Search", icon: Search },
   { id: "queue", label: "Queue", icon: ListOrdered },
   { id: "logs", label: "Logs", icon: Terminal },
   { id: "settings", label: "Settings", icon: Settings },
 ];
+const SYNC_TAB = { id: "sync", label: "Sync", icon: FolderSync };
 
 export default function App() {
   const [activeTab, setActiveTab] = useState("new");
@@ -41,6 +47,23 @@ export default function App() {
 
   // Central hook that manages all download state and Electron IPC
   const dl = useDownloader();
+
+  // Device Sync, mounted once here so its event subscription lives as long as
+  // the window: the Sync tab and Settings → Sync both read this one instance
+  // (hooks/useDeviceSync.js). `sync.enabled` is the service's live state, not
+  // the saved setting, so the tab appears only once the service has started.
+  const sync = useDeviceSync();
+  const tabs = useMemo(() => {
+    if (!sync.enabled) return BASE_TABS;
+    const at = BASE_TABS.findIndex((t) => t.id === "settings");
+    return [...BASE_TABS.slice(0, at), SYNC_TAB, ...BASE_TABS.slice(at)];
+  }, [sync.enabled]);
+
+  // Turning sync off while its tab is open would leave the view on a tab the
+  // rail no longer shows; land on Settings, where the switch that did it is.
+  useEffect(() => {
+    if (activeTab === "sync" && !sync.enabled) setActiveTab("settings");
+  }, [activeTab, sync.enabled]);
 
   // Apply the system dark/light theme on mount and listen for changes
   useEffect(() => {
@@ -101,7 +124,7 @@ export default function App() {
         </button>
 
         {/* Tab buttons */}
-        {TABS.map((tab) => {
+        {tabs.map((tab) => {
           const Icon = tab.icon;
           const isActive = activeTab === tab.id;
 
@@ -164,7 +187,7 @@ export default function App() {
           <h1 className="text-sm font-semibold tracking-wide">
             {activeTab === "library"
               ? "Library"
-              : TABS.find((t) => t.id === activeTab)?.label}
+              : tabs.find((t) => t.id === activeTab)?.label}
           </h1>
         </div>
 
@@ -250,12 +273,25 @@ export default function App() {
               onSaveSettings={dl.saveSettings}
             />
           )}
+          {activeTab === "sync" && sync.enabled && (
+            <SyncTab
+              sync={sync}
+              onOpenSettings={() => {
+                setSettingsCategory("sync");
+                setActiveTab("settings");
+              }}
+            />
+          )}
           {activeTab === "settings" && (
             <SettingsTab
               settings={dl.settings}
               onSave={dl.saveSettings}
               searchSiteHealth={dl.searchSiteHealth}
               initialCategory={settingsCategory}
+              sync={sync}
+              libraryEntries={dl.libraryEntries}
+              libraryLoading={dl.libraryLoading}
+              loadLibrary={dl.loadLibrary}
             />
           )}
         </div>

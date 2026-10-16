@@ -14,7 +14,13 @@
 //   4. the close-with-download dialog is unchanged, and quit time is
 //      measured from "Quit anyway" to process exit (compare against
 //      --baseline on the previous tree);
-//   5. no userData/sync/ folder appears, and main logs no [deviceSync] line.
+//   5. no userData/sync/ folder appears, and main logs no [deviceSync] line
+//      (checked before step 6, which turns sync on);
+//   6. turning sync on in Settings → Sync shows the Sync rail tab just above
+//      Settings, creates userData/sync/ and opens the placeholder Sync tab;
+//      turning it off hides the tab again (UI pass U1; skipped with
+//      --baseline).
+// Steps run 1, 2, 3, 5, 6, 4: the quit in step 4 ends the app.
 // userData isolation is Chromium's --user-data-dir switch: Electron honors it
 // for app.getPath("userData") from the first line of main, and the
 // single-instance lock is keyed on it (measured on Windows, Electron 40).
@@ -165,6 +171,37 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     else console.log("  --  minimize not observable under this window manager; restore not checked");
   }
 
+  // 5. inert while off (before step 6 turns sync on)
+  check("no userData/sync/", !fs.existsSync(path.join(userData, "sync")));
+  check("no [deviceSync] line in main's output", !/\[deviceSync\]/.test(stderr), stderr.split("\n").filter((l) => /deviceSync/.test(l)).join(" | "));
+
+  // 6. sync on, then off, through the UI. The rail is App.jsx's w-16 <nav>;
+  // SettingsTab's category list is the other <nav>.
+  if (!BASELINE) {
+    const railSync = win.locator('nav.w-16 button[title="Sync"]');
+    const railTitles = () => win.locator("nav.w-16 button[title]").evaluateAll((bs) => bs.map((b) => b.title));
+    const toggleSync = async () => {
+      await openSettings();
+      await win.locator("nav:not(.w-16) button", { hasText: /^Sync/ }).first().click();
+      await win.getByRole("switch").first().click();
+      await saveLabel().click();
+    };
+    check("no Sync rail tab while off", (await railSync.count()) === 0);
+    await toggleSync();
+    await railSync.waitFor({ timeout: 20_000 }).catch(() => {});
+    const titles = await railTitles();
+    const at = titles.indexOf("Sync");
+    check("Sync rail tab appears just above Settings", at >= 0 && at === titles.indexOf("Settings") - 1, JSON.stringify(titles));
+    check("userData/sync/ exists once on", fs.existsSync(path.join(userData, "sync")));
+    await win.locator("text=No targets yet").first().waitFor({ timeout: 10_000 }).catch(() => {});
+    check("Settings → Sync shows the Targets section", (await win.locator("text=No targets yet").count()) > 0);
+    await railSync.click();
+    check("Sync tab opens", (await win.locator("text=The Sync tab isn't built yet").count()) > 0);
+    await toggleSync();
+    await win.waitForFunction(() => !document.querySelector('nav.w-16 button[title="Sync"]'), null, { timeout: 20_000 }).catch(() => {});
+    check("Sync rail tab gone once off", (await railSync.count()) === 0);
+  }
+
   // 4. close with a running download
   // workingDir too: the app creates it on download start, and its default can
   // sit outside the temp dir (Documents\AIO Downloader when packaged).
@@ -186,10 +223,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const quitMs = Date.now() - tq;
   check("app exits after Quit anyway", ex !== "timeout", JSON.stringify(ex));
   console.log(`  ..  quit time: ${quitMs} ms`);
-
-  // 5. inert
-  check("no userData/sync/", !fs.existsSync(path.join(userData, "sync")));
-  check("no [deviceSync] line in main's output", !/\[deviceSync\]/.test(stderr), stderr.split("\n").filter((l) => /deviceSync/.test(l)).join(" | "));
 
   try {
     fs.rmSync(TMP, { recursive: true, force: true });

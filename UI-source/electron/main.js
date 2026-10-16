@@ -588,8 +588,8 @@ function createWindow() {
   // dialog rather than dialog.showMessageBox.
   // Device Sync asks only while an apply, prune or rename runs; a plan or
   // verify is just cancelled by the quit (sync/contract.js QUIT_ASK_PHASES).
-  // payload.sync is {target, phase, done, total} or null; `running` keeps its
-  // shape so ConfirmQuitDialog works unchanged.
+  // payload.sync is {target, phase, unit, done, total} or null (service.js
+  // quitInfo); `running` keeps its shape, and ConfirmQuitDialog renders both.
   mainWindow.on("close", (e) => {
     if (quitConfirmed) return;
     const downloadsRunning = !!downloader && downloader.runningCount() > 0;

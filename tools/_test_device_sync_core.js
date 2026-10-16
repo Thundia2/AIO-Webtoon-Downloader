@@ -243,8 +243,8 @@ test("resolveTargetName: alias byte-exact, else policy", () => {
   const cfg = target({ aliases: [{ identityKey: "hid:a:1", deviceFolder: "Record of Ragnarok." }] });
   assert.deepStrictEqual(naming.resolveTargetName(s, cfg), { name: "Record of Ragnarok.", source: "alias", error: null });
   assert.strictEqual(naming.resolveTargetName(s, target()).name, "Record of Ragnarok");
-  assert.strictEqual(naming.resolveTargetName(s, target({ namingPolicy: "as-is" })).name, "Record of Ragnarok (hid=9)");
-  assert.strictEqual(naming.resolveTargetName(s, target({ namingPolicy: "title" })).name, "Shuumatsu no Valkyrie");
+  assert.strictEqual(naming.resolveTargetName(s, target({ profile: "custom", namingPolicy: "as-is" })).name, "Record of Ragnarok (hid=9)");
+  assert.strictEqual(naming.resolveTargetName(s, target({ profile: "custom", namingPolicy: "title" })).name, "Shuumatsu no Valkyrie");
 });
 
 // ── chapter labels ────────────────────────────────────────────────────────
@@ -332,29 +332,56 @@ test("resolveSyncSettings: defaults and invalid-value fallback", () => {
   assert.strictEqual(bad.chapterPatternErrors.length, 1);
 });
 
-test("resolveTargetConfig fills null fields from the profile; a switch propagates", () => {
-  const k = profiles.resolveTargetConfig({ profile: "komikku", formats: null, sidecars: null, nomedia: null });
+test("resolveTargetConfig: presets fix their fields, custom stores its own", () => {
+  assert.deepStrictEqual(profiles.PROFILE_IDS, ["everything", "komikku", "pdf", "custom"]);
+  const k = profiles.resolveTargetConfig({ profile: "komikku" });
   assert.deepStrictEqual(k.formats, ["cbz", "zip", "cbr", "rar", "epub"]);
   assert.deepStrictEqual(k.sidecars, ["cover.jpg", "details.json"]);
   assert.strictEqual(k.nomedia, true);
-  const g = profiles.resolveTargetConfig({ profile: "generic", formats: null, sidecars: null, nomedia: null });
-  assert.ok(g.formats.includes("pdf"));
-  assert.deepStrictEqual(g.sidecars, ["cover.jpg"]);
-  assert.strictEqual(g.nomedia, false);
+  assert.ok(k.flags.tilde && k.flags.pdf && k.flags.missingCover);
+  const ev = profiles.resolveTargetConfig({});
+  assert.strictEqual(ev.profile, "everything", "a missing or unknown profile resolves to everything");
+  assert.deepStrictEqual(ev.formats, ["pdf", "cbz", "zip", "cbr", "rar", "epub"]);
+  assert.deepStrictEqual(ev.sidecars, ["cover.jpg", "details.json"]);
+  assert.strictEqual(ev.nomedia, true);
+  assert.deepStrictEqual(ev.flags, {});
+  assert.strictEqual(profiles.resolveTargetConfig({ profile: "generic" }).profile, "everything");
+  const pdf = profiles.resolveTargetConfig({ profile: "pdf" });
+  assert.deepStrictEqual([pdf.formats, pdf.sidecars, pdf.nomedia], [["pdf"], ["cover.jpg"], true]);
+  // A preset ignores stored custom fields (a hand-edited file); custom honours them.
+  const odd = { formats: ["pdf"], sidecars: [], nomedia: false, namingPolicy: "title", renameToMatch: true, cleanupNames: [".x"] };
+  const kp = profiles.resolveTargetConfig({ profile: "komikku", ...odd });
+  assert.deepStrictEqual([kp.formats, kp.nomedia, kp.namingPolicy, kp.renameToMatch, kp.cleanupNames], [k.formats, true, "strip-hid", false, k.cleanupNames]);
+  const c = profiles.resolveTargetConfig({ profile: "custom", ...odd });
+  assert.deepStrictEqual([c.formats, c.sidecars, c.nomedia, c.namingPolicy, c.renameToMatch, c.cleanupNames], [["pdf"], [], false, "title", true, [".x"]]);
+  const cd = profiles.resolveTargetConfig({ profile: "custom" });
+  assert.deepStrictEqual([cd.formats, cd.sidecars, cd.nomedia], [ev.formats, ev.sidecars, true], "custom's nulls default to everything");
   assert.strictEqual(k.namingPolicy, "strip-hid");
   assert.deepStrictEqual(k.cleanupNames, [".aio_series.json", ".mangafire_hid", ".series_hid", ".cover.webp"]);
 });
 
+test("validateTarget: a preset refuses custom-only fields; custom needs a format when it names them", () => {
+  const base = { kind: "folder", root: "E:\\T" };
+  for (const [f, v] of [["formats", ["cbz"]], ["sidecars", []], ["nomedia", false], ["namingPolicy", "title"], ["renameToMatch", true], ["cleanupNames", [".x"]]]) {
+    assert.ok(profiles.validateTarget({ ...base, profile: "komikku", [f]: v }, {}).some((x) => x.field === f), f);
+    assert.deepStrictEqual(profiles.validateTarget({ ...base, profile: "custom", [f]: v }, {}), [], f);
+  }
+  assert.deepStrictEqual(profiles.validateTarget({ ...base, profile: "pdf", formats: null, nomedia: null }, {}), [], "nulls are fine on a preset");
+  assert.ok(profiles.validateTarget({ ...base, profile: "custom", formats: [] }, {}).some((x) => x.field === "formats"));
+  assert.ok(profiles.validateTarget({ ...base, profile: "generic" }, {}).some((x) => x.field === "profile"));
+  assert.ok(profiles.validateTarget({ ...base, profile: "custom", nomedia: "yes" }, {}).some((x) => x.field === "nomedia"));
+});
+
 test("validateTarget: folder root may not be inside or contain the library or userData", () => {
   const ctx = { libraryRoot: "D:\\Manga", userDataDir: "C:\\Users\\legoc\\AppData\\Roaming\\aio-downloader-ui", platform: "win32" };
-  const base = { kind: "folder", profile: "generic" };
+  const base = { kind: "folder", profile: "everything" };
   assert.ok(profiles.validateTarget({ ...base, root: "d:\\manga\\_mirror" }, ctx).some((x) => x.field === "root"));
   assert.ok(profiles.validateTarget({ ...base, root: "D:\\" }, ctx).some((x) => x.field === "root"));
   assert.ok(profiles.validateTarget({ ...base, root: "C:\\Users\\legoc\\AppData" }, ctx).some((x) => x.field === "root"));
   assert.deepStrictEqual(profiles.validateTarget({ ...base, root: "E:\\Tablet" }, ctx), []);
   assert.ok(profiles.validateTarget({ kind: "adb", profile: "komikku", root: "/sdcard/../x", serial: "S" }, ctx).length);
   assert.ok(profiles.validateTarget({ kind: "adb", profile: "komikku", root: "/sdcard/x" }, ctx).some((x) => x.field === "serial"));
-  assert.ok(profiles.validateTarget({ kind: "folder", profile: "generic", root: "E:\\T", cleanupNames: ["cover.jpg"] }, ctx).some((x) => x.field === "cleanupNames"));
+  assert.ok(profiles.validateTarget({ kind: "folder", profile: "custom", root: "E:\\T", cleanupNames: ["cover.jpg"] }, ctx).some((x) => x.field === "cleanupNames"));
 });
 
 test("contract: refuse() has one shape and rejects unknown codes", () => {
@@ -466,7 +493,10 @@ test("rule 12: a new recordEpoch hides old shards and the old selection; header 
   assert.deepStrictEqual(v.staleShardIds, ["a"]);
   assert.deepStrictEqual(v.selection.ops, {});
   assert.ok(profiles.recordIdentityChanged(t, { ...t, root: "/sdcard/Other" }));
-  assert.ok(profiles.recordIdentityChanged(t, { ...t, profile: "generic" }));
+  assert.ok(!profiles.recordIdentityChanged(t, { ...t, profile: "pdf" }), "a reader switch keeps the record (2026-10-16)");
+  assert.ok(!("profile" in profiles.recordIdentity(t)));
+  const oldHeader = prov.loadRecordView({ header: { recordEpoch: "E2", ...profiles.recordIdentity(t), profile: "generic" }, shards: [], selection: null, target: t });
+  assert.deepStrictEqual(oldHeader.mismatch, [], "a pre-2026-10-16 header's profile key is ignored");
   assert.ok(!profiles.recordIdentityChanged(t, { ...t, name: "Renamed" }));
   const mism = prov.loadRecordView({ header: { recordEpoch: "E2", ...profiles.recordIdentity(t), serial: "OTHER" }, shards: [], selection: null, target: t });
   assert.deepStrictEqual(mism.mismatch, ["serial"]);
@@ -522,7 +552,7 @@ test("kept name: same bytes under another name → no op; rename toggle → rena
   const p = plan({ pc: pc([s]), device: device({ Alpha: devFiles }), view: v });
   assert.strictEqual(p.bySeriesKey.get("pc:Alpha").counts.kept, 1);
   assert.strictEqual(p.ops.size, 0);
-  const p2 = plan({ target: target({ renameToMatch: true }), pc: pc([s]), device: device({ Alpha: devFiles }), view: v });
+  const p2 = plan({ target: target({ profile: "custom", renameToMatch: true }), pc: pc([s]), device: device({ Alpha: devFiles }), view: v });
   const r = op(p2, "rename:Alpha/Ch.001.cbz->Ch.001 - Pilot.cbz");
   assert.deepStrictEqual([r.preselected, r.viaTemp], [true, false]);
 });
@@ -534,7 +564,7 @@ test("case-only difference is one slot; rename-to-match goes via a temp name", (
   const p = plan({ pc: pc([s]), device: device({ Alpha: devFiles }), view: v });
   assert.strictEqual(p.bySeriesKey.get("pc:Alpha").counts.inSync, 1);
   assert.strictEqual(p.ops.size, 0);
-  const p2 = plan({ target: target({ renameToMatch: true }), pc: pc([s]), device: device({ Alpha: devFiles }), view: v });
+  const p2 = plan({ target: target({ profile: "custom", renameToMatch: true }), pc: pc([s]), device: device({ Alpha: devFiles }), view: v });
   assert.strictEqual(op(p2, "rename:Alpha/Ch.001.cbz->CH.001.cbz").viaTemp, true);
 });
 
@@ -823,7 +853,7 @@ test("adoption ladder: identity, content ≥90%, name, similar", () => {
     dfiles.push([`Record of Ragnarok Ch ${i}.pdf`, 100 + i, 1]);
   }
   const s = series("Shuumatsu no Valkyrie", files, { url: "https://mangafire.to/manga/valk", anilistId: 123 });
-  const gen = target({ profile: "generic" });
+  const gen = target({ profile: "everything" });
   const v = view([], { target: gen, noHeader: true });
   const content = plan({ target: gen, pc: pc([s]), device: device({ "Record of Ragnarok": dfiles }), view: v });
   const g = content.suggestions[0];

@@ -1,8 +1,15 @@
 // ============================================================
 // useDeviceSync — renderer mirror of Device Sync (main: electron/sync/service.js)
 //
-// NOT MOUNTED YET: mounting it (once, for the app's lifetime, like
-// useUpdateCheck) is the UI pass's job.
+// Mounted ONCE, by App.jsx, for the app's lifetime (like useUpdateCheck);
+// every Sync surface reads it from App's props.
+//
+// DEV SEAM: useDeviceSync({source}) reads `source` instead of
+// window.electronAPI — an object with the same sync* wrappers and
+// onSyncEvent. Only the DEV gallery passes one (src/dev/SyncGallery.jsx,
+// fixtures from tools/_gen_sync_fixtures.js); it never touches
+// window.electronAPI, whose presence turns on every other hook's IPC.
+// `source` is read at mount; a later change is ignored.
 //
 // STATE OWNERSHIP: main owns everything. This hook adopts the sync:get-state
 // snapshot, then applies "sync-event" pushes by kind. Same startup ordering
@@ -22,7 +29,7 @@
 // re-read left: a `settings` event that flips `enabled` adopts a fresh
 // snapshot, since turning sync on or off replaces every field at once.
 //
-// Read by: nothing yet (UI pass). Depends on: preload.js sync* wrappers and
+// Read by: App.jsx (grep useDeviceSync). Depends on: preload.js sync* wrappers and
 // onSyncEvent. The event kinds below duplicate sync/contract.js EVENT_KINDS;
 // tools/_test_device_sync_contract.js keeps them equal, and
 // tools/_test_device_sync_hook.js runs this file. grep: deviceSync
@@ -52,6 +59,7 @@ const INITIAL = Object.freeze({
   findRows: {},
   prewarm: null,
   libraryStatus: null,
+  logDir: null,
 });
 
 // Action name → preload wrapper. get-state is refresh(); events come from
@@ -160,10 +168,13 @@ function fromSnapshot(snap) {
     prompts: Array.isArray(snap.prompts) ? snap.prompts : [],
     find: snap.find || null,
     prewarm: snap.prewarm || null,
+    logDir: typeof snap.logDir === "string" ? snap.logDir : null,
   };
 }
 
-export function useDeviceSync() {
+export function useDeviceSync(opts) {
+  const sourceRef = useRef(opts && opts.source ? opts.source : null);
+  const getApi = useCallback(() => sourceRef.current || api(), []);
   const [state, setState] = useState(INITIAL);
   const hydratedRef = useRef(false);
   const bufferRef = useRef([]);
@@ -173,7 +184,7 @@ export function useDeviceSync() {
 
   /** Re-read the whole snapshot (latest request wins). */
   const refresh = useCallback(() => {
-    const a = api();
+    const a = getApi();
     if (!a) return Promise.resolve(null);
     const seq = ++refreshSeqRef.current;
     return Promise.resolve(a.syncGetState())
@@ -185,7 +196,7 @@ export function useDeviceSync() {
         return snap;
       })
       .catch(() => null);
-  }, []);
+  }, [getApi]);
 
   const onEvent = useCallback(
     (ev) => {
@@ -203,7 +214,7 @@ export function useDeviceSync() {
   );
 
   useEffect(() => {
-    const a = api();
+    const a = getApi();
     if (!a) return undefined;
     let alive = true;
     hydratedRef.current = false;
@@ -228,13 +239,13 @@ export function useDeviceSync() {
       alive = false;
       if (typeof unsubscribe === "function") unsubscribe();
     };
-  }, [onEvent]);
+  }, [onEvent, getApi]);
 
   const actions = useMemo(() => {
     const out = { refresh };
     for (const [name, fn] of Object.entries(ACTIONS)) {
       out[name] = (payload) => {
-        const a = api();
+        const a = getApi();
         if (!a) return Promise.resolve({ ok: false, code: "disabled", message: "electronAPI unavailable" });
         return Promise.resolve(a[fn](payload));
       };
@@ -250,7 +261,7 @@ export function useDeviceSync() {
         return r;
       });
     return out;
-  }, [refresh]);
+  }, [refresh, getApi]);
 
   return { ...state, actions };
 }

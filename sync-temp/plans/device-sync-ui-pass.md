@@ -287,3 +287,26 @@ backend consequences become **phase U0b**, folded into the U0 commit (user, 2026
   is gone; the exclude stays. Summary/detail rows carry `removing`.
 - **U0b-5 (D8): renderer-only (U2).** The summary already carries `state`/`heldReason`; the ledger
   sorts held series last. No backend change.
+
+## Phase U1 decisions and deviations (2026-10-16)
+
+- **U1-1 (user): four reader presets replace "generic".** `everything` (default: all six formats,
+  cover.jpg + details.json, `.nomedia`, no Komikku warnings), `komikku` (cbz/zip/cbr/rar/epub, both
+  sidecars, `.nomedia`, warns on pdf / `~` / missing cover, never renames), `pdf` (pdf + cover.jpg +
+  `.nomedia`), `custom` (the only reader where formats, sidecars, `.nomedia`, naming policy,
+  rename-to-match and clean-up names are editable). validateTarget refuses those fields on a preset.
+  Switching into Custom seeds them from the old preset's values; leaving Custom clears them
+  (service.js update-target). No stored targets existed, so nothing migrates.
+- **U1-2 (user): the reader is no longer part of the record identity.** `RECORD_IDENTITY_FIELDS`
+  = kind, serial, root, volumeId (profiles.js); a preset change keeps sync history. This
+  supersedes spec §4's "identity fields (kind, tablet, folder, reader)".
+- **U1-3 (user): the Add-target draft card has a Reader field**, default Everything.
+- **U1-4: get-state while enabled carries `logDir`** (Advanced → "Open log folder").
+- **U1-5: the Sync tab is a placeholder** (`components/sync/SyncTab.jsx`) until U2; ChapterStrip
+  and CapacityGauge move to U2 with their first consumer.
+- **U1-6: the STATE.md obligation "call refresh() after a save that flips syncEnabled" is met by
+  the hook itself**: a `settings` event that flips `enabled` re-reads get-state. The dev smoke's
+  step 6 shows the rail tab appear and disappear through the UI.
+- **U1-7: the gallery's config-op is a naive fake** (`src/dev/syncFixtureSource.js`); every other
+  answer is recorded off the real service by `tools/_gen_sync_fixtures.js`. Re-run the generator
+  after a backend change.

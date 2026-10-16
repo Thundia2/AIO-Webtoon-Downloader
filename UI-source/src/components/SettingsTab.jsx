@@ -6,7 +6,7 @@ import {
   Save, RotateCcw, FolderOpen, FileText, Package, Terminal, RefreshCw,
   Check, AlertTriangle, Gauge, Cpu, Network, Lock, X,
   // Category-nav icons (2026-07-05 two-pane redesign) — one per CATEGORIES group.
-  Settings, Image as ImageIcon, Tags, Search, Library,
+  Settings, Image as ImageIcon, Tags, Search, Library, FolderSync,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LANGUAGES } from "@/lib/constants";
@@ -20,6 +20,9 @@ import {
 // Device Sync's eight global keys (owner: electron/sync/sync-settings.js;
 // drift guard: tools/_test_device_sync_settings_twin.js).
 import { SYNC_DEFAULTS } from "@/lib/syncSettings";
+// Settings → Sync's sections (draft keys + immediate config-op sections).
+import { syncSettingsSections, useConfigOps } from "@/components/sync/SyncSettings";
+import { Dialog } from "@/components/ui/overlay";
 
 // Default values for settings.searchOpts. Mirrors DEFAULT_OPTS in
 // SearchTab.jsx. Both surfaces (Settings + Search) read/write this
@@ -166,7 +169,9 @@ const DEV_DEFAULTS = {
 // The comments below are the field-level rationale that used to live inline in
 // the useState initializer — preserved because they're load-bearing for the
 // next reader (quality=100 fast-path, collapseSplits opt-in, etc.).
-const DEFAULT_SETTINGS = {
+// Exported only for the DEV gallery (src/dev/SyncGallery.jsx), which seeds
+// its frames' saved settings with it so the Save button reads "0 changed".
+export const DEFAULT_SETTINGS = {
   pythonCmd: DEV_DEFAULTS.pythonCmd,
   scriptPath: DEV_DEFAULTS.scriptPath,
   workingDir: DEV_DEFAULTS.workingDir,
@@ -441,7 +446,21 @@ const CATEGORIES = [
     desc: "Defaults for cross-site title search." },
   { id: "library", label: "Library", icon: Library,
     desc: "Update checks and how the library is scanned." },
+  // Last in the nav (approved Device Sync design, spec §4). Its sections
+  // come from components/sync/SyncSettings.jsx (grep syncSettingsSections).
+  { id: "sync", label: "Sync", icon: FolderSync,
+    desc: "Mirror your library to a tablet or a folder." },
 ];
+
+// Stand-in for the Device Sync hook when SettingsTab renders without one
+// (nothing mounts it that way today; keeps the Sync category inert rather
+// than crashing). Shape = useDeviceSync's INITIAL plus actions.
+const NO_SYNC = Object.freeze({
+  loaded: false, enabled: false, config: null, devices: [], folderPresence: {}, adb: null, job: null,
+  actions: new Proxy({}, { get: () => () => Promise.resolve({ ok: false, code: "disabled", message: "Device Sync isn't available" }) }),
+});
+// Sync job phases that write to a target (contract.js QUIT_ASK_PHASES).
+const SYNC_WRITING_PHASES = new Set(["apply", "prune", "rename"]);
 
 // ── Dirty diff for the Save Settings button ──
 // Compares the local in-memory settings draft against the most recently
@@ -663,7 +682,10 @@ function SaveSettingsButton({ dirty, onSave }) {
   );
 }
 
-export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, initialCategory }) {
+export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, initialCategory, sync: syncProp, libraryEntries, libraryLoading, loadLibrary }) {
+  // Device Sync (App.jsx mounts useDeviceSync once and passes it down).
+  const sync = syncProp || NO_SYNC;
+  const syncOps = useConfigOps(sync);
   // Local copy of settings so changes don't apply until you click Save
   // Local copy of settings so changes don't apply until you click Save.
   // Sourced from the module-level DEFAULT_SETTINGS (single source of truth,
@@ -917,8 +939,22 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
   // full, EACCES, etc.). Pre-change behavior dropped the promise; the
   // failure was an unhandled rejection. `await onSave(saveable)`
   // preserves the rejection so the button's try/catch sees it.
+  // Turning Device Sync off while a job writes to a target stops that job;
+  // ask first (plan decision 6). The dialog resolves the pending save:
+  // "Keep syncing" saves everything else with sync still on.
+  const [syncOffAsk, setSyncOffAsk] = useState(null); // {job, targetName, resolve}
   const handleSave = async () => {
     const { isPackaged, ...saveable } = local;
+    const job = sync.job;
+    if (settings?.syncEnabled && !local.syncEnabled && job && job.state === "running" && SYNC_WRITING_PHASES.has(job.phase)) {
+      const t = (sync.config?.targets || []).find((x) => x.id === job.targetId);
+      const stop = await new Promise((resolve) => setSyncOffAsk({ job, targetName: t ? t.name : "the target", resolve }));
+      setSyncOffAsk(null);
+      if (!stop) {
+        saveable.syncEnabled = true;
+        set("syncEnabled", true);
+      }
+    }
     await onSave(saveable);
   };
 
@@ -1488,7 +1524,15 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
           <span className="font-mono">details.json</span> (status, genres,
           authors). Forces format=CBZ, keep-chapters, no-final-file.
           Output stays at <span className="font-mono">manga/&lt;Series&gt;/</span>;
-          sync that into Komikku's storage root yourself.
+          copy that into Komikku's storage folder yourself, or turn on{" "}
+          <button
+            type="button"
+            onClick={() => setActiveCategory("sync")}
+            className="underline underline-offset-2 hover:text-foreground"
+          >
+            Settings → Sync
+          </button>
+          .
         </p>
       </div>
       <Switch
@@ -2792,6 +2836,10 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
     { group: "search",      title: "Search Options",                render: renderSearch },
     { group: "search",      title: "Search Sources",                render: renderSearchSources },
     { group: "library",     title: "Library & Update Checks",       render: renderLibrary },
+    ...syncSettingsSections({
+      local, set, settings, sync, ops: syncOps,
+      library: { entries: libraryEntries || [], loading: !!libraryLoading, load: loadLibrary },
+    }),
   ];
 
   const activeCat = CATEGORIES.find((c) => c.id === activeCategory) || CATEGORIES[0];
@@ -2892,6 +2940,29 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
           <RotateCcw className="w-4 h-4" />
         </Button>
       </div>
+
+      <Dialog
+        open={!!syncOffAsk}
+        onClose={() => syncOffAsk?.resolve(false)}
+        title="Turn off Device Sync?"
+        width={420}
+        footer={
+          <>
+            <Button variant="ghost" size="sm" onClick={() => syncOffAsk?.resolve(false)}>
+              Keep syncing
+            </Button>
+            <Button variant="destructive" size="sm" onClick={() => syncOffAsk?.resolve(true)}>
+              Stop and turn off
+            </Button>
+          </>
+        }
+      >
+        <p className="text-[13px]">
+          {syncOffAsk?.job?.phase === "apply" ? "Copying" : syncOffAsk?.job?.phase === "prune" ? "Removing folders" : "Renaming a folder"} on{" "}
+          <b className="font-semibold">{syncOffAsk?.targetName}</b> is still running. Turning sync off stops it; files already copied stay and count as synced.
+        </p>
+        <p className="mt-2 text-xs text-muted-foreground">Keep syncing saves your other changes and leaves Device Sync on.</p>
+      </Dialog>
     </div>
   );
 }

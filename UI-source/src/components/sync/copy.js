@@ -1,0 +1,390 @@
+// ============================================================
+// DEVICE SYNC COPY — every machine code the sync backend sends, as words
+//
+// One map per kind of code (reader presets, adb tracking, tablet states,
+// refusal codes, …). Every Sync surface reads its wording from here; none
+// spells a code out itself, so a new backend code shows up as one missing key
+// in the drift test instead of as raw text on screen.
+//
+// Copy rules (approved design spec §3, sync-temp/design/approved/spec.md):
+// sentence case; never a bare "device" — name the target, and where a name
+// can't fit say "there" with the full name in a tooltip. Functions take the
+// target's name for that reason.
+//
+// KEEP IN SYNC with the backend lists it covers (electron/sync/profiles.js
+// PROFILE_IDS, contract.js REFUSAL_CODES, …). Drift guard:
+// tools/_test_device_sync_copy.js, which imports this file as an ES module —
+// so it must stay import-free (plain data and functions).
+// ============================================================
+
+// ── Reader presets (profiles.js PROFILES; user decision 2026-10-16) ──
+// A preset fixes what is copied; only Custom exposes the file options.
+export const PROFILE_COPY = Object.freeze({
+  everything: {
+    label: "Everything",
+    hint: "Copies every chapter file (CBZ, ZIP, CBR, RAR, EPUB and PDF), plus cover.jpg and details.json, and hides covers from the gallery.",
+  },
+  komikku: {
+    label: "Komikku compatible",
+    hint: "For Komikku and Mihon's local source: archives, cover.jpg and details.json. PDFs aren't copied, and a ~ in a chapter number or a missing cover.jpg is flagged so you can fix it on the PC.",
+  },
+  pdf: {
+    label: "PDF only",
+    hint: "Copies PDF files and cover.jpg, and hides covers from the gallery.",
+  },
+  custom: {
+    label: "Custom",
+    hint: "You choose the file types, extra files, .nomedia, folder names and clean-up below.",
+  },
+});
+export const PROFILE_ORDER = Object.freeze(["everything", "komikku", "pdf", "custom"]);
+
+// ── Per-target fields ──
+export const DELETE_POLICY_COPY = Object.freeze({
+  guarded: { label: "Guarded", hint: "Removes chapters only after you confirm each series in Review." },
+  "add-only": { label: "Add only", hint: "Never removes anything from the target." },
+});
+export const HASH_MODE_COPY = Object.freeze({
+  cached: { label: "Cached", hint: "Reuses fingerprints from the last scan." },
+  rehash: { label: "Re-hash", hint: "Reads every PC file again on each check." },
+});
+export const NAMING_POLICY_COPY = Object.freeze({
+  "strip-hid": { label: "Without site id", example: "One Piece (hid=8f2) → One Piece" },
+  "as-is": { label: "Same as the PC folder", example: "One Piece (hid=8f2) → One Piece (hid=8f2)" },
+  title: { label: "Series title", example: "folder name → the title AIO recorded" },
+});
+export const SELECTION_MODE_COPY = Object.freeze({
+  "all-except": "All, except excluded",
+  only: "Only selected",
+});
+export const VERIFY_MODE_COPY = Object.freeze({
+  "read-back": { label: "Read back", hint: "Reads each file back from the target to check it. Slower, exact." },
+  "adopt-size": { label: "Trust matching sizes", hint: "Treats a file of the same name and size as already there. Fast." },
+});
+export const KIND_COPY = Object.freeze({ adb: "Tablet (adb)", folder: "Folder" });
+
+// ── adb (service.js _adbView `tracking`; monitor.js) ──
+// tone: ok | info | warn | muted | bad — maps to the token colour of the line.
+export function adbTrackingCopy(adb) {
+  const a = adb || {};
+  // No binary at all: the server error that follows ("no adb binary to start
+  // the server with", adb/locate.js) is a consequence, not the news. Only
+  // when the hook has loaded something (`adb` non-null) — before that the
+  // fields are just absent.
+  if (adb && !a.binary && a.tracking !== "tracking") {
+    return { tone: "bad", icon: "alert", title: "No adb on this PC", body: "Install Android SDK Platform-Tools, then re-detect, or browse to adb.exe." };
+  }
+  if (a.error && a.tracking !== "tracking") {
+    return { tone: "bad", icon: "alert", title: "adb couldn't start", body: `${a.error}. Pick another adb or re-detect.` };
+  }
+  switch (a.tracking) {
+    case "tracking":
+      return { tone: "ok", icon: "ok", title: "Watching for tablets", body: `adb${a.serverVersion ? ` ${formatAdbServer(a.serverVersion)}` : ""} is running. A tablet appears here as soon as you plug it in.` };
+    case "connecting":
+      return { tone: "info", icon: "spin", title: "Starting adb…", body: "Connecting to the adb server on this PC." };
+    case "polling":
+      return { tone: "warn", icon: "clock", title: "Checking every 5 s", body: "adb's live tracking isn't available, so the app checks for tablets every few seconds." };
+    default:
+      return { tone: "muted", icon: "idle", title: "Not watching", body: a.binary ? "adb is idle. It starts when a sync needs it." : "No adb found. Browse to adb.exe or re-detect." };
+  }
+}
+// The server reports its protocol version (41) where `adb version` says 1.0.41.
+export function formatAdbServer(v) {
+  return typeof v === "number" ? `1.0.${v}` : String(v || "");
+}
+// adb/locate.js candidate `source` (its @returns lists them).
+export const ADB_SOURCE_COPY = Object.freeze({
+  configured: "chosen",
+  PATH: "on PATH",
+  ANDROID_HOME: "ANDROID_HOME",
+  ANDROID_SDK_ROOT: "ANDROID_SDK_ROOT",
+  LOCALAPPDATA: "Android SDK",
+});
+
+// ── Tablet states (adb/wire.js DEVICE_STATES + "no-permissions" = stateKind) ──
+export const DEVICE_STATE_COPY = Object.freeze({
+  device: { tone: "ok", label: "Connected" },
+  unauthorized: { tone: "bad", label: "Allow USB debugging on the tablet" },
+  "no-permissions": { tone: "bad", label: "No permission to use this USB device" },
+  authorizing: { tone: "info", label: "Waiting for you to allow USB debugging" },
+  connecting: { tone: "info", label: "Connecting" },
+  offline: { tone: "muted", label: "Offline" },
+  detached: { tone: "muted", label: "Detached" },
+  bootloader: { tone: "muted", label: "In bootloader" },
+  recovery: { tone: "muted", label: "In recovery" },
+  rescue: { tone: "muted", label: "In rescue mode" },
+  sideload: { tone: "muted", label: "In sideload mode" },
+  host: { tone: "muted", label: "Not a tablet" },
+});
+
+// ── Refusals a config-op can answer (contract.js REFUSAL_CODES) ──
+// Settings renders these inline next to the field that caused them.
+export function configRefusalCopy(r, targetName) {
+  const tn = targetName || "this target";
+  switch (r && r.code) {
+    case "version-conflict":
+      return "The sync settings changed somewhere else. This screen now shows the current settings; make your change again.";
+    case "busy":
+      return `${tn} is busy with a sync job. Try again when it finishes.`;
+    case "invalid":
+      return r.message ? capitalize(r.message) + "." : "That value isn't allowed.";
+    case "disabled":
+      return "Device Sync is off.";
+    case "disconnected":
+      return `${tn} isn't connected.`;
+    default:
+      return (r && r.message) || "That didn't work.";
+  }
+}
+
+function capitalize(s) {
+  const t = String(s || "");
+  return t ? t[0].toUpperCase() + t.slice(1) : t;
+}
+
+// ── Display helpers ──
+/** The label a tablet goes by before it is a target: model, else serial. */
+export function deviceLabel(d) {
+  if (!d) return "";
+  return d.model ? String(d.model).replace(/_/g, "-") : d.serial || "(no serial number)";
+}
+
+// ── File options (profiles.js CHAPTER_FORMATS / SIDECAR_NAMES / custom
+// defaults). A custom target's null field resolves to these, so the editor
+// shows them as the current value. ──
+export const CHAPTER_FORMATS = Object.freeze(["cbz", "zip", "cbr", "rar", "epub", "pdf"]);
+export const SIDECAR_NAMES = Object.freeze(["cover.jpg", "details.json"]);
+export const DEFAULT_CLEANUP_NAMES = Object.freeze([".aio_series.json", ".mangafire_hid", ".series_hid", ".cover.webp"]);
+export const CUSTOM_DEFAULTS = Object.freeze({
+  formats: CHAPTER_FORMATS,
+  sidecars: SIDECAR_NAMES,
+  nomedia: true,
+  namingPolicy: "strip-hid",
+  renameToMatch: false,
+  cleanupNames: DEFAULT_CLEANUP_NAMES,
+});
+
+// ── Ledger (planner.js SERIES_STATES / HELD_REASONS, analysis.js TAG_KINDS) ──
+// null = the state shows no badge.
+export function seriesStateCopy(state, tn) {
+  return {
+    bound: null,
+    "needs-verify": "Needs a check",
+    new: "New series",
+    gone: `Removed on ${tn}`,
+    held: null,
+  }[state];
+}
+export function heldReasonCopy(reason, tn) {
+  const there = tn ? `on ${tn}` : "there";
+  return {
+    excluded: "Excluded",
+    fork: "Another library folder holds the same series",
+    "empty-pc-folder": "No chapters on your PC",
+    "image-only": "Loose images, not chapter files",
+    "folder-unreadable": `Couldn't read its folder ${there}`,
+    "name-taken": `That folder name is already taken ${there}`,
+    "name-invalid": `That folder name isn't allowed ${there}`,
+  }[reason];
+}
+export const TAG_COPY = Object.freeze({
+  "pc-ahead": "PC ahead",
+  "device-ahead": "Target ahead",
+  "pc-gaps": "Gaps on PC",
+  "sub-chapter-split": "Split chapters",
+  "ch0-asymmetry": "Chapter 0 differs",
+  "different-start": "Different start",
+  "numbering-mismatch": "Numbering differs",
+  "volumes-not-comparable": "Volumes",
+  mixed: "Mixed numbering",
+});
+// Strip states (planner.js chapterStrip; colours in spec §2), for tooltips.
+export const STRIP_STATE_COPY = Object.freeze({
+  synced: "on the target",
+  push: "will copy",
+  warn: "needs a decision",
+  delete: "will remove",
+  absent: "not copied",
+  other: "volumes, ranges or unnumbered files",
+});
+export function anomalyCopy(kind, tn) {
+  const there = tn || "the target";
+  return {
+    "fork-collision": "Two library folders are the same series",
+    "merge-in-library": "This series is split across library folders",
+    "format-mismatch": `A chapter has a different format on ${there}`,
+    "size-mismatch": `A chapter's size differs on ${there}`,
+    "single-bundled-file": "One file holds the whole series",
+    "empty-pc-folder": "The PC folder has no chapters",
+    "malformed-json": "details.json can't be read",
+    "image-only": "The folder holds loose images",
+    "reader-compat": "Komikku may not read some files",
+    "unparsed-files": "Some file names aren't chapter numbers",
+    "name-too-long": `The folder name is too long for ${there}`,
+    "name-invalid": `The folder name isn't allowed on ${there}`,
+    "name-taken": `A folder with that name already exists on ${there}`,
+    "folder-unreadable": `Couldn't read the folder on ${there}`,
+    "loose-root-files": `Files sit loose in the sync folder on ${there}`,
+  }[kind];
+}
+// reader-compat issues (analysis.js data.issues).
+export const READER_ISSUE_COPY = Object.freeze({
+  "no-cover": "no cover.jpg, so Komikku shows no cover",
+  pdf: "PDFs, which Komikku can't open",
+  tilde: "a ~ in a chapter number, which Komikku reads as another chapter",
+});
+
+// ── Op reasons (planner.js; per op kind) ──
+export function opReasonCopy(kind, reason, tn) {
+  const there = tn || "the target";
+  const m = {
+    push: { new: "New on your PC", "removed-on-device": `Removed on ${there}; copy it back`, missing: `Missing on ${there}` },
+    update: { repair: "Unfinished copy; copy again", "changed-on-pc": "Changed on your PC", "unresolved-pending": "An earlier copy didn't finish" },
+    replace: { "changed-on-device": `Changed on ${there}`, foreign: "Not copied by this app", unverified: "Not checked yet" },
+    rename: { "rename-to-match": "Match the PC name" },
+    delete: { sidecar: "Extra file", replacement: "Replaced by the PC copy", extra: "Not on your PC", "removed-from-target": `Stopped syncing to ${there}` },
+  };
+  return (m[kind] || {})[reason];
+}
+export const OP_REASONS = Object.freeze({
+  push: ["new", "removed-on-device", "missing"],
+  update: ["repair", "changed-on-pc", "unresolved-pending"],
+  replace: ["changed-on-device", "foreign", "unverified"],
+  rename: ["rename-to-match"],
+  delete: ["sidecar", "replacement", "extra", "removed-from-target"],
+});
+
+// ── Device-only folders, link suggestions, the Library chip ──
+export const DEVICE_ONLY_COPY = Object.freeze({
+  orphaned: "Was synced, now not in your library",
+  preserved: "Never synced by this app; always kept",
+});
+export const SUGGESTION_TIER_COPY = Object.freeze({
+  identity: "Same series id",
+  content: "Same chapter files",
+  record: "Sync history matches",
+  name: "Same name",
+  similar: "Similar name",
+});
+export const LIBRARY_STATUS_COPY = Object.freeze({
+  synced: "In sync",
+  pending: "Changes to copy",
+  absent: "Not on the target yet",
+  removed: "Removed on the target",
+});
+export const PREWARM_PAUSE_COPY = Object.freeze({
+  download: "paused while a download runs",
+  "check-all": "paused while checking for updates",
+  search: "paused while a search runs",
+  "sync-job": "paused while a sync job runs",
+});
+
+// ── Refusal titles (contract.js REFUSAL_CODES; bodies are built per surface) ──
+export function refusalTitle(code, tn) {
+  return {
+    disabled: "Device Sync is off",
+    busy: "Another sync job is running",
+    disconnected: `${tn} disconnected`,
+    "library-missing": "Your library folder isn't reachable",
+    "record-mismatch": `The folder on ${tn} isn't the one this app synced to`,
+    "device-listing-suspect": `${tn} listed far fewer files than expected`,
+    "needs-mode": `How should ${tn} be checked?`,
+    blocked: "Start is waiting on you",
+    invalid: "That request wasn't valid",
+    "version-conflict": "Target settings changed elsewhere",
+  }[code];
+}
+// A `blocked` refusal's checklist item (refusal.blocking[].kind).
+export const BLOCKING_KINDS = Object.freeze(["loss", "mass-delete", "mass-repush", "listing-sanity", "refused", "plan-changed", "free-space"]);
+export function blockingCopy(b, tn) {
+  switch (b && b.kind) {
+    case "loss":
+      return "Confirm removing chapters that aren't on your PC";
+    case "mass-delete":
+      return `Confirm removing ${b.count} files from ${tn}`;
+    case "mass-repush":
+      return `Confirm copying ${b.count} files back to ${tn}`;
+    case "listing-sanity":
+      return `Re-check: ${tn} listed fewer files than its history says`;
+    case "refused":
+      return refusalTitle(b.refusal && b.refusal.code, tn) || "The plan was refused";
+    case "plan-changed":
+      return "The plan changed since you reviewed it. Review again.";
+    case "free-space":
+      return `${tn} doesn't have enough free space`;
+    default:
+      return "Something needs your attention";
+  }
+}
+
+// ── Job results (contract.js JOB_STATUSES; executor.js policyFor reasons).
+// Templated reasons (rename-refused-*, invalid-name-*) match by prefix. ──
+export const JOB_REASONS = Object.freeze([
+  "cancelled", "device-lost", "offline", "still-connecting", "unauthorized", "server-unavailable", "no-space",
+  "read-only", "record-write-failed", "error-budget", "internal", "pc-file-unreadable", "unknown-shard",
+  "not-a-bound-folder", "needs-mode", "same-name",
+]);
+export function jobReasonCopy(reason, tn) {
+  const r = String(reason || "");
+  const fixed = {
+    cancelled: "you cancelled",
+    "device-lost": `${tn} was unplugged`,
+    offline: `${tn} went offline`,
+    "still-connecting": `${tn} was still connecting`,
+    unauthorized: `${tn} asked for USB debugging permission again`,
+    "server-unavailable": "adb stopped responding",
+    "no-space": `${tn} ran out of space`,
+    "read-only": "the folder became read-only",
+    "record-write-failed": "couldn't save sync history (files are fine)",
+    "error-budget": "too many files failed",
+    internal: "something went wrong inside sync (see log)",
+    "pc-file-unreadable": "a PC file couldn't be read",
+    "unknown-shard": "the sync history didn't match this folder",
+    "not-a-bound-folder": "a folder wasn't the one this app synced to",
+    "needs-mode": `${tn} needs a check mode first`,
+    "same-name": "the folder already has that name",
+  };
+  if (fixed[r]) return fixed[r];
+  if (r.startsWith("rename-refused-destination-exists")) return "a folder with the new name already exists";
+  if (r.startsWith("rename-refused-source-missing")) return "the folder to rename is gone";
+  if (r.startsWith("rename-refused-")) return "the rename was refused";
+  if (r.startsWith("invalid-name-") || r.startsWith("invalid-folder-")) return `a name isn't allowed on ${tn}`;
+  return r || "it stopped";
+}
+export const SKIP_REASON_COPY = Object.freeze({
+  downloading: "still downloading",
+  "changed-since-review": "changed after you reviewed it",
+  settling: "too new; waiting for it to settle",
+  "pc-file-unreadable": "couldn't read the PC file",
+  "listing-failed": "couldn't list the folder",
+  "changed-since-plan": "changed after the plan",
+  "already-gone": "already gone",
+  "slot-guard": "your PC has a file with that name",
+});
+
+// ── Warnings (prepare / planner / executor / pc-inventory `kind`) ──
+export function warningCopy(w, tn) {
+  const there = tn || "the target";
+  const f = (w && w.folder) || "";
+  return {
+    "shard-corrupt": "Part of the sync history couldn't be read; those folders are checked again",
+    "header-corrupt": "The sync history header couldn't be read",
+    "undecodable-names": `Some names on ${there} aren't valid text and are left alone${f ? ` (${f})` : ""}`,
+    "verify-failed": `Couldn't check ${f || "a folder"} on ${there}`,
+    "free-space-unknown": `Couldn't read the free space on ${there}`,
+    "pc-unhashed": "A PC file couldn't be fingerprinted",
+    "rename-conflict": `A rename on ${there} clashes with an existing name`,
+    "rename-unresolved": `An earlier rename on ${there} didn't finish`,
+    "pending-unresolved": `An earlier copy to ${there} didn't finish`,
+    "folder-unreadable": `Couldn't read ${f || "a library folder"} on your PC`,
+    "file-unreadable": `Couldn't read a file in ${f || "a library folder"}`,
+    "alias-conflict": "Two series link to the same folder",
+    "duplicate-op": "A change was planned twice (ignored)",
+    "pc-name-collision": "Two PC files map to one name",
+    "deletes-first": `Removals run first to make room on ${there}`,
+    "nomedia-failed": `Couldn't write .nomedia on ${there}`,
+    "post-listing-failed": `Couldn't list ${f || "a folder"} after copying`,
+    "cleanup-failed": `Couldn't remove bookkeeping files in ${f || "a folder"}`,
+    "quick-verify": `A copied file's size on ${there} doesn't match`,
+  }[w && w.kind];
+}

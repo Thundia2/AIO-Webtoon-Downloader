@@ -75,11 +75,17 @@ export default {
           "0%, 100%": { opacity: "1" },
           "50%": { opacity: "0.7" },
         },
+        // Dialogs and popovers appear without movement (Device Sync spec §6).
+        "fade-in": {
+          from: { opacity: "0" },
+          to: { opacity: "1" },
+        },
       },
       animation: {
         "slide-in": "slide-in-right 0.2s ease-out",
         "slide-up": "slide-up 0.15s ease-out",
         "pulse-subtle": "pulse-subtle 2s ease-in-out infinite",
+        "in-fade": "fade-in 120ms ease-out",
       },
     },
   },

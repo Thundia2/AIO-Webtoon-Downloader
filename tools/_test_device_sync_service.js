@@ -380,7 +380,7 @@ test("config ops: validation incl. root containment, versioning, broadcast", asy
     assert.strictEqual(ok.config.version, v + 1);
     assert.deepStrictEqual(ok.config.targets[0].aliases, [{ pcFolder: "A", deviceFolder: "A dev" }]);
     assertRefusal(await a.call("config-op", { op: "add-alias", targetId: id, alias: { pcFolder: "A", deviceFolder: "a/b" } }), "invalid");
-    assertRefusal(await a.call("config-op", { op: "update-target", targetId: id, patch: { cleanupNames: ["cover.jpg"] } }), "invalid");
+    assertRefusal(await a.call("config-op", { op: "update-target", targetId: id, patch: { profile: "custom", cleanupNames: ["cover.jpg"] } }), "invalid");
     const onDisk = JSON.parse(fs.readFileSync(path.join(a.userData, "sync-targets.json"), "utf8"));
     assert.strictEqual(onDisk.version, v + 1);
     assert.strictEqual(onDisk.targets[0].aliases.length, 1);
@@ -1202,6 +1202,38 @@ test("diag-log: rotates past maxBytes into one old file, truncates long lines, n
   assert.strictEqual(diagLog.insideAsar(path.join(SYNC, "service.js")), false);
 });
 
+test("a reader switch keeps the record; into custom seeds the preset's values, out of custom clears them", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Sigma", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
+    await a.idle();
+    const hdrPath = path.join(a.userData, "targets", id, "header.json");
+    const before = JSON.parse(fs.readFileSync(hdrPath, "utf8"));
+    assert.ok(!("profile" in before), "new headers don't pin the reader");
+    assertRefusal(await a.call("config-op", { op: "update-target", targetId: id, patch: { nomedia: false } }), "invalid");
+    const toCustom = await a.call("config-op", { op: "update-target", targetId: id, patch: { profile: "custom" } });
+    assert.ok(toCustom.ok, JSON.stringify(toCustom));
+    const ct = toCustom.config.targets.find((t) => t.id === id);
+    assert.deepStrictEqual([ct.formats, ct.sidecars, ct.nomedia, ct.namingPolicy], [["cbz", "zip", "cbr", "rar", "epub"], ["cover.jpg", "details.json"], true, "strip-hid"]);
+    assert.ok((await a.call("config-op", { op: "update-target", targetId: id, patch: { nomedia: false } })).ok, "custom may change .nomedia");
+    const toPdf = await a.call("config-op", { op: "update-target", targetId: id, patch: { profile: "pdf" } });
+    assert.ok(toPdf.ok, JSON.stringify(toPdf));
+    const pt = toPdf.config.targets.find((t) => t.id === id);
+    for (const f of ["formats", "sidecars", "nomedia", "namingPolicy", "renameToMatch", "cleanupNames"]) assert.strictEqual(pt[f], null, f);
+    assertRefusal(await a.call("config-op", { op: "update-target", targetId: id, patch: { profile: "komikku", nomedia: false } }), "invalid");
+    await a.idle();
+    const after = JSON.parse(fs.readFileSync(hdrPath, "utf8"));
+    assert.strictEqual(after.recordEpoch, before.recordEpoch, "no reader switch cleared the record");
+    const p = await a.plan(id);
+    assert.strictEqual(p.summary.plan.firstSync, false);
+  } finally {
+    await a.close();
+  }
+});
+
 test("forget-record clears through a new epoch; the next plan is a first sync again", async () => {
   const a = await app();
   try {
@@ -1354,7 +1386,7 @@ test("U0b removals are a target field: add-target stamps the global, a later glo
     const next = await a.plan(id);
     assert.strictEqual(next.summary.plan.policy.hashMode, "cached");
     assert.ok(!("overrides" in next.summary.plan.policy));
-    const t2 = await a.call("config-op", { op: "add-target", target: { name: "Second", kind: "folder", root: path.join(a.dir, "device2"), profile: "generic" } });
+    const t2 = await a.call("config-op", { op: "add-target", target: { name: "Second", kind: "folder", root: path.join(a.dir, "device2"), profile: "everything" } });
     assert.strictEqual(t2.config.targets.find((t) => t.id === t2.targetId).deletePolicy, "add-only", "a new target takes the changed global");
   } finally {
     await a.close();

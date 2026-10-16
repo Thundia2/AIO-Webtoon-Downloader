@@ -3,8 +3,23 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./styles/globals.css";
 
-ReactDOM.createRoot(document.getElementById("root")).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-);
+const root = ReactDOM.createRoot(document.getElementById("root"));
+
+// DEV-only Device Sync gallery (src/dev/SyncGallery.jsx). The import sits
+// inside the import.meta.env.DEV branch so a production build drops it and
+// its fixtures entirely; the build check greps dist for "__aioSyncFixture".
+if (import.meta.env.DEV && new URLSearchParams(window.location.search).get("gallery") === "sync") {
+  import("./dev/SyncGallery").then(({ default: SyncGallery }) =>
+    root.render(
+      <React.StrictMode>
+        <SyncGallery />
+      </React.StrictMode>
+    )
+  );
+} else {
+  root.render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>
+  );
+}
