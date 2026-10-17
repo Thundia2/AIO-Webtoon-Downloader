@@ -113,14 +113,16 @@ class FakeSearcher {
   }
 }
 
+// 7 series matches (the runner keeps 5); match 0 is on 7 sites (all kept:
+// sites past the 5th used to be cut), the rest on one.
+const EXTRA_SITES = ["weebcentral", "mangakatana", "mangapill", "mangahub", "atsumaru", "dynasty"];
 function searchResult(query) {
   const cands = [];
   for (let i = 0; i < 7; i += 1) {
-    cands.push({
-      canonical_title: `${query} ${i}`,
-      canonical_year: 2020,
-      sources: [{ site: "mangafire", url: `https://mangafire.to/manga/${encodeURIComponent(query)}.${i}`, title: `${query} ${i}`, composite_score: 1 - i / 10, actual_chapter_count: 10 + i, quality_basis: "seed" }],
-    });
+    const q = encodeURIComponent(query);
+    const sources = [{ site: "mangafire", url: `https://mangafire.to/manga/${q}.${i}`, title: `${query} ${i}`, composite_score: 1 - i / 10, actual_chapter_count: 10 + i, quality_basis: "seed", title_match: 0.9 }];
+    if (i === 0) for (const s of EXTRA_SITES) sources.push({ site: s, url: `https://${s}.test/${q}`, title: `${query} ${i}`, composite_score: 0.5, quality_basis: "chapter_probe", title_match: 0.9 });
+    cands.push({ canonical_title: `${query} ${i}`, canonical_year: 2020, sources });
   }
   return { candidates: cands };
 }
@@ -882,7 +884,7 @@ test("shutdownNow mid-run: synchronous, kills find-sources' search, leaves whole
 
 // ---------------------------------------------------------------- find-sources
 
-test("find-sources: top 5 per row, waits while Check All runs, edited query re-queues, rows persist", async () => {
+test("find-sources: top 5 matches (every site kept) per row, waits while Check All runs, edited query re-queues, rows persist", async () => {
   const a = await app();
   try {
     series(a.lib, "Iota", { "Ch.001.cbz": 1000 });
@@ -907,7 +909,9 @@ test("find-sources: top 5 per row, waits while Check All runs, edited query re-q
     assert.strictEqual(kappa.state, "done");
     assert.strictEqual(kappa.candidates.length, 5);
     assert.strictEqual(kappa.candidates[0].best.site, "mangafire");
-    assert.strictEqual(kappa.pick, 0);
+    assert.strictEqual(kappa.candidates[0].sources.length, 1 + EXTRA_SITES.length, "every site of a match is kept");
+    assert.deepStrictEqual([kappa.candidates[0].sources[6].titleMatch, kappa.candidates[0].canonicalTitle], [0.9, "Kappa 0"]);
+    assert.deepStrictEqual([kappa.pickUrl, kappa.multiSource, "pick" in kappa], [null, false, false], "default pick; the search ran without multi-source");
     assert.strictEqual(lambda.state, "error");
     // Retry with an edited query; the done row isn't searched again.
     a.search.fail = null;
@@ -921,6 +925,7 @@ test("find-sources: top 5 per row, waits while Check All runs, edited query re-q
     assert.deepStrictEqual(a.search.calls.slice(2), ["Lambda Official"]);
     const file = JSON.parse(fs.readFileSync(path.join(a.userData, "targets", id, "find-sources.json"), "utf8"));
     assert.strictEqual(file.rows.length, 2);
+    assert.strictEqual(file.version, 2);
     assert.ok(file.rows.every((x) => x.state === "done"));
     got = await a.call("find-sources:get", { targetId: id });
     assert.strictEqual(got.running, false);
@@ -951,6 +956,74 @@ test("find-sources: top 5 per row, waits while Check All runs, edited query re-q
   } finally {
     await a.close();
   }
+});
+
+// The runner on its own (no service): the v1 → v2 file migration and the
+// URL pick. A v1 row's index pick becomes the picked match's top-site URL and
+// a finished v1 row is re-queued (its sites were cut at 5); a re-search keeps
+// a pick some match still lists, else drops it; a query change clears it.
+test("find-sources v2: v1 rows migrate, pickUrl is validated and survives a re-search only while listed, multiSource is recorded", async () => {
+  const { FindSources } = require(path.join(SYNC, "find-sources.js"));
+  const dir = mkdir("fs-v2");
+  const u = (s) => `https://${s}.test/x`;
+  const cand = (title, ...urls) => ({ title, year: null, best: { site: "s", url: urls[0] }, sources: urls.map((url) => ({ site: "s", url })) });
+  const v1 = {
+    version: 1,
+    rows: [
+      { folder: "A", query: "A", include: true, state: "done", candidates: [cand("a0", u("a0")), cand("a1", u("keep"))], pick: 1, pinnedUrl: null, skip: false, error: null, searchedAt: 1 },
+      { folder: "B", query: "B", include: true, state: "done", candidates: [cand("b0", u("b0")), cand("b1", u("gone"))], pick: 1, pinnedUrl: null, skip: false, error: null, searchedAt: 1 },
+      { folder: "C", query: "C", include: true, state: "searching", candidates: [], pick: null, pinnedUrl: null, skip: false, error: null, searchedAt: null },
+      { folder: "D", query: "D", include: true, state: "error", candidates: [], pick: null, pinnedUrl: null, skip: false, error: "x", searchedAt: 1 },
+    ],
+  };
+  fs.mkdirSync(path.join(dir, "t1"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "t1", "find-sources.json"), JSON.stringify(v1));
+  // A's re-search lists the kept URL in TWO matches (the first wins in the
+  // view, findView.rowCandidate); B's no longer lists its pick.
+  const results = {
+    A: { candidates: [{ canonical_title: "A x", sources: [{ site: "x", url: u("x0") }, { site: "keep", url: u("keep") }] }, { canonical_title: "A y", sources: [{ site: "keep", url: u("keep") }] }] },
+    B: { candidates: [{ canonical_title: "B", sources: [{ site: "b0", url: u("b0") }] }] },
+  };
+  const settings = { searchOpts: { multiSource: true } };
+  const events = [];
+  let onDone = null;
+  const f = new FindSources({
+    targetsDir: dir,
+    getSettings: () => settings,
+    spawnPaths: () => ({}),
+    emit: (ev) => {
+      events.push(ev);
+      if ((ev.state === "done" || ev.state === "cancelled") && !ev.row && onDone) onDone();
+    },
+    makeSearcher: () => ({ runSearch: async ({ query }) => results[query] || { candidates: [] }, cancel() {}, cancelNow() {} }),
+  });
+  const byFolder = async () => Object.fromEntries((await f.get("t1")).rows.map((r) => [r.folder, r]));
+  let rows = await byFolder();
+  assert.deepStrictEqual(
+    ["A", "B", "C", "D"].map((k) => [rows[k].state, rows[k].pickUrl, rows[k].multiSource, "pick" in rows[k]]),
+    [["queued", u("keep"), null, false], ["queued", u("gone"), null, false], ["queued", null, null, false], ["error", null, null, false]],
+    "v1: pick → pickUrl, done → queued, searching → queued, error kept",
+  );
+  assert.strictEqual(rows.A.candidates.length, 2, "a migrated row keeps its old candidates until re-searched");
+  const ran = new Promise((r) => (onDone = r));
+  assert.deepStrictEqual(await f.start({ targetId: "t1", folders: ["A", "B", "C", "D"], only: ["A", "B"] }), { ok: true, started: true });
+  await ran;
+  rows = await byFolder();
+  assert.deepStrictEqual([rows.A.state, rows.A.pickUrl, rows.A.multiSource], ["done", u("keep"), true], "a pick still listed survives the re-search");
+  assert.deepStrictEqual([rows.B.state, rows.B.pickUrl, rows.B.multiSource], ["done", null, true], "a pick no longer listed is dropped");
+  assert.strictEqual(rows.A.candidates[0].canonicalTitle, "A x");
+  const file = JSON.parse(fs.readFileSync(path.join(dir, "t1", "find-sources.json"), "utf8"));
+  assert.strictEqual(file.version, 2);
+  assert.ok(file.rows.every((r) => !("pick" in r)), "no row carries the v1 index pick");
+
+  assert.strictEqual((await f.updateRow({ targetId: "t1", folder: "A", patch: { pickUrl: u("x0") } })).ok, true);
+  assertRefusal(await f.updateRow({ targetId: "t1", folder: "A", patch: { pickUrl: u("elsewhere") } }), "invalid");
+  assertRefusal(await f.updateRow({ targetId: "t1", folder: "A", patch: { pickUrl: 3 } }), "invalid");
+  assertRefusal(await f.updateRow({ targetId: "t1", folder: "A", patch: { pick: 1 } }), "invalid");
+  assert.strictEqual((await f.updateRow({ targetId: "t1", folder: "A", patch: { pickUrl: null } })).row.pickUrl, null, "null = back to the default");
+  await f.updateRow({ targetId: "t1", folder: "A", patch: { pickUrl: u("keep") } });
+  const q = await f.updateRow({ targetId: "t1", folder: "A", patch: { query: "A2" } });
+  assert.deepStrictEqual([q.row.state, q.row.pickUrl, q.row.multiSource, q.row.candidates.length], ["queued", null, null, 0], "a query change clears the pick");
 });
 
 // ---------------------------------------------------------------- adb flow

@@ -397,18 +397,21 @@ function eq(label, actual, expected) {
       { key: "dev:Linked", name: "Linked", query: "Linked" },
       { key: "dev:New", name: "New", query: "New" },
     ];
-    const cand = (site, url, composite, basis) => ({ title: site, best: { site, url, title: site, composite, chapters: 97, qualityBasis: basis } });
+    const cand = (site, url, composite, basis) => {
+      const best = { site, url, title: site, composite, chapters: 97, qualityBasis: basis };
+      return { title: site, best, sources: [best] };
+    };
     const rows = {
-      "Dungeon Meshi": { folder: "Dungeon Meshi", query: "Dungeon Meshi", state: "done", candidates: [cand("mangadex", "https://a/1", 0.92, "chapter_probe"), cand("weeb", "https://b/2", 0.5, "seed")], pick: 1, pinnedUrl: null, skip: false },
-      Hunter_x_Hunter: { folder: "Hunter_x_Hunter", query: "HxH", state: "done", candidates: [], pick: null, pinnedUrl: "https://pin/x", skip: false },
-      SHELTER: { folder: "SHELTER", query: "SHELTER", state: "done", candidates: [cand("mf", "https://c/3", 0.8, "chapter_probe")], pick: 0, pinnedUrl: null, skip: true },
-      Linked: { folder: "Linked", query: "Linked", state: "done", candidates: [cand("mf", "https://d/4", 0.8, "chapter_probe")], pick: 0, pinnedUrl: null, skip: false },
+      "Dungeon Meshi": { folder: "Dungeon Meshi", query: "Dungeon Meshi", state: "done", candidates: [cand("mangadex", "https://a/1", 0.92, "chapter_probe"), cand("weeb", "https://b/2", 0.5, "seed")], pickUrl: "https://b/2", pinnedUrl: null, skip: false },
+      Hunter_x_Hunter: { folder: "Hunter_x_Hunter", query: "HxH", state: "done", candidates: [], pickUrl: null, pinnedUrl: "https://pin/x", skip: false },
+      SHELTER: { folder: "SHELTER", query: "SHELTER", state: "done", candidates: [cand("mf", "https://c/3", 0.8, "chapter_probe")], pickUrl: null, pinnedUrl: null, skip: true },
+      Linked: { folder: "Linked", query: "Linked", state: "done", candidates: [cand("mf", "https://d/4", 0.8, "chapter_probe")], pickUrl: null, pinnedUrl: null, skip: false },
       Gone: { folder: "Gone", state: "done", candidates: [] },
     };
     const target = { id: "a", profile: "komikku", aliases: [{ url: "https://d/4", deviceFolder: "Linked" }] };
     const v = F.findRows(items, rows, target);
     eq("one view row per current device-only folder", v.map((r) => r.folder), ["Dungeon Meshi", "Hunter_x_Hunter", "SHELTER", "Linked", "New"]);
-    eq("url = the picked candidate", v[0].url, "https://b/2");
+    eq("url = the picked site", v[0].url, "https://b/2");
     eq("a pinned URL wins", v[1].url, "https://pin/x");
     eq("queueable: not skipped, not linked, has a url", v.map((r) => r.queueable), [true, true, false, false, false]);
     eq("Linked is read from the target's aliases", [v[3].linked, v[0].linked], ["https://d/4", null]);
@@ -422,6 +425,98 @@ function eq(label, actual, expected) {
     eq("status while waiting", F.findStatusLine({ targetId: "a", done: 0, total: 3, waiting: "check-all" }, "a", v), "Waiting for Library Check All to finish");
     eq("status after a run", F.findStatusLine(null, "a", v), "3 of 5 found a source.");
     eq("no status before any search", F.findStatusLine(null, "a", F.findRows(items, {}, target)), null);
+    eq("score/unmeasured take a site too", [F.candidateScore(rows["Dungeon Meshi"].candidates[1].best), F.unmeasured(rows["Dungeon Meshi"].candidates[1].best)], ["0.50 · ch.97", true]);
+
+    // ── what a queued row downloads (rowQueueArgs = the Search tab's rules) ──
+    const site = (s, extra) => ({ site: s, url: `https://${s}.test/x`, title: `T ${s}`, cover: null, composite: 0.8, chapters: 9, qualityBasis: "chapter_probe", titleMatch: 0.9, ...(extra || {}) });
+    const series = (title, ...sites) => ({ title, canonicalTitle: title, year: 2018, best: sites[0], sources: sites });
+    const multi = series("Chainsaw Man", site("mangadex"), site("mangafire", { cover: "https://c/1.jpg" }), site("mangakatana", { title: null }), site("mangapill"), site("mangahub"), site("atsumaru"));
+    const shared = series("Other", site("dynasty"), site("mangafire"));
+    const row = (o) => ({ folder: "F", candidates: [multi, shared, series("Solo", site("weebcentral"))], pickUrl: null, pinnedUrl: null, multiSource: true, ...o });
+    const altSites = (a) => a.prefetchedAlts.alternatives.map((x) => x.site);
+    let q = F.rowQueueArgs(row());
+    eq("default pick: match 0's top site, the other 5 sites as fallbacks in rank order", [F.rowUrl(row()), q.multiSource, q.prefetchedAlts.primary, altSites(q)], ["https://mangadex.test/x", true, { site: "mangadex", url: "https://mangadex.test/x" }, ["mangafire", "mangakatana", "mangapill", "mangahub", "atsumaru"]]);
+    eq("payload title/year are the search's canonical ones", [q.prefetchedAlts.title, q.prefetchedAlts.year], ["Chainsaw Man", 2018]);
+    eq("absent title/cover ride as undefined (dropped by JSON), like the Search tab", JSON.parse(JSON.stringify(q.prefetchedAlts.alternatives.slice(0, 2))), [{ site: "mangafire", url: "https://mangafire.test/x", title: "T mangafire", cover: "https://c/1.jpg" }, { site: "mangakatana", url: "https://mangakatana.test/x" }]);
+    q = F.rowQueueArgs(row({ pickUrl: "https://mangapill.test/x" }));
+    eq("a picked site is the primary and leaves the fallbacks", [q.prefetchedAlts.primary.site, altSites(q)], ["mangapill", ["mangadex", "mangafire", "mangakatana", "mangahub", "atsumaru"]]);
+    q = F.rowQueueArgs(row({ pickUrl: "https://mangafire.test/x" }));
+    eq("a URL listed by two matches belongs to the FIRST", [F.rowCandidate(row({ pickUrl: "https://mangafire.test/x" })).title, q.prefetchedAlts.title], ["Chainsaw Man", "Chainsaw Man"]);
+    q = F.rowQueueArgs(row({ pickUrl: "https://dynasty.test/x" }));
+    eq("picking another match's site falls back over THAT match", [q.prefetchedAlts.title, altSites(q)], ["Other", ["mangafire"]]);
+    eq("a single-site match: multiSource true, no fallbacks (aio-dl.py finds its own)", F.rowQueueArgs(row({ pickUrl: "https://weebcentral.test/x" })), { multiSource: true });
+    eq("multi-source off: multiSource false, no fallbacks", F.rowQueueArgs(row({ multiSource: false })), { multiSource: false });
+    eq("a stale pickUrl: match 0's top site", [F.rowUrl(row({ pickUrl: "https://nowhere/x" })), F.rowQueueArgs(row({ pickUrl: "https://nowhere/x" })).prefetchedAlts.primary.site], ["https://mangadex.test/x", "mangadex"]);
+    eq("pinned: the pin, nothing added (download defaults)", [F.rowUrl(row({ pinnedUrl: "https://pin/y" })), F.rowQueueArgs(row({ pinnedUrl: "https://pin/y" })), F.rowSource(row({ pinnedUrl: "https://pin/y" }))], ["https://pin/y", {}, null]);
+    eq("not yet re-searched since v1 (multiSource unknown): nothing added", F.rowQueueArgs(row({ multiSource: null })), {});
+    eq("nothing found / no row: nothing added", [F.rowQueueArgs({ candidates: [], multiSource: true }), F.rowQueueArgs(null)], [{}, {}]);
+    const vr = F.findRows([{ key: "k", name: "F" }], { F: { ...row(), state: "done", skip: false } }, { aliases: [] })[0];
+    eq("findRows carries what rowQueueArgs reads", [vr.pickUrl, vr.multiSource, F.rowQueueArgs(vr).prefetchedAlts.primary.site], [null, true, "mangadex"]);
+  }
+
+  // ── one fallback payload for both tabs (src/lib/prefetchedAlts.js) ──
+  // OLD_SEARCH_CARD_BUILD is SearchSourceCard.handleDownload's inline builder
+  // as it was before the extraction (commit d89e092), verbatim: the shared
+  // builder must reproduce it exactly, and the sync path (find-sources.js
+  // compactCandidates → findView.rowQueueArgs) must send the same payload the
+  // Search tab would for the same search result.
+  {
+    const o = path.join(os.tmpdir(), `aio-prefetchedAlts-${process.pid}.mjs`);
+    await esbuild.build({ entryPoints: [path.join(UI, "src", "lib", "prefetchedAlts.js")], bundle: true, format: "esm", platform: "neutral", outfile: o, logLevel: "error" });
+    const P = await import(pathToFileURL(o).href);
+    fs.rmSync(o, { force: true });
+    const F = await bundle("findView");
+    const { compactCandidates } = require(path.join(UI, "electron", "sync", "find-sources.js"));
+    const OLD_SEARCH_CARD_BUILD = (candidate, source) => {
+      if (candidate?.sources?.length > 1) {
+        const alternatives = candidate.sources
+          .filter((s) => s.url !== source.url)
+          .map((s) => ({
+            site: s.site,
+            url: s.url,
+            title: s.title || undefined,
+            cover: s.cover || undefined,
+          }));
+        if (alternatives.length > 0) {
+          return {
+            primary: { site: source.site, url: source.url },
+            alternatives,
+            title: candidate.canonical_title || "",
+            year: candidate.canonical_year || null,
+          };
+        }
+      }
+      return null;
+    };
+    const raw = (s, extra) => ({ site: s, url: `https://${s}.test/r`, title: `R ${s}`, cover: `https://${s}.test/c.jpg`, composite_score: 0.7, actual_chapter_count: 50, quality_basis: "seed", title_match: 0.95, ...(extra || {}) });
+    const json = {
+      candidates: [
+        { canonical_title: "Raw One", canonical_year: 2019, sources: [raw("a"), raw("b", { title: "" }), raw("c", { cover: null }), raw("d"), raw("e"), raw("f"), raw("g")] },
+        { canonical_title: null, canonical_year: null, sources: [raw("h"), raw("i", { title: undefined, cover: undefined })] },
+        { canonical_title: "Solo", canonical_year: 2001, sources: [raw("j")] },
+        { canonical_title: "", sources: [raw("k"), raw("l")] },
+      ],
+    };
+    const compact = compactCandidates(json);
+    const cases = [];
+    json.candidates.forEach((c, ci) => c.sources.forEach((s, si) => cases.push([ci, si])));
+    const mismatch = [];
+    for (const [ci, si] of cases) {
+      const c = json.candidates[ci];
+      const s = c.sources[si];
+      const old = OLD_SEARCH_CARD_BUILD(c, s);
+      const shared = P.buildPrefetchedAlts(c.sources, s, c.canonical_title, c.canonical_year);
+      const sync = F.rowQueueArgs({ candidates: compact, pickUrl: s.url, pinnedUrl: null, multiSource: true }).prefetchedAlts || null;
+      const j = (x) => JSON.stringify(x);
+      if (j(old) !== j(shared) || j(old) !== j(sync)) mismatch.push({ ci, si, old, shared, sync });
+      // undefined keys are dropped by JSON: also compare the in-memory shape.
+      try {
+        require("assert").deepStrictEqual(shared, old);
+      } catch (_) {
+        mismatch.push({ ci, si, inMemory: true });
+      }
+    }
+    eq(`Search-tab builder == shared builder == sync path, ${cases.length} picks`, mismatch, []);
   }
 
   if (failures) {

@@ -14,6 +14,7 @@ import React, { useEffect, useState } from "react";
 import { Button, Badge } from "@/components/ui/primitives";
 import { Download, Image as ImageIcon, AlertTriangle, Clock } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { buildPrefetchedAlts } from "@/lib/prefetchedAlts";
 
 // Map a 0..1 quality score to one of 4 visual tiers. Returns Tailwind
 // classes that match the existing primitives' destructive/warning/
@@ -121,31 +122,13 @@ export default function SearchSourceCard({
       multiSource: multiSourceUsed,
     };
 
-    if (candidate?.sources?.length > 1) {
-      // Strip the primary itself; keep everything else as alternatives. The
-      // ordering preserves the search-time quality ranking (candidate.sources
-      // is sorted official-first / DMCA-last / quality-desc by the orchestrator),
-      // which becomes the alignment input order in chapter_merger.
-      const alternatives = candidate.sources
-        .filter((s) => s.url !== source.url)
-        .map((s) => ({
-          site: s.site,
-          url: s.url,
-          title: s.title || undefined,
-          cover: s.cover || undefined,
-        }));
-      if (alternatives.length > 0) {
-        // downloader.js intercepts `prefetchedAlts`, writes it to a JSON file
-        // under ~/.aio-dl/cache/, and replaces it with `multiSourcePrefetched`
-        // (a path) which buildCliArgs's flagMap turns into the CLI arg.
-        args.prefetchedAlts = {
-          primary: { site: source.site, url: source.url },
-          alternatives,
-          title: candidate.canonical_title || "",
-          year: candidate.canonical_year || null,
-        };
-      }
-    }
+    // The candidate's other sites, primary stripped, in the search's rank
+    // order. Shared with Device Sync's Find sources (lib/prefetchedAlts.js).
+    // downloader.js intercepts `prefetchedAlts`, writes it to a JSON file
+    // under ~/.aio-dl/cache/, and replaces it with `multiSourcePrefetched`
+    // (a path) which buildCliArgs's flagMap turns into the CLI arg.
+    const alts = buildPrefetchedAlts(candidate?.sources, source, candidate?.canonical_title, candidate?.canonical_year);
+    if (alts) args.prefetchedAlts = alts;
 
     onQueue?.(source.url, args, { source, candidate });
   };

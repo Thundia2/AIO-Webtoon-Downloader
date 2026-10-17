@@ -251,8 +251,9 @@ function makeFindChannels(snap, emit) {
     syncFindSourcesUpdateRow: ({ folder, patch }) => {
       const row = rows.get(folder);
       if (!row) return Promise.resolve({ ok: false, code: "invalid", message: "unknown row" });
-      if (patch.query != null && patch.query !== row.query) Object.assign(row, { query: patch.query, state: "queued", candidates: [], pick: null, error: null });
-      for (const k of ["pick", "pinnedUrl", "skip", "include"]) if (k in patch) row[k] = patch[k];
+      if (patch.query != null && patch.query !== row.query) Object.assign(row, { query: patch.query, state: "queued", candidates: [], pickUrl: null, multiSource: null, error: null });
+      // The runner's ROW_PATCH_KEYS (electron/sync/find-sources.js).
+      for (const k of ["pickUrl", "pinnedUrl", "skip", "include"]) if (k in patch) row[k] = patch[k];
       rowEv(row);
       return later(60, { ok: true, row: clone(row) });
     },
@@ -267,7 +268,7 @@ function makeFindChannels(snap, emit) {
         }, 400 * i + 50);
         setTimeout(() => {
           const rec = recorded.get(r.folder) || {};
-          Object.assign(r, { state: rec.state === "error" ? "error" : "done", candidates: clone(rec.candidates || []), pick: rec.pick != null ? rec.pick : null, error: rec.error || null });
+          Object.assign(r, { state: rec.state === "error" ? "error" : "done", candidates: clone(rec.candidates || []), pickUrl: rec.pickUrl || null, multiSource: typeof rec.multiSource === "boolean" ? rec.multiSource : null, error: rec.error || null });
           emit({ kind: "find", targetId: tid(), state: "running", done: i + 1, total: todo.length, row: clone(r) });
         }, 400 * i + 400);
       });

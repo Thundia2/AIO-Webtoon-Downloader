@@ -4,6 +4,9 @@
 //
 // For a target's device-only folders: search each folder's name, let the
 // user pick a candidate or pin a URL per row, then "Queue N downloads".
+// A queued row downloads its picked site with the series' other sites as
+// multi-source fallbacks, exactly as a Search-tab download would
+// (findView.rowQueueArgs → lib/prefetchedAlts.js).
 //
 // WHO OWNS WHAT
 //   * the search runs in main (electron/sync/find-sources.js: its own
@@ -35,7 +38,7 @@ import { Sheet } from "@/components/ui/overlay";
 import { cn } from "@/lib/utils";
 import { Cover } from "./Ledger";
 import { configRefusalCopy } from "./copy";
-import { aliasFor, candidateScore, findQueueArgs, findRows, findStatusLine, searchable, unmeasured } from "./findView";
+import { aliasFor, candidateScore, findQueueArgs, findRows, findStatusLine, rowCandidate, rowQueueArgs, rowSource, searchable, unmeasured } from "./findView";
 
 const XS = "h-7 px-2 text-xs gap-1 [&_svg]:h-3.5 [&_svg]:w-3.5";
 
@@ -57,6 +60,9 @@ function RowState({ row }) {
     );
   if (row.state === "error") return <span className="truncate text-[11.5px] text-destructive" title={row.error || ""}>Search failed{row.error ? `: ${row.error}` : ""}</span>;
   if (row.state === "done" && !row.candidates.length && !row.pinnedUrl) return <span className="text-[11.5px] text-muted-foreground">No source found. Edit the query, or pin a URL.</span>;
+  // Queued WITH results = a row searched before file version 2 (only 5 sites
+  // per match were kept then; find-sources.js _migrateRow re-queues it).
+  if (row.state === "queued" && row.candidates.length) return <span className="text-[11.5px] text-muted-foreground">Searched by an older version. Search again to see every site.</span>;
   if (row.state === "unsearched" || row.state === "queued" || row.state === "cancelled") return <span className="text-[11.5px] text-muted-foreground">Not searched yet</span>;
   return null;
 }
@@ -73,7 +79,11 @@ function FindRow({ row, cover, busy, result, onPatch, onUnlink }) {
     if (q && q !== row.query) onPatch({ query: q });
     else setQuery(row.query);
   };
-  const c = row.pick != null ? row.candidates[row.pick] : null;
+  // Interim picker until F2's redesign: one option per series match; picking
+  // one picks its top site. The score shows the site actually queued.
+  const pickedCand = rowCandidate(row);
+  const pickedIdx = pickedCand ? row.candidates.indexOf(pickedCand) : -1;
+  const src = rowSource(row);
   return (
     <div data-testid="find-row" data-folder={row.folder} className={cn("flex items-start gap-2.5 border-b border-border/70 px-3 py-2.5", (row.skip || linked) && "opacity-70")}>
       <Checkbox
@@ -118,10 +128,13 @@ function FindRow({ row, cover, busy, result, onPatch, onUnlink }) {
         ) : !linked && row.candidates.length > 0 ? (
           <div className="flex min-w-0 items-center gap-2">
             <select
-              value={row.pick == null ? "" : String(row.pick)}
+              value={pickedIdx < 0 ? "" : String(pickedIdx)}
               disabled={busy}
               aria-label={`Source for ${row.folder}`}
-              onChange={(e) => onPatch({ pick: Number(e.target.value) })}
+              onChange={(e) => {
+                const cand = row.candidates[Number(e.target.value)];
+                onPatch({ pickUrl: (cand && cand.best && cand.best.url) || null });
+              }}
               className="h-7 min-w-0 flex-1 truncate rounded-md border border-input bg-background px-2 text-xs"
             >
               {row.candidates.map((cand, i) => (
@@ -130,10 +143,10 @@ function FindRow({ row, cover, busy, result, onPatch, onUnlink }) {
                 </option>
               ))}
             </select>
-            {c && (
-              <span className="flex shrink-0 items-center gap-1 font-mono text-[11px] text-muted-foreground" title={unmeasured(c) ? "Rating not measured from chapter pages" : undefined}>
-                {candidateScore(c)}
-                {unmeasured(c) && <AlertTriangle className="h-3 w-3 text-destructive" aria-hidden="true" />}
+            {src && (
+              <span className="flex shrink-0 items-center gap-1 font-mono text-[11px] text-muted-foreground" title={unmeasured(src) ? "Rating not measured from chapter pages" : undefined}>
+                {candidateScore(src)}
+                {unmeasured(src) && <AlertTriangle className="h-3 w-3 text-destructive" aria-hidden="true" />}
               </span>
             )}
           </div>
@@ -190,7 +203,10 @@ function searchLine(s) {
   const o = s || {};
   const sites = o.seededOnly === false ? "all sites" : "curated sites only";
   const collapse = o.collapseSplits === true ? "split chapters collapsed" : "split chapters kept";
-  return `Your search settings: ${sites} · ${collapse}`;
+  // multiSource: the toggle new searches run with; each found row queues with
+  // the value ITS search ran with (findView.rowQueueArgs).
+  const fallback = o.multiSource === true ? "fallback sites on" : "fallback sites off";
+  return `Your search settings: ${sites} · ${collapse} · ${fallback}`;
 }
 
 /**
@@ -198,7 +214,7 @@ function searchLine(s) {
  * @param {boolean} p.open
  * @param {object} p.target      the config target (name, profile, aliases)
  * @param {Array} p.items        summary.deviceOnly (with `query`, U4-1)
- * @param {{seededOnly?:boolean, collapseSplits?:boolean}} [p.searchSettings]  the SAVED
+ * @param {{seededOnly?:boolean, collapseSplits?:boolean, multiSource?:boolean}} [p.searchSettings]  the SAVED
  *   search settings, shown only: the search itself runs with them in main
  *   (find-sources.js _searchOptions), with no per-run override
  * @param {() => void} [p.onOpenSearchSettings]  App: Settings → Search
@@ -293,7 +309,9 @@ export default function FindSourcesSheet({ open, onClose, target, tn, items, wid
         continue;
       }
       try {
-        await onQueueDownload(row.url, findQueueArgs(target));
+        // rowQueueArgs = the Search tab's multi-source + fallback-sites rules;
+        // findQueueArgs (komikku) last, as before.
+        await onQueueDownload(row.url, { ...rowQueueArgs(row), ...findQueueArgs(target) });
         setResults((x) => ({ ...x, [row.folder]: { ok: true, text: "Queued. It syncs into this folder once it's downloaded." } }));
       } catch (e) {
         setResults((x) => ({ ...x, [row.folder]: { ok: false, text: `Linked, but the download didn't queue: ${(e && e.message) || e}` } }));

@@ -121,7 +121,7 @@ const TAB_CASES = [
 
 function TabCase({ c }) {
   const sync = useDeviceSync({ source: makeSyncSource(c.spec) });
-  return <SyncTab sync={sync} contained initial={c.initial} libraryEntries={TAB_LIBRARY} onOpenSettings={() => {}} onQueueDownload={() => Promise.resolve()} onFindSource={() => {}} searchSettings={{ seededOnly: true, collapseSplits: false }} />;
+  return <SyncTab sync={sync} contained initial={c.initial} libraryEntries={TAB_LIBRARY} onOpenSettings={() => {}} onQueueDownload={() => Promise.resolve()} onFindSource={() => {}} searchSettings={{ seededOnly: true, collapseSplits: false, multiSource: true }} />;
 }
 
 // Library surfaces (U4): the recorded library-status over the recorded

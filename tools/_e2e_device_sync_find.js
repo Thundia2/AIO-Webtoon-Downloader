@@ -18,7 +18,12 @@
 //   1. batch: Only on <target> → Find sources… → skip one → Search → pin a
 //      URL on the row that found nothing → Queue 2: both aliases recorded
 //      (two back-to-back config ops), both downloads spawned with --komikku
-//      (the target's reader is Komikku), both device folders bind after
+//      (the target's reader is Komikku), both device folders bind after.
+//      The saved search settings have multi-source ON, so the picked row
+//      downloads like a Search-tab download: --multi-source plus its series'
+//      other sites as --multi-source-prefetched (the fake backend logs that
+//      file's JSON, which downloader.js deletes when the process exits); the
+//      pinned row adds neither.
 //   2. single: a row's Find source → Search tab with the banner, the search
 //      already run → Download → Queue: alias recorded, banner gone, Queue tab
 //   3. Library: the chip on a series with chapters to copy, the detail's
@@ -68,6 +73,8 @@ function series(lib, folder, chapters) {
 
 const CSM_URL = "https://mangadex.org/title/e2e-csm/chainsaw-man";
 const DAN_URL = "https://mangafire.to/title/e2e-dan-dandadan";
+// Chainsaw Man's other sites: the fallbacks its queued download carries.
+const CSM_ALTS = ["https://mangafire.to/title/e2e-csm-chainsaw-man", "https://mangakatana.com/manga/e2e-csm.1"];
 // Pinned by hand on the row whose search found nothing.
 const KAG_URL = "https://weebcentral.com/series/e2e-kag/kagurabachi";
 // --search-json answers by query. Device folder names are their own queries
@@ -75,7 +82,15 @@ const KAG_URL = "https://weebcentral.com/series/e2e-kag/kagurabachi";
 const FAKE_SEARCH = {
   "Chainsaw Man": {
     candidates: [
-      { canonical_title: "Chainsaw Man", canonical_year: 2018, sources: [{ site: "mangadex", url: CSM_URL, title: "Chainsaw Man", composite_score: 0.91, actual_chapter_count: 2, quality_basis: "chapter_probe" }] },
+      {
+        canonical_title: "Chainsaw Man",
+        canonical_year: 2018,
+        sources: [
+          { site: "mangadex", url: CSM_URL, title: "Chainsaw Man", composite_score: 0.91, actual_chapter_count: 2, quality_basis: "chapter_probe" },
+          { site: "mangafire", url: CSM_ALTS[0], title: "Chainsaw Man", cover: "https://mangafire.to/e2e.jpg", composite_score: 0.85, actual_chapter_count: 2, quality_basis: "chapter_probe" },
+          { site: "mangakatana", url: CSM_ALTS[1], title: "Chainsaw Man", composite_score: 0.8, chapter_count_hint: 2, quality_basis: "seed" },
+        ],
+      },
     ],
   },
   Kagurabachi: { candidates: [] },
@@ -96,6 +111,9 @@ const FAKE_PY = `import json, os, sys
 args = sys.argv[1:]
 with open(os.environ["AIO_E2E_FAKE_LOG"], "a", encoding="utf-8") as f:
     f.write(json.dumps(args) + "\\n")
+    if "--multi-source-prefetched" in args:
+        with open(args[args.index("--multi-source-prefetched") + 1], encoding="utf-8") as p:
+            f.write(json.dumps(["__prefetched__", p.read()]) + "\\n")
 if "--search" in args:
     q = args[args.index("--search") + 1]
     table = json.loads(os.environ["AIO_E2E_FAKE_SEARCH"])
@@ -181,7 +199,9 @@ sys.exit(0)
       .split("\n")
       .filter(Boolean)
       .map((l) => JSON.parse(l));
-  const downloadsOf = (url) => calls().filter((a) => !a.includes("--search") && a.includes(url));
+  const downloadsOf = (url) => calls().filter((a) => a[0] !== "__prefetched__" && !a.includes("--search") && a.includes(url));
+  // The --multi-source-prefetched payloads the fake backend read, in order.
+  const prefetched = () => calls().filter((a) => a[0] === "__prefetched__").map((a) => JSON.parse(a[1]));
   const state = () => win.evaluate(() => window.electronAPI.syncGetState());
   const targetOf = (st) => (st.config && st.config.targets ? st.config.targets.find((t) => t.name === TN) : null);
   const planOf = (st) => {
@@ -223,7 +243,7 @@ sys.exit(0)
     // already present with three folders the library doesn't have.
     const s = await win.evaluate(() => window.electronAPI.getSettings());
     const saved = await win.evaluate(
-      (x) => window.electronAPI.saveSettings({ ...x.s, pythonCmd: x.py, scriptPath: x.fake, workingDir: x.wd, syncEnabled: true, syncPromptOnConnect: false }),
+      (x) => window.electronAPI.saveSettings({ ...x.s, pythonCmd: x.py, scriptPath: x.fake, workingDir: x.wd, syncEnabled: true, syncPromptOnConnect: false, searchOpts: { ...(x.s.searchOpts || {}), multiSource: true } }),
       { s, py: PYTHON, fake: FAKE, wd: TMP }
     );
     check("sync on, fake backend set", saved && saved.ok === true, JSON.stringify(saved));
@@ -271,6 +291,21 @@ sys.exit(0)
         if (!d.length) throw new Error(`no download call for ${url}`);
         if (!d[0].includes("--komikku")) throw new Error(`args ${d[0].join(" ")}`);
       }
+    });
+    await step("the picked row downloads with its series' other sites as fallbacks; the pinned row with none", async () => {
+      const csm = downloadsOf(CSM_URL)[0];
+      const kag = downloadsOf(KAG_URL)[0];
+      if (!csm.includes("--multi-source") || !csm.includes("--multi-source-prefetched")) throw new Error(`csm args ${csm.join(" ")}`);
+      if (kag.includes("--multi-source-prefetched")) throw new Error(`kag args ${kag.join(" ")}`);
+      const p = prefetched();
+      if (p.length !== 1) throw new Error(`${p.length} prefetched payloads`);
+      const want = {
+        primary: { site: "mangadex", url: CSM_URL },
+        alternatives: [{ site: "mangafire", url: CSM_ALTS[0], title: "Chainsaw Man", cover: "https://mangafire.to/e2e.jpg" }, { site: "mangakatana", url: CSM_ALTS[1], title: "Chainsaw Man" }],
+        title: "Chainsaw Man",
+        year: 2018,
+      };
+      if (JSON.stringify(p[0]) !== JSON.stringify(want)) throw new Error(`payload ${JSON.stringify(p[0])}`);
     });
     await step("after the downloads both device folders bind through their aliases", async () => {
       await waitBound("Chainsaw Man");

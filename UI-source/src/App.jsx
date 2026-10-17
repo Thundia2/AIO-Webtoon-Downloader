@@ -369,7 +369,7 @@ export default function App() {
                 setActiveTab("search");
               }}
               onQueueDownload={(url, args) => dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args })}
-              searchSettings={{ seededOnly: dl.settings?.searchOpts?.seededOnly, collapseSplits: dl.settings?.collapseSplits }}
+              searchSettings={{ seededOnly: dl.settings?.searchOpts?.seededOnly, collapseSplits: dl.settings?.collapseSplits, multiSource: dl.settings?.searchOpts?.multiSource }}
             />
           )}
           {activeTab === "settings" && (

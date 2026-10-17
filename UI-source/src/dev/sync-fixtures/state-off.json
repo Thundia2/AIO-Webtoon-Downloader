@@ -77,17 +77,17 @@
       "job": {
         "runId": 1,
         "phase": "plan",
-        "targetId": "t8606d66027",
+        "targetId": "tdd67e9561e",
         "serial": "R5CW71ABCDE",
         "auto": true,
         "state": "done",
-        "startedAt": 1792231267507,
-        "finishedAt": 1792231267634,
+        "startedAt": 1792242099619,
+        "finishedAt": 1792242099720,
         "progress": {
           "bytesDone": 0,
           "bytesTotal": 0,
           "filesDone": 0,
-          "filesTotal": 0,
+          "filesTotal": 2,
           "current": {
             "folder": "Dungeon Meshi"
           },
@@ -111,7 +111,7 @@
             "refusal": null
           },
           "step": "verify",
-          "at": 1792231267599,
+          "at": 1792242099712,
           "lane": null
         },
         "status": "cancelled",

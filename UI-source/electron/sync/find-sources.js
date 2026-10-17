@@ -4,7 +4,9 @@
 // Owns batch find-sources for a target's device-only folders (parent
 // "Batch find-sources"): one search per included row, sequential, on its OWN
 // Searcher (the Search tab's searcher is never shared), keeping the top
-// TOP_CANDIDATES candidates per row. Rows persist per target in
+// TOP_CANDIDATES series matches per row and EVERY site of each match (sites
+// past the 5th used to be cut, so mangafire/mangakatana/... never reached
+// the sheet; plan sync-temp/plans/find-sources-all-sites.md). Rows persist per target in
 // userData/sync/targets/<id>/find-sources.json, written after every row, so
 // a run is resumable: start() runs every included row that isn't `done`.
 // ROWS FOLLOW THE TARGET'S DEVICE-ONLY FOLDERS (UI pass U4): get() and
@@ -31,11 +33,30 @@
 // LIFECYCLE: cancel() / cancelAndWait() tree-kill the search (proc-kill.js
 // through Searcher); cancelNow() is the synchronous kill for shutdownNow().
 //
-// Row: {folder, query, include, state, candidates[≤5], pick, pinnedUrl,
-//       skip, error, searchedAt}
+// Row: {folder, query, include, state, candidates[≤5], pickUrl, multiSource,
+//       pinnedUrl, skip, error, searchedAt}
 //   state: queued | searching | done | error | cancelled
-//   candidate: {title, year, best:{site, url, title, cover, composite,
-//               chapters, qualityBasis}, sources:[same, ≤5]}
+//   candidate: {title, canonicalTitle, year, best, sources:[source, all sites]}
+//     one candidate = one SERIES; its sources = the sites carrying it, in the
+//     search's rank order (best = sources[0]). title is for display (falls
+//     back to the top site's title); canonicalTitle is the search's own
+//     canonical_title, kept apart so the fallback payload matches the Search
+//     tab's (src/lib/prefetchedAlts.js).
+//   source: {site, url, title, cover, composite, chapters, qualityBasis,
+//            titleMatch}
+//   pickUrl: the site the user chose as the download source, by URL (not an
+//     index: indices went stale across re-searches). null = the default,
+//     candidate 0's top site. The match holding it is the FIRST candidate
+//     listing that URL. A re-search keeps it only while some candidate still
+//     lists it; a query change clears it.
+//   multiSource: the multi-source toggle THIS row's search ran with (null
+//     until searched). The renderer's queue follows it the way the Search
+//     tab's download follows the search's snapshot (findView.rowQueueArgs).
+//
+// FILE VERSION 2 (2026-10-17). Version 1 rows carried an index `pick` and
+// at most 5 sites per match; _load migrates them (pick → pickUrl, and a
+// `done` row goes back to `queued` so the next Search re-runs it with every
+// site, keeping its old candidates visible until then).
 //
 // Read by: service.js. Depends on: ../searcher.js (Searcher, injectable),
 // ../resource-limits.js, store.js (WriteQueue, readJson), naming.js
@@ -49,7 +70,8 @@ const { deriveSearchQuery } = require("./naming");
 const TOP_CANDIDATES = 5;
 const BLOCKED_POLL_MS = 2000;
 const FILE = "find-sources.json";
-const ROW_PATCH_KEYS = Object.freeze(["query", "pick", "pinnedUrl", "skip", "include"]);
+const FILE_VERSION = 2;
+const ROW_PATCH_KEYS = Object.freeze(["query", "pickUrl", "pinnedUrl", "skip", "include"]);
 
 /**
  * The Search tab's options for one batch row, from the SAVED settings only:
@@ -92,16 +114,49 @@ function _source(s) {
     composite: _num(s.composite_score),
     chapters: _num(s.actual_chapter_count) != null ? s.actual_chapter_count : _num(s.chapter_count_hint),
     qualityBasis: s.quality_basis || null,
+    titleMatch: _num(s.title_match),
   };
 }
 
-/** --search-json payload → at most TOP_CANDIDATES compact candidates. */
+/** --search-json payload → at most TOP_CANDIDATES compact series matches, each with all its sites. */
 function compactCandidates(json) {
   const list = json && Array.isArray(json.candidates) ? json.candidates : [];
   return list.slice(0, TOP_CANDIDATES).map((c) => {
-    const sources = (Array.isArray(c.sources) ? c.sources : []).slice(0, TOP_CANDIDATES).map(_source);
-    return { title: c.canonical_title || (sources[0] && sources[0].title) || null, year: _num(c.canonical_year), best: sources[0] || null, sources };
+    const sources = (Array.isArray(c.sources) ? c.sources : []).map(_source);
+    return {
+      title: c.canonical_title || (sources[0] && sources[0].title) || null,
+      canonicalTitle: c.canonical_title || null,
+      year: _num(c.canonical_year),
+      best: sources[0] || null,
+      sources,
+    };
   });
+}
+
+/** True when some candidate of `candidates` lists `url` as a site. */
+function _listsUrl(candidates, url) {
+  return (candidates || []).some((c) => (c.sources || []).some((s) => s && s.url === url));
+}
+
+/**
+ * A stored row → the current shape. Version-1 rows: index `pick` → pickUrl
+ * (pick 0 / none = the default, null), and `done` → `queued` (their site
+ * lists were cut at 5 and nothing else re-runs a finished row whose query is
+ * unchanged). A run killed mid-search left the row `searching`: back to
+ * `queued` in every version.
+ */
+function _migrateRow(row, version) {
+  const out = { ...row };
+  if (version < 2) {
+    const c = Number.isInteger(row.pick) && row.pick > 0 && Array.isArray(row.candidates) ? row.candidates[row.pick] : null;
+    out.pickUrl = (c && c.best && c.best.url) || null;
+    if (out.state === "done") out.state = "queued";
+  }
+  delete out.pick;
+  if (!("pickUrl" in out)) out.pickUrl = null;
+  if (typeof out.multiSource !== "boolean") out.multiSource = null;
+  if (out.state === "searching") out.state = "queued";
+  return out;
 }
 
 class FindSources {
@@ -141,10 +196,10 @@ class FindSources {
     const r = await readJson(this._file(targetId));
     const m = new Map();
     const list = r.state === "ok" && r.value && Array.isArray(r.value.rows) ? r.value.rows : [];
+    const version = r.state === "ok" && r.value && Number.isInteger(r.value.version) ? r.value.version : 1;
     for (const row of list) {
       if (!row || typeof row.folder !== "string") continue;
-      // A run killed mid-search left the row `searching`: it never finished.
-      m.set(row.folder, { ...row, state: row.state === "searching" ? "queued" : row.state });
+      m.set(row.folder, _migrateRow(row, version));
     }
     this.rows.set(targetId, m);
     return m;
@@ -152,11 +207,11 @@ class FindSources {
 
   _save(targetId) {
     const m = this.rows.get(targetId);
-    return this.queue.write(this._file(targetId), { version: 1, rows: [...(m ? m.values() : [])] });
+    return this.queue.write(this._file(targetId), { version: FILE_VERSION, rows: [...(m ? m.values() : [])] });
   }
 
   _newRow(folder, query) {
-    return { folder, query: query || deriveSearchQuery(folder), include: true, state: "queued", candidates: [], pick: null, pinnedUrl: null, skip: false, error: null, searchedAt: null };
+    return { folder, query: query || deriveSearchQuery(folder), include: true, state: "queued", candidates: [], pickUrl: null, multiSource: null, pinnedUrl: null, skip: false, error: null, searchedAt: null };
   }
 
   isRunning() {
@@ -249,10 +304,12 @@ class FindSources {
         this.emit({ targetId: run.targetId, state: "running", done: run.done, total: run.total, row: { ...row } });
         try {
           const settings = this.getSettings() || {};
-          const json = await this.searcher.runSearch({ ...this.spawnPaths(settings), query: row.query, opts: _searchOptions(settings) });
+          const opts = _searchOptions(settings);
+          const json = await this.searcher.runSearch({ ...this.spawnPaths(settings), query: row.query, opts });
           row.candidates = compactCandidates(json);
+          row.multiSource = opts.multiSource === true;
           row.state = "done";
-          if (row.pick == null || row.pick >= row.candidates.length) row.pick = row.candidates.length ? 0 : null;
+          if (row.pickUrl && !_listsUrl(row.candidates, row.pickUrl)) row.pickUrl = null;
         } catch (e) {
           if (e && e.cancelled) {
             row.state = "queued";
@@ -317,15 +374,16 @@ class FindSources {
         row.query = q;
         row.state = "queued";
         row.candidates = [];
-        row.pick = null;
+        row.pickUrl = null;
+        row.multiSource = null;
         row.error = null;
       }
     }
-    if ("pick" in p) {
-      if (p.pick != null && !(Number.isInteger(p.pick) && p.pick >= 0 && p.pick < row.candidates.length)) {
-        return { ok: false, code: "invalid", message: "pick out of range" };
+    if ("pickUrl" in p) {
+      if (p.pickUrl != null && !(typeof p.pickUrl === "string" && _listsUrl(row.candidates, p.pickUrl))) {
+        return { ok: false, code: "invalid", message: "that site isn't one of this row's results" };
       }
-      row.pick = p.pick;
+      row.pickUrl = p.pickUrl == null ? null : p.pickUrl;
     }
     if ("pinnedUrl" in p) {
       if (p.pinnedUrl != null && !/^https?:\/\/\S+$/i.test(String(p.pinnedUrl))) return { ok: false, code: "invalid", message: "not an http(s) URL" };
@@ -376,4 +434,4 @@ class FindSources {
   }
 }
 
-module.exports = { FindSources, compactCandidates, TOP_CANDIDATES, BLOCKED_POLL_MS, FIND_SOURCES_FILE: FILE };
+module.exports = { FindSources, compactCandidates, TOP_CANDIDATES, FILE_VERSION, BLOCKED_POLL_MS, FIND_SOURCES_FILE: FILE };
