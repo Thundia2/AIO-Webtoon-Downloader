@@ -397,8 +397,8 @@ function eq(label, actual, expected) {
       { key: "dev:Linked", name: "Linked", query: "Linked" },
       { key: "dev:New", name: "New", query: "New" },
     ];
-    const cand = (site, url, composite, basis) => {
-      const best = { site, url, title: site, composite, chapters: 97, qualityBasis: basis };
+    const cand = (site, url, rating, basis) => {
+      const best = { site, url, title: site, rating, chapters: 97, qualityBasis: basis };
       return { title: site, best, sources: [best] };
     };
     const rows = {
@@ -425,10 +425,11 @@ function eq(label, actual, expected) {
     eq("status while waiting", F.findStatusLine({ targetId: "a", done: 0, total: 3, waiting: "check-all" }, "a", v), "Waiting for Library Check All to finish");
     eq("status after a run", F.findStatusLine(null, "a", v), "3 of 5 found a source.");
     eq("no status before any search", F.findStatusLine(null, "a", F.findRows(items, {}, target)), null);
+    eq("score = rating; a row saved with only the old composite (= title match) shows chapters only", [F.candidateScore({ rating: 0.7, composite: 1, chapters: 3 }), F.candidateScore({ composite: 1, chapters: 3 })], ["0.70 · ch.3", "ch.3"]);
     eq("score/unmeasured take a site too", [F.candidateScore(rows["Dungeon Meshi"].candidates[1].best), F.unmeasured(rows["Dungeon Meshi"].candidates[1].best)], ["0.50 · ch.97", true]);
 
     // ── what a queued row downloads (rowQueueArgs = the Search tab's rules) ──
-    const site = (s, extra) => ({ site: s, url: `https://${s}.test/x`, title: `T ${s}`, cover: null, composite: 0.8, chapters: 9, qualityBasis: "chapter_probe", titleMatch: 0.9, ...(extra || {}) });
+    const site = (s, extra) => ({ site: s, url: `https://${s}.test/x`, title: `T ${s}`, cover: null, rating: 0.8, chapters: 9, qualityBasis: "chapter_probe", titleMatch: 0.9, ...(extra || {}) });
     const series = (title, ...sites) => ({ title, canonicalTitle: title, year: 2018, best: sites[0], sources: sites });
     const multi = series("Chainsaw Man", site("mangadex"), site("mangafire", { cover: "https://c/1.jpg" }), site("mangakatana", { title: null }), site("mangapill"), site("mangahub"), site("atsumaru"));
     const shared = series("Other", site("dynasty"), site("mangafire"));

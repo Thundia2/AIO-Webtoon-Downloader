@@ -42,8 +42,13 @@
 //     back to the top site's title); canonicalTitle is the search's own
 //     canonical_title, kept apart so the fallback payload matches the Search
 //     tab's (src/lib/prefetchedAlts.js).
-//   source: {site, url, title, cover, composite, chapters, qualityBasis,
+//   source: {site, url, title, cover, rating, chapters, qualityBasis,
 //            titleMatch}
+//     rating = the Search tab's displayed rating (SearchSourceCard.jsx
+//     `final`): the measured image-quality score, else the site's seed prior.
+//     NOT composite_score, which in the current search IS the title match
+//     (search_orchestrator.py "composite = title_match"). Rows saved before
+//     this field (they stored `composite`) show no rating until re-searched.
 //   pickUrl: the site the user chose as the download source, by URL (not an
 //     index: indices went stale across re-searches). null = the default,
 //     candidate 0's top site. The match holding it is the FIRST candidate
@@ -111,7 +116,7 @@ function _source(s) {
     url: s.url || null,
     title: s.title || null,
     cover: s.cover || null,
-    composite: _num(s.composite_score),
+    rating: _num(s.img_quality_score) != null ? s.img_quality_score : _num(s.seed_quality),
     chapters: _num(s.actual_chapter_count) != null ? s.actual_chapter_count : _num(s.chapter_count_hint),
     qualityBasis: s.quality_basis || null,
     titleMatch: _num(s.title_match),

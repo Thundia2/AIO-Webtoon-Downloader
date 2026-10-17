@@ -120,8 +120,8 @@ function searchResult(query) {
   const cands = [];
   for (let i = 0; i < 7; i += 1) {
     const q = encodeURIComponent(query);
-    const sources = [{ site: "mangafire", url: `https://mangafire.to/manga/${q}.${i}`, title: `${query} ${i}`, composite_score: 1 - i / 10, actual_chapter_count: 10 + i, quality_basis: "seed", title_match: 0.9 }];
-    if (i === 0) for (const s of EXTRA_SITES) sources.push({ site: s, url: `https://${s}.test/${q}`, title: `${query} ${i}`, composite_score: 0.5, quality_basis: "chapter_probe", title_match: 0.9 });
+    const sources = [{ site: "mangafire", url: `https://mangafire.to/manga/${q}.${i}`, title: `${query} ${i}`, composite_score: 1 - i / 10, seed_quality: 0.6, img_quality_score: null, actual_chapter_count: 10 + i, quality_basis: "seed", title_match: 0.9 }];
+    if (i === 0) for (const s of EXTRA_SITES) sources.push({ site: s, url: `https://${s}.test/${q}`, title: `${query} ${i}`, composite_score: 0.5, seed_quality: 0.7, img_quality_score: 0.55, quality_basis: "chapter_probe", title_match: 0.9 });
     cands.push({ canonical_title: `${query} ${i}`, canonical_year: 2020, sources });
   }
   return { candidates: cands };
@@ -911,6 +911,8 @@ test("find-sources: top 5 matches (every site kept) per row, waits while Check A
     assert.strictEqual(kappa.candidates[0].best.site, "mangafire");
     assert.strictEqual(kappa.candidates[0].sources.length, 1 + EXTRA_SITES.length, "every site of a match is kept");
     assert.deepStrictEqual([kappa.candidates[0].sources[6].titleMatch, kappa.candidates[0].canonicalTitle], [0.9, "Kappa 0"]);
+    // rating = measured image score, else the seed prior; never composite_score (= title match).
+    assert.deepStrictEqual(kappa.candidates[0].sources.slice(0, 2).map((s) => [s.rating, "composite" in s]), [[0.6, false], [0.55, false]]);
     assert.deepStrictEqual([kappa.pickUrl, kappa.multiSource, "pick" in kappa], [null, false, false], "default pick; the search ran without multi-source");
     assert.strictEqual(lambda.state, "error");
     // Retry with an edited query; the done row isn't searched again.

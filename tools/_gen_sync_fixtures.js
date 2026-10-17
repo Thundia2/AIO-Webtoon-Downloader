@@ -164,12 +164,27 @@ const FAKE_SEARCH = {
     ],
   },
 };
+// The real --search-json: composite_score IS the title match, and the rating
+// the UI shows is img_quality_score (measured) else seed_quality. The data
+// above writes the intended rating as composite_score; asJson moves it to
+// where the real search puts it, so a UI reading composite would show 1.00s.
+function asJson(payload) {
+  for (const c of payload.candidates) {
+    for (const s of c.sources) {
+      const rating = s.composite_score;
+      if (s.quality_basis === "seed") Object.assign(s, { img_quality_score: null, seed_quality: rating });
+      else Object.assign(s, { img_quality_score: rating, seed_quality: 0.7 });
+      s.composite_score = s.title_match;
+    }
+  }
+  return payload;
+}
 function fakeSearcher() {
   return {
     runSearch: async ({ query }) => {
       await sleep(40);
       if (!(query in FAKE_SEARCH)) throw new Error("search exited with code 1");
-      return JSON.parse(JSON.stringify(FAKE_SEARCH[query]));
+      return asJson(JSON.parse(JSON.stringify(FAKE_SEARCH[query])));
     },
     cancel() {},
     cancelAndWait: async () => {},

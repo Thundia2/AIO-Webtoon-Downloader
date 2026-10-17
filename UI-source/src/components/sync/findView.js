@@ -8,7 +8,7 @@
 //   {folder, query, include, state, candidates[≤5], pickUrl, multiSource,
 //    pinnedUrl, skip, error, searchedAt}
 //   candidate {title, canonicalTitle, year, best, sources[every site]}
-//   source {site, url, title, cover, composite, chapters, qualityBasis,
+//   source {site, url, title, cover, rating, chapters, qualityBasis,
 //           titleMatch}
 // (the runner's header owns the field meanings).
 //
@@ -204,7 +204,9 @@ export function candidateScore(c) {
   const b = _site(c);
   if (!b) return "";
   const parts = [];
-  if (b.composite != null) parts.push(b.composite.toFixed(2));
+  // rating, never the old `composite` (that was the title match; see the
+  // runner's header): a row saved with only `composite` shows chapters only.
+  if (b.rating != null) parts.push(b.rating.toFixed(2));
   if (b.chapters != null) parts.push(`ch.${b.chapters}`);
   return parts.join(" · ");
 }
