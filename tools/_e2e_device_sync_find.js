@@ -97,6 +97,19 @@ const FAKE_SEARCH = {
         ],
       },
     ],
+    // The multi-source search's per-site chapter map (coverage plan C1): the
+    // runner stores it on candidate 0 (find-sources.js compactCandidates).
+    winner_chapter_map: {
+      canonical_title: "Chainsaw Man",
+      // mangakatana lacks chapter 2: the opened list draws its strip with a gap.
+      merge_diagnostics: Object.fromEntries(["mangadex", "mangafire", "mangakatana"].map((site, i) => [site, { role: i ? "alternative" : "anchor", total_chapters: i === 2 ? 1 : 2, unique_main_chapters: i === 2 ? 1 : 2, effective_chapters: i === 2 ? 1 : 2, compatibility: 1, breakdown: {} }])),
+      collapse_splits_applied: false,
+      effective_chapters_aligned: 2,
+      total_chapters_aligned: 2,
+      consensus_set: [1, 2],
+      consensus_max: 2,
+      chapters: [1, 2].map((n) => ({ chapter_num: n, chapter_label: String(n), sources: ["mangadex", "mangafire", "mangakatana"].slice(0, n === 2 ? 2 : 3).map((site) => ({ site, is_official: false, publisher: null, group_name: null })) })),
+    },
   },
   Kagurabachi: { candidates: [] },
   Dandadan: {
@@ -282,6 +295,40 @@ sys.exit(0)
       const labels = await row.locator("label").allTextContents();
       if (!/mangadex.*fallback 1/.test(labels[0]) || !/mangafire.*downloads/.test(labels[1]) || !/mangakatana.*fallback 2/.test(labels[2])) throw new Error(`labels ${JSON.stringify(labels)}`);
     });
+    await step("the opened list draws each site's chapter coverage from the search's map", async () => {
+      const row = win.locator('[data-testid="find-row"][data-folder="Chainsaw Man"]');
+      // div[role=img]: the strips (the rating's warning triangle is an img too).
+      const strips = await row.locator("div[role=img]").evaluateAll((els) => els.map((e) => e.getAttribute("aria-label")));
+      const want = ["2 of 2 chapters", "2 of 2 chapters", "1 of 2 chapters, missing 2"];
+      if (JSON.stringify(strips) !== JSON.stringify(want)) throw new Error(`strips ${JSON.stringify(strips)}`);
+    });
+    await step("Coverage details opens over the sheet; a pick there moves the list's pick; Escape closes only it", async () => {
+      const row = win.locator('[data-testid="find-row"][data-folder="Chainsaw Man"]');
+      const link = row.getByRole("button", { name: "Coverage details for Chainsaw Man" });
+      await link.click();
+      // CoverageSheet is a sibling of the Find sources sheet, not inside the row.
+      const sheet = win.getByRole("dialog", { name: /^Chapter coverage for / });
+      await sheet.getByText("compared against").waitFor({ timeout: 5_000 });
+      await sheet.getByRole("radio", { name: /mangakatana/ }).click();
+      await row.locator("label", { hasText: /mangakatana.*downloads/ }).waitFor({ timeout: 5_000 });
+      await sheet.locator("label", { hasText: /mangakatana.*downloads/ }).waitFor({ timeout: 5_000 });
+      // Back to mangafire: the queue steps below expect it as the download.
+      await sheet.getByRole("radio", { name: /mangafire/ }).click();
+      await row.locator("label", { hasText: /mangafire.*downloads/ }).waitFor({ timeout: 5_000 });
+      await win.keyboard.press("Escape");
+      await sheet.waitFor({ state: "detached", timeout: 5_000 });
+      await win.getByRole("dialog", { name: /^Find sources for / }).waitFor({ timeout: 2_000 });
+      const focused = await win.evaluate(() => document.activeElement && document.activeElement.getAttribute("aria-label"));
+      if (focused !== "Coverage details for Chainsaw Man") throw new Error(`focus on ${focused}`);
+      if ((await row.getByRole("radio").count()) !== 3) throw new Error("the row's list closed");
+    });
+    {
+      const t = targetOf(await state());
+      const got = t ? await win.evaluate((id) => window.electronAPI.syncFindSourcesGet({ targetId: id }), t.id) : null;
+      const csm = got && got.rows ? got.rows.find((r) => r.folder === "Chainsaw Man") : null;
+      const cands = (csm && csm.candidates) || [];
+      check("the found row keeps the search's chapter map on its top match", !!cands[0] && !!cands[0].chapterMap && cands[0].chapterMap.chapters.length === 2, JSON.stringify(cands[0] && Object.keys(cands[0])));
+    }
     check("the skipped folder wasn't searched", !calls().some((a) => a.includes("--search") && a.includes("Dandadan")));
     check("the search ran with --search-json", calls().some((a) => a.includes("--search") && a.includes("Chainsaw Man") && a.includes("--search-json")));
     await step("pin a URL on the row that found nothing", async () => {

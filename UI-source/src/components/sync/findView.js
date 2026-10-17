@@ -34,6 +34,12 @@
 // folder leaves device-only once the download lands and the planner binds
 // it through that alias (planner step 5).
 //
+// CHAPTER COVERAGE (coverage plan C3, sync-temp/plans/find-sources-coverage.md):
+// the runner keeps the search's winner_chapter_map on candidate 0 only
+// (`chapterMap`, find-sources.js compactCandidates). rowCoverage says what
+// the open site list can show for a row; siteCoverageState places one site
+// in that map. Both are copy-free; the sheet words them.
+//
 // Consumers: FindSourcesSheet.jsx, App.jsx (findQueueArgs), the DEV gallery.
 // Tested by tools/_test_device_sync_view.js.
 // ============================================================
@@ -144,6 +150,49 @@ export function otherMatches(row) {
   return ((row && row.candidates) || []).filter((x) => x && x !== c);
 }
 
+/**
+ * What a row's open site list can say about chapter coverage:
+ *   {kind: "fallbacks-off"}  searched with fallback sites off: the search
+ *                            builds no map then (aio_search_cli.py, only
+ *                            with --multi-source)
+ *   {kind: "other-match"}    the pick is another match ("Not this series?");
+ *                            only match 0 is compared
+ *   {kind: "map", map}       match 0 carries the map
+ *   {kind: "search-again"}   no map on match 0: searched before the runner
+ *                            kept it (incl. a migrated row, multiSource null)
+ * null when pinned or nothing was found. Checked in this order: fallbacks
+ * off explains every missing map, so it wins over other-match.
+ */
+export function rowCoverage(row) {
+  const c = rowCandidate(row);
+  if (!c) return null;
+  if (row.multiSource === false) return { kind: "fallbacks-off" };
+  if (c !== (row.candidates || [])[0]) return { kind: "other-match" };
+  if (c.chapterMap) return { kind: "map", map: c.chapterMap };
+  return { kind: "search-again" };
+}
+
+/**
+ * One site of the picked match against the coverage model
+ * (lib/chapterCoverage.js coverageModel), matched by site name (the map has
+ * no URLs; the aligner already merged one series listed twice on a site):
+ *   {kind: "covered", site}     strip + count
+ *   {kind: "low-match", site}   numbering overlaps the anchor < 50 %: its
+ *                               strip would be partial by construction, so
+ *                               the match % and count instead
+ *   {kind: "empty", site}       the site listed no chapters
+ *   {kind: "not-compared"}      not in the map (its rating cleared neither
+ *                               the seed nor the probe bar, plan User call 2);
+ *                               still a fallback
+ */
+export function siteCoverageState(model, source) {
+  const s = model && source ? model.sites.find((x) => x.site === source.site) : null;
+  if (!s) return { kind: "not-compared" };
+  if (s.empty) return { kind: "empty", site: s };
+  if (s.lowMatch) return { kind: "low-match", site: s };
+  return { kind: "covered", site: s };
+}
+
 /** The target's alias for a device folder, or null. */
 export function aliasFor(target, folder) {
   const list = (target && Array.isArray(target.aliases) && target.aliases) || [];
@@ -209,6 +258,12 @@ export function candidateScore(c) {
   if (b.rating != null) parts.push(b.rating.toFixed(2));
   if (b.chapters != null) parts.push(`ch.${b.chapters}`);
   return parts.join(" · ");
+}
+
+/** The rating alone ("0.92"), for the coverage list where the count column replaces ch.N. */
+export function ratingText(c) {
+  const b = _site(c);
+  return b && b.rating != null ? b.rating.toFixed(2) : "";
 }
 
 /** A rating not measured from chapter pages gets the red triangle (SearchSourceCard's rule). */

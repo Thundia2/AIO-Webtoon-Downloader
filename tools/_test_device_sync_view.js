@@ -485,6 +485,40 @@ function eq(label, actual, expected) {
     eq("sites: the fallback ranks are rowQueueArgs' alternatives order", F.rowSites(row()).filter((x) => x.fallback).map((x) => x.source.site), altSites(F.rowQueueArgs(row())));
     eq("sites: none when pinned or nothing found", [F.rowSites(row({ pinnedUrl: "https://p/1" })), F.rowSites({ candidates: [] })], [[], []]);
     eq("other matches: every match but the picked one", [F.otherMatches(row()).map((c) => c.title), F.otherMatches(row({ pickUrl: "https://dynasty.test/x" })).map((c) => c.title)], [["Other", "Solo"], ["Chainsaw Man", "Solo"]]);
+
+    // ── chapter coverage (coverage plan C3): which line a row shows, where each site sits ──
+    const o = path.join(os.tmpdir(), `aio-chapterCoverage-${process.pid}.mjs`);
+    await esbuild.build({ entryPoints: [path.join(UI, "src", "lib", "chapterCoverage.js")], bundle: true, format: "esm", platform: "neutral", outfile: o, logLevel: "error" });
+    const C = await import(pathToFileURL(o).href);
+    fs.rmSync(o, { force: true });
+    const rec = (folder) => TAB.find.rows.find((r) => r.folder === folder);
+    const csm = rec("Chainsaw Man");
+    const kind = (r) => (F.rowCoverage(r) || {}).kind || null;
+    eq("recorded: both found rows carry a map on match 0 only", [kind(csm), kind(rec("Tis Time for Torture Princess")), !!csm.candidates[1].chapterMap], ["map", "map", false]);
+    eq("the map is match 0's own", F.rowCoverage(csm).map, csm.candidates[0].chapterMap);
+    eq(
+      "[default, other match picked, fallbacks off, old row (map not kept), migrated (multiSource null), pinned, nothing found]",
+      [
+        kind(csm),
+        kind({ ...csm, pickUrl: csm.candidates[1].best.url }),
+        kind({ ...csm, multiSource: false }),
+        kind({ ...csm, candidates: csm.candidates.map(({ chapterMap, ...c }) => c) }),
+        kind({ ...csm, multiSource: null, candidates: csm.candidates.map(({ chapterMap, ...c }) => c) }),
+        kind({ ...csm, pinnedUrl: "https://pin/q" }),
+        kind({ candidates: [] }),
+      ],
+      ["map", "other-match", "fallbacks-off", "search-again", "search-again", null, null],
+    );
+    eq("picking another site of match 0 keeps the map", kind({ ...csm, pickUrl: csm.candidates[0].sources[2].url }), "map");
+    const model = C.coverageModel(F.rowCoverage(csm).map);
+    const states = csm.candidates[0].sources.map((s) => [s.site, F.siteCoverageState(model, s).kind]);
+    eq("recorded Chainsaw Man: covered / low match / not compared", states, [["mangadex", "covered"], ["weebcentral", "covered"], ["mangafire", "covered"], ["mangakatana", "low-match"], ["mangapill", "covered"], ["mangahub", "not-compared"]]);
+    const tis = rec("Tis Time for Torture Princess");
+    const tModel = C.coverageModel(F.rowCoverage(tis).map);
+    eq("recorded princess: an empty list", tis.candidates[0].sources.map((s) => [s.site, F.siteCoverageState(tModel, s).kind]), [["mangadex", "covered"], ["mangafire", "covered"], ["atsumaru", "empty"]]);
+    eq("a state carries the model's site", F.siteCoverageState(model, csm.candidates[0].sources[0]).site.main, 179);
+    eq("no model or no site: not compared", [F.siteCoverageState(null, csm.candidates[0].sources[0]).kind, F.siteCoverageState(model, null).kind], ["not-compared", "not-compared"]);
+    eq("rating alone", [F.ratingText(csm.candidates[0].sources[0]), F.ratingText({ chapters: 3 }), F.ratingText(null)], ["0.91", "", ""]);
   }
 
   // ── one fallback payload for both tabs (src/lib/prefetchedAlts.js) ──

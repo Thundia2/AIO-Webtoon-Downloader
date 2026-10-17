@@ -914,6 +914,7 @@ test("find-sources: top 5 matches (every site kept) per row, waits while Check A
     // rating = measured image score, else the seed prior; never composite_score (= title match).
     assert.deepStrictEqual(kappa.candidates[0].sources.slice(0, 2).map((s) => [s.rating, "composite" in s]), [[0.6, false], [0.55, false]]);
     assert.deepStrictEqual([kappa.pickUrl, kappa.multiSource, "pick" in kappa], [null, false, false], "default pick; the search ran without multi-source");
+    assert.ok(kappa.candidates.every((c) => !("chapterMap" in c)), "a search without winner_chapter_map stores no map");
     assert.strictEqual(lambda.state, "error");
     // Retry with an edited query; the done row isn't searched again.
     a.search.fail = null;
@@ -1026,6 +1027,60 @@ test("find-sources v2: v1 rows migrate, pickUrl is validated and survives a re-s
   await f.updateRow({ targetId: "t1", folder: "A", patch: { pickUrl: u("keep") } });
   const q = await f.updateRow({ targetId: "t1", folder: "A", patch: { query: "A2" } });
   assert.deepStrictEqual([q.row.state, q.row.pickUrl, q.row.multiSource, q.row.candidates.length], ["queued", null, null, 0], "a query change clears the pick");
+});
+
+// Coverage plan C1 (sync-temp/plans/find-sources-coverage.md): the search's
+// winner_chapter_map rides candidate 0 verbatim and nowhere else; a payload
+// without one (multi-source off) or with a malformed one stores none; rows
+// saved before the field load and re-save unchanged.
+test("find-sources: candidate 0 keeps the search's chapter map verbatim, other candidates and map-less searches carry none", async () => {
+  const { FindSources, compactCandidates } = require(path.join(SYNC, "find-sources.js"));
+  const map = {
+    canonical_title: "M",
+    merge_diagnostics: { s1: { total_chapters: 2, effective_chapters: 2, compatibility: 1, breakdown: {} }, s2: { total_chapters: 1, effective_chapters: 1, compatibility: 0.4, skipped_reason: "low compatibility" } },
+    collapse_splits_applied: true,
+    effective_chapters_aligned: 2,
+    total_chapters_aligned: 2,
+    consensus_set: [1, 2],
+    consensus_max: 2,
+    chapters: [
+      { chapter_num: 1, chapter_label: "1", sources: [{ site: "s1", is_official: false, publisher: null, group_name: null }, { site: "s2", is_official: true, publisher: "P", group_name: "P" }] },
+      { chapter_num: 2, chapter_label: "2", sources: [{ site: "s1", is_official: false, publisher: null, group_name: null }] },
+    ],
+  };
+  const cands = [0, 1, 2].map((i) => ({ canonical_title: `M${i}`, sources: [{ site: "s1", url: `https://s1.test/${i}` }, { site: "s2", url: `https://s2.test/${i}` }] }));
+  const out = compactCandidates({ candidates: cands, winner_chapter_map: map });
+  assert.deepStrictEqual(out[0].chapterMap, map, "verbatim");
+  assert.ok(out.slice(1).every((c) => !("chapterMap" in c)), "only candidate 0 has a map");
+  assert.ok(compactCandidates({ candidates: cands }).every((c) => !("chapterMap" in c)), "no map without winner_chapter_map");
+  for (const bad of [null, [], "x", { chapters: "no" }, {}]) {
+    assert.ok(!("chapterMap" in compactCandidates({ candidates: cands, winner_chapter_map: bad })[0]), `malformed map dropped: ${JSON.stringify(bad)}`);
+  }
+  assert.deepStrictEqual(compactCandidates({ candidates: [], winner_chapter_map: map }), [], "no candidates → nowhere to put it");
+
+  // Through the runner: the stored file carries it; an old row (no field)
+  // survives a load + save untouched.
+  const dir = mkdir("fs-map");
+  const old = { folder: "Old", query: "Old", include: true, state: "done", candidates: [{ title: "o", canonicalTitle: "o", year: null, best: { site: "s1", url: "https://s1.test/o" }, sources: [{ site: "s1", url: "https://s1.test/o" }] }], pickUrl: null, multiSource: true, pinnedUrl: null, skip: false, error: null, searchedAt: 1 };
+  fs.mkdirSync(path.join(dir, "t1"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "t1", "find-sources.json"), JSON.stringify({ version: 2, rows: [old] }));
+  let onDone = null;
+  const f = new FindSources({
+    targetsDir: dir,
+    getSettings: () => ({ searchOpts: { multiSource: true } }),
+    spawnPaths: () => ({}),
+    emit: (ev) => {
+      if ((ev.state === "done" || ev.state === "cancelled") && !ev.row && onDone) onDone();
+    },
+    makeSearcher: () => ({ runSearch: async () => ({ candidates: cands, winner_chapter_map: map }), cancel() {}, cancelNow() {} }),
+  });
+  const ran = new Promise((r) => (onDone = r));
+  await f.start({ targetId: "t1", folders: ["Old", "New"], only: ["New"] });
+  await ran;
+  const file = JSON.parse(fs.readFileSync(path.join(dir, "t1", "find-sources.json"), "utf8"));
+  const rows = Object.fromEntries(file.rows.map((r) => [r.folder, r]));
+  assert.deepStrictEqual(rows.New.candidates[0].chapterMap, map, "the saved row carries the map");
+  assert.deepStrictEqual(rows.Old, old, "a row saved before the field is left as it was");
 });
 
 // ---------------------------------------------------------------- adb flow

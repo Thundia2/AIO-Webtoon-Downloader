@@ -35,10 +35,26 @@ const STACK = [];
 
 const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
 
+/**
+ * The browser's Tab stops among `els`: a named radio group is ONE stop, its
+ * checked radio (or the first one when none is checked). Without this, a
+ * sheet ending in a radio group (CoverageSheet's "Download from") never sees
+ * focus on its "last" element, and Tab leaves the panel.
+ */
+function tabStops(els) {
+  const groups = new Map();
+  for (const el of els) {
+    if (el.type !== "radio" || !el.name) continue;
+    const g = groups.get(el.name);
+    if (!g || (!g.checked && el.checked)) groups.set(el.name, el);
+  }
+  return els.filter((el) => el.type !== "radio" || !el.name || groups.get(el.name) === el || el === document.activeElement);
+}
+
 /** Wrap Tab / Shift+Tab inside `panel`, so a modal's ledger behind it can't take focus. */
 function trapTab(e, panel) {
   if (!panel) return;
-  const list = [...panel.querySelectorAll(FOCUSABLE)].filter((el) => el.offsetParent !== null || el === document.activeElement);
+  const list = tabStops([...panel.querySelectorAll(FOCUSABLE)].filter((el) => el.offsetParent !== null || el === document.activeElement));
   if (!list.length) {
     e.preventDefault();
     panel.focus({ preventScroll: true });
@@ -55,6 +71,17 @@ function trapTab(e, panel) {
     first.focus();
   }
 }
+
+/**
+ * A scrim's mousedown: close, and cancel the browser's default, which would
+ * otherwise move focus to <body> AFTER the closing overlay's cleanup put it
+ * back on the opener (a synthetic event has no default, so only real clicks
+ * showed it). Returns the handler.
+ */
+const scrimDown = (onClose) => (e) => {
+  e.preventDefault();
+  onClose?.();
+};
 
 function useOverlayLifecycle(open, onClose, panelRef, { restoreFocus = true, trap = true } = {}) {
   const closeRef = useRef(onClose);
@@ -105,7 +132,7 @@ export function Dialog({ open, onClose, title, description, children, footer, wi
   if (!open) return null;
   return (
     <div className={cn(contained ? "absolute" : "fixed", "inset-0 z-50 flex items-center justify-center p-4")}>
-      <div className="absolute inset-0 bg-black/45 animate-in-fade motion-reduce:animate-none" onMouseDown={onClose} aria-hidden="true" />
+      <div className="absolute inset-0 bg-black/45 animate-in-fade motion-reduce:animate-none" onMouseDown={scrimDown(onClose)} aria-hidden="true" />
       <div
         ref={panelRef}
         role="dialog"
@@ -160,7 +187,7 @@ export function Sheet({ open, onClose, title, description, children, footer, wid
     <div className={cn(contained ? "absolute" : "fixed", "inset-0 z-50 flex justify-end overflow-hidden")}>
       <div
         className={cn("absolute inset-0 bg-black/35 transition-opacity duration-200 motion-reduce:transition-none", shown ? "opacity-100" : "opacity-0")}
-        onMouseDown={onClose}
+        onMouseDown={scrimDown(onClose)}
         aria-hidden="true"
       />
       <div

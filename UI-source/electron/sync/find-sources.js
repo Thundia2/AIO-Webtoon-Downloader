@@ -36,12 +36,22 @@
 // Row: {folder, query, include, state, candidates[≤5], pickUrl, multiSource,
 //       pinnedUrl, skip, error, searchedAt}
 //   state: queued | searching | done | error | cancelled
-//   candidate: {title, canonicalTitle, year, best, sources:[source, all sites]}
+//   candidate: {title, canonicalTitle, year, best, sources:[source, all sites],
+//               chapterMap?}
 //     one candidate = one SERIES; its sources = the sites carrying it, in the
 //     search's rank order (best = sources[0]). title is for display (falls
 //     back to the top site's title); canonicalTitle is the search's own
 //     canonical_title, kept apart so the fallback payload matches the Search
 //     tab's (src/lib/prefetchedAlts.js).
+//   chapterMap: the search's `winner_chapter_map`, VERBATIM, on candidate 0
+//     only (aio_search_cli.py builds it for candidates[0] alone, and only
+//     with --multi-source). Absent = no coverage to show: multi-source off,
+//     a row searched before this field, or a search with no candidates. It
+//     is the same object the Search tab's "Chapter coverage" panel reads
+//     (SearchChapterMap.jsx), stored whole by user decision (2026-10-17,
+//     plan sync-temp/plans/find-sources-coverage.md: no compact summary, so
+//     one shape feeds both tabs). It holds one entry per chapter per site,
+//     so it is most of a row's bytes; it is read, never edited, here.
 //   source: {site, url, title, cover, rating, chapters, qualityBasis,
 //            titleMatch}
 //     rating = the Search tab's displayed rating (SearchSourceCard.jsx
@@ -123,10 +133,20 @@ function _source(s) {
   };
 }
 
-/** --search-json payload → at most TOP_CANDIDATES compact series matches, each with all its sites. */
+/** The payload's winner_chapter_map when it has the shape the renderer reads, else null. */
+function _chapterMap(json) {
+  const m = json && json.winner_chapter_map;
+  return m && typeof m === "object" && !Array.isArray(m) && Array.isArray(m.chapters) ? m : null;
+}
+
+/**
+ * --search-json payload → at most TOP_CANDIDATES compact series matches, each
+ * with all its sites; candidate 0 also carries the payload's chapter map.
+ */
 function compactCandidates(json) {
   const list = json && Array.isArray(json.candidates) ? json.candidates : [];
-  return list.slice(0, TOP_CANDIDATES).map((c) => {
+  const map = _chapterMap(json);
+  return list.slice(0, TOP_CANDIDATES).map((c, i) => {
     const sources = (Array.isArray(c.sources) ? c.sources : []).map(_source);
     return {
       title: c.canonical_title || (sources[0] && sources[0].title) || null,
@@ -134,6 +154,7 @@ function compactCandidates(json) {
       year: _num(c.canonical_year),
       best: sources[0] || null,
       sources,
+      ...(i === 0 && map ? { chapterMap: map } : {}),
     };
   });
 }

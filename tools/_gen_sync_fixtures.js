@@ -164,6 +164,76 @@ const FAKE_SEARCH = {
     ],
   },
 };
+// winner_chapter_map for a fake payload, in aio_search_cli.py's shape
+// (chapter_merger.align_chapter_lists output). `sites` = {site: {nums,
+// official?, total?, compatibility?, skipped?, latest?}}; `nums` are the
+// chapters the site reaches chapters[] with (for a low-match site only its
+// overlapping ones, as the merger does), `total` its full list length. The
+// anchor is the first key (the merger's is the longest list). Breakdown
+// counts are only roughly consistent: the gallery shows them, nothing checks
+// them against chapters[].
+function fakeChapterMap(title, sites) {
+  const nums = [...new Set(Object.values(sites).flatMap((x) => x.nums))].sort((a, b) => a - b);
+  const names = Object.keys(sites);
+  const diag = {};
+  names.forEach((site, i) => {
+    const x = sites[site];
+    const total = x.total != null ? x.total : x.nums.length;
+    const side = x.nums.filter((n) => !Number.isInteger(n)).length;
+    diag[site] = {
+      role: i === 0 ? "anchor" : "alternative",
+      total_chapters: total,
+      unique_main_chapters: total - side,
+      effective_chapters: total,
+      matched_with_anchor: x.nums.length,
+      compatibility: x.compatibility != null ? x.compatibility : 1,
+      breakdown: { consensus_main: total - side - (x.latest || 0), source_only_latest: x.latest || 0, consensus_side_stories: side, safe_decimals: 0, prologue_count: 0, merged_split_fragments: 0, source_only_orphans: 0, fragments_dropped: 0, unparseable_passthrough: 0 },
+      consensus_threshold_sources: 2,
+      ...(x.skipped ? { skipped_reason: x.skipped } : {}),
+    };
+  });
+  return {
+    canonical_title: title,
+    merge_diagnostics: diag,
+    collapse_splits_applied: true,
+    effective_chapters_aligned: nums.length,
+    consensus_set: nums.filter((n) => names.filter((s) => sites[s].nums.includes(n)).length >= 2),
+    consensus_max: Math.max(...nums),
+    chapters: nums.map((n) => ({
+      chapter_num: n,
+      chapter_label: String(n),
+      sources: names.filter((s) => sites[s].nums.includes(n)).map((s) => {
+        const off = (sites[s].official || []).includes(n);
+        return { site: s, is_official: off, publisher: off ? sites[s].publisher || null : null, group_name: off ? sites[s].publisher || null : null };
+      }),
+    })),
+    total_chapters_aligned: nums.length,
+  };
+}
+const range = (a, b) => Array.from({ length: b - a + 1 }, (_, i) => a + i);
+const without = (list, ...drop) => list.filter((n) => !drop.includes(n));
+const LOW_MATCH = "compatibility 38% below 50% threshold; only overlapping chapters merged";
+
+// Chainsaw Man's map (coverage plan C1): weebcentral anchors with a side
+// story; mangadex has gaps and three official chapters; mangakatana's
+// numbering differs (low match, only its overlap merged); mangapill has
+// scattered gaps; mangahub is absent (the search didn't compare it). The
+// princess map has an empty-list site (atsumaru). The other states the sheet
+// renders (an old row, multi-source off, a "Not this series?" pick) come
+// from these rows minus their map, in the gallery.
+FAKE_SEARCH["Chainsaw Man"].winner_chapter_map = fakeChapterMap("Chainsaw Man", {
+  weebcentral: { nums: [...range(1, 181), 97.5].sort((a, b) => a - b) },
+  mangadex: { nums: without(range(1, 181), 97, 98), official: [1, 2, 3], publisher: "MANGA Plus" },
+  mangafire: { nums: range(1, 180) },
+  mangakatana: { nums: range(1, 68), total: 179, compatibility: 0.38, skipped: LOW_MATCH },
+  mangapill: { nums: without(range(1, 181), 37, 60, 61, 81) },
+});
+FAKE_SEARCH["Tis Time for Torture Princess"].winner_chapter_map = fakeChapterMap("'Tis Time for \"Torture,\" Princess", {
+  mangadex: { nums: range(1, 212), latest: 2 },
+  mangafire: { nums: range(1, 210) },
+  atsumaru: { nums: [], total: 0, compatibility: 0, skipped: "empty chapter list" },
+});
+
 // The real --search-json: composite_score IS the title match, and the rating
 // the UI shows is img_quality_score (measured) else seed_quality. The data
 // above writes the intended rating as composite_score; asJson moves it to

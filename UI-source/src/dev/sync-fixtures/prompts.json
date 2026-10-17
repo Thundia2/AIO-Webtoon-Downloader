@@ -9,13 +9,13 @@
         "prompts": [],
         "pending": [
           {
-            "promptId": "p1-1792247061753",
-            "connKey": "folder:tc5789b6986",
+            "promptId": "p1-1792266576218",
+            "connKey": "folder:t7080313f1c",
             "serial": null,
             "targetIds": [
-              "tc5789b6986"
+              "t7080313f1c"
             ],
-            "since": 1792247061753
+            "since": 1792266576218
           }
         ]
       },
@@ -23,17 +23,17 @@
         "kind": "prompt",
         "action": "show",
         "prompt": {
-          "promptId": "p1-1792247061753",
-          "connKey": "folder:tc5789b6986",
+          "promptId": "p1-1792266576218",
+          "connKey": "folder:t7080313f1c",
           "serial": null,
           "targetIds": [
-            "tc5789b6986"
+            "t7080313f1c"
           ],
           "card": {
             "serial": null,
             "targets": [
               {
-                "targetId": "tc5789b6986",
+                "targetId": "t7080313f1c",
                 "targetName": "Galaxy Tab",
                 "firstSync": true,
                 "series": 3,
@@ -53,21 +53,21 @@
             "attention": [],
             "empty": false
           },
-          "createdAt": 1792247061793
+          "createdAt": 1792266576262
         },
         "prompts": [
           {
-            "promptId": "p1-1792247061753",
-            "connKey": "folder:tc5789b6986",
+            "promptId": "p1-1792266576218",
+            "connKey": "folder:t7080313f1c",
             "serial": null,
             "targetIds": [
-              "tc5789b6986"
+              "t7080313f1c"
             ],
             "card": {
               "serial": null,
               "targets": [
                 {
-                  "targetId": "tc5789b6986",
+                  "targetId": "t7080313f1c",
                   "targetName": "Galaxy Tab",
                   "firstSync": true,
                   "series": 3,
@@ -87,7 +87,7 @@
               "attention": [],
               "empty": false
             },
-            "createdAt": 1792247061793
+            "createdAt": 1792266576262
           }
         ],
         "pending": []
@@ -165,7 +165,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "tc5789b6986",
+              "id": "t7080313f1c",
               "deletePolicy": "guarded",
               "excludes": [],
               "aliases": [],
@@ -189,18 +189,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "tc5789b6986": true
+          "t7080313f1c": true
         },
         "job": {
           "job": {
             "runId": 1,
             "phase": "plan",
-            "targetId": "tc5789b6986",
+            "targetId": "t7080313f1c",
             "serial": null,
             "auto": true,
             "state": "done",
-            "startedAt": 1792247061753,
-            "finishedAt": 1792247061793,
+            "startedAt": 1792266576218,
+            "finishedAt": 1792266576262,
             "progress": {
               "bytesDone": 39037,
               "bytesTotal": 39037,
@@ -221,13 +221,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792247061787
+              "at": 1792266576257
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "tc5789b6986",
-                "asOf": 1792247061787,
+                "targetId": "t7080313f1c",
+                "asOf": 1792266576257,
                 "firstSync": true,
                 "totals": {
                   "push": {
@@ -398,15 +398,15 @@
                 "gen": 1,
                 "warnings": [],
                 "capacity": {
-                  "free": 228755873792,
+                  "free": 226251931648,
                   "total": 1999343972352,
                   "needed": 39037,
                   "reserve": 1073741824,
                   "freeable": 0,
                   "freeableEarly": 0,
-                  "after": 228755834755,
+                  "after": 226251892611,
                   "fits": true,
-                  "asOf": 1792247061759
+                  "asOf": 1792266576225
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -419,10 +419,10 @@
           "queue": []
         },
         "plans": {
-          "tc5789b6986": {
+          "t7080313f1c": {
             "summary": {
-              "targetId": "tc5789b6986",
-              "asOf": 1792247061787,
+              "targetId": "t7080313f1c",
+              "asOf": 1792266576257,
               "firstSync": true,
               "totals": {
                 "push": {
@@ -593,15 +593,15 @@
               "gen": 1,
               "warnings": [],
               "capacity": {
-                "free": 228755873792,
+                "free": 226251931648,
                 "total": 1999343972352,
                 "needed": 39037,
                 "reserve": 1073741824,
                 "freeable": 0,
                 "freeableEarly": 0,
-                "after": 228755834755,
+                "after": 226251892611,
                 "fits": true,
-                "asOf": 1792247061759
+                "asOf": 1792266576225
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -619,22 +619,22 @@
               "status": "completed",
               "auto": true,
               "reason": null,
-              "at": 1792247061793
+              "at": 1792266576262
             }
           }
         },
         "prompt": {
-          "promptId": "p1-1792247061753",
-          "connKey": "folder:tc5789b6986",
+          "promptId": "p1-1792266576218",
+          "connKey": "folder:t7080313f1c",
           "serial": null,
           "targetIds": [
-            "tc5789b6986"
+            "t7080313f1c"
           ],
           "card": {
             "serial": null,
             "targets": [
               {
-                "targetId": "tc5789b6986",
+                "targetId": "t7080313f1c",
                 "targetName": "Galaxy Tab",
                 "firstSync": true,
                 "series": 3,
@@ -654,21 +654,21 @@
             "attention": [],
             "empty": false
           },
-          "createdAt": 1792247061793
+          "createdAt": 1792266576262
         },
         "prompts": [
           {
-            "promptId": "p1-1792247061753",
-            "connKey": "folder:tc5789b6986",
+            "promptId": "p1-1792266576218",
+            "connKey": "folder:t7080313f1c",
             "serial": null,
             "targetIds": [
-              "tc5789b6986"
+              "t7080313f1c"
             ],
             "card": {
               "serial": null,
               "targets": [
                 {
-                  "targetId": "tc5789b6986",
+                  "targetId": "t7080313f1c",
                   "targetName": "Galaxy Tab",
                   "firstSync": true,
                   "series": 3,
@@ -688,7 +688,7 @@
               "attention": [],
               "empty": false
             },
-            "createdAt": 1792247061793
+            "createdAt": 1792266576262
           }
         ],
         "pending": [],
@@ -706,11 +706,11 @@
       "job": {
         "runId": 1,
         "phase": "plan",
-        "targetId": "tc5789b6986",
+        "targetId": "t7080313f1c",
         "serial": null,
         "auto": true,
         "state": "running",
-        "startedAt": 1792247061753,
+        "startedAt": 1792266576218,
         "finishedAt": null,
         "progress": {
           "bytesDone": 0,
@@ -729,18 +729,18 @@
         "kind": "prompt",
         "action": "show",
         "prompt": {
-          "promptId": "p1-1792247061812",
+          "promptId": "p1-1792266576280",
           "connKey": "R5CW71ABCDE#1",
           "serial": "R5CW71ABCDE",
           "targetIds": [
-            "tcc521724a9"
+            "t618048f02c"
           ],
           "card": {
             "serial": "R5CW71ABCDE",
             "targets": [],
             "attention": [
               {
-                "targetId": "tcc521724a9",
+                "targetId": "t618048f02c",
                 "targetName": "Old tablet",
                 "code": "needs-mode",
                 "message": "this device can't hash files: choose how to verify",
@@ -755,22 +755,22 @@
             ],
             "empty": false
           },
-          "createdAt": 1792247061911
+          "createdAt": 1792266576372
         },
         "prompts": [
           {
-            "promptId": "p1-1792247061812",
+            "promptId": "p1-1792266576280",
             "connKey": "R5CW71ABCDE#1",
             "serial": "R5CW71ABCDE",
             "targetIds": [
-              "tcc521724a9"
+              "t618048f02c"
             ],
             "card": {
               "serial": "R5CW71ABCDE",
               "targets": [],
               "attention": [
                 {
-                  "targetId": "tcc521724a9",
+                  "targetId": "t618048f02c",
                   "targetName": "Old tablet",
                   "code": "needs-mode",
                   "message": "this device can't hash files: choose how to verify",
@@ -785,7 +785,7 @@
               ],
               "empty": false
             },
-            "createdAt": 1792247061911
+            "createdAt": 1792266576372
           }
         ],
         "pending": []
@@ -863,7 +863,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "tcc521724a9",
+              "id": "t618048f02c",
               "deletePolicy": "guarded",
               "excludes": [],
               "aliases": [],
@@ -902,12 +902,12 @@
           "job": {
             "runId": 1,
             "phase": "plan",
-            "targetId": "tcc521724a9",
+            "targetId": "t618048f02c",
             "serial": "R5CW71ABCDE",
             "auto": true,
             "state": "done",
-            "startedAt": 1792247061812,
-            "finishedAt": 1792247061911,
+            "startedAt": 1792266576280,
+            "finishedAt": 1792266576372,
             "progress": {
               "bytesDone": 39037,
               "bytesTotal": 39037,
@@ -934,7 +934,7 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792247061910
+              "at": 1792266576370
             },
             "status": "failed",
             "summary": {
@@ -958,7 +958,7 @@
           "queue": []
         },
         "plans": {
-          "tcc521724a9": {
+          "t618048f02c": {
             "summary": null,
             "refusal": {
               "folders": [
@@ -984,23 +984,23 @@
               "status": "failed",
               "auto": true,
               "reason": "needs-mode",
-              "at": 1792247061911
+              "at": 1792266576372
             }
           }
         },
         "prompt": {
-          "promptId": "p1-1792247061812",
+          "promptId": "p1-1792266576280",
           "connKey": "R5CW71ABCDE#1",
           "serial": "R5CW71ABCDE",
           "targetIds": [
-            "tcc521724a9"
+            "t618048f02c"
           ],
           "card": {
             "serial": "R5CW71ABCDE",
             "targets": [],
             "attention": [
               {
-                "targetId": "tcc521724a9",
+                "targetId": "t618048f02c",
                 "targetName": "Old tablet",
                 "code": "needs-mode",
                 "message": "this device can't hash files: choose how to verify",
@@ -1015,22 +1015,22 @@
             ],
             "empty": false
           },
-          "createdAt": 1792247061911
+          "createdAt": 1792266576372
         },
         "prompts": [
           {
-            "promptId": "p1-1792247061812",
+            "promptId": "p1-1792266576280",
             "connKey": "R5CW71ABCDE#1",
             "serial": "R5CW71ABCDE",
             "targetIds": [
-              "tcc521724a9"
+              "t618048f02c"
             ],
             "card": {
               "serial": "R5CW71ABCDE",
               "targets": [],
               "attention": [
                 {
-                  "targetId": "tcc521724a9",
+                  "targetId": "t618048f02c",
                   "targetName": "Old tablet",
                   "code": "needs-mode",
                   "message": "this device can't hash files: choose how to verify",
@@ -1045,7 +1045,7 @@
               ],
               "empty": false
             },
-            "createdAt": 1792247061911
+            "createdAt": 1792266576372
           }
         ],
         "pending": [],

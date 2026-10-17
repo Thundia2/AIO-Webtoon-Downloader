@@ -60,7 +60,8 @@ export const FIXTURES = {
  *   snapshot name; prompt, a prompts.json recording's get-state at its card,
  *   wins over both); adb swaps in one recorded adb state; mutate edits the
  *   snapshot copy before the hook sees it; hold leaves every set-selection
- *   unanswered (the pending state).
+ *   unanswered (the pending state); findRows(rows) edits a copy of the
+ *   recorded find-sources rows (tab mode; the coverage cases).
  */
 export function makeSyncSource(spec = {}) {
   const snap = clone(spec.prompt ? FIXTURES.prompts[spec.prompt].state : spec.tab ? FIXTURES.tab.snapshots[spec.tab] : spec.base === "off" ? FIXTURES.stateOff : FIXTURES.stateOn);
@@ -116,7 +117,7 @@ export function makeSyncSource(spec = {}) {
     }
   }
 
-  const tabApi = spec.tab ? makeTabChannels(snap, emit, !!spec.hold) : {};
+  const tabApi = spec.tab ? makeTabChannels(snap, emit, !!spec.hold, spec.findRows) : {};
   return {
     syncGetState: () => Promise.resolve(clone(snap)),
     onSyncEvent: (fn) => {
@@ -179,7 +180,7 @@ const later = (ms, v) => new Promise((r) => setTimeout(() => r(v), ms));
 const selKey = ({ gen, seq, targetId, ...rest }) => JSON.stringify(rest);
 
 /** The plan-backed channels for TAB MODE (header). Mutates `snap` as the job runs. */
-function makeTabChannels(snap, emit, hold) {
+function makeTabChannels(snap, emit, hold, findRows) {
   const T = FIXTURES.tab;
   const tid = () => Object.keys(snap.plans || {})[0] || T.targetId;
   const view = () => snap.plans[tid()];
@@ -230,7 +231,7 @@ function makeTabChannels(snap, emit, hold) {
     syncExportReport: () => later(200, { ok: true, path: "D:/Sync-fixture/report.txt" }),
     syncDeviceCover: () => Promise.resolve({ ok: false, code: "invalid", message: "no covers in the gallery" }),
     syncLibraryStatus: () => Promise.resolve(clone(T.libraryStatus)),
-    ...makeFindChannels(snap, emit),
+    ...makeFindChannels(snap, emit, findRows),
   };
 }
 
@@ -239,11 +240,14 @@ function makeTabChannels(snap, emit, hold) {
  * results are synthetic: see the generator). get answers the recording;
  * update-row patches a copy the naive way (a new query re-queues the row);
  * start replays the recorded run: each searched row turns `searching`, then
- * its recorded result. Nothing here searches.
+ * its recorded result. Nothing here searches. `edit` (spec.findRows) rewrites
+ * a copy of the recorded rows first; a replayed search still lands the
+ * recorded result.
  */
-function makeFindChannels(snap, emit) {
+function makeFindChannels(snap, emit, edit) {
   const T = FIXTURES.tab;
-  const rows = new Map(T.find.rows.map((r) => [r.folder, clone(r)]));
+  const start = clone(T.find.rows);
+  const rows = new Map((edit ? edit(start) || start : start).map((r) => [r.folder, r]));
   const tid = () => Object.keys(snap.plans || {})[0] || T.targetId;
   const rowEv = (row, extra) => emit({ kind: "find", targetId: tid(), state: "idle", row: clone(row), ...(extra || {}) });
   return {

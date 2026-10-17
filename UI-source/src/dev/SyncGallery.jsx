@@ -117,6 +117,39 @@ const TAB_CASES = [
     spec: { tab: "planned", mutate: (s) => { s.config = JSON.parse(JSON.stringify(FIXTURES.tab.findConfig)); } },
     initial: { find: true },
   },
+  {
+    id: "tab-find-coverage",
+    title: "Tab: find sources, chapter coverage",
+    note: "Both site lists open (synthetic maps). Chainsaw Man: weebcentral anchors with a side story, mangadex has gaps and 3 licensed chapters, mangakatana's numbering differs, mangapill has scattered gaps, mangahub was not compared. The princess series: atsumaru listed no chapters.",
+    spec: { tab: "planned" },
+    initial: { find: true, findOpen: ["Chainsaw Man", "Tis Time for Torture Princess"] },
+  },
+  {
+    id: "tab-find-coverage-details",
+    title: "Tab: find sources, coverage details",
+    note: "Chainsaw Man's Coverage details sheet over Find sources (synthetic map): the counts, Download from radios, the per-site summary and the grid. Picking a site here moves the list's pick too.",
+    spec: { tab: "planned" },
+    initial: { find: true, findOpen: ["Chainsaw Man"], findCoverage: "Chainsaw Man" },
+  },
+  {
+    id: "tab-find-coverage-nomap",
+    title: "Tab: find sources, rows without coverage",
+    note: "Chainsaw Man searched before the map was kept (Search again); the princess folder picked its other match (top match only); Kagurabachi_ given Chainsaw Man's sites searched with fallback sites off.",
+    spec: {
+      tab: "planned",
+      findRows: (rows) => {
+        const by = Object.fromEntries(rows.map((r) => [r.folder, r]));
+        const csm = by["Chainsaw Man"];
+        const noMap = csm.candidates.map(({ chapterMap, ...c }) => c);
+        csm.candidates = noMap;
+        const tis = by["Tis Time for Torture Princess"];
+        tis.pickUrl = tis.candidates[1].best.url;
+        Object.assign(by["Kagurabachi_"], { candidates: JSON.parse(JSON.stringify(noMap)), multiSource: false });
+        return rows;
+      },
+    },
+    initial: { find: true, findOpen: ["Chainsaw Man", "Kagurabachi_", "Tis Time for Torture Princess"] },
+  },
 ];
 
 function TabCase({ c }) {

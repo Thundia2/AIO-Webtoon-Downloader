@@ -101,7 +101,7 @@ function useNow(active) {
  *   onView?(patch), contained?:boolean}} props
  *   contained = overlays stay inside the tab (gallery). libraryEntries feed the
  *   covers (useDownloader's library scan; loaded here once if still empty).
- *   initial = {detail?:seriesKey, review?, prune?, edit?, find?}: overlays
+ *   initial = {detail?:seriesKey, review?, prune?, edit?, find?, findOpen?:folder[], findCoverage?:folder}: overlays
  *   open at mount (the DEV gallery's seam; App never passes it).
  *   onFindSource({targetId, targetName, folder, query}) = single find (U4-6);
  *   onQueueDownload(url, args) = App's queueDownload with the download
@@ -547,6 +547,8 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
         searchSettings={searchSettings}
         onOpenSearchSettings={onOpenSettings ? () => onOpenSettings("search") : undefined}
         onQueueDownload={onQueueDownload || (() => Promise.reject(new Error("downloads aren't available here")))}
+        openSites={init.findOpen}
+        openCoverage={init.findCoverage}
       />
       <PruneDialog open={pruneOpen} onClose={() => setPruneOpen(false)} targetId={tid} tn={tn} items={deviceOnly} contained={contained} sync={sync} onAction={onAction} />
       <Sheet
