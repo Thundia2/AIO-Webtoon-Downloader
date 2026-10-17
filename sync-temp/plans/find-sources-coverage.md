@@ -1,7 +1,7 @@
 # Find sources (Device Sync): per-site chapter coverage (option A + B)
 
-Status: rev 3, APPROVED 2026-10-17. C1-C4 done (uncommitted; C1 measurements under User
-call 1, C2 notes under Decision 2, C3 and C4 under "as built"); approved by the user 2026-10-17; next commit. rev 2 → rev 3 = the user's answers (section "User calls"). Phases C1 → C4, report and
+Status: rev 3, APPROVED 2026-10-17. C1-C4 done (C1 measurements under User
+call 1, C2 notes under Decision 2, C3 and C4 under "as built"); approved by the user 2026-10-17; committed `99b1571` (2026-10-18). Oracle pinned to `ecf8ec7`. rev 2 → rev 3 = the user's answers (section "User calls"). Phases C1 → C4, report and
 wait after each.
 Memory pointer: `device-sync-feature.md` (Find-sources coverage sub-task line).
 Mockups: shown in the session that wrote this plan (A = inline strips, B = details sheet).
