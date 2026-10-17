@@ -310,3 +310,63 @@ backend consequences become **phase U0b**, folded into the U0 commit (user, 2026
 - **U1-7: the gallery's config-op is a naive fake** (`src/dev/syncFixtureSource.js`); every other
   answer is recorded off the real service by `tools/_gen_sync_fixtures.js`. Re-run the generator
   after a backend change.
+
+## Phase U2 design (2026-10-16)
+
+Built from a draft, an independent design agent (goal + evidence only) and an adversarial review of
+the draft; every load-bearing claim below was re-read in the code first.
+
+**Backend (each with a test in `_test_device_sync_service.js` / `_core.js`):**
+- **U2-1 auto-plan is the service's call, not the tab's.** `plan {ifNeeded:true}` plans only when the
+  target is connected, has no summary or a stale one, nothing is queued/running for it, it holds no
+  refusal, and its last plan attempt didn't fail or get cancelled since the last config / connect /
+  library change. It goes through `jobs.enqueueAuto` (dedup). Why: a renderer rule ("no summary, no
+  refusal") loops forever after a cancelled or internally-failed plan (both leave summary and refusal
+  null, svc `_runJob` catch), never fires for a stale summary when prompt-on-connect is off (svc
+  `_connected` returns early), and the tab unmounts on every tab switch so it can't hold a latch.
+  The plan view gains `lastPlan {runId, status, reason, at}`; verifyFirst's needs-mode now goes
+  through `_refused` like prepare's. Recovery buttons (needs-mode save, Start fresh) send no follow-up
+  plan: the config op's own `replan:true` already queues one.
+- **U2-2 acknowledgements are bound to what was shown.** The review stores each loss tick as
+  `seriesKey → sorted lossOpIds at tick time` and drops it when that list changes; `ackLosses` sends
+  only stored ids. `ackMassDelete` / `ackMassRepush` over IPC are the COUNT the user acknowledged;
+  reconcileForApply blocks unless it equals the fresh count (`true` stays valid only for in-process
+  callers/tests). Why: set-selection doesn't bump gen, so a gen-keyed reset misses selection-driven
+  growth of the loss / mass-delete sets.
+- **U2-3 selection echoes its sequence.** set-selection takes optional `gen` (mismatch → `blocked
+  {plan-changed}`) and the plan view carries `selSeq` (last applied client seq). A pending checkbox
+  clears when a pushed view's `selSeq` reaches its request, independent of reply/event order.
+  `bulk:'series' {seriesKey, selected}`: false = every offered op off, true = delete the stored
+  entries (back to the plan's pre-selection).
+- **U2-4 summary rows gain** `counts.offered` / `counts.preselected` (tri-state + when the row box is
+  useful), `attention: [reason…]` (held-not-excluded, anomaly, loss, blocked-by-suggestion,
+  needs-verify, rebind fell back, unticked replace candidate), and the summary a `suggestionList`
+  (id, seriesKey, deviceFolder, tier) so device-only rows can draw Link. Tile counts are trivial
+  folds over these.
+- **U2-5 capacity gains `total` and `after`.** Transports grow `storage() → {free, total}` (adb
+  `stat -f %a %b %S`, df fallback; folder `statfs`); prepare reads it when present.
+- **U2-6 settling re-plans itself:** `_adopt` arms `_replanSoon` at `settleAt + 1 s`, cleared by the
+  next adopt.
+- **U2-7 apply progress** carries `at` and `folder {key, landed, total}` (files actually landed, not
+  skipped) for the transfer lane. No batch field: intentBatch is 1.
+- **U2-8 `remove-series {removeFiles:false}`** = the detail sheet's Exclude.
+- **U2-9 verify takes a one-shot `hashMode`**; the renderer's Read back always sends
+  `mode:'read-back'`.
+
+**Renderer:**
+- **U2-10 the selection client lives in useDeviceSync** (app lifetime) as a pure FIFO reducer with an
+  injected clock (`src/hooks/selectionQueue.js`, node-tested). `changes` and bulks never share a
+  request; one in flight per target; locked while apply/prune/rename runs there.
+- **U2-11 Start is enabled only when** review `(gen, selSeq)` matches the pushed view, not stale, no
+  job on the target, no selection request pending, every ack ticked, `fits !== false`. A gen change
+  from someone else shows "The plan changed. Review it again."; the user's own rebind resets acks
+  silently. The detail sheet re-fetches on every `plans` push for its target (debounced).
+- **U2-12 held rows:** Include only for `heldReason === 'excluded'`; Rename only for bound folders;
+  a `removing` series stays in the main list (−N pill, Removals filter), not the dimmed held section.
+- **U2-13 apply/prune refusals render on the LastRunCard** from `lastRun.summary` (the fresh re-plan's
+  `_adopt` clears the plan-view refusal), de-duplicated against the plan-view refusal.
+- **U2-14 tab state that must survive a tab switch** (chosen target, dismissed last-run ids) lives in
+  App and is passed down.
+- **U2-15 fixtures record real set-selection replies and the `plans` pushes that follow them**, so
+  the gallery shows pending → settled and ack resets; the E2E reaches `plan-changed` by sending an
+  old-gen apply through `page.evaluate` and asserts the UI's notice separately.

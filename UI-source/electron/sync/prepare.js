@@ -348,19 +348,28 @@ async function preparePlan(c) {
 
 // ------------------------------------------------------------------ steps
 
-/** {bytes|null, asOf}: unknown is null, never 0 (a 0 would read as "full"). */
+/**
+ * {bytes|null, total|null, asOf}: unknown is null, never 0 (a 0 would read
+ * as "full"). `total` (the gauge's "used" part) comes only from storage();
+ * a transport with just freeSpace() (test stubs) reports no total.
+ */
 async function _readFreeSpace(transport, { dev, signal, now, warnings }) {
-  if (typeof transport.freeSpace !== "function") return { bytes: null, asOf: now() };
+  const fin = (n) => (Number.isFinite(n) ? n : null);
+  if (typeof transport.storage !== "function" && typeof transport.freeSpace !== "function") return { bytes: null, total: null, asOf: now() };
   try {
+    if (typeof transport.storage === "function") {
+      const st = (await dev(() => transport.storage())) || {};
+      return { bytes: fin(st.free), total: fin(st.total), asOf: now() };
+    }
     const b = await dev(() => transport.freeSpace());
-    return { bytes: Number.isFinite(b) ? b : null, asOf: now() };
+    return { bytes: fin(b), total: null, asOf: now() };
   } catch (e) {
     if (e instanceof RunStop || (signal && signal.aborted)) throw e;
     // A device that drops here fails the next listing anyway; anything
     // else only costs the gauge.
     if (e && ["device-lost", "offline", "unauthorized"].includes(e.kind)) throw e;
     warnings.push({ kind: "free-space-unknown", message: e && e.message });
-    return { bytes: null, asOf: now() };
+    return { bytes: null, total: null, asOf: now() };
   }
 }
 

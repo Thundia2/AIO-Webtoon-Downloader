@@ -1372,6 +1372,46 @@ test("U0b evict: removing a whole series trips the mass-delete acknowledgement",
   assert.ok(planner.reconcileForApply({ reviewed: p, fresh: p, storedOps: {}, ackMassDelete: true }).ok);
 });
 
+test("U2 mass acknowledgement is the count the user saw: a different count blocks", () => {
+  const p = evictFixture({ n: 12 });
+  const ok = (stored, ack) => planner.reconcileForApply({ reviewed: p, fresh: p, storedOps: stored, ackMassDelete: ack }).ok;
+  assert.ok(ok({}, 12), "the shown count acknowledges");
+  assert.ok(!ok({}, 11), "a stale count does not");
+  assert.ok(!ok({}, false));
+  // The selection shrinks after the tick: the count moved, so the old tick is void.
+  const one = opsOf(p, "pc:Alpha").find((o) => o.kind === "delete" && o.name === "Ch.001.cbz");
+  const stored = { [one.id]: { sha: one.sha, selected: false } };
+  assert.strictEqual(planner.evaluateSelection(p, sel(p, stored)).massDelete.count, 11);
+  assert.ok(!ok(stored, 12));
+  assert.ok(ok(stored, 11));
+});
+
+test("U2 bulk series: off unticks every offered op; on returns to the plan's pre-selection", () => {
+  const p = evictFixture({ extraDev: [["Ch.004.cbz", 1004, 9]] });
+  const ids = opsOf(p, "pc:Alpha").map((o) => o.id);
+  const off = planner.changeSelection(p, {}, { bulk: "series", seriesKey: "pc:Alpha", selected: false });
+  assert.ok(off.ok);
+  assert.deepStrictEqual(off.changedSeries, ["pc:Alpha"]);
+  const s0 = sel(p, off.ops);
+  assert.ok(ids.every((id) => s0.get(id) === false));
+  const on = planner.changeSelection(p, off.ops, { bulk: "series", seriesKey: "pc:Alpha", selected: true });
+  assert.ok(on.ok);
+  assert.deepStrictEqual(Object.keys(on.ops), [], "stored choices forgotten");
+  const s1 = sel(p, on.ops);
+  for (const o of opsOf(p, "pc:Alpha")) assert.strictEqual(s1.get(o.id), !!o.preselected, o.name);
+  assert.strictEqual(s1.get(opsOf(p, "pc:Alpha").find((o) => o.name === "Ch.004.cbz").id), false, "never ticks the unproven delete");
+  assert.strictEqual(planner.changeSelection(p, {}, { bulk: "series", seriesKey: "pc:Nope", selected: true }).code, "invalid");
+});
+
+test("U2 summary rows: offered/preselected counts, attention codes, suggestionList", () => {
+  const p = evictFixture({ extraDev: [["Ch.004.cbz", 1004, 9]] });
+  const sum = planner.planSummary(p, sel(p));
+  const row = sum.series.find((x) => x.seriesKey === "pc:Alpha");
+  assert.deepStrictEqual([row.counts.offered, row.counts.preselected], [4, 3], "3 proven chapter deletes + the unticked foreign Ch.004");
+  assert.deepStrictEqual(row.attention, [], "excluded + removing is not attention (it is under Removals)");
+  assert.ok(Array.isArray(sum.suggestionList));
+});
+
 console.log("job record");
 
 function fakeClock() {

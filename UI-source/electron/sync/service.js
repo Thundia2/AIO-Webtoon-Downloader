@@ -65,7 +65,8 @@
 // UI-PASS CONTRACT (U0, plan sync-temp/plans/device-sync-ui-pass.md):
 //   * PUSHED, NOT RE-READ. Every change to a target's plan state calls
 //     _planChanged(id) → one coalesced `plans` event per target per tick
-//     {targetId, summary, refusal, stale, lastRun, gen, removed?}. `adb`
+//     {targetId, summary, refusal, stale, lastRun, gen, selSeq, lastPlan,
+//     removed?}. `adb`
 //     and `settings` events cover the rest. get-state is the first read only.
 //   * GEN IS THE REVIEW CONTRACT. Every adopted plan gets a new gen
 //     (summary.gen). apply {gen} must name the gen the user looked at; a
@@ -83,6 +84,17 @@
 //     outlives the re-plan its own job queues.
 //   * DOWNLOAD GUARD: the executor skips a series folder a running download
 //     writes (grep _busyCheck).
+//
+// SYNC TAB CONTRACT (U2, same plan, section "Phase U2 design"):
+//   * AUTO-PLAN IS DECIDED HERE: plan {ifNeeded:true} plans only when the
+//     target needs it (grep _planIfNeeded); a cancelled or failed plan sets
+//     rt.autoHold until _replanSoon / a connect / a manual plan clears it, so
+//     a renderer that asks on every tab open can't loop.
+//   * ACKS ARE WHAT WAS SHOWN: apply's ackMassDelete / ackMassRepush are the
+//     counts the review displayed (grep _ackArgs); set-selection takes the
+//     plan `gen` the click was made on and echoes its `seq` as the plan
+//     view's selSeq.
+//   * SETTLING RE-PLANS ITSELF at settleAt (grep _armSettle).
 //
 // HANDOFF OBLIGATIONS FOR THE UI PASS (non-UI plan, Integration edits):
 //   * render payload.sync in ConfirmQuitDialog (a sync-only close would say
@@ -129,6 +141,9 @@ const { ServiceLog, insideAsar } = require("./diag-log");
 
 const PREWARM_DELAY_MS = 30 * 1000;
 const REPLAN_DEBOUNCE_MS = 10 * 1000;
+// _armSettle fires this long after a plan's settleAt, so the file that set
+// it is past the settle age when the re-plan's listing reads it.
+const SETTLE_REPLAN_SLACK_MS = 1000;
 const BUSY_POLL_MS = 5000;
 const SHUTDOWN_MS = 5000;
 const COVER_MAX_BYTES = 8 * 1024 * 1024;
@@ -337,6 +352,15 @@ function initDeviceSync(deps) {
         refusal: null,
         stale: false,
         lastRun: null,
+        // UI-pass U2-3: the last set-selection `seq` applied, echoed in the
+        // plan view so the renderer's pending marks clear on the push that
+        // carries the change, whatever order reply and event arrive in.
+        selSeq: null,
+        // U2-1: the last plan job's outcome, and whether `plan {ifNeeded}`
+        // must hold off (a failed/cancelled plan, until something changes).
+        lastPlan: null,
+        autoHold: false,
+        settleTimer: null,
       };
       rts.set(id, r);
     }
@@ -345,10 +369,11 @@ function initDeviceSync(deps) {
 
   /** What `plans` events and get-state's plans[targetId] carry. */
   function _planView(id) {
-    if (!_target(id)) return { removed: true, summary: null, refusal: null, stale: false, lastRun: null, gen: null };
+    const empty = { summary: null, refusal: null, stale: false, lastRun: null, gen: null, selSeq: null, lastPlan: null };
+    if (!_target(id)) return { ...empty, removed: true };
     const rt = rts.get(id);
-    if (!rt) return { summary: null, refusal: null, stale: false, lastRun: null, gen: null };
-    return { summary: rt.summary, refusal: rt.refusal, stale: rt.stale, lastRun: rt.lastRun, gen: rt.summary ? rt.gen : null };
+    if (!rt) return empty;
+    return { summary: rt.summary, refusal: rt.refusal, stale: rt.stale, lastRun: rt.lastRun, gen: rt.summary ? rt.gen : null, selSeq: rt.selSeq, lastPlan: rt.lastPlan };
   }
 
   async function _loadConfig() {
@@ -491,6 +516,10 @@ function initDeviceSync(deps) {
     clearTimeout(prewarmTimer);
     clearTimeout(replanTimer);
     busyTimer = prewarmTimer = replanTimer = null;
+    for (const rt of rts.values()) {
+      clearTimeout(rt.settleTimer);
+      rt.settleTimer = null;
+    }
     if (prewarmAc) prewarmAc.abort();
     if (prompts) for (const p of prompts.shown()) emit("prompt", { action: "withdraw", prompt: p, prompts: [] });
     for (const k of ["adb", "folder"]) connected[k].clear();
@@ -601,6 +630,10 @@ function initDeviceSync(deps) {
   }
 
   function _connected(connKey, serial, targetIds) {
+    for (const id of targetIds) {
+      const crt = rts.get(id);
+      if (crt) crt.autoHold = false;
+    }
     if (!settings.syncPromptOnConnect) return;
     if (!prompts.connected({ connKey, serial, targetIds })) return;
     autoBatches.set(connKey, { serial, waiting: new Set(targetIds), summaries: [] });
@@ -822,6 +855,13 @@ function initDeviceSync(deps) {
       const { plan: _omit, ...rest } = summary || {};
       lrt.lastRun = { runId: job.runId, phase: job.phase, status, auto: !!job.auto, at: now(), summary: rest };
     }
+    if (lrt && job.phase === "plan") {
+      lrt.lastPlan = { runId: job.runId, status, auto: !!job.auto, reason: (summary && (summary.reason || (summary.refusal && summary.refusal.code))) || null, at: now() };
+      // A plan that didn't land holds `plan {ifNeeded}` off until something
+      // changes (_replanSoon / a connect / a manual plan): otherwise the
+      // Sync tab re-asks forever after a Cancel or an internal failure.
+      lrt.autoHold = status !== "completed";
+    }
     _planChanged(job.targetId);
     // Prompt bookkeeping for automatic connect plans.
     if (job.phase === "plan") {
@@ -904,8 +944,10 @@ function initDeviceSync(deps) {
         jobs.progress(runId, { step: "device-ready", preflight: ev.preflight || null }, { immediate: true });
         return;
       }
-      const p = { step: ev.phase || null };
-      if (ev.filesDone != null) Object.assign(p, { filesDone: ev.filesDone, filesTotal: ev.filesTotal, bytesDone: ev.bytesDone, bytesTotal: ev.bytesTotal, current: ev.current || null });
+      // `at` is main's clock, so the renderer's throughput/ETA (U2-7) don't
+      // measure IPC jitter; `lane` = this series' landed writes (apply only).
+      const p = { step: ev.phase || null, at: now() };
+      if (ev.filesDone != null) Object.assign(p, { filesDone: ev.filesDone, filesTotal: ev.filesTotal, bytesDone: ev.bytesDone, bytesTotal: ev.bytesTotal, current: ev.current || null, lane: ev.lane || null });
       else if (ev.done != null) Object.assign(p, { filesDone: ev.done, filesTotal: ev.total, bytesDone: ev.bytesDone || 0, bytesTotal: ev.bytesTotal || 0, current: ev.folder || null });
       jobs.progress(runId, p);
     };
@@ -977,10 +1019,16 @@ function initDeviceSync(deps) {
     const free = fsr.bytes;
     return {
       free,
+      // UI-pass U2-5: the gauge's "used" part; null when the transport
+      // can't say (then the bar is drawn against free space alone).
+      total: fsr.total == null ? null : fsr.total,
       needed,
       reserve: RESERVE_BYTES,
       freeable,
       freeableEarly,
+      // Free space once the selection has run: growth minus what its
+      // deletes give back. The gauge's ghost bar and "after sync" label.
+      after: free == null ? null : free - needed + freeable,
       fits: free == null ? null : needed <= 0 || needed <= free - RESERVE_BYTES + freeableEarly,
       asOf: fsr.asOf,
     };
@@ -1014,8 +1062,28 @@ function initDeviceSync(deps) {
     rt.selRebinds = { ...(prep.view.selection.rebinds || {}) };
     rt.selEpoch = epoch;
     rt.summary = _summarize(rt);
+    _armSettle(rt);
     _planChanged(rt.id);
     return rt.summary;
+  }
+
+  /**
+   * UI-pass U2-6: files younger than the settle age are held (planner
+   * SETTLE_MS) and the summary counts down to `settleAt`; nothing else
+   * re-plans then, so the countdown would reach 0 and stop. One timer per
+   * target, replaced by every adopt, cleared on stop.
+   */
+  function _armSettle(rt) {
+    if (rt.settleTimer) clearTimeout(rt.settleTimer);
+    rt.settleTimer = null;
+    const at = rt.plan && rt.plan.settleAt;
+    if (at == null) return;
+    const ms = Math.max(0, at - now()) + SETTLE_REPLAN_SLACK_MS;
+    rt.settleTimer = setTimeout(() => {
+      rt.settleTimer = null;
+      if (started && rts.get(rt.id) === rt) _replanSoon(rt.id);
+    }, ms);
+    if (rt.settleTimer.unref) rt.settleTimer.unref();
   }
 
   function _refused(rt, r) {
@@ -1028,6 +1096,7 @@ function initDeviceSync(deps) {
   /** overrides: one-shot {hashMode, verifyMode, verifyFirst} for this plan only. */
   function _startPlan(targetId, { auto = false, overrides = {} } = {}) {
     const t = _target(targetId);
+    if (!auto && rts.get(targetId)) rts.get(targetId).autoHold = false;
     return _runJob({ phase: "plan", targetId, serial: t.serial, auto }, async (runId, signal, transport, cfg) => {
       const rt = _rt(targetId);
       const opts = { hashMode: overrides.hashMode, verifyMode: overrides.verifyMode };
@@ -1035,6 +1104,8 @@ function initDeviceSync(deps) {
       if (!prep.ok) return _refused(rt, prep);
       if (overrides.verifyFirst) {
         const v = await _verifyFolders(rt, prep, transport, signal, runId, overrides.verifyMode || cfg.verifyMode, null);
+        // needs-mode is a refusal the Sync tab answers (U2-1), not a failed run.
+        if (v.status === "failed" && v.reason === "needs-mode") return _refused(rt, refuse("needs-mode", "this device can't hash files: choose how to verify", { modes: ["read-back", "adopt-size"] }));
         if (v.status !== "completed") return { status: v.status, summary: { reason: v.reason } };
         prep = await _prepare(rt, cfg, transport, signal, runId, opts);
         if (!prep.ok) return _refused(rt, prep);
@@ -1148,6 +1219,7 @@ function initDeviceSync(deps) {
   /** Queue a fresh plan of this target behind the current job (after an edit or a run). */
   function _replanSoon(targetId) {
     const rt = rts.get(targetId);
+    if (rt) rt.autoHold = false;
     if (rt && !rt.stale) {
       rt.stale = true;
       _planChanged(targetId);
@@ -1429,7 +1501,9 @@ function initDeviceSync(deps) {
     const ref = _planSeriesRef(t.id, p.seriesKey);
     if (!ref) return refuse("invalid", "that series isn't in this target's plan");
     const excludes = (t.excludes || []).filter((e) => !_sameSeries(e, ref));
-    excludes.push({ ...ref, removeFiles: true });
+    // removeFiles:false is the detail sheet's Exclude (U2-8): stop syncing,
+    // leave the folder on the target (it becomes a preserved device-only row).
+    excludes.push(p.removeFiles === false ? { ...ref } : { ...ref, removeFiles: true });
     const only = (t.only || []).filter((e) => !_sameSeries(e, ref));
     return { patch: { excludes, only } };
   };
@@ -1577,6 +1651,7 @@ function initDeviceSync(deps) {
   }
 
   H.plan = async (p) => {
+    if (p.ifNeeded === true) return _planIfNeeded(p);
     const pre = _jobPre(p);
     if (pre.refusal) return pre.refusal;
     if (!(await _libraryPresent())) return refuse("library-missing", "the library folder can't be read");
@@ -1597,6 +1672,39 @@ function initDeviceSync(deps) {
     }
     return _startPlan(pre.t.id, { overrides });
   };
+
+  /**
+   * `plan {ifNeeded:true}` (UI-pass U2-1): the Sync tab asks on every open
+   * and target switch, and the SERVICE decides, so a renderer that unmounts
+   * on each tab switch can't loop or miss a stale plan. Plans only when the
+   * target is connected and has no current summary (none, or stale), holds
+   * no refusal, isn't queued or running, and its last plan didn't fail
+   * (autoHold). Queued as an automatic plan (jobs.enqueueAuto dedups),
+   * never refused `busy`. {ok, planned:boolean, why} says what it did.
+   */
+  async function _planIfNeeded(p) {
+    const t = _target(p.targetId);
+    if (!t) return refuse("invalid", "unknown target");
+    const rt = rts.get(t.id);
+    const why = !_isConnected(t)
+      ? "disconnected"
+      : current && current.targetId === t.id
+        ? "running"
+        : jobs.snapshot().queue.some((q) => q.targetId === t.id)
+          ? "queued"
+          : rt && rt.refusal
+            ? "refused"
+            : rt && rt.summary && !rt.stale
+              ? "fresh"
+              : rt && rt.autoHold
+                ? "held"
+                : null;
+    if (why) return { ok: true, planned: false, why };
+    if (!(await _libraryPresent())) return refuse("library-missing", "the library folder can't be read");
+    jobs.enqueueAuto({ targetId: t.id, serial: t.serial || null });
+    setImmediate(_pump);
+    return { ok: true, planned: true, why: null };
+  }
 
   H["series-detail"] = async (p) => {
     const rt = rts.get(p.targetId);
@@ -1632,6 +1740,9 @@ function initDeviceSync(deps) {
     if (current && current.targetId === p.targetId && QUIT_ASK_PHASES.has(current.phase)) {
       return refuse("busy", "that target's sync is running", { job: jobs.snapshot().job });
     }
+    // U2-3: a toggle made on an older plan would land on the new plan's op
+    // of the same id. Optional so in-process callers needn't track gens.
+    if (p.gen != null && p.gen !== rt.gen) return _genMismatch(rt, p.gen);
     let changedSeries = [];
     if (_isObj(p.rebind)) {
       if (current) return refuse("busy", "another sync job is running");
@@ -1661,6 +1772,7 @@ function initDeviceSync(deps) {
       rt.summary = _summarize(rt);
       changedSeries = r.changedSeries;
     }
+    if (Number.isInteger(p.seq)) rt.selSeq = p.seq;
     _planChanged(p.targetId);
     const ev = planner.evaluateSelection(rt.plan, _selection(rt));
     return {
@@ -1689,20 +1801,29 @@ function initDeviceSync(deps) {
       return refuse("needs-mode", "this device can't hash files: choose how to verify", { modes: ["read-back", "adopt-size"] });
     }
     const folders = Array.isArray(p.folders) ? p.folders.map(String) : null;
+    // Re-check's "Re-hash" + "Read back" together (design D4, U2-9): the
+    // PC-side choice rides this one verify job's prepares, then is gone.
+    const hashMode = ["cached", "rehash"].includes(p.hashMode) ? p.hashMode : undefined;
+    const vopts = { verifyMode: mode === "device-hash" ? undefined : mode, hashMode };
     return _runJob({ phase: "verify", targetId: pre.t.id, serial: pre.t.serial }, async (runId, signal, transport, cfg) => {
-      let prep = await _prepare(rt, cfg, transport, signal, runId, { verifyMode: mode === "device-hash" ? undefined : mode });
+      let prep = await _prepare(rt, cfg, transport, signal, runId, vopts);
       if (!prep.ok) return _refused(rt, prep);
       const v = await _verifyFolders(rt, prep, transport, signal, runId, mode, folders);
       if (v.status === "failed" && v.reason === "needs-mode") return _refused(rt, refuse("needs-mode", "this device can't hash files: choose how to verify", { modes: ["read-back", "adopt-size"] }));
       if (v.status !== "completed") return { status: v.status, summary: _runSummary(v) };
-      prep = await _prepare(rt, cfg, transport, signal, runId, { verifyMode: mode === "device-hash" ? undefined : mode });
+      prep = await _prepare(rt, cfg, transport, signal, runId, { verifyMode: vopts.verifyMode });
       if (!prep.ok) return _refused(rt, prep);
       return { status: "completed", summary: { ..._runSummary(v), plan: _adopt(rt, prep) } };
     });
   };
 
+  // Mass acknowledgments over IPC are the COUNT the review showed (U2-2):
+  // reconcileForApply blocks unless it equals the fresh count, so a
+  // selection change that grows the set after the tick can't ride on it.
+  // A bare `true` is not accepted from the renderer.
   function _ackArgs(p) {
-    return { ackLosses: Array.isArray(p.ackLosses) ? p.ackLosses.map(String) : [], ackMassDelete: p.ackMassDelete === true, ackMassRepush: p.ackMassRepush === true };
+    const n = (v) => (Number.isInteger(v) && v >= 0 ? v : false);
+    return { ackLosses: Array.isArray(p.ackLosses) ? p.ackLosses.map(String) : [], ackMassDelete: n(p.ackMassDelete), ackMassRepush: n(p.ackMassRepush) };
   }
 
   H.apply = async (p) => {
@@ -2118,6 +2239,7 @@ function initDeviceSync(deps) {
         clearInterval(busyTimer);
         clearTimeout(prewarmTimer);
         clearTimeout(replanTimer);
+        for (const rt of rts.values()) clearTimeout(rt.settleTimer);
         if (prewarmAc) prewarmAc.abort();
       } catch (_) {}
       try {

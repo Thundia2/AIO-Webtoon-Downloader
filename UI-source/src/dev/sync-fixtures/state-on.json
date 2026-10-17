@@ -74,7 +74,7 @@
       "adbPath": null,
       "targets": [
         {
-          "id": "t536c8b07d4",
+          "id": "ta04a6a7d40",
           "deletePolicy": "guarded",
           "excludes": [
             {
@@ -96,7 +96,7 @@
           "profile": "komikku"
         },
         {
-          "id": "t4cddf0349c",
+          "id": "tf123a9409e",
           "deletePolicy": "guarded",
           "excludes": [],
           "aliases": [],
@@ -108,7 +108,7 @@
           "profile": "everything"
         },
         {
-          "id": "ta2b07914bf",
+          "id": "ta639c4d7b4",
           "deletePolicy": "guarded",
           "excludes": [],
           "aliases": [],
@@ -153,7 +153,7 @@
       ],
       "tracking": "tracking",
       "trackingError": null,
-      "at": 1792177153783
+      "at": 1792184438862
     },
     "devices": [
       {
@@ -176,17 +176,17 @@
       }
     ],
     "folderPresence": {
-      "t4cddf0349c": true
+      "tf123a9409e": true
     },
     "job": {
       "job": {
         "runId": 1,
         "phase": "plan",
-        "targetId": "t536c8b07d4",
+        "targetId": "ta04a6a7d40",
         "serial": "R5CW71ABCDE",
         "auto": true,
         "state": "running",
-        "startedAt": 1792177153799,
+        "startedAt": 1792184438882,
         "finishedAt": null,
         "progress": {
           "bytesDone": 0,
@@ -195,45 +195,52 @@
           "filesTotal": 0,
           "current": null,
           "preflight": null,
-          "step": "probe"
+          "step": "probe",
+          "at": 1792184438883
         },
         "status": null,
         "summary": null
       },
       "queue": [
         {
-          "targetId": "t4cddf0349c",
+          "targetId": "tf123a9409e",
           "serial": null,
-          "queuedAt": 1792177153809
+          "queuedAt": 1792184438892
         },
         {
-          "targetId": "t536c8b07d4",
+          "targetId": "ta04a6a7d40",
           "serial": "R5CW71ABCDE",
-          "queuedAt": 1792177153819
+          "queuedAt": 1792184438903
         }
       ]
     },
     "plans": {
-      "t536c8b07d4": {
+      "ta04a6a7d40": {
         "summary": null,
         "refusal": null,
         "stale": true,
         "lastRun": null,
-        "gen": null
+        "gen": null,
+        "selSeq": null,
+        "lastPlan": null
       },
-      "t4cddf0349c": {
+      "tf123a9409e": {
         "summary": null,
         "refusal": null,
         "stale": false,
         "lastRun": null,
-        "gen": null
+        "gen": null,
+        "selSeq": null,
+        "lastPlan": null
       },
-      "ta2b07914bf": {
+      "ta639c4d7b4": {
         "summary": null,
         "refusal": null,
         "stale": false,
         "lastRun": null,
-        "gen": null
+        "gen": null,
+        "selSeq": null,
+        "lastPlan": null
       }
     },
     "prompt": null,

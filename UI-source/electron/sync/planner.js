@@ -1383,7 +1383,7 @@ function evaluateSelection(plan, selected) {
  * the series whose ops changed; rebind changes go through applyRebind.
  * @param {object} plan
  * @param {object} storedOps
- * @param {object} req  {changes:[{opId, selected}]} or {bulk:'covered-extras'|'split-parts'|'group', seriesKey?, group?, reason?, selected?}
+ * @param {object} req  {changes:[{opId, selected}]} or {bulk:'covered-extras'|'split-parts'|'group'|'series', seriesKey?, group?, reason?, selected?}
  *   A `group` bulk with `reason` touches only that kind's ops with that
  *   reason: the review's group checkboxes are per (kind, reason)
  *   (planReview), so "untick every sidecar delete" leaves extras alone.
@@ -1405,7 +1405,22 @@ function changeSelection(plan, storedOps, req) {
     return { ok: true, ops, changedSeries: [...changed] };
   }
   const inScope = (sp) => !req.seriesKey || sp.seriesKey === req.seriesKey;
-  if (req.bulk === "group") {
+  if (req.bulk === "series") {
+    // The ledger row's checkbox (UI-pass U2-3). Off = every offered op of the
+    // series off. On = forget the stored choices, so the plan's own
+    // pre-selection applies again: never "tick everything", which would
+    // select replace candidates and unproven deletes nobody looked at.
+    const sp = plan.bySeriesKey.get(req.seriesKey);
+    if (!sp) return refuse("invalid", "unknown series");
+    for (const id of sp.opIds) {
+      const op = plan.ops.get(id);
+      if (req.selected === false) set(op, false);
+      else {
+        delete ops[id];
+        if (current.get(id) !== !!op.preselected) changed.add(op.seriesKey);
+      }
+    }
+  } else if (req.bulk === "group") {
     if (!["push", "update", "replace", "rename", "delete"].includes(req.group)) return refuse("invalid", "unknown group");
     if (req.reason != null && typeof req.reason !== "string") return refuse("invalid", "reason must be a string");
     for (const sp of plan.series) {
@@ -1494,8 +1509,8 @@ function _signature(op) {
  * @param {object} a.fresh        The re-plan.
  * @param {object} a.storedOps    selection.json `ops`.
  * @param {string[]} [a.ackLosses]  Loss op ids the user ticked individually.
- * @param {boolean} [a.ackMassDelete]
- * @param {boolean} [a.ackMassRepush]
+ * @param {boolean|number} [a.ackMassDelete]  true, or the acknowledged count
+ * @param {boolean|number} [a.ackMassRepush]
  * @returns {{ok:boolean, ops:object[], dropped:Array<{opId,reason}>, blocking:object[], evaluation:object}}
  */
 function reconcileForApply(a) {
@@ -1532,8 +1547,12 @@ function reconcileForApply(a) {
   const blocking = [];
   const unacked = ev.losses.filter((id) => !acked.has(id));
   if (unacked.length) blocking.push({ kind: "loss", opIds: unacked });
-  if (ev.massDelete.required && !a.ackMassDelete) blocking.push({ kind: "mass-delete", count: ev.massDelete.count });
-  if (ev.massRepush.required && !a.ackMassRepush) blocking.push({ kind: "mass-repush", count: ev.massRepush.count });
+  // A mass acknowledgment is the COUNT the user saw (UI-pass U2-2): a
+  // selection change after the tick that grows the set needs a new tick.
+  // `true` is the in-process form (tests); service.js _ackArgs never passes it.
+  const ackOk = (ack, n) => ack === true || (Number.isInteger(ack) && ack === n);
+  if (ev.massDelete.required && !ackOk(a.ackMassDelete, ev.massDelete.count)) blocking.push({ kind: "mass-delete", count: ev.massDelete.count });
+  if (ev.massRepush.required && !ackOk(a.ackMassRepush, ev.massRepush.count)) blocking.push({ kind: "mass-repush", count: ev.massRepush.count });
   if (a.fresh.sanity.length) blocking.push({ kind: "listing-sanity", folders: a.fresh.sanity.map((x) => x.folder) });
   const ops = [];
   for (const sp of a.fresh.series) {
@@ -1763,6 +1782,8 @@ function seriesDetail(plan, seriesKey, selected) {
 function planSummary(plan, selected) {
   const ev = evaluateSelection(plan, selected);
   const lossSet = new Set(ev.losses);
+  const ackedAnomaly = new Set(plan.anomalies.filter((a) => a.acknowledged).map((a) => a.id));
+  const verifyKeys = new Set(plan.needsVerify.map((n) => n.seriesKey));
   return {
     targetId: plan.targetId,
     asOf: plan.asOf,
@@ -1781,9 +1802,10 @@ function planSummary(plan, selected) {
       state: sp.state,
       heldReason: sp.heldReason,
       removing: !!sp.evict,
-      counts: { ...sp.counts, ...ev.perSeries.get(sp.seriesKey) },
+      counts: { ...sp.counts, ...ev.perSeries.get(sp.seriesKey), ..._offeredCounts(plan, sp) },
       tags: sp.tags,
       anomalies: sp.anomalyIds.length,
+      attention: _attention(plan, sp, selected, lossSet, ackedAnomaly, verifyKeys),
       suggestions: plan.suggestions.filter((g) => g.seriesKey === sp.seriesKey && !g.ignored).length,
       hasLoss: sp.opIds.some((id) => lossSet.has(id)),
       rebind: sp.rebind ? { chosen: sp.rebind.chosen, fellBack: sp.rebind.fellBack, declined: sp.rebind.declined } : null,
@@ -1792,7 +1814,48 @@ function planSummary(plan, selected) {
     deviceOnly: plan.deviceOnly,
     anomalies: plan.anomalies.length,
     suggestions: plan.suggestions.filter((g) => !g.ignored).length,
+    // Enough for the device-only rows to draw Link without a detail pull.
+    suggestionList: plan.suggestions
+      .filter((g) => !g.ignored)
+      .map((g) => ({ id: g.id, seriesKey: g.seriesKey, deviceFolder: g.deviceFolder, tier: g.tier, strong: g.strong })),
   };
+}
+
+/**
+ * Per-series offer counts for the ledger row's checkbox (UI-pass U2-4):
+ * `offered` = ops the row's box acts on, `preselected` = how many of them the
+ * plan ticks by itself. offered 0 → no box; preselected 0 → the box opens the
+ * detail instead (bulk 'series' on would change nothing).
+ */
+function _offeredCounts(plan, sp) {
+  let offered = 0;
+  let preselected = 0;
+  for (const id of sp.opIds) {
+    offered += 1;
+    if (plan.ops.get(id).preselected) preselected += 1;
+  }
+  return { offered, preselected };
+}
+
+/**
+ * Why a series lands under "Needs attention" (spec §5 tiles), as reason
+ * codes the renderer only maps to copy (copy.js ATTENTION_COPY). Excluded
+ * series aren't attention (the user chose that); a series being removed is
+ * shown under Removals instead.
+ */
+function _attention(plan, sp, selected, lossSet, ackedAnomaly, verifyKeys) {
+  const out = [];
+  if (sp.state === "held" && sp.heldReason !== "excluded" && !sp.evict) out.push("held");
+  if (sp.anomalyIds.some((id) => !ackedAnomaly.has(id))) out.push("anomaly");
+  if (sp.opIds.some((id) => lossSet.has(id))) out.push("loss");
+  if (sp.blockedBy.length) out.push("suggestion");
+  if (verifyKeys.has(sp.seriesKey)) out.push("needs-verify");
+  if (sp.rebind && sp.rebind.fellBack) out.push("rebind-fell-back");
+  // A replace candidate is a `replace` op, or the delete of the target's own
+  // copy of that chapter (reason `replacement`) the plan left unticked.
+  const isCandidate = (op) => op.kind === "replace" || (op.kind === "delete" && op.reason === "replacement");
+  if (sp.opIds.some((id) => isCandidate(plan.ops.get(id)) && !selected.get(id))) out.push("replace-unticked");
+  return out;
 }
 
 /** The selected ops, in plan order (service.js's capacity: spaceNeeded). */

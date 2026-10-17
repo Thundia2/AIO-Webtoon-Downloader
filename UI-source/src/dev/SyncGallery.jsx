@@ -4,8 +4,9 @@
 // Renders the REAL components (SettingsTab at its Sync category, the quit
 // dialog's sync line, the overlay primitives) against fixture-backed fake
 // sync backends (./syncFixtureSource.js), each case in a light and a `.dark`
-// frame at a fixed width. Phase U1 of sync-temp/plans/device-sync-ui-pass.md;
-// later phases add their cases here.
+// frame at a fixed width. Phase U1 of sync-temp/plans/device-sync-ui-pass.md
+// added the Settings cases; U2 adds the Sync tab ("tab-*", the fake source's
+// TAB MODE) and the card sheet ("cards").
 //
 // URL: ?gallery=sync                      index of cases
 //      ?gallery=sync&case=<id>            one case, light above dark
@@ -24,6 +25,9 @@ import SettingsTab, { DEFAULT_SETTINGS } from "@/components/SettingsTab";
 import { Dialog, Sheet } from "@/components/ui/overlay";
 import { Button } from "@/components/ui/primitives";
 import { useDeviceSync } from "@/hooks/useDeviceSync";
+import SyncTab from "@/components/sync/SyncTab";
+import { LastRunCard, RefusalCard } from "@/components/sync/SyncCards";
+import { lastRunView } from "@/components/sync/syncView";
 import { FIXTURES, makeSyncSource } from "./syncFixtureSource";
 
 const savedFrom = (snap, over) => {
@@ -63,6 +67,89 @@ const CASES = [
     saved: savedFrom(FIXTURES.stateOn, { syncChapterPatterns: "Episode (\\d+" }),
   },
 ];
+
+// The fixture library (tools/_gen_sync_fixtures.js): titles only, no cover
+// files, so rows show the placeholder cover.
+const TAB_LIBRARY = ["Blue Lock", "Dungeon Meshi", "Eleceed", "Frieren", "Kagurabachi", "Solo Leveling", "Tower of God"].map((n) => ({
+  folderName: n,
+  title: n,
+  folderPath: "D:/Sync-fixture/manga/" + n,
+}));
+const tabPlan = (s) => Object.values(s.plans)[0];
+const TAB_CASES = [
+  { id: "tab-planned", title: "Tab: planned", note: "Pre-selected changes, mass-delete pending, one held series, device-only section.", spec: { tab: "planned" } },
+  { id: "tab-loss", title: "Tab: a loss ticked", note: "Dungeon Meshi ch.3 removal ticked (lives on neither side after).", spec: { tab: "withLoss" } },
+  {
+    id: "tab-settling",
+    title: "Tab: settling",
+    note: "settleAt moved to now + 23 s: the dock counts down.",
+    spec: { tab: "planned", mutate: (s) => { tabPlan(s).summary.settleAt = Date.now() + 23000; } },
+  },
+  { id: "tab-pending", title: "Tab: selection pending", note: "Every set-selection is held: click a row box to see the pending state.", spec: { tab: "planned", hold: true } },
+  { id: "tab-detail", title: "Tab: series detail (Eleceed)", spec: { tab: "planned" }, initial: { detail: "pc:Eleceed" } },
+  { id: "tab-detail-loss", title: "Tab: series detail with a loss", spec: { tab: "withLoss" }, initial: { detail: "pc:Dungeon Meshi" } },
+  { id: "tab-detail-device", title: "Tab: device-only folder detail", spec: { tab: "planned" }, initial: { detail: "dev:Kagurabachi_" } },
+  { id: "tab-review", title: "Tab: review", spec: { tab: "planned" }, initial: { review: true } },
+  { id: "tab-review-loss", title: "Tab: review with a loss to confirm", spec: { tab: "withLoss" }, initial: { review: true } },
+  { id: "tab-prune", title: "Tab: remove folders", spec: { tab: "planned" }, initial: { prune: true } },
+  { id: "tab-edit", title: "Tab: connected target settings", spec: { tab: "planned" }, initial: { edit: true } },
+  { id: "tab-applying", title: "Tab: applying", note: "The recorded mid-apply snapshot.", spec: { tab: "applying" } },
+  { id: "tab-after", title: "Tab: after apply", note: "Last-run card (evicted Tower of God).", spec: { tab: "afterApply" } },
+  { id: "tab-first", title: "Tab: first sync", spec: { tab: "firstSync" } },
+  { id: "tab-mismatch", title: "Tab: record mismatch", spec: { tab: "recordMismatch" } },
+  { id: "tab-suspect", title: "Tab: device listing suspect", spec: { tab: "listingSuspect" } },
+  { id: "tab-disconnected", title: "Tab: disconnected", spec: { tab: "disconnected" } },
+  { id: "tab-needs-mode", title: "Tab: needs a verify mode (adb)", spec: { tab: "needsMode" } },
+  { id: "tab-none", title: "Tab: no targets", spec: { tab: "planned", mutate: (s) => { s.config.targets = []; } } },
+];
+
+function TabCase({ c }) {
+  const sync = useDeviceSync({ source: makeSyncSource(c.spec) });
+  return <SyncTab sync={sync} contained initial={c.initial} libraryEntries={TAB_LIBRARY} onOpenSettings={() => {}} />;
+}
+
+// Every refusal code and last-run outcome as a card. Synthetic objects in the
+// service's shapes (service.js refuse(), _runSummary) except where a recorded
+// one exists (tab.json refusals, the recorded snapshots' lastRun).
+const T = FIXTURES.tab;
+const REFUSALS = [
+  ...Object.values(T.refusals),
+  tabPlan(T.snapshots.recordMismatch).refusal,
+  tabPlan(T.snapshots.listingSuspect).refusal,
+  tabPlan(T.snapshots.needsMode).refusal,
+  { ok: false, code: "device-listing-suspect", message: "far fewer files than recorded" },
+  { ok: false, code: "blocked", message: "the selection needs acknowledgments first", blocking: [{ kind: "loss", seriesKey: "pc:Dungeon Meshi", opIds: ["x"] }, { kind: "mass-delete", count: 12 }, { kind: "free-space", needed: 9.1e9, free: 4.2e9 }] },
+  FIXTURES.refusals.versionConflict,
+  FIXTURES.refusals.invalidField,
+  { ok: false, code: "disabled", message: "Device Sync is off" },
+  { ok: false, code: "internal", internal: true, message: "TypeError: x is undefined" },
+];
+const run = (status, summary, phase = "apply") => ({ runId: 1, phase, status, at: Date.now() - 60000, summary: { filesDone: 0, filesTotal: 0, bytesDone: 0, ...summary } });
+const RUNS = [
+  tabPlan(T.snapshots.afterApply).lastRun,
+  run("completed", { filesDone: 4, bytesDone: 1.2e8, skippedSeries: [{ seriesKey: "pc:Frieren", reason: "folder-reappeared" }], skippedReasons: { downloading: 2 } }),
+  run("cancelled", { filesDone: 12, filesTotal: 40, bytesDone: 3.4e8 }),
+  run("disconnected", { filesDone: 7, filesTotal: 40, bytesDone: 2.1e8 }),
+  run("failed", { reason: "no-space", filesDone: 3, failed: [{ folder: "Eleceed", name: "Ch.210 - Eleceed.cbz" }] }),
+  run("failed", { reason: "error-budget", filesDone: 20, failed: [{ folder: "Solo Leveling", name: "Ch.012.cbz" }] }),
+  run("failed", { refusal: { ok: false, code: "blocked", blocking: [{ kind: "plan-changed", gen: 6, reviewedGen: 5 }] } }),
+  run("completed", { prune: { removed: 2 } }, "prune"),
+  run("completed", {}, "rename"),
+  run("completed", { filesDone: 212 }, "verify"),
+];
+function CardsCase() {
+  const titleOf = (k) => String(k || "").replace(/^pc:/, "");
+  return (
+    <div className="flex h-full flex-col gap-2 overflow-auto p-4">
+      {REFUSALS.map((r, i) => (
+        <RefusalCard key={`r${i}`} refusal={r} tn="Galaxy Tab" onAction={() => {}} onDismiss={() => {}} />
+      ))}
+      {RUNS.map((r, i) => (
+        <LastRunCard key={`l${i}`} view={lastRunView(r, "Galaxy Tab", titleOf)} tn="Galaxy Tab" onAction={() => {}} onDismiss={() => {}} />
+      ))}
+    </div>
+  );
+}
 
 function Case({ c }) {
   const sync = useDeviceSync({ source: makeSyncSource(c.spec) });
@@ -119,12 +206,17 @@ function OverlaysCase() {
   );
 }
 
-const ALL = [...CASES, { id: "overlays", title: "Overlay primitives", note: "Dialog over a Sheet, both contained.", render: () => <OverlaysCase /> }];
+const ALL = [
+  ...CASES,
+  { id: "overlays", title: "Overlay primitives", note: "Dialog over a Sheet, both contained.", render: () => <OverlaysCase /> },
+  ...TAB_CASES.map((c) => ({ ...c, render: () => <TabCase c={c} /> })),
+  { id: "cards", title: "Tab: every refusal and last-run card", height: 2600, render: () => <CardsCase /> },
+];
 
-function Frame({ theme, width, children }) {
+function Frame({ theme, width, height = 640, children }) {
   return (
     <div className={theme === "dark" ? "dark" : ""}>
-      <div className="relative overflow-hidden border bg-background text-foreground" style={{ width, height: 640 }}>
+      <div className="relative overflow-hidden border bg-background text-foreground" style={{ width, height }}>
         {children}
       </div>
     </div>
@@ -159,7 +251,7 @@ export default function SyncGallery() {
         <b className="text-foreground">{c.title}</b> · {width}px {c.note ? `· ${c.note}` : ""} · <a className="underline" href="?gallery=sync">all cases</a>
       </div>
       {themes.map((t) => (
-        <Frame key={t} theme={t} width={width}>
+        <Frame key={t} theme={t} width={width} height={c.height}>
           {c.render ? c.render() : <Case c={c} />}
         </Frame>
       ))}

@@ -53,6 +53,11 @@ export default function App() {
   // (hooks/useDeviceSync.js). `sync.enabled` is the service's live state, not
   // the saved setting, so the tab appears only once the service has started.
   const sync = useDeviceSync();
+  // The Sync tab's per-visit view (picked target, tile filter, query, sort,
+  // dismissed last-run cards) lives here, not in the tab: App unmounts tabs
+  // on every switch (UI-pass U2-14; components/sync/SyncTab.jsx `view`).
+  const [syncView, setSyncView] = useState({ targetId: null, tile: null, query: "", sort: "copy", dismissed: {} });
+  const patchSyncView = React.useCallback((patch) => setSyncView((v) => ({ ...v, ...patch })), []);
   const tabs = useMemo(() => {
     if (!sync.enabled) return BASE_TABS;
     const at = BASE_TABS.findIndex((t) => t.id === "settings");
@@ -276,8 +281,12 @@ export default function App() {
           {activeTab === "sync" && sync.enabled && (
             <SyncTab
               sync={sync}
-              onOpenSettings={() => {
-                setSettingsCategory("sync");
+              view={syncView}
+              onView={patchSyncView}
+              libraryEntries={dl.libraryEntries}
+              loadLibrary={dl.loadLibrary}
+              onOpenSettings={(category) => {
+                setSettingsCategory(category === "general" ? "general" : "sync");
                 setActiveTab("settings");
               }}
             />

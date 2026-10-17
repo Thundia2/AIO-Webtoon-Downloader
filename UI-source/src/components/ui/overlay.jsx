@@ -61,9 +61,10 @@ function useOverlayLifecycle(open, onClose, panelRef, { restoreFocus = true } = 
 /**
  * Centered modal. Sizes from the spec: Review 660 / 720 px, Remove folders
  * 520 px; max height is the frame minus 32 px, the body scrolls.
+ * `bodyClassName` overrides the body's padding (a list that runs edge to edge).
  * Appears without movement (opacity, 120 ms).
  */
-export function Dialog({ open, onClose, title, description, children, footer, width = 520, contained, className, "aria-label": ariaLabel }) {
+export function Dialog({ open, onClose, title, description, children, footer, width = 520, contained, className, bodyClassName, "aria-label": ariaLabel }) {
   const panelRef = useRef(null);
   useOverlayLifecycle(open, onClose, panelRef);
   if (!open) return null;
@@ -92,7 +93,7 @@ export function Dialog({ open, onClose, title, description, children, footer, wi
             <CloseButton onClick={onClose} />
           </div>
         )}
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>
+        <div className={cn("min-h-0 flex-1 overflow-y-auto px-5 py-4", bodyClassName)}>{children}</div>
         {footer && <div className="flex items-center justify-end gap-2 border-t px-5 py-3">{footer}</div>}
       </div>
     </div>
@@ -103,9 +104,9 @@ export function Dialog({ open, onClose, title, description, children, footer, wi
  * Right-side sheet over a scrim. Widths from the spec: series detail 440/520,
  * target editor 470/560, find sources 600/680 — pass `width`.
  * Slides in over 220 ms cubic-bezier(.2,.7,.2,1); a 2 px primary accent line
- * on top (series detail) is the caller's `accent`.
+ * on top (series detail) is the caller's `accent`. `bodyClassName` as Dialog's.
  */
-export function Sheet({ open, onClose, title, description, children, footer, width = 470, contained, accent, className, "aria-label": ariaLabel }) {
+export function Sheet({ open, onClose, title, description, children, footer, width = 470, contained, accent, className, bodyClassName, "aria-label": ariaLabel }) {
   const panelRef = useRef(null);
   const [shown, setShown] = useState(false);
   // Two-phase entrance: mount at translate-x-full, flip after one paint so the
@@ -151,7 +152,7 @@ export function Sheet({ open, onClose, title, description, children, footer, wid
             <CloseButton onClick={onClose} />
           </div>
         )}
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div>
+        <div className={cn("min-h-0 flex-1 overflow-y-auto px-5 py-4", bodyClassName)}>{children}</div>
         {footer && <div className="flex items-center gap-2 border-t px-5 py-3">{footer}</div>}
       </div>
     </div>

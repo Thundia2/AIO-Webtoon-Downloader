@@ -246,6 +246,26 @@ export function opReasonCopy(kind, reason, tn) {
   };
   return (m[kind] || {})[reason];
 }
+// Review-dialog group titles (spec §4 review; mockup review()): one plain
+// sentence per (kind, reason). A pair missing here falls back to
+// "<Kind>: <opReasonCopy>" in ReviewDialog, so a new planner reason still
+// reads, just less naturally; the copy test keeps this table complete.
+export function reviewGroupTitle(kind, reason, tn) {
+  const there = tn || "the target";
+  const m = {
+    push: { new: "Copy new series", missing: `Copy chapters not on ${there} yet`, "removed-on-device": `Copy back a series removed on ${there}` },
+    update: { "changed-on-pc": "Update files changed on your PC", repair: "Copy unfinished files again", "unresolved-pending": "Copy again files an earlier sync didn't finish" },
+    replace: { "changed-on-device": `Replace files changed on ${there}`, foreign: "Replace files this app didn't copy", unverified: "Replace files not checked yet" },
+    rename: { "rename-to-match": "Rename files to match your PC" },
+    delete: {
+      sidecar: "Remove extra files",
+      replacement: "Remove files replaced on your PC",
+      extra: "Remove chapters that aren't on your PC",
+      "removed-from-target": `Remove series you stopped syncing to ${there}`,
+    },
+  };
+  return (m[kind] || {})[reason];
+}
 export const OP_REASONS = Object.freeze({
   push: ["new", "removed-on-device", "missing"],
   update: ["repair", "changed-on-pc", "unresolved-pending"],
@@ -343,6 +363,7 @@ export function jobReasonCopy(reason, tn) {
     "not-a-bound-folder": "a folder wasn't the one this app synced to",
     "needs-mode": `${tn} needs a check mode first`,
     "same-name": "the folder already has that name",
+    "folder-reappeared": "its folder came back on the target meanwhile",
   };
   if (fixed[r]) return fixed[r];
   if (r.startsWith("rename-refused-destination-exists")) return "a folder with the new name already exists";
@@ -387,4 +408,81 @@ export function warningCopy(w, tn) {
     "cleanup-failed": `Couldn't remove bookkeeping files in ${f || "a folder"}`,
     "quick-verify": `A copied file's size on ${there} doesn't match`,
   }[w && w.kind];
+}
+
+// ── Needs attention (planner.js _attention codes; the "Needs attention" tile
+// and a row's tooltip). The scrape in tools/_test_device_sync_copy.js reads
+// the codes from _attention's own `out.push("…")` calls. ──
+export function attentionCopy(code, tn) {
+  const there = tn || "the target";
+  return {
+    held: "Can't be synced yet",
+    anomaly: "Something to check before syncing",
+    loss: "Removes chapters that aren't on your PC",
+    suggestion: `A folder on ${there} may already be this series`,
+    "needs-verify": `Needs a check against ${there} first`,
+    "rebind-fell-back": `Its old folder name on ${there} is taken; it copies back under the PC name`,
+    "replace-unticked": `A different copy on ${there} needs a decision`,
+  }[code];
+}
+
+// ── Refusal cards (Sync tab, spec §5 "Refusal panel"; mockup refusals()).
+// tone: info | warn | bad | muted. icon: a name SyncTab maps to a lucide
+// icon (this file stays import-free). Bodies only; titles are refusalTitle.
+// `r` is the refusal object ({code, message, fields?, detail?, internal?}). ──
+export function refusalCardCopy(r, tn) {
+  const code = r && r.code;
+  if (r && r.internal) return { tone: "bad", icon: "x-circle", body: "This is a bug, not something you did. The details are in the log folder." };
+  switch (code) {
+    case "needs-mode":
+      return { tone: "info", icon: "shield-check", body: `${tn} can't fingerprint files itself, so pick how sync proves what's already there. Your choice is remembered for this target.` };
+    case "blocked":
+      return { tone: "warn", icon: "list-checks", body: null };
+    case "record-mismatch":
+      return {
+        tone: "bad",
+        icon: "alert-triangle",
+        body: `The sync history on ${tn} was written for a different ${r && Array.isArray(r.fields) && r.fields.includes("serial") ? "tablet" : "folder"}. It may have been restored, moved or copied from somewhere else, so nothing is changed until you choose.`,
+      };
+    case "device-listing-suspect":
+      return {
+        tone: "warn",
+        icon: "file-warning",
+        body:
+          r && r.detail === "empty-root"
+            ? `${tn} shows no series folders, but its sync history lists some. A half-mounted SD card, a locked tablet or a storage permission prompt can cause this, so nothing will be removed.`
+            : `${tn} listed far fewer files than its sync history. A half-mounted SD card or a storage permission prompt can cause this, so nothing will be removed.`,
+      };
+    case "disconnected":
+      return { tone: "muted", icon: "unlink", body: "Plug it back in (and unlock it). The plan picks up when it reappears." };
+    case "busy":
+      return { tone: "muted", icon: "loader", body: "This one can start when it finishes." };
+    case "library-missing":
+      return { tone: "bad", icon: "folder-x", body: "The library folder doesn't exist or can't be read. Check the drive, or change the library folder in Settings → General." };
+    case "version-conflict":
+      return { tone: "info", icon: "refresh-cw", body: "Settings for this target were saved somewhere else first. Your edit wasn't applied; the current settings are loaded." };
+    case "invalid":
+      return { tone: "bad", icon: "x-circle", body: r && r.message ? `${capitalize(r.message)}. Nothing was changed.` : "Nothing was changed." };
+    case "disabled":
+      return { tone: "muted", icon: "circle-dashed", body: "Turn it on in Settings → Sync." };
+    default:
+      return { tone: "bad", icon: "alert-circle", body: (r && r.message) || "Sync stopped." };
+  }
+}
+
+// ── Last-run cards (spec §5; mockup LAST_RUNS). The numbers are formatted by
+// the caller; this only picks words and tone. ──
+export const LAST_RUN_PHASE_COPY = Object.freeze({
+  apply: { done: (tn) => `Synced to ${tn}`, verb: "copied" },
+  prune: { done: (tn) => `Removed folders from ${tn}`, verb: "removed" },
+  rename: { done: (tn) => `Renamed a folder on ${tn}`, verb: "renamed" },
+  verify: { done: (tn) => `Checked ${tn}`, verb: "checked" },
+});
+export function lastRunTitle(phase, status, tn, reason) {
+  const p = LAST_RUN_PHASE_COPY[phase] || LAST_RUN_PHASE_COPY.apply;
+  if (status === "completed") return p.done(tn);
+  if (status === "cancelled") return "Sync cancelled";
+  if (status === "disconnected") return `${tn} disconnected mid-sync`;
+  if (reason === "error-budget") return "Sync stopped after too many failed files";
+  return "Sync stopped";
 }

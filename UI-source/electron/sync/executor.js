@@ -180,6 +180,7 @@ class Executor {
     this.signal = d.signal || null;
     this.now = d.now || Date.now;
     this.intentBatch = Math.max(1, d.intentBatch | 0 || 1);
+    this.lane = null; // {seriesKey, landed, total} of the series being written (_writes)
     this.connectWaitMs = d.connectWaitMs != null ? d.connectWaitMs : CONNECT_WAIT_MS;
     this.reserveBytes = d.reserveBytes != null ? d.reserveBytes : RESERVE_BYTES;
     this.budgetLimit = Math.max(1, (this.settings.syncErrorBudget | 0) || DEFAULT_BUDGET);
@@ -422,6 +423,9 @@ class Executor {
       bytesDone: r.bytesDone,
       bytesTotal: r.bytesTotal,
       current: current || null,
+      // The Sync tab's transfer lane (UI-pass U2-7): this series' writes
+      // that LANDED, not merely passed (filesDone also counts skips).
+      lane: this.lane ? { ...this.lane } : null,
     });
   }
 
@@ -671,6 +675,7 @@ class Executor {
   // ---------------------------------------------------------------- writes
 
   async _writes(sp, shard, writes, pushedSlots) {
+    this.lane = { seriesKey: sp.seriesKey, landed: 0, total: writes.length };
     for (let i = 0; i < writes.length; i += this.intentBatch) {
       this._checkCancel();
       const batch = [];
@@ -709,6 +714,8 @@ class Executor {
         shard.files.set(this._slot(b.op.name), { name: b.op.name, size: r.bytes, sha256: r.sha256, devMtime: null, origin: "pushed" });
         pushedSlots.add(this._slot(b.op.name));
         landed.push(b);
+        this.lane.landed += 1;
+        this._progress({ folder: shard.name, name: b.op.name });
         if (this.intentBatch === 1) {
           await this._writeShard(shard);
           await this._hook("after-pushed", { folder: shard.name, name: b.op.name, opId: b.op.id });

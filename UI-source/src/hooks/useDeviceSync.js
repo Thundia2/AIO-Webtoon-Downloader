@@ -29,6 +29,13 @@
 // re-read left: a `settings` event that flips `enabled` adopts a fresh
 // snapshot, since turning sync on or off replaces every field at once.
 //
+// SELECTION CLIENT (UI-pass U2-10): actions.select(targetId, req) queues an
+// edit through selectionQueue.js (pure; batching, FIFO, one request in
+// flight, pending until a `plans` push's selSeq reaches it). It lives here,
+// not in the Sync tab, because the tab unmounts on every tab switch and its
+// pending marks must outlive that. state.selection[targetId] is that queue;
+// selectionQueue.isSettled() says when Review's Start may run.
+//
 // Read by: App.jsx (grep useDeviceSync). Depends on: preload.js sync* wrappers and
 // onSyncEvent. The event kinds below duplicate sync/contract.js EVENT_KINDS;
 // tools/_test_device_sync_contract.js keeps them equal, and
@@ -36,6 +43,7 @@
 // ============================================================
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import * as SQ from "./selectionQueue";
 
 const EVENT_KINDS = ["device", "job", "config", "prompt", "find", "prewarm", "library-status", "plans", "adb", "settings"];
 
@@ -60,6 +68,7 @@ const INITIAL = Object.freeze({
   prewarm: null,
   libraryStatus: null,
   logDir: null,
+  selection: {}, // targetId → selectionQueue state (renderer-only)
 });
 
 // Action name → preload wrapper. get-state is refresh(); events come from
@@ -137,7 +146,17 @@ function applySyncEvent(s, ev) {
       if (typeof ev.targetId !== "string") return s;
       const plans = { ...s.plans };
       if (ev.removed) delete plans[ev.targetId];
-      else plans[ev.targetId] = { summary: ev.summary || null, refusal: ev.refusal || null, stale: !!ev.stale, lastRun: ev.lastRun || null, gen: ev.gen == null ? null : ev.gen };
+      else {
+        plans[ev.targetId] = {
+          summary: ev.summary || null,
+          refusal: ev.refusal || null,
+          stale: !!ev.stale,
+          lastRun: ev.lastRun || null,
+          gen: ev.gen == null ? null : ev.gen,
+          selSeq: Number.isInteger(ev.selSeq) ? ev.selSeq : null,
+          lastPlan: ev.lastPlan || null,
+        };
+      }
       return { ...s, plans };
     }
     case "adb":
@@ -181,6 +200,35 @@ export function useDeviceSync(opts) {
   // The last `enabled` the hook adopted, read by onEvent without a render.
   const enabledRef = useRef(false);
   const refreshSeqRef = useRef(0);
+  // Selection queues: the ref is the source of truth (timers and replies
+  // read it synchronously); state.selection mirrors it for rendering.
+  const selRef = useRef({});
+  const selTimers = useRef({});
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  function _selPut(targetId, next) {
+    if (selRef.current[targetId] === next) return;
+    selRef.current = { ...selRef.current, [targetId]: next };
+    setState((s) => ({ ...s, selection: { ...s.selection, [targetId]: next } }));
+  }
+
+  /** Send the target's next queued edit if none is in flight. */
+  const pumpSel = useCallback((targetId) => {
+    const cur = selRef.current[targetId] || SQ.EMPTY;
+    const view = stateRef.current.plans[targetId];
+    const { st, request } = SQ.takeNext(cur, view ? view.selSeq : null);
+    if (!request) return;
+    _selPut(targetId, st);
+    const a = getApi();
+    const call = a ? Promise.resolve(a.syncSetSelection({ targetId, ...request })) : Promise.resolve({ ok: false, code: "disabled", message: "electronAPI unavailable" });
+    call
+      .catch((e) => ({ ok: false, code: "invalid", message: (e && e.message) || "the request failed" }))
+      .then((reply) => {
+        _selPut(targetId, SQ.onReply(selRef.current[targetId] || SQ.EMPTY, request.seq, reply));
+        pumpSel(targetId);
+      });
+  }, [getApi]);
 
   /** Re-read the whole snapshot (latest request wins). */
   const refresh = useCallback(() => {
@@ -205,6 +253,7 @@ export function useDeviceSync(opts) {
         return;
       }
       setState((s) => applySyncEvent(s, ev));
+      if (ev && ev.kind === "plans" && selRef.current[ev.targetId]) _selPut(ev.targetId, SQ.onView(selRef.current[ev.targetId], ev.selSeq));
       if (ev && ev.kind === "settings" && !!ev.enabled !== enabledRef.current) {
         enabledRef.current = !!ev.enabled;
         refresh();
@@ -252,6 +301,29 @@ export function useDeviceSync(opts) {
     }
     // find-sources:get answers the target's rows; keep them so find events
     // (which carry one row each) patch a complete table.
+    /**
+     * Queue a selection edit: {changes:[{opId,selected}], seriesKey?} or a
+     * bulk request ({bulk, …} / {rebind}) with an optional seriesKey for the
+     * row's pending mark. False when refused locally: no plan, or an
+     * apply/prune/rename holds the target (the service would answer busy).
+     */
+    out.select = (targetId, req) => {
+      const s = stateRef.current;
+      const view = s.plans[targetId];
+      if (!req || !view || view.gen == null || SQ.selectionLocked(s.job, targetId)) return false;
+      const cur = selRef.current[targetId] || SQ.EMPTY;
+      // seriesKey marks the row pending for both shapes; a bulk request also
+      // SENDS it (bulk "series" needs it, bulk "group" is scoped by it).
+      const { seriesKey, changes, ...rest } = req;
+      _selPut(targetId, Array.isArray(changes) ? SQ.enqueueChanges(cur, changes, view.gen, seriesKey) : SQ.enqueueBulk(cur, seriesKey ? { ...rest, seriesKey } : rest, view.gen, seriesKey));
+      clearTimeout(selTimers.current[targetId]);
+      selTimers.current[targetId] = setTimeout(() => pumpSel(targetId), SQ.BATCH_MS);
+      return true;
+    };
+    out.clearSelectionError = (targetId) => {
+      const cur = selRef.current[targetId];
+      if (cur && cur.error) _selPut(targetId, { ...cur, error: null });
+    };
     const getRows = out.findSourcesGet;
     out.findSourcesGet = (payload) =>
       getRows(payload).then((r) => {
@@ -261,7 +333,11 @@ export function useDeviceSync(opts) {
         return r;
       });
     return out;
-  }, [refresh, getApi]);
+  }, [refresh, getApi, pumpSel]);
+
+  useEffect(() => () => {
+    for (const t of Object.values(selTimers.current)) clearTimeout(t);
+  }, []);
 
   return { ...state, actions };
 }

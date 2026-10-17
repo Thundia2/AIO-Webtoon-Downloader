@@ -93,6 +93,264 @@ function scrub(v, tmp) {
   return walk(v);
 }
 
+
+// ---------------------------------------------------------------- Sync tab
+//
+// recordTab (UI-pass U2-15): one FOLDER target driven through the states the
+// Sync tab renders, every answer recorded off the real service:
+//   * a first apply, then edits that give the second plan: new chapters
+//     (push), a changed chapter (update), a foreign same-label file on the
+//     target (replace candidate), a PC chapter deleted (removal + loss), a
+//     series whose folder vanished from the target (gone, rebind choice), an
+//     excluded series, a series marked "remove from target", a new series
+//     with a name-match suggestion, a young file (settling), a series gone
+//     from the PC (orphaned) and a folder the app never wrote (preserved);
+//   * that plan's series-detail for every row and device-only folder, the
+//     review, real set-selection replies with the `plans` push after each;
+//   * an apply's job events with their timing (each landed file is slowed so
+//     the progress isn't coalesced away) and the lastRun it leaves;
+//   * refusals: plan-changed, busy, record-mismatch, device-listing-suspect,
+//     library-missing, disconnected; needs-mode comes from a fake-adb
+//     device without sha256sum.
+// Snapshots are whole get-state answers, so the gallery feeds them as is.
+
+function writeYoung(p, data, ageS) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, data);
+  const t = new Date(Date.now() - ageS * 1000);
+  fs.utimesSync(p, t, t);
+}
+
+async function recordTab(tmp) {
+  const lib = path.join(tmp, "tab-manga");
+  const userData = path.join(tmp, "tab-ud", "sync");
+  const root = path.join(tmp, "Tablet", "Komikku");
+  fs.mkdirSync(lib, { recursive: true });
+  fs.mkdirSync(root, { recursive: true });
+  const ch = (title, from, to, size = 3000) => {
+    const o = {};
+    for (let i = from; i <= to; i += 1) o[`Ch.${String(i).padStart(3, "0")} - ${title}.cbz`] = size + i;
+    return o;
+  };
+  series(lib, "Eleceed", { ...ch("Eleceed", 1, 6), "cover.jpg": 900 });
+  series(lib, "Dungeon Meshi", ch("Dungeon Meshi", 1, 4));
+  series(lib, "Solo Leveling", ch("Solo Leveling", 1, 12));
+  series(lib, "Blue Lock", ch("Blue Lock", 1, 3));
+  series(lib, "Berserk", ch("Berserk", 1, 5));
+  // 12 chapters: "remove from target" then trips the mass-delete acknowledgement.
+  series(lib, "Tower of God", ch("Tower of God", 1, 12));
+
+  let libRoot = lib;
+  const events = [];
+  const handlers = new Map();
+  let slow = 0;
+  const settings = { syncEnabled: true, cpuLimit: "unlimited", syncPromptOnConnect: false };
+  const deps = {
+    ipcMain: { handle: (c, fn) => handlers.set(c, fn) },
+    send: (c, p) => events.push({ at: Date.now(), ev: p }),
+    userDataDir: userData,
+    getSettings: () => settings,
+    getLibraryRoot: () => libRoot,
+    getRunningDownloads: () => [],
+    isCheckAllRunning: () => false,
+    isSearchRunning: () => false,
+    resolveSpawnPaths: () => ({ pythonCmd: "python", scriptPath: "aio-dl.py", workingDir: tmp }),
+    extraEnv: {},
+    onFocus: () => {},
+    isFocused: () => true,
+    getWindow: () => null,
+    showSaveDialog: async () => ({ canceled: true }),
+    _test: {
+      clientOpts: { port: 1, recheckMs: 20, idleMs: 5000, connectTimeoutMs: 500 },
+      locateAdb: async () => ({ resolved: null, candidates: [] }),
+      ensureServer: async () => ({ ok: false, error: new Error("no adb in this recording"), started: false }),
+      prewarmDelayMs: 60 * 60 * 1000,
+      replanDebounceMs: 30,
+      busyPollMs: 40,
+      bootEpoch: 1,
+      connectWaitMs: 2000,
+      executorDeps: { hooks: (pt) => (pt === "after-pushed" && slow ? sleep(slow) : undefined) },
+    },
+  };
+  const svc = service.initDeviceSync(deps);
+  const raw = (name, payload) => handlers.get(`sync:${name}`)({}, payload || {});
+  const call = async (name, payload) => {
+    const r = await raw(name, payload);
+    assert.ok(r && r.ok !== false, `sync:${name} refused: ${JSON.stringify(r)}`);
+    return r;
+  };
+  const state = () => raw("get-state");
+  const idle = async () => {
+    await waitFor(() => !svc._debug().current, 30000, "idle lane");
+    await sleep(60);
+    await waitFor(() => !svc._debug().current, 30000, "idle lane (2)");
+  };
+  const jobDone = (runId) => waitFor(() => (events.find((e) => e.ev.kind === "job" && e.ev.runId === runId && e.ev.state === "done") || {}).ev, 60000, `job ${runId}`);
+  const planNow = async (id) => {
+    await idle();
+    const r = await call("plan", { targetId: id });
+    await jobDone(r.runId);
+    await idle();
+    return (await state()).plans[id];
+  };
+  const out = { snapshots: {}, details: {}, selection: [], refusals: {} };
+  try {
+    const t = await call("config-op", { op: "add-target", target: { name: "Galaxy Tab", kind: "folder", root, profile: "komikku" } });
+    const id = t.targetId;
+    out.targetId = id;
+    await waitFor(async () => (await raw("plan", { targetId: id, ifNeeded: true })).why === "fresh" || null, 30000, "first plan");
+    await idle();
+    out.snapshots.firstSync = await state();
+    const first = await call("apply", { targetId: id, gen: (await state()).plans[id].gen });
+    await jobDone(first.runId);
+    await idle();
+
+    // The edits behind the second plan.
+    const dev = (rel) => path.join(root, rel);
+    const touchOld = (p, d) => {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, d);
+      const o = new Date(OLD_S * 1000);
+      fs.utimesSync(p, o, o);
+    };
+    for (const [n, s] of Object.entries(ch("Eleceed", 7, 9))) touchOld(path.join(lib, "Eleceed", n), bytes(n, s));
+    touchOld(path.join(lib, "Eleceed", "Ch.002 - Eleceed.cbz"), bytes("Ch.002 v2", 3402));
+    touchOld(dev("Eleceed/Ch.004 [Asura].cbz"), bytes("asura 4", 2900));
+    fs.rmSync(path.join(lib, "Dungeon Meshi", "Ch.003 - Dungeon Meshi.cbz"));
+    fs.rmSync(dev("Solo Leveling"), { recursive: true, force: true });
+    fs.rmSync(path.join(lib, "Berserk"), { recursive: true, force: true });
+    touchOld(dev("Chainsaw Man/Ch.001.cbz"), bytes("csm 1", 2500));
+    touchOld(dev("Chainsaw Man/Ch.002.cbz"), bytes("csm 2", 2600));
+    series(lib, "Frieren", ch("Frieren", 1, 3));
+    touchOld(dev("Frieren/Ch.001 - Frieren.cbz"), bytes("Ch.001 - Frieren.cbz", 3001));
+    series(lib, "Kagurabachi", ch("Kagurabachi", 1, 2));
+    writeYoung(path.join(lib, "Kagurabachi", "Ch.003 - Kagurabachi.cbz"), bytes("kb3", 3003), 5);
+    // A folder the app never wrote whose name matches a new series once
+    // punctuation is dropped (planner compactKey): a weak ("name" tier) link
+    // suggestion. Not a case-only variant: on NTFS that IS the same folder.
+    touchOld(dev("Kagurabachi_/Ch.001.cbz"), bytes("kb other", 2100));
+    let st = await state();
+    const keyOf = (title) => st.plans[id].summary.series.find((x) => x.title === title || x.folder === title).seriesKey;
+    await call("config-op", { op: "add-exclude", targetId: id, expectVersion: st.config.version, entry: { pcFolder: "Blue Lock" } });
+    st = await state();
+    await call("config-op", { op: "remove-series", targetId: id, seriesKey: keyOf("Tower of God") });
+    const planned = await planNow(id);
+    assert.ok(planned.summary, JSON.stringify(planned.refusal));
+    out.snapshots.planned = await state();
+    st = out.snapshots.planned;
+    const sum = st.plans[id].summary;
+    for (const row of sum.series) out.details[row.seriesKey] = await call("series-detail", { targetId: id, seriesKey: row.seriesKey });
+    for (const d of sum.deviceOnly) out.details[d.key] = await call("series-detail", { targetId: id, seriesKey: d.key });
+    out.review = await call("review", { targetId: id });
+
+    // Selection: each request with its reply and the `plans` push after it.
+    const recordSel = async (label, req) => {
+      const from = events.length;
+      const reply = await raw("set-selection", { targetId: id, ...req });
+      // A refused request changes nothing and pushes nothing.
+      let view = null;
+      if (reply.ok) {
+        await waitFor(() => events.slice(from).find((e) => e.ev.kind === "plans" && e.ev.targetId === id), 4000, `plans after ${label}`);
+        view = events.slice(from).reverse().find((e) => e.ev.kind === "plans" && e.ev.targetId === id).ev;
+      }
+      out.selection.push({ label, request: req, reply, view });
+      return reply;
+    };
+    const gen = sum.gen;
+    const el = sum.series.find((x) => x.title === "Eleceed");
+    const elPush = out.details[el.seriesKey].rows.find((r) => r.kind === "push");
+    await recordSel("untick one push", { gen, seq: 1, changes: [{ opId: elPush.opId, selected: false }] });
+    await recordSel("series off", { gen, seq: 2, bulk: "series", seriesKey: el.seriesKey, selected: false });
+    await recordSel("series back to pre-selection", { gen, seq: 3, bulk: "series", seriesKey: el.seriesKey, selected: true });
+    await recordSel("stale gen", { gen: gen - 1, seq: 4, changes: [] });
+    // Tick the removal of a chapter the PC no longer has: a loss to acknowledge.
+    const dm = sum.series.find((x) => x.title === "Dungeon Meshi");
+    const dmDel = out.details[dm.seriesKey].rows.find((r) => r.kind === "delete");
+    await recordSel("tick a loss", { gen, seq: 5, changes: [{ opId: dmDel.opId, selected: true }] });
+    out.reviewWithLoss = await call("review", { targetId: id });
+    out.snapshots.withLoss = await state();
+
+    // Refusals that need no state change first.
+    out.refusals.planChanged = await raw("apply", { targetId: id, gen: gen - 1 });
+
+    // Apply with timing (acks as the review shows them).
+    const rv = out.reviewWithLoss;
+    const ackLosses = rv.losses.flatMap((l) => l.lossOpIds);
+    slow = 120;
+    const from = events.length;
+    const t0 = Date.now();
+    const ap = await call("apply", { targetId: id, gen, ackLosses, ackMassDelete: rv.massDelete.count, ackMassRepush: rv.massRepush.count });
+    await waitFor(() => svc._debug().current, 5000, "apply running");
+    await sleep(150);
+    out.snapshots.applying = await state();
+    out.refusals.busy = await raw("plan", { targetId: id });
+    await jobDone(ap.runId);
+    slow = 0;
+    out.applyEvents = events.slice(from).filter((e) => e.ev.kind === "job" && e.ev.runId === ap.runId).map((e) => ({ t: e.at - t0, ev: e.ev }));
+    await idle();
+    out.snapshots.afterApply = await state();
+
+    // record-mismatch: the record names another folder.
+    const hp = path.join(userData, "targets", id, "header.json");
+    const header = JSON.parse(fs.readFileSync(hp, "utf8"));
+    fs.writeFileSync(hp, JSON.stringify({ ...header, root: path.join(tmp, "Old Tablet", "Komikku") }));
+    await planNow(id).catch(() => null);
+    out.snapshots.recordMismatch = await state();
+    fs.writeFileSync(hp, JSON.stringify(header));
+
+    // device-listing-suspect: the target folder suddenly almost empty.
+    const parked = path.join(tmp, "parked");
+    fs.renameSync(root, parked);
+    fs.mkdirSync(root);
+    fs.writeFileSync(path.join(root, ".nomedia"), "");
+    await planNow(id).catch(() => null);
+    out.snapshots.listingSuspect = await state();
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.renameSync(parked, root);
+
+    // library-missing, then disconnected (both answered by the call itself).
+    await idle();
+    libRoot = path.join(tmp, "unplugged-drive", "manga");
+    out.refusals.libraryMissing = await raw("plan", { targetId: id });
+    libRoot = lib;
+    fs.renameSync(root, parked);
+    await waitFor(async () => (await raw("plan", { targetId: id, ifNeeded: true })).why === "disconnected", 15000, "target gone");
+    out.refusals.disconnected = await raw("plan", { targetId: id });
+    out.snapshots.disconnected = await state();
+    fs.renameSync(parked, root);
+  } finally {
+    await svc.shutdown({ timeoutMs: 2000 });
+  }
+
+  // needs-mode: a non-hashing tablet's automatic plan.
+  const srv = new FakeAdbServer();
+  const port = await srv.listen();
+  const d2 = srv.addDevice({ serial: SERIAL, model: "SM-T290", inject: { symlinks: { "/sdcard": "/storage/emulated/0" }, tools: { sha256sum: false } } });
+  d2.fs.mkdirs(CANON);
+  d2.fs.writeFile(`${CANON}/Eleceed/Ch.001 - Eleceed.cbz`, bytes("Ch.001 - Eleceed.cbz", 3001), { mtime: OLD_S });
+  const h2 = new Map();
+  const svc2 = service.initDeviceSync({
+    ...deps,
+    userDataDir: path.join(tmp, "tab-ud2", "sync"),
+    ipcMain: { handle: (c, fn) => h2.set(c, fn) },
+    send: () => {},
+    _test: { ...deps._test, clientOpts: { port, recheckMs: 20, idleMs: 5000, connectTimeoutMs: 500 }, ensureServer: async (client) => ({ ok: true, version: await client.version(), started: false }) },
+  });
+  try {
+    const r = await h2.get("sync:config-op")({}, { op: "add-target", target: { name: "Old tablet", kind: "adb", serial: SERIAL, root: "/sdcard/Komikku/local", profile: "komikku" } });
+    // Prompt-on-connect is off here: the tab's own ifNeeded asks for the plan.
+    await waitFor(async () => {
+      await h2.get("sync:plan")({}, { targetId: r.targetId, ifNeeded: true });
+      const s = await h2.get("sync:get-state")({}, {});
+      return s.plans[r.targetId] && s.plans[r.targetId].refusal ? s : null;
+    }, 30000, "needs-mode refusal");
+    out.snapshots.needsMode = await h2.get("sync:get-state")({}, {});
+  } finally {
+    await svc2.shutdown({ timeoutMs: 2000 });
+    await srv.close();
+  }
+  return out;
+}
 async function main() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aio-sync-fixtures-"));
   const lib = path.join(tmp, "manga");
@@ -198,6 +456,7 @@ async function main() {
     await svc.shutdown({ timeoutMs: 2000 });
     await srv.close();
   }
+  out.tab = await recordTab(tmp);
 
   const adb = out.stateOn.adb;
   out.adbStates = {
@@ -220,6 +479,7 @@ async function main() {
     "refusals.json": { versionConflict: out.versionConflict, invalidField: out.invalidField },
     "adb-states.json": out.adbStates,
     "events.json": out.events,
+    "tab.json": out.tab,
   };
   for (const [name, data] of Object.entries(files)) {
     const body = { [SYNC_FIXTURE_MARKER]: name, generatedBy: "tools/_gen_sync_fixtures.js", data: scrub(data, tmp) };

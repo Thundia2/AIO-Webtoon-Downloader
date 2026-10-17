@@ -111,6 +111,14 @@ const scrape = (text, re) => [...text.matchAll(re)].map((m) => m[1]);
       check(`op reason ${kind}/${r} has copy and exists`, c.opReasonCopy(kind, r, "T") != null && all.includes(`"${r}"`));
     }
   }
+  for (const [kind, reasons] of Object.entries(c.OP_REASONS)) {
+    for (const r of reasons) check(`review group title ${kind}/${r}`, typeof c.reviewGroupTitle(kind, r, "T") === "string");
+  }
+  // Row attention codes: scraped from planner.js _attention (`out.push("…")`).
+  const attnFn = (stripSrc.match(/function _attention\([\s\S]*?\n\}/) || [""])[0];
+  const attn = scrape(attnFn, /out\.push\("([a-z-]+)"\)/g);
+  check("found attention codes", attn.length >= 5, String(attn.length));
+  sameSet("attention codes", attn.filter((k) => c.attentionCopy(k, "T") != null), attn);
   for (const r of c.JOB_REASONS) check(`job reason ${r} exists in the backend`, all.includes(`"${r}"`) && c.jobReasonCopy(r, "T") !== r);
   for (const r of Object.keys(c.SKIP_REASON_COPY)) check(`skip reason ${r} exists`, all.includes(`"${r}"`));
 

@@ -18,6 +18,9 @@
 //   - prompt / device / prewarm / library-status / config by kind; unknown kinds ignored
 //   - without electronAPI the hook is inert and actions answer `disabled`
 //   - a refused or rejected first get-state still loads and drains the buffer
+//   - the selection client (U2-10): batching, one in flight, seq above the
+//     view's selSeq, marks cleared by the view (before or after the reply),
+//     a refusal drops its marks, locked while an apply runs
 
 const fs = require("fs");
 const path = require("path");
@@ -45,8 +48,17 @@ function loadHook() {
   const importLine = /^import\s*\{[^}]*\}\s*from\s*"react";\s*$/m;
   const n = (src.match(new RegExp(importLine.source, "gm")) || []).length;
   if (n !== 1) throw new Error(`useDeviceSync.js must have exactly one react import line (found ${n})`);
-  if (/^import\s/m.test(src.replace(importLine, ""))) throw new Error("useDeviceSync.js has a second import");
+  // The one other import is the pure selection queue (U2-10): inlined as an
+  // `SQ` object built from its own source with `export` stripped.
+  const sqLine = /^import \* as SQ from "\.\/selectionQueue";\s*$/m;
+  if (!sqLine.test(src)) throw new Error("useDeviceSync.js must import selectionQueue as SQ");
+  src = src.replace(sqLine, "");
+  if (/^import\s/m.test(src.replace(importLine, ""))) throw new Error("useDeviceSync.js has a third import");
   src = src.replace(importLine, "");
+  src = `const SQ = (() => {
+${loadSelectionQueueSource()}
+})();
+${src}`;
   src = src.replace(/^export function useDeviceSync/m, "function useDeviceSync");
   src = src.replace(/^export default useDeviceSync;\s*$/m, "");
   // eslint-disable-next-line no-new-func
@@ -54,6 +66,14 @@ function loadHook() {
     "useState", "useEffect", "useCallback", "useMemo", "useRef", "window", "console",
     `${src}\nreturn useDeviceSync;`
   );
+}
+
+/** selectionQueue.js as a function body returning its exports. */
+function loadSelectionQueueSource() {
+  const sq = fs.readFileSync(path.join(ROOT, "UI-source", "src", "hooks", "selectionQueue.js"), "utf8");
+  const names = [...sq.matchAll(/^export (?:const|function) (\w+)/gm)].map((m) => m[1]);
+  return `${sq.replace(/^export /gm, "")}
+return { ${names.join(", ")} };`;
 }
 
 // ── Minimal hook runtime ─────────────────────────────────────────────────
@@ -158,6 +178,9 @@ function mount(hookFactory, windowStub, consoleStub, props) {
 
 // ── Test rig ─────────────────────────────────────────────────────────────
 const hookFactory = loadHook();
+// The pure queue itself, for assertions on state.selection.
+// eslint-disable-next-line no-new-func
+const SQX = new Function(loadSelectionQueueSource())();
 
 const settleAsync = () => new Promise((r) => setImmediate(r));
 
@@ -215,6 +238,8 @@ function makeHarness({ snap = snapshot(), delayed = false, noApi = false } = {})
   for (const fn of ["syncConfigOp", "syncPlan", "syncApply", "syncLink", "syncFindSourcesGet", "syncCancel"]) {
     electronAPI[fn] = (p) => { calls.invokes.push([fn, p]); return Promise.resolve(harness.answers[fn] || { ok: true }); };
   }
+  // set-selection answers through harness.setSelection when a test sets one.
+  electronAPI.syncSetSelection = (p) => { calls.invokes.push(["syncSetSelection", p]); return harness.setSelection ? harness.setSelection(p) : Promise.resolve({ ok: true, seq: p.seq }); };
   const windowStub = noApi ? {} : { electronAPI };
   harness.mounted = mount(hookFactory, windowStub, console, undefined);
   return harness;
@@ -290,7 +315,7 @@ function deferred(value) {
     eq("config applied at once", h.mounted.state.config.version, 4);
     const lastRun = { runId: 5, phase: "apply", status: "completed", summary: { files: { done: 3 } } };
     h.mounted.act(() => h.emit({ kind: "plans", targetId: "t1", summary: { ops: 7 }, refusal: null, stale: false, lastRun, gen: 12 }));
-    eq("plans overwrites the target's view", h.mounted.state.plans.t1, { summary: { ops: 7 }, refusal: null, stale: false, lastRun, gen: 12 });
+    eq("plans overwrites the target's view", h.mounted.state.plans.t1, { summary: { ops: 7 }, refusal: null, stale: false, lastRun, gen: 12, selSeq: null, lastPlan: null });
     h.mounted.act(() => h.emit({ kind: "plans", targetId: "t2", summary: null, refusal: { ok: false, code: "needs-mode" }, stale: true, lastRun: null, gen: null }));
     eq("another target is added beside it", Object.keys(h.mounted.state.plans).sort(), ["t1", "t2"]);
     eq("a refusal rides the event", h.mounted.state.plans.t2.refusal.code, "needs-mode");
@@ -399,6 +424,55 @@ function deferred(value) {
     h.reject(new Error("ipc down"));
     await h.mounted.actAsync(() => {});
     eq("loaded with defaults plus buffered events", [h.mounted.state.loaded, h.mounted.state.prewarm], [true, { state: "y" }]);
+  }
+
+  console.log("\n[11] selection client: batched, one in flight, pending until the view's selSeq, locked during a write job");
+  {
+    // No job in the snapshot: the default one is an apply on t1 (locked).
+    const h = makeHarness({ snap: snapshot({ job: { job: null, queue: [] } }) });
+    const replies = [];
+    h.setSelection = (p) => {
+      const d = deferred({ ok: true, seq: p.seq });
+      replies.push({ p, d });
+      return d.promise;
+    };
+    await h.mounted.actAsync(() => {});
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const select = (req) => h.mounted.state.actions.select("t1", req);
+    eq("no plan yet: refused locally", select({ changes: [{ opId: "a", selected: false }] }), false);
+    h.mounted.act(() => h.emit({ kind: "plans", targetId: "t1", summary: { ops: 1 }, gen: 3, selSeq: 4 }));
+    h.mounted.act(() => {
+      select({ changes: [{ opId: "a", selected: false }], seriesKey: "S" });
+      select({ changes: [{ opId: "b", selected: false }, { opId: "a", selected: true }] });
+      select({ bulk: "series", seriesKey: "S", selected: false });
+    });
+    eq("marks show at once", h.mounted.state.selection.t1.ops, { a: { desired: true, seq: 0 }, b: { desired: false, seq: 0 } });
+    eq("the row with pending ops reads pending", [...SQX.pendingRows(h.mounted.state.selection.t1)], ["S"]);
+    await h.mounted.actAsync(() => sleep(200));
+    eq("one request in flight: the merged changes", replies.length, 1);
+    eq("it carries gen and a seq above the view's selSeq", [replies[0].p.gen, replies[0].p.seq, replies[0].p.changes], [3, 5, [{ opId: "a", selected: true }, { opId: "b", selected: false }]]);
+    await h.mounted.actAsync(() => { replies[0].d.resolve(); return sleep(10); });
+    eq("the bulk goes next, after the reply", [replies.length, replies[1] && replies[1].p.bulk, replies[1] && replies[1].p.seq], [2, "series", 6]);
+    // The service resolves a bulk series by its seriesKey (planner.js
+    // applySelection: "unknown series" without it); the E2E caught it stripped.
+    eq("the bulk carries its seriesKey on the wire", replies[1] && replies[1].p.seriesKey, "S");
+    eq("the reply alone doesn't clear the marks", Object.keys(h.mounted.state.selection.t1.ops), ["a", "b"]);
+    h.mounted.act(() => h.emit({ kind: "plans", targetId: "t1", summary: { ops: 1 }, gen: 3, selSeq: 5 }));
+    eq("selSeq 5 clears the first request's marks", h.mounted.state.selection.t1.ops, {});
+    eq("the bulk's series mark is still pending", Object.keys(h.mounted.state.selection.t1.series), ["S"]);
+    // The view lands before the reply this time.
+    h.mounted.act(() => h.emit({ kind: "plans", targetId: "t1", summary: { ops: 1 }, gen: 3, selSeq: 6 }));
+    eq("view before reply clears too", h.mounted.state.selection.t1.series, {});
+    await h.mounted.actAsync(() => { replies[1].d.resolve(); return sleep(10); });
+    eq("settled", h.mounted.state.selection.t1.inflight, null);
+    // A refusal drops its marks and records the error.
+    h.setSelection = (p) => { replies.push({ p }); return Promise.resolve({ ok: false, code: "blocked", blocking: [{ kind: "plan-changed" }] }); };
+    h.mounted.act(() => select({ changes: [{ opId: "c", selected: true }] }));
+    await h.mounted.actAsync(() => sleep(200));
+    eq("refused: mark dropped, error kept", [h.mounted.state.selection.t1.ops, h.mounted.state.selection.t1.error.code], [{}, "blocked"]);
+    // Locked while an apply runs on the target.
+    h.mounted.act(() => h.emit({ kind: "job", runId: 9, job: { runId: 9, state: "running", phase: "apply", targetId: "t1", progress: {} } }));
+    eq("locked during apply", select({ changes: [{ opId: "d", selected: true }] }), false);
   }
 
   console.log(failures === 0 ? "\nAll useDeviceSync checks passed." : `\n${failures} check(s) FAILED.`);

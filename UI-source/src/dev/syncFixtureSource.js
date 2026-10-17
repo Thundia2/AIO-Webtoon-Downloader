@@ -13,6 +13,16 @@
 // validation, no identity clearing and no re-plan. Never treat its behaviour
 // as the service's.
 //
+// TAB MODE (spec.tab = a snapshot name from tab.json, phase U2): the plan-
+// backed channels answer from the same recording. seriesDetail and review are
+// the recorded replies; set-selection looks the request up among the recorded
+// selection steps (seq and gen ignored) and pushes that step's recorded
+// `plans` view, or re-pushes the current view unchanged when it wasn't
+// recorded — so a tick on an unrecorded op shows its pending state and then
+// snaps back. That snap-back is the fake's limit, not the service's.
+// apply replays the recorded job events on their own clock, then pushes the
+// recorded after-apply view. Nothing here re-plans.
+//
 // Loaded only through src/dev/SyncGallery.jsx, which main.jsx imports
 // dynamically under import.meta.env.DEV, so none of this reaches dist
 // (the build check greps dist for "__aioSyncFixture").
@@ -26,6 +36,7 @@ import browseRemote from "./sync-fixtures/browse-remote.json";
 import labelPreview from "./sync-fixtures/label-preview.json";
 import adbStates from "./sync-fixtures/adb-states.json";
 import refusals from "./sync-fixtures/refusals.json";
+import tab from "./sync-fixtures/tab.json";
 
 const clone = (x) => (x == null ? x : JSON.parse(JSON.stringify(x)));
 export const FIXTURES = {
@@ -37,15 +48,18 @@ export const FIXTURES = {
   labelPreview: labelPreview.data,
   adbStates: adbStates.data,
   refusals: refusals.data,
+  tab: tab.data,
 };
 
 /**
- * @param {{base?:"on"|"off", adb?:string, mutate?:(snap)=>void}} spec
- *   base picks the recorded snapshot; adb swaps in one recorded adb state;
- *   mutate edits the snapshot copy before the hook sees it.
+ * @param {{base?:"on"|"off", tab?:string, adb?:string, mutate?:(snap)=>void, hold?:boolean}} spec
+ *   base picks the recorded snapshot (tab, when set, wins: a tab.json
+ *   snapshot name); adb swaps in one recorded adb state; mutate edits the
+ *   snapshot copy before the hook sees it; hold leaves every set-selection
+ *   unanswered (the pending state).
  */
 export function makeSyncSource(spec = {}) {
-  const snap = clone(spec.base === "off" ? FIXTURES.stateOff : FIXTURES.stateOn);
+  const snap = clone(spec.tab ? FIXTURES.tab.snapshots[spec.tab] : spec.base === "off" ? FIXTURES.stateOff : FIXTURES.stateOn);
   if (spec.adb && FIXTURES.adbStates[spec.adb]) snap.adb = clone(FIXTURES.adbStates[spec.adb]);
   if (spec.mutate) spec.mutate(snap);
   const listeners = new Set();
@@ -94,6 +108,7 @@ export function makeSyncSource(spec = {}) {
     }
   }
 
+  const tabApi = spec.tab ? makeTabChannels(snap, emit, !!spec.hold) : {};
   return {
     syncGetState: () => Promise.resolve(clone(snap)),
     onSyncEvent: (fn) => {
@@ -136,5 +151,64 @@ export function makeSyncSource(spec = {}) {
         "syncPromptResponse", "syncLibraryStatus", "syncExportReport", "syncDeviceCover", "syncFindSourcesStart", "syncFindSourcesCancel",
         "syncFindSourcesGet", "syncFindSourcesUpdateRow", "syncLink", "syncReview"].map((k) => [k, () => Promise.resolve({ ok: false, code: "disabled", message: "not in the gallery" })]),
     ),
+    ...tabApi,
+  };
+}
+
+const later = (ms, v) => new Promise((r) => setTimeout(() => r(v), ms));
+// A selection request's identity: what it asks for, not when.
+const selKey = ({ gen, seq, targetId, ...rest }) => JSON.stringify(rest);
+
+/** The plan-backed channels for TAB MODE (header). Mutates `snap` as the job runs. */
+function makeTabChannels(snap, emit, hold) {
+  const T = FIXTURES.tab;
+  const tid = () => Object.keys(snap.plans || {})[0] || T.targetId;
+  const view = () => snap.plans[tid()];
+  const push = (v) => {
+    snap.plans[tid()] = v;
+    emit({ kind: "plans", targetId: tid(), ...clone(v) });
+  };
+  const byKey = new Map(T.selection.filter((x) => x.view).map((x) => [selKey(x.request), x]));
+  return {
+    syncPlan: (p) => {
+      if (p && p.ifNeeded) return Promise.resolve({ ok: true, planned: false, why: "fresh" });
+      push({ ...view(), stale: true });
+      return later(700).then(() => {
+        push({ ...view(), stale: false });
+        return { ok: true, planned: true };
+      });
+    },
+    syncSeriesDetail: ({ seriesKey }) => later(120, T.details[seriesKey] ? clone(T.details[seriesKey]) : { ok: false, code: "invalid", message: `no fixture for ${seriesKey}` }),
+    syncReview: () => {
+      const v = view();
+      const r = clone((v.selSeq || 0) >= 5 ? T.reviewWithLoss : T.review);
+      return later(150, { ...r, gen: v.gen });
+    },
+    syncSetSelection: (p) => {
+      if (hold) return new Promise(() => {});
+      const v = view();
+      if (p.gen !== v.gen) return later(150, clone(T.refusals.planChanged));
+      const hit = byKey.get(selKey(p));
+      return later(250).then(() => {
+        const { kind, targetId, ...next } = hit ? clone(hit.view) : clone(v);
+        push({ ...next, gen: v.gen, selSeq: p.seq });
+        return hit ? { ...clone(hit.reply), seq: p.seq, gen: v.gen } : { ok: true, gen: v.gen, seq: p.seq, totals: v.summary && v.summary.totals };
+      });
+    },
+    syncApply: (p) => {
+      const v = view();
+      if (p.gen !== v.gen) return Promise.resolve(clone(T.refusals.planChanged));
+      for (const { t, ev } of T.applyEvents) setTimeout(() => emit(clone(ev)), t);
+      const end = T.applyEvents.length ? T.applyEvents[T.applyEvents.length - 1].t : 0;
+      setTimeout(() => push(clone(T.snapshots.afterApply.plans[T.targetId])), end + 60);
+      return Promise.resolve({ ok: true, runId: 7 });
+    },
+    syncCancel: () => Promise.resolve({ ok: true }),
+    syncVerify: () => Promise.resolve({ ok: true, runId: 8 }),
+    syncPrune: () => later(300, { ok: true, runId: 9 }),
+    syncRenameDeviceFolder: () => later(300, { ok: true, runId: 10 }),
+    syncLink: () => later(200, { ok: true }),
+    syncExportReport: () => later(200, { ok: true, path: "D:/Sync-fixture/report.txt" }),
+    syncDeviceCover: () => Promise.resolve({ ok: false, code: "invalid", message: "no covers in the gallery" }),
   };
 }

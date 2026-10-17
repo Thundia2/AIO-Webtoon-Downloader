@@ -1666,6 +1666,206 @@ test("U0 settings: applySettings pushes `settings`; a planning setting change re
   }
 });
 
+test("U2 plan ifNeeded: the service decides; a cancelled plan holds it off until something changes", async () => {
+  const a = await app({ adb: true });
+  try {
+    a.dev = a.srv.addDevice({ serial: SERIAL, inject: { symlinks: { "/sdcard": "/storage/emulated/0" }, shellDelayMs: 150 } });
+    a.dev.fs.mkdirs(CANON);
+    series(a.lib, "Omicron", { "Ch.001.cbz": 1000 });
+    const t = await a.call("config-op", { op: "add-target", target: { name: "Tab", kind: "adb", serial: SERIAL, root: "/sdcard/Komikku/local", profile: "komikku" } });
+    const id = t.targetId;
+    // The add queued an automatic plan; asking now joins it.
+    await waitFor(() => a.svc._debug().current, 8000, "auto plan running");
+    const running = await a.call("plan", { targetId: id, ifNeeded: true });
+    assert.deepStrictEqual([running.ok, running.planned, running.why], [true, false, "running"]);
+    const from = a.since();
+    assert.strictEqual((await a.call("cancel")).ok, true);
+    const done = await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, from, "cancelled plan");
+    assert.strictEqual(done.status, "cancelled");
+    await a.idle();
+    const v = (await lastPlans(a, id)) || {};
+    assert.strictEqual(v.summary, null);
+    assert.strictEqual(v.refusal, null);
+    assert.strictEqual(v.lastPlan && v.lastPlan.status, "cancelled", JSON.stringify(v.lastPlan));
+    // The old renderer rule ("no summary, no refusal") would re-plan here forever.
+    const held = await a.call("plan", { targetId: id, ifNeeded: true });
+    assert.deepStrictEqual([held.planned, held.why], [false, "held"]);
+    await sleep(100);
+    assert.ok(!a.svc._debug().current, "nothing started");
+    // A config edit is a change: the hold lifts and the edit's own re-plan runs.
+    a.dev.inject.shellDelayMs = 0;
+    const from2 = a.since();
+    assert.ok((await a.call("config-op", { op: "update-target", targetId: id, patch: { name: "Tab 2" } })).ok);
+    const again = await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, from2, "re-plan");
+    assert.strictEqual(again.status, "completed");
+    await a.idle();
+    const fresh = await a.call("plan", { targetId: id, ifNeeded: true });
+    assert.deepStrictEqual([fresh.planned, fresh.why], [false, "fresh"]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("U2 plan ifNeeded: a fresh summary doesn't re-plan; a disconnected folder says so; a reconnect plans", async () => {
+  const a = await app({ settings: { syncPromptOnConnect: false } });
+  try {
+    series(a.lib, "Pi", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    // Prompt-on-connect is off: the add's re-plan may have found the folder
+    // not yet watched, so the first plan can come from ifNeeded itself.
+    await waitFor(async () => {
+      await a.idle();
+      const r = await a.call("plan", { targetId: id, ifNeeded: true });
+      return r.why === "fresh";
+    }, 15000, "a fresh plan");
+    const g0 = (await a.state()).plans[id].gen;
+    fs.rmSync(a.target, { recursive: true, force: true });
+    await waitFor(async () => (await a.call("plan", { targetId: id, ifNeeded: true })).why === "disconnected", 8000, "folder gone");
+    // While away, something marks the plan stale (a download landed).
+    a.svc.notifyLibraryChanged("download");
+    await waitFor(async () => (await a.state()).plans[id].stale === true, 8000, "stale mark");
+    fs.mkdirSync(a.target, { recursive: true });
+    // Prompt-on-connect is off, so only ifNeeded re-plans the stale summary.
+    await waitFor(async () => (await a.call("plan", { targetId: id, ifNeeded: true })).why !== "disconnected", 8000, "folder back");
+    await waitFor(async () => {
+      const v = (await a.state()).plans[id];
+      return v.gen > g0 && !v.stale;
+    }, 15000, "re-planned after reconnect");
+  } finally {
+    await a.close();
+  }
+});
+
+test("U2 selection: seq is echoed in the plan view; an old gen is refused plan-changed; bulk series", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Rho", { "Ch.001.cbz": 1000, "Ch.002.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const s0 = await a.summary(id);
+    const row = s0.series[0];
+    assert.deepStrictEqual([row.counts.offered, row.counts.preselected], [2, 2]);
+    const from = a.since();
+    const off = await a.call("set-selection", { targetId: id, gen: s0.gen, seq: 7, bulk: "series", seriesKey: row.seriesKey, selected: false });
+    assert.ok(off.ok, JSON.stringify(off));
+    assert.strictEqual(off.seq, 7);
+    assert.strictEqual(off.totals.push.count, 0);
+    const ev = await a.waitEvent((e) => e.kind === "plans" && e.targetId === id && e.selSeq === 7, 4000, from, "plans with selSeq 7");
+    assert.strictEqual(ev.summary.totals.push.count, 0);
+    const on = await a.call("set-selection", { targetId: id, gen: s0.gen, seq: 8, bulk: "series", seriesKey: row.seriesKey, selected: true });
+    assert.strictEqual(on.totals.push.count, 2);
+    const stale = await a.call("set-selection", { targetId: id, gen: s0.gen - 1, seq: 9, changes: [] });
+    assertRefusal(stale, "blocked");
+    assert.strictEqual(stale.blocking[0].kind, "plan-changed");
+    assert.strictEqual((await lastPlans(a, id)).selSeq, 8, "a refused request leaves selSeq alone");
+  } finally {
+    await a.close();
+  }
+});
+
+test("U2 capacity carries total and after; apply progress carries `at` and the series lane", async () => {
+  // Each landed file waits 150 ms, so progress isn't coalesced into the
+  // job's end (job-record COALESCE_MS drops the last pending update).
+  const a = await app({ executorDeps: { hooks: (pt) => (pt === "after-pushed" ? sleep(150) : undefined) } });
+  try {
+    series(a.lib, "Tau", { "Ch.001.cbz": 1000, "Ch.002.cbz": 2000, "Ch.003.cbz": 3000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const c = (await a.summary(id)).capacity;
+    if (c.free != null) {
+      assert.ok(c.total >= c.free, JSON.stringify(c));
+      assert.strictEqual(c.after, c.free - c.needed + c.freeable);
+    } else assert.strictEqual(c.after, null);
+    const from = a.since();
+    const ap = await a.apply({ targetId: id });
+    assert.ok(ap.ok, JSON.stringify(ap));
+    assert.strictEqual((await a.job(ap.runId)).status, "completed");
+    const prog = a.events.slice(from).filter((e) => e.kind === "job" && e.runId === ap.runId && e.progress && e.progress.lane);
+    assert.ok(prog.length, "a progress event carried the lane");
+    for (const e of prog) {
+      assert.ok(Number.isFinite(e.progress.at));
+      assert.ok(e.progress.lane.landed <= e.progress.lane.total && e.progress.lane.total === 3, JSON.stringify(e.progress.lane));
+    }
+  } finally {
+    await a.close();
+  }
+});
+
+test("U2 settling: a plan holding a young file re-plans itself after settleAt", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Upsilon", { "Ch.001.cbz": 1000 });
+    // 28 s old: inside the 30 s settle age, out of it ~2 s from now.
+    writeOld(path.join(a.lib, "Upsilon", "Ch.002.cbz"), bytes("Ch.002.cbz", 1000), Date.now() / 1000 - 28);
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const s0 = await a.summary(id);
+    assert.ok(s0.settleAt != null, "a file is settling");
+    const g0 = s0.gen;
+    await waitFor(() => a.events.some((e) => e.kind === "plans" && e.targetId === id && e.gen > g0), 15000, "self re-plan");
+    await a.idle();
+    const s1 = await a.summary(id);
+    assert.strictEqual(s1.settleAt, null);
+    assert.strictEqual(s1.totals.push.count, 2);
+  } finally {
+    await a.close();
+  }
+});
+
+test("U2 exclude: remove-series {removeFiles:false} stops syncing without offering deletes", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Phi", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const ap = await a.apply({ targetId: id });
+    await a.job(ap.runId);
+    await a.idle();
+    const key = (await a.summary(id)).series[0].seriesKey;
+    const r = await a.call("config-op", { op: "remove-series", targetId: id, seriesKey: key, removeFiles: false });
+    assert.ok(r.ok, JSON.stringify(r));
+    assert.strictEqual(r.config.targets[0].excludes.length, 1);
+    assert.ok(!("removeFiles" in r.config.targets[0].excludes[0]));
+    await a.idle();
+    const row = (await a.summary(id)).series.find((x) => x.seriesKey === key);
+    assert.deepStrictEqual([row.state, row.heldReason, row.removing], ["held", "excluded", false]);
+    assert.strictEqual(row.counts.offered, 0);
+    assert.deepStrictEqual(devNames(a, "Phi"), ["Ch.001.cbz"], "files stay");
+  } finally {
+    await a.close();
+  }
+});
+
+test("U2 mass acknowledgement over IPC: `true` is not accepted, the shown count is", async () => {
+  const a = await app();
+  try {
+    const files = {};
+    for (let i = 1; i <= 12; i += 1) files[`Ch.${String(i).padStart(3, "0")}.cbz`] = 1000 + i;
+    series(a.lib, "Chi", files);
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const ap = await a.apply({ targetId: id });
+    await a.job(ap.runId);
+    await a.idle();
+    const key = (await a.summary(id)).series[0].seriesKey;
+    assert.ok((await a.call("config-op", { op: "remove-series", targetId: id, seriesKey: key })).ok);
+    await a.idle();
+    const s = await a.summary(id);
+    assert.ok(s.massDelete.required, JSON.stringify(s.massDelete));
+    const n = s.massDelete.count;
+    const bad = await a.call("apply", { targetId: id, gen: s.gen, ackMassDelete: true });
+    assertRefusal(bad, "blocked");
+    assert.ok(bad.blocking.some((b) => b.kind === "mass-delete"));
+    assertRefusal(await a.call("apply", { targetId: id, gen: s.gen, ackMassDelete: n - 1 }), "blocked");
+    const ok = await a.call("apply", { targetId: id, gen: s.gen, ackMassDelete: n });
+    assert.ok(ok.ok, JSON.stringify(ok));
+    assert.strictEqual((await a.job(ok.runId)).status, "completed");
+  } finally {
+    await a.close();
+  }
+});
+
 (async () => {
   const only = process.env.TEST_ONLY ? new RegExp(process.env.TEST_ONLY) : null;
   for (const t of tests) {

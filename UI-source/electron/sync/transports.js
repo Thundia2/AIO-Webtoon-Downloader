@@ -31,6 +31,8 @@
 //   {ok, reason?}; rmdirIfEmpty(rel) → {removed}
 //   hashFolder(name, {largest, signal}) → {ok, rc, hashes:Map name→sha}
 //   freeSpace() → bytes | null;  freeSpaceNeeded(ops) (sync) → bytes
+//   storage() → {free, total} (each bytes | null): the Sync tab's gauge
+//     (prepare.js _readFreeSpace); freeSpace() is storage().free
 //   waitReady({timeoutMs, signal}) → {state}   (adb `connecting` policy)
 //   close(); destroy() (sync: cancel, shutdown)
 // `rel` is a path relative to the canonical root ("Folder/name.cbz"); every
@@ -606,19 +608,23 @@ class AdbTransport {
   }
 
   async freeSpace() {
+    return (await this.storage()).free;
+  }
+
+  async storage() {
     const caps = (await this.probe()).caps;
     const root = this._abs("");
     if (caps.statF) {
-      const r = await this._sh(`stat -f -c '%a %S' ${shq(root)}`);
-      const m = /^(\d+) (\d+)/.exec(r.stdout.toString("utf8"));
-      if (r.rc === 0 && m) return Number(m[1]) * Number(m[2]);
+      const r = await this._sh(`stat -f -c '%a %b %S' ${shq(root)}`);
+      const m = /^(\d+) (\d+) (\d+)/.exec(r.stdout.toString("utf8"));
+      if (r.rc === 0 && m) return { free: Number(m[1]) * Number(m[3]), total: Number(m[2]) * Number(m[3]) };
     }
     if (caps.df) {
       const r = await this._sh(`df -P -k ${shq(root)}`);
       const kb = r.rc === 0 ? _parseDf(r.stdout.toString("utf8")) : null;
-      if (kb != null) return kb * 1024;
+      if (kb != null) return { free: kb.avail * 1024, total: kb.total == null ? null : kb.total * 1024 };
     }
-    return null;
+    return { free: null, total: null };
   }
 
   /** adb writes in place (SEND unlinks the old file first): growth only. */
@@ -668,7 +674,8 @@ function _parseDf(text) {
   if (lines.length < 2) return null;
   const cols = lines[1].trim().split(/\s+/);
   const avail = Number(cols[3]);
-  return cols.length >= 6 && Number.isFinite(avail) ? avail : null;
+  const total = Number(cols[1]);
+  return cols.length >= 6 && Number.isFinite(avail) ? { avail, total: Number.isFinite(total) ? total : null } : null;
 }
 
 /** Tag errors from a PC read stream so the executor can tell them apart. */
@@ -1061,12 +1068,16 @@ class FolderTransport {
   }
 
   async freeSpace() {
+    return (await this.storage()).free;
+  }
+
+  async storage() {
     try {
-      if (typeof this.fsp.statfs !== "function") return null;
+      if (typeof this.fsp.statfs !== "function") return { free: null, total: null };
       const s = await this.fsp.statfs(this.canonicalRoot || this.root);
-      return Number(s.bavail) * Number(s.bsize);
+      return { free: Number(s.bavail) * Number(s.bsize), total: Number(s.blocks) * Number(s.bsize) };
     } catch (_) {
-      return null;
+      return { free: null, total: null };
     }
   }
 

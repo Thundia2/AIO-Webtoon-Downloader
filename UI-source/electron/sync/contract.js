@@ -66,7 +66,9 @@ const EVENT_CHANNEL = "sync-event";
 // UI shows is pushed when it changes, so the renderer never re-reads
 // get-state to catch up (the re-read raced the identity clear and lost job
 // results). `plans` {targetId, summary, refusal, stale, lastRun, gen,
-// removed?} is per target and coalesced to one event per tick; `adb`
+// selSeq, lastPlan, removed?} is per target and coalesced to one event per
+// tick (selSeq: the last set-selection seq applied; lastPlan: the last plan
+// job's {runId, status, reason, at} — UI-pass U2-1/U2-3); `adb`
 // {adb} carries the binary, server and tracking state; `settings`
 // {enabled, settings} follows every applySettings.
 const EVENT_KINDS = Object.freeze([
