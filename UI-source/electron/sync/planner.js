@@ -302,7 +302,7 @@ function buildPlan(input) {
   const early = inputRefusal(pc, view);
   if (early) return early;
   if (device.trusted === false) {
-    return refuse("device-listing-suspect", "the device listing looks incomplete");
+    return refuse("device-listing-suspect", "the device listing looks incomplete", { cause: "few-files" });
   }
 
   const ci = !!view.caseInsensitive;
@@ -806,7 +806,18 @@ function _addCover(sp, label, opIdOrNull, strong) {
 }
 
 function _settling(f, now) {
-  return Number.isFinite(f.mtimeMs) && now - f.mtimeMs < SETTLE_MS;
+  return Number.isFinite(f.mtimeMs) && isSettling(f.mtimeMs, now);
+}
+
+/**
+ * A file is settling while its mtime is within SETTLE_MS of now, on EITHER
+ * side. A future mtime farther out is a bad clock or an archive's stamp,
+ * not a write in progress: counting it as settling held the file until that
+ * date, and past ~24.8 days the re-plan timer overflowed (review R4).
+ * Shared with executor.js _guard, so plan and apply agree.
+ */
+function isSettling(mtimeMs, now) {
+  return Math.abs(now - mtimeMs) < SETTLE_MS;
 }
 
 function _noteSettle(plan, f) {
@@ -1966,6 +1977,7 @@ function planReview(plan, selected) {
 
 module.exports = {
   SETTLE_MS,
+  isSettling,
   ADOPT_RATIO,
   MASS_RATIO,
   MASS_MIN,

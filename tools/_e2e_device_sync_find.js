@@ -239,7 +239,7 @@ sys.exit(0)
       await win.getByText("Find sources for 3 folders").waitFor({ timeout: 10_000 });
     });
     await step("Skip one, then Search the other two", async () => {
-      await win.getByRole("checkbox", { name: "Skip Dandadan" }).click();
+      await win.getByRole("checkbox", { name: "Include Dandadan" }).click();
       await win.getByRole("button", { name: "Search 2 folders" }).click();
       await win.getByRole("button", { name: "Queue 1 download" }).waitFor({ timeout: 30_000 });
     });

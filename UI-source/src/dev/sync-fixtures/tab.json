@@ -76,7 +76,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "ta086fd923e",
+              "id": "t82a93410f8",
               "deletePolicy": "guarded",
               "excludes": [],
               "aliases": [],
@@ -100,18 +100,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "ta086fd923e": true
+          "t82a93410f8": true
         },
         "job": {
           "job": {
             "runId": 1,
             "phase": "plan",
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "serial": null,
             "auto": true,
             "state": "done",
-            "startedAt": 1792226408788,
-            "finishedAt": 1792226408855,
+            "startedAt": 1792231267679,
+            "finishedAt": 1792231267730,
             "progress": {
               "bytesDone": 127108,
               "bytesTotal": 127108,
@@ -132,13 +132,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792226408847
+              "at": 1792231267724
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "ta086fd923e",
-                "asOf": 1792226408847,
+                "targetId": "t82a93410f8",
+                "asOf": 1792231267723,
                 "firstSync": true,
                 "totals": {
                   "push": {
@@ -430,15 +430,15 @@
                 "gen": 1,
                 "warnings": [],
                 "capacity": {
-                  "free": 229113716736,
+                  "free": 229051305984,
                   "total": 1999343972352,
                   "needed": 127108,
                   "reserve": 1073741824,
                   "freeable": 0,
                   "freeableEarly": 0,
-                  "after": 229113589628,
+                  "after": 229051178876,
                   "fits": true,
-                  "asOf": 1792226408805
+                  "asOf": 1792231267691
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -451,10 +451,10 @@
           "queue": []
         },
         "plans": {
-          "ta086fd923e": {
+          "t82a93410f8": {
             "summary": {
-              "targetId": "ta086fd923e",
-              "asOf": 1792226408847,
+              "targetId": "t82a93410f8",
+              "asOf": 1792231267723,
               "firstSync": true,
               "totals": {
                 "push": {
@@ -746,15 +746,15 @@
               "gen": 1,
               "warnings": [],
               "capacity": {
-                "free": 229113716736,
+                "free": 229051305984,
                 "total": 1999343972352,
                 "needed": 127108,
                 "reserve": 1073741824,
                 "freeable": 0,
                 "freeableEarly": 0,
-                "after": 229113589628,
+                "after": 229051178876,
                 "fits": true,
-                "asOf": 1792226408805
+                "asOf": 1792231267691
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -772,7 +772,7 @@
               "status": "completed",
               "auto": true,
               "reason": null,
-              "at": 1792226408855
+              "at": 1792231267730
             }
           }
         },
@@ -863,7 +863,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "ta086fd923e",
+              "id": "t82a93410f8",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -898,18 +898,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "ta086fd923e": true
+          "t82a93410f8": true
         },
         "job": {
           "job": {
             "runId": 6,
             "phase": "plan",
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792226410008,
-            "finishedAt": 1792226410044,
+            "startedAt": 1792231269029,
+            "finishedAt": 1792231269058,
             "progress": {
               "bytesDone": 91442,
               "bytesTotal": 91442,
@@ -930,13 +930,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792226410043
+              "at": 1792231269057
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "ta086fd923e",
-                "asOf": 1792226410043,
+                "targetId": "t82a93410f8",
+                "asOf": 1792231269057,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -974,7 +974,7 @@
                   "count": 1
                 },
                 "needsVerify": 0,
-                "settleAt": 1792226434822,
+                "settleAt": 1792231293840,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -1325,7 +1325,7 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "cf8f24225093fd8c",
+                    "shardId": "49a6466f0a38f42d",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
@@ -1377,15 +1377,15 @@
                 "gen": 5,
                 "warnings": [],
                 "capacity": {
-                  "free": 229113475072,
+                  "free": 229051129856,
                   "total": 1999343972352,
                   "needed": 60912,
                   "reserve": 1073741824,
                   "freeable": 36078,
                   "freeableEarly": 36078,
-                  "after": 229113450238,
+                  "after": 229051105022,
                   "fits": true,
-                  "asOf": 1792226410030
+                  "asOf": 1792231269048
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -1398,10 +1398,10 @@
           "queue": []
         },
         "plans": {
-          "ta086fd923e": {
+          "t82a93410f8": {
             "summary": {
-              "targetId": "ta086fd923e",
-              "asOf": 1792226410043,
+              "targetId": "t82a93410f8",
+              "asOf": 1792231269057,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -1439,7 +1439,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792226434822,
+              "settleAt": 1792231293840,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -1790,7 +1790,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "cf8f24225093fd8c",
+                  "shardId": "49a6466f0a38f42d",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -1842,15 +1842,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 229113475072,
+                "free": 229051129856,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 36078,
                 "freeableEarly": 36078,
-                "after": 229113450238,
+                "after": 229051105022,
                 "fits": true,
-                "asOf": 1792226410030
+                "asOf": 1792231269048
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -1865,7 +1865,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792226409684,
+              "at": 1792231268667,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -1894,7 +1894,7 @@
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792226410044
+              "at": 1792231269058
             }
           }
         },
@@ -1985,7 +1985,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "ta086fd923e",
+              "id": "t82a93410f8",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -2020,18 +2020,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "ta086fd923e": true
+          "t82a93410f8": true
         },
         "job": {
           "job": {
             "runId": 6,
             "phase": "plan",
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792226410008,
-            "finishedAt": 1792226410044,
+            "startedAt": 1792231269029,
+            "finishedAt": 1792231269058,
             "progress": {
               "bytesDone": 91442,
               "bytesTotal": 91442,
@@ -2052,13 +2052,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792226410043
+              "at": 1792231269057
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "ta086fd923e",
-                "asOf": 1792226410043,
+                "targetId": "t82a93410f8",
+                "asOf": 1792231269057,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -2096,7 +2096,7 @@
                   "count": 1
                 },
                 "needsVerify": 0,
-                "settleAt": 1792226434822,
+                "settleAt": 1792231293840,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -2447,7 +2447,7 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "cf8f24225093fd8c",
+                    "shardId": "49a6466f0a38f42d",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
@@ -2499,15 +2499,15 @@
                 "gen": 5,
                 "warnings": [],
                 "capacity": {
-                  "free": 229113475072,
+                  "free": 229051129856,
                   "total": 1999343972352,
                   "needed": 60912,
                   "reserve": 1073741824,
                   "freeable": 36078,
                   "freeableEarly": 36078,
-                  "after": 229113450238,
+                  "after": 229051105022,
                   "fits": true,
-                  "asOf": 1792226410030
+                  "asOf": 1792231269048
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -2520,10 +2520,10 @@
           "queue": []
         },
         "plans": {
-          "ta086fd923e": {
+          "t82a93410f8": {
             "summary": {
-              "targetId": "ta086fd923e",
-              "asOf": 1792226410043,
+              "targetId": "t82a93410f8",
+              "asOf": 1792231269057,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -2561,7 +2561,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792226434822,
+              "settleAt": 1792231293840,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -2913,7 +2913,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "cf8f24225093fd8c",
+                  "shardId": "49a6466f0a38f42d",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -2965,15 +2965,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 229113475072,
+                "free": 229051129856,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 39081,
                 "freeableEarly": 39081,
-                "after": 229113453241,
+                "after": 229051108025,
                 "fits": true,
-                "asOf": 1792226410030
+                "asOf": 1792231269048
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -2988,7 +2988,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792226409684,
+              "at": 1792231268667,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -3017,7 +3017,7 @@
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792226410044
+              "at": 1792231269058
             }
           }
         },
@@ -3108,7 +3108,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "ta086fd923e",
+              "id": "t82a93410f8",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -3143,17 +3143,17 @@
         },
         "devices": [],
         "folderPresence": {
-          "ta086fd923e": true
+          "t82a93410f8": true
         },
         "job": {
           "job": {
             "runId": 7,
             "phase": "apply",
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "serial": null,
             "auto": false,
             "state": "running",
-            "startedAt": 1792226410413,
+            "startedAt": 1792231269450,
             "finishedAt": null,
             "progress": {
               "bytesDone": 3402,
@@ -3178,7 +3178,7 @@
                 "refusal": null
               },
               "step": "apply",
-              "at": 1792226410487,
+              "at": 1792231269513,
               "lane": {
                 "seriesKey": "pc:Eleceed",
                 "landed": 1,
@@ -3191,10 +3191,10 @@
           "queue": []
         },
         "plans": {
-          "ta086fd923e": {
+          "t82a93410f8": {
             "summary": {
-              "targetId": "ta086fd923e",
-              "asOf": 1792226410043,
+              "targetId": "t82a93410f8",
+              "asOf": 1792231269057,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -3232,7 +3232,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792226434822,
+              "settleAt": 1792231293840,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -3584,7 +3584,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "cf8f24225093fd8c",
+                  "shardId": "49a6466f0a38f42d",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -3636,15 +3636,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 229113475072,
+                "free": 229051129856,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 39081,
                 "freeableEarly": 39081,
-                "after": 229113453241,
+                "after": 229051108025,
                 "fits": true,
-                "asOf": 1792226410030
+                "asOf": 1792231269048
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -3659,7 +3659,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792226409684,
+              "at": 1792231268667,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -3688,7 +3688,7 @@
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792226410044
+              "at": 1792231269058
             }
           }
         },
@@ -3779,7 +3779,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "ta086fd923e",
+              "id": "t82a93410f8",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -3813,18 +3813,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "ta086fd923e": true
+          "t82a93410f8": true
         },
         "job": {
           "job": {
             "runId": 8,
             "phase": "plan",
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "serial": null,
             "auto": true,
             "state": "done",
-            "startedAt": 1792226413505,
-            "finishedAt": 1792226413546,
+            "startedAt": 1792231272372,
+            "finishedAt": 1792231272407,
             "progress": {
               "bytesDone": 91442,
               "bytesTotal": 91442,
@@ -3845,13 +3845,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792226413545
+              "at": 1792231272406
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "ta086fd923e",
-                "asOf": 1792226413545,
+                "targetId": "t82a93410f8",
+                "asOf": 1792231272406,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -3889,7 +3889,7 @@
                   "count": 0
                 },
                 "needsVerify": 0,
-                "settleAt": 1792226434822,
+                "settleAt": 1792231293840,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -4186,7 +4186,7 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "cf8f24225093fd8c",
+                    "shardId": "49a6466f0a38f42d",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
@@ -4228,15 +4228,15 @@
                 "gen": 6,
                 "warnings": [],
                 "capacity": {
-                  "free": 229120700416,
+                  "free": 229050912768,
                   "total": 1999343972352,
                   "needed": 0,
                   "reserve": 1073741824,
                   "freeable": 0,
                   "freeableEarly": 0,
-                  "after": 229120700416,
+                  "after": 229050912768,
                   "fits": true,
-                  "asOf": 1792226413530
+                  "asOf": 1792231272392
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -4249,10 +4249,10 @@
           "queue": []
         },
         "plans": {
-          "ta086fd923e": {
+          "t82a93410f8": {
             "summary": {
-              "targetId": "ta086fd923e",
-              "asOf": 1792226413545,
+              "targetId": "t82a93410f8",
+              "asOf": 1792231272406,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -4290,7 +4290,7 @@
                 "count": 0
               },
               "needsVerify": 0,
-              "settleAt": 1792226434822,
+              "settleAt": 1792231293840,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -4587,7 +4587,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "cf8f24225093fd8c",
+                  "shardId": "49a6466f0a38f42d",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -4629,15 +4629,15 @@
               "gen": 6,
               "warnings": [],
               "capacity": {
-                "free": 229120700416,
+                "free": 229050912768,
                 "total": 1999343972352,
                 "needed": 0,
                 "reserve": 1073741824,
                 "freeable": 0,
                 "freeableEarly": 0,
-                "after": 229120700416,
+                "after": 229050912768,
                 "fits": true,
-                "asOf": 1792226413530
+                "asOf": 1792231272392
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -4652,7 +4652,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792226413505,
+              "at": 1792231272372,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -4690,7 +4690,7 @@
               "status": "completed",
               "auto": true,
               "reason": null,
-              "at": 1792226413546
+              "at": 1792231272407
             }
           }
         },
@@ -4781,7 +4781,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "ta086fd923e",
+              "id": "t82a93410f8",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -4815,18 +4815,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "ta086fd923e": true
+          "t82a93410f8": true
         },
         "job": {
           "job": {
             "runId": 9,
             "phase": "plan",
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792226413697,
-            "finishedAt": 1792226413721,
+            "startedAt": 1792231272550,
+            "finishedAt": 1792231272571,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -4854,7 +4854,7 @@
                 }
               },
               "step": "device-ready",
-              "at": 1792226413697
+              "at": 1792231272550
             },
             "status": "failed",
             "summary": {
@@ -4872,7 +4872,7 @@
           "queue": []
         },
         "plans": {
-          "ta086fd923e": {
+          "t82a93410f8": {
             "summary": null,
             "refusal": {
               "fields": [
@@ -4889,7 +4889,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792226413505,
+              "at": 1792231272372,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -4927,7 +4927,7 @@
               "status": "failed",
               "auto": false,
               "reason": "record-mismatch",
-              "at": 1792226413721
+              "at": 1792231272571
             }
           }
         },
@@ -5018,7 +5018,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "ta086fd923e",
+              "id": "t82a93410f8",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -5052,18 +5052,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "ta086fd923e": true
+          "t82a93410f8": true
         },
         "job": {
           "job": {
             "runId": 10,
             "phase": "plan",
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792226413885,
-            "finishedAt": 1792226413909,
+            "startedAt": 1792231272736,
+            "finishedAt": 1792231272757,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -5083,18 +5083,20 @@
                 "mayNeedMode": false,
                 "refusal": {
                   "detail": "empty-root",
+                  "cause": "empty-root",
                   "ok": false,
                   "code": "device-listing-suspect",
                   "message": "the device lists no folders while this target has synced series (locked or not mounted?)"
                 }
               },
               "step": "device-ready",
-              "at": 1792226413909
+              "at": 1792231272757
             },
             "status": "failed",
             "summary": {
               "refusal": {
                 "detail": "empty-root",
+                "cause": "empty-root",
                 "ok": false,
                 "code": "device-listing-suspect",
                 "message": "the device lists no folders while this target has synced series (locked or not mounted?)",
@@ -5105,10 +5107,11 @@
           "queue": []
         },
         "plans": {
-          "ta086fd923e": {
+          "t82a93410f8": {
             "summary": null,
             "refusal": {
               "detail": "empty-root",
+              "cause": "empty-root",
               "ok": false,
               "code": "device-listing-suspect",
               "message": "the device lists no folders while this target has synced series (locked or not mounted?)",
@@ -5120,7 +5123,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792226413505,
+              "at": 1792231272372,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -5158,7 +5161,7 @@
               "status": "failed",
               "auto": false,
               "reason": "device-listing-suspect",
-              "at": 1792226413909
+              "at": 1792231272757
             }
           }
         },
@@ -5249,7 +5252,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "ta086fd923e",
+              "id": "t82a93410f8",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -5283,18 +5286,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "ta086fd923e": false
+          "t82a93410f8": false
         },
         "job": {
           "job": {
             "runId": 10,
             "phase": "plan",
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792226413885,
-            "finishedAt": 1792226413909,
+            "startedAt": 1792231272736,
+            "finishedAt": 1792231272757,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -5314,18 +5317,20 @@
                 "mayNeedMode": false,
                 "refusal": {
                   "detail": "empty-root",
+                  "cause": "empty-root",
                   "ok": false,
                   "code": "device-listing-suspect",
                   "message": "the device lists no folders while this target has synced series (locked or not mounted?)"
                 }
               },
               "step": "device-ready",
-              "at": 1792226413909
+              "at": 1792231272757
             },
             "status": "failed",
             "summary": {
               "refusal": {
                 "detail": "empty-root",
+                "cause": "empty-root",
                 "ok": false,
                 "code": "device-listing-suspect",
                 "message": "the device lists no folders while this target has synced series (locked or not mounted?)",
@@ -5336,10 +5341,11 @@
           "queue": []
         },
         "plans": {
-          "ta086fd923e": {
+          "t82a93410f8": {
             "summary": null,
             "refusal": {
               "detail": "empty-root",
+              "cause": "empty-root",
               "ok": false,
               "code": "device-listing-suspect",
               "message": "the device lists no folders while this target has synced series (locked or not mounted?)",
@@ -5351,7 +5357,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792226413505,
+              "at": 1792231272372,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -5389,7 +5395,7 @@
               "status": "failed",
               "auto": false,
               "reason": "device-listing-suspect",
-              "at": 1792226413909
+              "at": 1792231272757
             }
           }
         },
@@ -5480,7 +5486,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t5721599c0a",
+              "id": "t4db8240d7b",
               "deletePolicy": "guarded",
               "excludes": [],
               "aliases": [],
@@ -5519,12 +5525,12 @@
           "job": {
             "runId": 1,
             "phase": "plan",
-            "targetId": "t5721599c0a",
+            "targetId": "t4db8240d7b",
             "serial": "R5CW71ABCDE",
             "auto": true,
             "state": "done",
-            "startedAt": 1792226423866,
-            "finishedAt": 1792226423989,
+            "startedAt": 1792231282759,
+            "finishedAt": 1792231282882,
             "progress": {
               "bytesDone": 136526,
               "bytesTotal": 136526,
@@ -5551,7 +5557,7 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792226423988
+              "at": 1792231282881
             },
             "status": "failed",
             "summary": {
@@ -5575,7 +5581,7 @@
           "queue": []
         },
         "plans": {
-          "t5721599c0a": {
+          "t4db8240d7b": {
             "summary": null,
             "refusal": {
               "folders": [
@@ -5601,7 +5607,7 @@
               "status": "failed",
               "auto": true,
               "reason": "needs-mode",
-              "at": 1792226423989
+              "at": 1792231282882
             }
           }
         },
@@ -6458,7 +6464,7 @@
         ],
         "suggestions": [],
         "rebind": {
-          "shardId": "da53a4a456571d54",
+          "shardId": "9f754b1a55924719",
           "choices": [
             {
               "source": "previous",
@@ -6728,7 +6734,7 @@
           "key": "dev:Berserk",
           "name": "Berserk",
           "state": "orphaned",
-          "shardId": "cf8f24225093fd8c",
+          "shardId": "49a6466f0a38f42d",
           "listed": true,
           "files": 5,
           "bytes": 15015,
@@ -6923,10 +6929,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "ta086fd923e",
+          "targetId": "t82a93410f8",
           "summary": {
-            "targetId": "ta086fd923e",
-            "asOf": 1792226410043,
+            "targetId": "t82a93410f8",
+            "asOf": 1792231269057,
             "firstSync": false,
             "totals": {
               "push": {
@@ -6964,7 +6970,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792226434822,
+            "settleAt": 1792231293840,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -7321,7 +7327,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "cf8f24225093fd8c",
+                "shardId": "49a6466f0a38f42d",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -7373,15 +7379,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229113475072,
+              "free": 229051129856,
               "total": 1999343972352,
               "needed": 57905,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 229113453245,
+              "after": 229051108029,
               "fits": true,
-              "asOf": 1792226410030
+              "asOf": 1792231269048
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -7396,7 +7402,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792226409684,
+            "at": 1792231268667,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -7425,7 +7431,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792226410044
+            "at": 1792231269058
           }
         }
       },
@@ -7487,10 +7493,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "ta086fd923e",
+          "targetId": "t82a93410f8",
           "summary": {
-            "targetId": "ta086fd923e",
-            "asOf": 1792226410043,
+            "targetId": "t82a93410f8",
+            "asOf": 1792231269057,
             "firstSync": false,
             "totals": {
               "push": {
@@ -7528,7 +7534,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792226434822,
+            "settleAt": 1792231293840,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -7879,7 +7885,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "cf8f24225093fd8c",
+                "shardId": "49a6466f0a38f42d",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -7931,15 +7937,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229113475072,
+              "free": 229051129856,
               "total": 1999343972352,
               "needed": 48086,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 229113463064,
+              "after": 229051117848,
               "fits": true,
-              "asOf": 1792226410030
+              "asOf": 1792231269048
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -7954,7 +7960,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792226409684,
+            "at": 1792231268667,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -7983,7 +7989,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792226410044
+            "at": 1792231269058
           }
         }
       },
@@ -8045,10 +8051,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "ta086fd923e",
+          "targetId": "t82a93410f8",
           "summary": {
-            "targetId": "ta086fd923e",
-            "asOf": 1792226410043,
+            "targetId": "t82a93410f8",
+            "asOf": 1792231269057,
             "firstSync": false,
             "totals": {
               "push": {
@@ -8086,7 +8092,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792226434822,
+            "settleAt": 1792231293840,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -8437,7 +8443,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "cf8f24225093fd8c",
+                "shardId": "49a6466f0a38f42d",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -8489,15 +8495,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229113475072,
+              "free": 229051129856,
               "total": 1999343972352,
               "needed": 60912,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 229113450238,
+              "after": 229051105022,
               "fits": true,
-              "asOf": 1792226410030
+              "asOf": 1792231269048
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -8512,7 +8518,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792226409684,
+            "at": 1792231268667,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -8541,7 +8547,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792226410044
+            "at": 1792231269058
           }
         }
       },
@@ -8627,10 +8633,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "ta086fd923e",
+          "targetId": "t82a93410f8",
           "summary": {
-            "targetId": "ta086fd923e",
-            "asOf": 1792226410043,
+            "targetId": "t82a93410f8",
+            "asOf": 1792231269057,
             "firstSync": false,
             "totals": {
               "push": {
@@ -8668,7 +8674,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792226434822,
+            "settleAt": 1792231293840,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -9020,7 +9026,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "cf8f24225093fd8c",
+                "shardId": "49a6466f0a38f42d",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -9072,15 +9078,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229113475072,
+              "free": 229051129856,
               "total": 1999343972352,
               "needed": 60912,
               "reserve": 1073741824,
               "freeable": 39081,
               "freeableEarly": 39081,
-              "after": 229113453241,
+              "after": 229051108025,
               "fits": true,
-              "asOf": 1792226410030
+              "asOf": 1792231269048
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -9095,7 +9101,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792226409684,
+            "at": 1792231268667,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -9124,7 +9130,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792226410044
+            "at": 1792231269058
           }
         }
       }
@@ -9146,11 +9152,11 @@
         "job": {
           "runId": 7,
           "phase": "apply",
-          "targetId": "ta086fd923e",
+          "targetId": "t82a93410f8",
           "serial": null,
           "auto": false,
           "state": "running",
-          "startedAt": 1792226410413,
+          "startedAt": 1792231269450,
           "finishedAt": null,
           "progress": {
             "bytesDone": 3402,
@@ -9175,7 +9181,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226410487,
+            "at": 1792231269513,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 1,
@@ -9200,11 +9206,11 @@
         "message": "the folder isn't available"
       }
     },
-    "targetId": "ta086fd923e",
+    "targetId": "t82a93410f8",
     "review": {
       "ok": true,
-      "targetId": "ta086fd923e",
-      "asOf": 1792226410043,
+      "targetId": "t82a93410f8",
+      "asOf": 1792231269057,
       "firstSync": false,
       "deletePolicy": "guarded",
       "totals": {
@@ -9931,7 +9937,7 @@
           "seriesKey": "pc:Solo Leveling",
           "series": "Solo Leveling",
           "rebind": {
-            "shardId": "da53a4a456571d54",
+            "shardId": "9f754b1a55924719",
             "choices": [
               {
                 "source": "previous",
@@ -9951,17 +9957,18 @@
       "sanity": [],
       "needsVerify": 0,
       "gen": 5,
+      "selSeq": null,
       "stale": false,
       "capacity": {
-        "free": 229113475072,
+        "free": 229051129856,
         "total": 1999343972352,
         "needed": 60912,
         "reserve": 1073741824,
         "freeable": 36078,
         "freeableEarly": 36078,
-        "after": 229113450238,
+        "after": 229051105022,
         "fits": true,
-        "asOf": 1792226410030
+        "asOf": 1792231269048
       },
       "policy": {
         "deletePolicy": "guarded",
@@ -9973,42 +9980,42 @@
     },
     "libraryStatus": {
       "ok": true,
-      "asOf": 1792226410064,
+      "asOf": 1792231269077,
       "bySeries": {
         "D:\\Sync-fixture\\tab-manga\\Dungeon Meshi": [
           {
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "state": "synced",
             "pending": 0
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Eleceed": [
           {
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "state": "pending",
             "pending": 4
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Frieren": [
           {
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "state": "pending",
             "pending": 2
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Kagurabachi": [
           {
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "state": "absent",
             "pending": 3
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Solo Leveling": [
           {
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "state": "removed",
             "pending": 12,
-            "asOf": 1792226410043
+            "asOf": 1792231269057
           }
         ]
       }
@@ -10016,7 +10023,7 @@
     "find": {
       "ok": true,
       "running": false,
-      "targetId": "ta086fd923e",
+      "targetId": "t82a93410f8",
       "waiting": null,
       "done": 0,
       "total": 0,
@@ -10031,7 +10038,7 @@
           "pinnedUrl": null,
           "skip": false,
           "error": "search exited with code 1",
-          "searchedAt": 1792226410179
+          "searchedAt": 1792231269199
         },
         {
           "folder": "Chainsaw Man",
@@ -10101,7 +10108,7 @@
           "pinnedUrl": null,
           "skip": false,
           "error": null,
-          "searchedAt": 1792226410227
+          "searchedAt": 1792231269246
         },
         {
           "folder": "Kagurabachi_",
@@ -10113,13 +10120,13 @@
           "pinnedUrl": null,
           "skip": false,
           "error": null,
-          "searchedAt": 1792226410273
+          "searchedAt": 1792231269292
         }
       ]
     },
     "findRunning": {
       "kind": "find",
-      "targetId": "ta086fd923e",
+      "targetId": "t82a93410f8",
       "state": "running",
       "done": 0,
       "total": 3,
@@ -10138,8 +10145,8 @@
     },
     "reviewWithLoss": {
       "ok": true,
-      "targetId": "ta086fd923e",
-      "asOf": 1792226410043,
+      "targetId": "t82a93410f8",
+      "asOf": 1792231269057,
       "firstSync": false,
       "deletePolicy": "guarded",
       "totals": {
@@ -10877,7 +10884,7 @@
           "seriesKey": "pc:Solo Leveling",
           "series": "Solo Leveling",
           "rebind": {
-            "shardId": "da53a4a456571d54",
+            "shardId": "9f754b1a55924719",
             "choices": [
               {
                 "source": "previous",
@@ -10897,17 +10904,18 @@
       "sanity": [],
       "needsVerify": 0,
       "gen": 5,
+      "selSeq": 5,
       "stale": false,
       "capacity": {
-        "free": 229113475072,
+        "free": 229051129856,
         "total": 1999343972352,
         "needed": 60912,
         "reserve": 1073741824,
         "freeable": 39081,
         "freeableEarly": 39081,
-        "after": 229113453241,
+        "after": 229051108025,
         "fits": true,
-        "asOf": 1792226410030
+        "asOf": 1792231269048
       },
       "policy": {
         "deletePolicy": "guarded",
@@ -10927,11 +10935,11 @@
           "job": {
             "runId": 7,
             "phase": "apply",
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "serial": null,
             "auto": false,
             "state": "running",
-            "startedAt": 1792226410413,
+            "startedAt": 1792231269450,
             "finishedAt": null,
             "progress": {
               "bytesDone": 0,
@@ -10960,12 +10968,12 @@
             "current": null,
             "preflight": null,
             "step": "probe",
-            "at": 1792226410413
+            "at": 1792231269450
           }
         }
       },
       {
-        "t": 23,
+        "t": 19,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -10990,12 +10998,12 @@
               "refusal": null
             },
             "step": "device-ready",
-            "at": 1792226410435
+            "at": 1792231269469
           }
         }
       },
       {
-        "t": 123,
+        "t": 125,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11023,7 +11031,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226410487,
+            "at": 1792231269513,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 1,
@@ -11033,7 +11041,7 @@
         }
       },
       {
-        "t": 232,
+        "t": 234,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11061,7 +11069,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226410625,
+            "at": 1792231269647,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 2,
@@ -11071,7 +11079,7 @@
         }
       },
       {
-        "t": 347,
+        "t": 334,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11099,7 +11107,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226410760,
+            "at": 1792231269783,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 2,
@@ -11109,7 +11117,7 @@
         }
       },
       {
-        "t": 450,
+        "t": 437,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11137,7 +11145,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226410764,
+            "at": 1792231269788,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 3,
@@ -11147,7 +11155,7 @@
         }
       },
       {
-        "t": 559,
+        "t": 546,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11175,7 +11183,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226410906,
+            "at": 1792231269930,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 4,
@@ -11185,7 +11193,7 @@
         }
       },
       {
-        "t": 670,
+        "t": 656,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11213,7 +11221,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226411053,
+            "at": 1792231270074,
             "lane": {
               "seriesKey": "pc:Frieren",
               "landed": 1,
@@ -11223,13 +11231,13 @@
         }
       },
       {
-        "t": 784,
+        "t": 756,
         "ev": {
           "kind": "job",
           "runId": 7,
           "state": "running",
           "progress": {
-            "bytesDone": 15428,
+            "bytesDone": 18431,
             "bytesTotal": 60512,
             "filesDone": 5,
             "filesTotal": 20,
@@ -11251,7 +11259,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226411197,
+            "at": 1792231270204,
             "lane": {
               "seriesKey": "pc:Frieren",
               "landed": 1,
@@ -11261,7 +11269,7 @@
         }
       },
       {
-        "t": 888,
+        "t": 858,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11289,7 +11297,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226411203,
+            "at": 1792231270208,
             "lane": {
               "seriesKey": "pc:Frieren",
               "landed": 2,
@@ -11299,7 +11307,7 @@
         }
       },
       {
-        "t": 996,
+        "t": 966,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11327,7 +11335,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226411358,
+            "at": 1792231270361,
             "lane": {
               "seriesKey": "pc:Kagurabachi",
               "landed": 1,
@@ -11337,45 +11345,7 @@
         }
       },
       {
-        "t": 1104,
-        "ev": {
-          "kind": "job",
-          "runId": 7,
-          "state": "running",
-          "progress": {
-            "bytesDone": 24434,
-            "bytesTotal": 60512,
-            "filesDone": 7,
-            "filesTotal": 20,
-            "current": {
-              "folder": "Kagurabachi",
-              "name": "Ch.002 - Kagurabachi.cbz"
-            },
-            "preflight": {
-              "kind": "folder",
-              "caps": {
-                "sha256sum": true,
-                "local": true
-              },
-              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
-              "caseInsensitive": true,
-              "caseMeasured": true,
-              "canHash": true,
-              "mayNeedMode": false,
-              "refusal": null
-            },
-            "step": "apply",
-            "at": 1792226411496,
-            "lane": {
-              "seriesKey": "pc:Kagurabachi",
-              "landed": 1,
-              "total": 2
-            }
-          }
-        }
-      },
-      {
-        "t": 1226,
+        "t": 1074,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11403,45 +11373,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226411639,
-            "lane": {
-              "seriesKey": "pc:Kagurabachi",
-              "landed": 1,
-              "total": 2
-            }
-          }
-        }
-      },
-      {
-        "t": 1337,
-        "ev": {
-          "kind": "job",
-          "runId": 7,
-          "state": "running",
-          "progress": {
-            "bytesDone": 24434,
-            "bytesTotal": 60512,
-            "filesDone": 8,
-            "filesTotal": 20,
-            "current": {
-              "folder": "Kagurabachi",
-              "name": "Ch.002 - Kagurabachi.cbz"
-            },
-            "preflight": {
-              "kind": "folder",
-              "caps": {
-                "sha256sum": true,
-                "local": true
-              },
-              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
-              "caseInsensitive": true,
-              "caseMeasured": true,
-              "canHash": true,
-              "mayNeedMode": false,
-              "refusal": null
-            },
-            "step": "apply",
-            "at": 1792226411639,
+            "at": 1792231270503,
             "lane": {
               "seriesKey": "pc:Kagurabachi",
               "landed": 2,
@@ -11451,7 +11383,45 @@
         }
       },
       {
-        "t": 1448,
+        "t": 1202,
+        "ev": {
+          "kind": "job",
+          "runId": 7,
+          "state": "running",
+          "progress": {
+            "bytesDone": 24434,
+            "bytesTotal": 60512,
+            "filesDone": 8,
+            "filesTotal": 20,
+            "current": {
+              "folder": "Solo Leveling",
+              "name": "Ch.001 - Solo Leveling.cbz"
+            },
+            "preflight": {
+              "kind": "folder",
+              "caps": {
+                "sha256sum": true,
+                "local": true
+              },
+              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
+              "caseInsensitive": true,
+              "caseMeasured": true,
+              "canHash": true,
+              "mayNeedMode": false,
+              "refusal": null
+            },
+            "step": "apply",
+            "at": 1792231270652,
+            "lane": {
+              "seriesKey": "pc:Solo Leveling",
+              "landed": 0,
+              "total": 12
+            }
+          }
+        }
+      },
+      {
+        "t": 1309,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11479,7 +11449,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226411792,
+            "at": 1792231270656,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 1,
@@ -11489,7 +11459,7 @@
         }
       },
       {
-        "t": 1556,
+        "t": 1419,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11517,7 +11487,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226411934,
+            "at": 1792231270801,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 2,
@@ -11527,45 +11497,7 @@
         }
       },
       {
-        "t": 1656,
-        "ev": {
-          "kind": "job",
-          "runId": 7,
-          "state": "running",
-          "progress": {
-            "bytesDone": 30437,
-            "bytesTotal": 60512,
-            "filesDone": 10,
-            "filesTotal": 20,
-            "current": {
-              "folder": "Solo Leveling",
-              "name": "Ch.003 - Solo Leveling.cbz"
-            },
-            "preflight": {
-              "kind": "folder",
-              "caps": {
-                "sha256sum": true,
-                "local": true
-              },
-              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
-              "caseInsensitive": true,
-              "caseMeasured": true,
-              "canHash": true,
-              "mayNeedMode": false,
-              "refusal": null
-            },
-            "step": "apply",
-            "at": 1792226412068,
-            "lane": {
-              "seriesKey": "pc:Solo Leveling",
-              "landed": 2,
-              "total": 12
-            }
-          }
-        }
-      },
-      {
-        "t": 1758,
+        "t": 1527,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11593,7 +11525,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226412073,
+            "at": 1792231270940,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 3,
@@ -11603,7 +11535,45 @@
         }
       },
       {
-        "t": 1867,
+        "t": 1628,
+        "ev": {
+          "kind": "job",
+          "runId": 7,
+          "state": "running",
+          "progress": {
+            "bytesDone": 33440,
+            "bytesTotal": 60512,
+            "filesDone": 11,
+            "filesTotal": 20,
+            "current": {
+              "folder": "Solo Leveling",
+              "name": "Ch.004 - Solo Leveling.cbz"
+            },
+            "preflight": {
+              "kind": "folder",
+              "caps": {
+                "sha256sum": true,
+                "local": true
+              },
+              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
+              "caseInsensitive": true,
+              "caseMeasured": true,
+              "canHash": true,
+              "mayNeedMode": false,
+              "refusal": null
+            },
+            "step": "apply",
+            "at": 1792231271078,
+            "lane": {
+              "seriesKey": "pc:Solo Leveling",
+              "landed": 3,
+              "total": 12
+            }
+          }
+        }
+      },
+      {
+        "t": 1730,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11631,7 +11601,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226412213,
+            "at": 1792231271083,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 4,
@@ -11641,7 +11611,7 @@
         }
       },
       {
-        "t": 1975,
+        "t": 1840,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11669,7 +11639,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226412352,
+            "at": 1792231271220,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 5,
@@ -11679,45 +11649,7 @@
         }
       },
       {
-        "t": 2074,
-        "ev": {
-          "kind": "job",
-          "runId": 7,
-          "state": "running",
-          "progress": {
-            "bytesDone": 39449,
-            "bytesTotal": 60512,
-            "filesDone": 13,
-            "filesTotal": 20,
-            "current": {
-              "folder": "Solo Leveling",
-              "name": "Ch.006 - Solo Leveling.cbz"
-            },
-            "preflight": {
-              "kind": "folder",
-              "caps": {
-                "sha256sum": true,
-                "local": true
-              },
-              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
-              "caseInsensitive": true,
-              "caseMeasured": true,
-              "canHash": true,
-              "mayNeedMode": false,
-              "refusal": null
-            },
-            "step": "apply",
-            "at": 1792226412486,
-            "lane": {
-              "seriesKey": "pc:Solo Leveling",
-              "landed": 5,
-              "total": 12
-            }
-          }
-        }
-      },
-      {
-        "t": 2179,
+        "t": 1949,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11745,7 +11677,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226412490,
+            "at": 1792231271363,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 6,
@@ -11755,7 +11687,45 @@
         }
       },
       {
-        "t": 2290,
+        "t": 2049,
+        "ev": {
+          "kind": "job",
+          "runId": 7,
+          "state": "running",
+          "progress": {
+            "bytesDone": 42455,
+            "bytesTotal": 60512,
+            "filesDone": 14,
+            "filesTotal": 20,
+            "current": {
+              "folder": "Solo Leveling",
+              "name": "Ch.007 - Solo Leveling.cbz"
+            },
+            "preflight": {
+              "kind": "folder",
+              "caps": {
+                "sha256sum": true,
+                "local": true
+              },
+              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
+              "caseInsensitive": true,
+              "caseMeasured": true,
+              "canHash": true,
+              "mayNeedMode": false,
+              "refusal": null
+            },
+            "step": "apply",
+            "at": 1792231271498,
+            "lane": {
+              "seriesKey": "pc:Solo Leveling",
+              "landed": 6,
+              "total": 12
+            }
+          }
+        }
+      },
+      {
+        "t": 2152,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11783,7 +11753,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226412634,
+            "at": 1792231271502,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 7,
@@ -11793,7 +11763,7 @@
         }
       },
       {
-        "t": 2400,
+        "t": 2262,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11821,7 +11791,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226412776,
+            "at": 1792231271643,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 8,
@@ -11831,45 +11801,7 @@
         }
       },
       {
-        "t": 2500,
-        "ev": {
-          "kind": "job",
-          "runId": 7,
-          "state": "running",
-          "progress": {
-            "bytesDone": 48470,
-            "bytesTotal": 60512,
-            "filesDone": 16,
-            "filesTotal": 20,
-            "current": {
-              "folder": "Solo Leveling",
-              "name": "Ch.009 - Solo Leveling.cbz"
-            },
-            "preflight": {
-              "kind": "folder",
-              "caps": {
-                "sha256sum": true,
-                "local": true
-              },
-              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
-              "caseInsensitive": true,
-              "caseMeasured": true,
-              "canHash": true,
-              "mayNeedMode": false,
-              "refusal": null
-            },
-            "step": "apply",
-            "at": 1792226412912,
-            "lane": {
-              "seriesKey": "pc:Solo Leveling",
-              "landed": 8,
-              "total": 12
-            }
-          }
-        }
-      },
-      {
-        "t": 2602,
+        "t": 2371,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11897,7 +11829,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226412918,
+            "at": 1792231271785,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 9,
@@ -11907,7 +11839,45 @@
         }
       },
       {
-        "t": 2710,
+        "t": 2471,
+        "ev": {
+          "kind": "job",
+          "runId": 7,
+          "state": "running",
+          "progress": {
+            "bytesDone": 51479,
+            "bytesTotal": 60512,
+            "filesDone": 17,
+            "filesTotal": 20,
+            "current": {
+              "folder": "Solo Leveling",
+              "name": "Ch.010 - Solo Leveling.cbz"
+            },
+            "preflight": {
+              "kind": "folder",
+              "caps": {
+                "sha256sum": true,
+                "local": true
+              },
+              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
+              "caseInsensitive": true,
+              "caseMeasured": true,
+              "canHash": true,
+              "mayNeedMode": false,
+              "refusal": null
+            },
+            "step": "apply",
+            "at": 1792231271920,
+            "lane": {
+              "seriesKey": "pc:Solo Leveling",
+              "landed": 9,
+              "total": 12
+            }
+          }
+        }
+      },
+      {
+        "t": 2573,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11935,7 +11905,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226413056,
+            "at": 1792231271924,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 10,
@@ -11945,7 +11915,7 @@
         }
       },
       {
-        "t": 2819,
+        "t": 2683,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11973,7 +11943,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226413196,
+            "at": 1792231272065,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 11,
@@ -11983,45 +11953,7 @@
         }
       },
       {
-        "t": 2919,
-        "ev": {
-          "kind": "job",
-          "runId": 7,
-          "state": "running",
-          "progress": {
-            "bytesDone": 60512,
-            "bytesTotal": 60512,
-            "filesDone": 19,
-            "filesTotal": 20,
-            "current": {
-              "folder": "Solo Leveling",
-              "name": "Ch.012 - Solo Leveling.cbz"
-            },
-            "preflight": {
-              "kind": "folder",
-              "caps": {
-                "sha256sum": true,
-                "local": true
-              },
-              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
-              "caseInsensitive": true,
-              "caseMeasured": true,
-              "canHash": true,
-              "mayNeedMode": false,
-              "refusal": null
-            },
-            "step": "apply",
-            "at": 1792226413332,
-            "lane": {
-              "seriesKey": "pc:Solo Leveling",
-              "landed": 11,
-              "total": 12
-            }
-          }
-        }
-      },
-      {
-        "t": 3020,
+        "t": 2791,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -12049,7 +11981,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792226413335,
+            "at": 1792231272205,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 12,
@@ -12059,7 +11991,7 @@
         }
       },
       {
-        "t": 3092,
+        "t": 2922,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -12097,12 +12029,12 @@
           "job": {
             "runId": 7,
             "phase": "apply",
-            "targetId": "ta086fd923e",
+            "targetId": "t82a93410f8",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792226410413,
-            "finishedAt": 1792226413505,
+            "startedAt": 1792231269450,
+            "finishedAt": 1792231272372,
             "progress": {
               "bytesDone": 60512,
               "bytesTotal": 60512,
@@ -12126,7 +12058,7 @@
                 "refusal": null
               },
               "step": "apply",
-              "at": 1792226413335,
+              "at": 1792231272205,
               "lane": {
                 "seriesKey": "pc:Solo Leveling",
                 "landed": 12,
@@ -12172,7 +12104,7 @@
       "adbPath": null,
       "targets": [
         {
-          "id": "ta086fd923e",
+          "id": "t82a93410f8",
           "deletePolicy": "guarded",
           "excludes": [
             {

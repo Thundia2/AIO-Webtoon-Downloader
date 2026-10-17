@@ -276,13 +276,27 @@ class FolderWatcher {
     await Promise.all(
       [...this.targets].map(async ([id, t]) => {
         let present = false;
+        // checkPresence hands every caller the ONE in-flight check
+        // (transports.js FolderTransport), and checkAll runs from both the
+        // poll and setTargets: two continuations of one check must count as
+        // one answer, or a single slow stat reached ABSENT_POLLS_TO_LEAVE
+        // by itself (review low: a config edit during a slow poll
+        // "disconnected" the folder).
+        let check;
         try {
-          present = !!(await t.transport.checkPresence()).present;
+          check = t.transport.checkPresence();
+        } catch (_) {
+          check = Promise.resolve({ present: false });
+        }
+        try {
+          present = !!(await check).present;
         } catch (_) {
           present = false;
         }
         const cur = this.targets.get(id);
         if (!cur || cur !== t) return;
+        if (t.counted === check) return;
+        t.counted = check;
         // UI-pass U3-8: a present folder reads gone only after
         // ABSENT_POLLS_TO_LEAVE misses in a row. checkPresence's 3 s
         // timeout reads absent, and a leave deletes the prompt mark, so one

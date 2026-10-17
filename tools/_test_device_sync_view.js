@@ -87,8 +87,12 @@ function eq(label, actual, expected) {
   eq("tile only = device-only folders", tiles.only.n, S.deviceOnly.length);
   eq("tile attn = rows with attention", tiles.attn.n, S.series.filter((r) => r.attention.length).length);
   const lr = V.ledgerRows(S, {});
-  eq("held rows go last, by name", lr.held.map((r) => r.title), ["Blue Lock", "Tower of God"]);
-  check("active rows exclude held", lr.active.every((r) => r.state !== "held"));
+  // Tower of God is the recorded "Remove from <target>" series: held
+  // `excluded` by the planner but with removals pending, so it stays in the
+  // main list (U2-12, review low "removing series sorted into dimmed").
+  eq("held rows go last, by name", lr.held.map((r) => r.title), ["Blue Lock"]);
+  check("active rows exclude held, except a series being removed", lr.active.every((r) => r.state !== "held" || r.removing));
+  check("the removing series is in the main list", lr.active.some((r) => r.title === "Tower of God" && r.removing));
   const writes = lr.active.map((r) => V.rowView(r).writes);
   check("sort copy: most writes first", writes.every((w, i) => i === 0 || writes[i - 1] >= w), JSON.stringify(writes));
   eq("sort name", V.ledgerRows(S, { sort: "name" }).active.map((r) => r.title), lr.active.map((r) => r.title).sort((a, b) => a.localeCompare(b)));
@@ -97,6 +101,8 @@ function eq(label, actual, expected) {
   check("tile delete keeps only rows removing something", V.ledgerRows(S, { tile: "delete" }).active.every((r) => V.rowView(r).deletes > 0));
   const dock = V.dockTotals(S);
   eq("dock totals", [dock.files, dock.bytes, dock.removals], [S.totals.files, S.totals.bytes, S.totals.delete.count]);
+  eq("dock counts renames (R5)", V.dockTotals({ totals: { files: 0, rename: { count: 2 } }, series: [] }).renames, 2);
+  eq("work counts files, removals and renames", V.workCount({ files: 1, delete: { count: 2 }, rename: { count: 3 } }), 6);
 
   // ── Settle, throughput, jobs ──
   const settling = { settleAt: 10_000, series: [{ title: "A", counts: { settling: 2 } }] };
@@ -159,17 +165,35 @@ function eq(label, actual, expected) {
   eq("changed gen", gate(rv, {}, { viewGen: rv.gen + 1 }).why, "changed");
   eq("doesn't fit", gate({ ...rv, capacity: { ...rv.capacity, fits: false } }, {}).why, "space");
   eq("nothing selected", gate({ ...rv, totals: { files: 0, delete: { count: 0 } } }, {}).why, "empty");
+  eq("a rename-only selection can start (R5)", gate({ ...rv, massDelete: { required: false }, totals: { files: 0, delete: { count: 0 }, rename: { count: 1 } } }, {}).why, null);
+  eq("review behind the latest selection → changed (R6)", gate({ ...rv, selSeq: 3 }, {}, { viewSelSeq: 4 }).why, "changed");
+  eq("undismissed plan-changed notice blocks (R7)", gate(rv, { massDelete: rv.massDelete.count }, { changedNotice: true }).why, "notice");
+  check("recorded review carries selSeq (null before any change)", "selSeq" in rv, "re-run tools/_gen_sync_fixtures.js");
   check("recorded loss review has one loss series", rl.losses.length === 1);
   eq("loss counts as one confirmation", gate(rl, { massDelete: rl.massDelete.count }).left, 1);
-  const lossKey = rl.losses[0].seriesKey;
-  eq("payload: loss op ids + mass ack", V.applyPayload("t", rl, { losses: new Set([lossKey]), massDelete: rl.massDelete.count }), {
+  const loss = rl.losses[0];
+  const ticked = { losses: new Map([[loss.seriesKey, V.lossSig(loss.lossOpIds)]]), massDelete: rl.massDelete.count };
+  eq("a tick over the current loss ids counts", gate(rl, ticked).left, 0);
+  // R3: a selection change that adds a loss to the ticked series re-opens it.
+  const grown = { ...rl, losses: [{ ...loss, lossOpIds: [...loss.lossOpIds, "delete:X/new.cbz"] }] };
+  eq("a tick doesn't cover a loss added after it", gate(grown, ticked).left, 1);
+  eq("payload: a stale tick sends no loss ids", V.applyPayload("t", grown, ticked).ackLosses, []);
+  eq("payload: loss op ids + mass ack", V.applyPayload("t", rl, ticked), {
     targetId: "t",
     gen: rl.gen,
-    ackLosses: rl.losses[0].lossOpIds,
+    ackLosses: loss.lossOpIds,
+    selSeq: rl.selSeq,
     ackMassDelete: rl.massDelete.count,
   });
   eq("payload: no mass acks when not required", V.applyPayload("t", { gen: 1, losses: [], massDelete: { required: false } }, { massDelete: 3 }), { targetId: "t", gen: 1, ackLosses: [] });
+  eq("payload: a null selSeq is still sent", V.applyPayload("t", { gen: 1, selSeq: null, losses: [] }, {}).selSeq, null);
   eq("loading", V.reviewGate(null, {}).why, "loading");
+  // reviewSig: a re-plan that only moves gen/asOf/selSeq asks nothing new.
+  eq("sig ignores gen, asOf, selSeq", V.reviewSig({ ...rl, gen: rl.gen + 1, asOf: 1, selSeq: 99 }), V.reviewSig(rl));
+  const flipped = { ...rl, groups: rl.groups.map((g, i) => (i ? g : { ...g, ops: g.ops.map((o, j) => (j ? o : { ...o, selected: !o.selected })) })) };
+  check("sig sees a changed tick", V.reviewSig(flipped) !== V.reviewSig(rl));
+  check("sig sees a grown loss", V.reviewSig(grown) !== V.reviewSig(rl));
+  eq("sig of a refusal is null", V.reviewSig({ ok: false }), null);
 
   // ── Detail ──
   const d = TAB.details["pc:Eleceed"];

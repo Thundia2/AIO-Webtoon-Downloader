@@ -213,9 +213,12 @@ export default function SeriesSheet({ open, onClose, targetId, seriesKey, row, t
   const footer = isDev ? null : (
     <div className="flex w-full flex-wrap items-center gap-1.5">
       {held && !removing ? (
-        <Button size="sm" variant="outline" className={XS} disabled={locked} onClick={() => run("include-series").then((r) => r.ok && onClose())}>
-          Include on {tn}
-        </Button>
+        // Include undoes an exclude only (see Ledger.jsx); other holds say why.
+        row && row.heldReason === "excluded" ? (
+          <Button size="sm" variant="outline" className={XS} disabled={locked} onClick={() => run("include-series").then((r) => r.ok && onClose())}>
+            Include on {tn}
+          </Button>
+        ) : null
       ) : !removing ? (
         <>
           <Button size="sm" variant="ghost" className={XS} disabled={locked} onClick={() => run("remove-series", { removeFiles: false }).then((r) => r.ok && onClose())}>
@@ -281,7 +284,20 @@ export default function SeriesSheet({ open, onClose, targetId, seriesKey, row, t
           }}
         >
           <span className="shrink-0 text-xs text-muted-foreground">New name on {tn}</span>
-          <Input autoFocus value={renaming} onChange={(e) => setRenaming(e.target.value)} className="h-7 font-mono text-xs" aria-label={`New folder name on ${tn}`} />
+          <Input
+            autoFocus
+            value={renaming}
+            onChange={(e) => setRenaming(e.target.value)}
+            // Escape cancels the rename only; preventDefault tells the Sheet's
+            // Escape handler (overlay.jsx) it was handled.
+            onKeyDown={(e) => {
+              if (e.key !== "Escape") return;
+              e.preventDefault();
+              setRenaming(null);
+            }}
+            className="h-7 font-mono text-xs"
+            aria-label={`New folder name on ${tn}`}
+          />
           <Button size="sm" type="submit" className={XS}>Rename</Button>
           <Button size="sm" type="button" variant="ghost" className={XS} onClick={() => setRenaming(null)}>Cancel</Button>
         </form>

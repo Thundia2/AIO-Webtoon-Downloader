@@ -5,7 +5,9 @@
 // Shown while App holds a single-find request (App.jsx `findFor`). While it
 // is up, a download started from Search is linked to that folder first
 // (config-op add-alias), so it syncs into the existing folder on the target.
-// `error` is that link's refusal; nothing was queued then.
+// `error` is that link's refusal; nothing was queued then. Until the find's
+// own search has started (`searched`, SearchTab), nothing is linked and the
+// banner says so (review R13).
 // Consumer: SearchTab.jsx.
 // ============================================================
 
@@ -25,7 +27,9 @@ export default function FindBanner({ findFor, onDismiss }) {
               Finding a source for “{findFor.folder}” on {findFor.targetName}.
             </b>{" "}
             <span className="text-muted-foreground">
-              A download you start from these results is linked to that folder, so it's synced into it instead of creating a new one.
+              {findFor.searched
+                ? "A download you start from these results is linked to that folder, so it's synced into it instead of creating a new one."
+                : "Another search is still running. The search for this folder starts when it ends; downloads from the results above aren't linked to the folder."}
             </span>
             {findFor.error && <div className="mt-1 text-destructive">Not queued: {findFor.error}</div>}
           </div>

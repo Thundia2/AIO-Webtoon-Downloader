@@ -93,8 +93,9 @@
 // SYNC TAB CONTRACT (U2, same plan, section "Phase U2 design"):
 //   * AUTO-PLAN IS DECIDED HERE: plan {ifNeeded:true} plans only when the
 //     target needs it (grep _planIfNeeded); a cancelled or failed plan sets
-//     rt.autoHold until _replanSoon / a connect / a manual plan clears it, so
-//     a renderer that asks on every tab open can't loop.
+//     rt.autoHold until _replanSoon / a connect / a manual plan / an identity
+//     edit (_identityClear) clears it, so a renderer that asks on every tab
+//     open can't loop.
 //   * ACKS ARE WHAT WAS SHOWN: apply's ackMassDelete / ackMassRepush are the
 //     counts the review displayed (grep _ackArgs); set-selection takes the
 //     plan `gen` the click was made on and echoes its `seq` as the plan
@@ -149,6 +150,11 @@ const REPLAN_DEBOUNCE_MS = 10 * 1000;
 // _armSettle fires this long after a plan's settleAt, so the file that set
 // it is past the settle age when the re-plan's listing reads it.
 const SETTLE_REPLAN_SLACK_MS = 1000;
+const SETTLE_TIMER_MAX_MS = 10 * 60 * 1000;
+// R1: list-devices (the Add-target picker, the connect card's re-check)
+// keeps the device tracker running this long with no adb target, so the
+// FIRST adb target can be picked from a live list; the picker renews it.
+const DISCOVER_MS = 2 * 60 * 1000;
 const BUSY_POLL_MS = 5000;
 const SHUTDOWN_MS = 5000;
 const COVER_MAX_BYTES = 8 * 1024 * 1024;
@@ -308,6 +314,8 @@ function initDeviceSync(deps) {
   let busyTimer = null;
   let prewarmTimer = null;
   let replanTimer = null;
+  let discoverUntil = 0;
+  let discoverTimer = null;
   let prewarm = { state: "idle", done: 0, total: 0, bytesDone: 0, bytesTotal: 0, at: null };
   let prewarmAc = null;
   let libStatus = null;
@@ -387,6 +395,22 @@ function initDeviceSync(deps) {
     const targets = Array.isArray(v.targets) ? v.targets.filter((t) => _isObj(t) && typeof t.id === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(t.id)) : [];
     if (r.state === "corrupt") _log("sync-targets.json unreadable; starting empty:", r.error);
     return { version: Number.isInteger(v.version) ? v.version : 0, adbPath: typeof v.adbPath === "string" ? v.adbPath : null, targets };
+  }
+
+  /**
+   * Runs one config read-modify-write at a time. Every op reads `config`,
+   * awaits (validation, the write, an identity clear), then saves a `next`
+   * built from what it read, so two ops in flight together lost the first
+   * one's change (found by the R12 test: two chip clicks sent at once kept
+   * only the second). The renderer's queue (useDeviceSync configOp) only
+   * orders ONE renderer's calls; this covers every caller. Every writer of
+   * `config` goes through here: H["config-op"], _clearEvictionMarks.
+   */
+  let configChain = Promise.resolve();
+  function _configTxn(fn) {
+    const run = configChain.then(fn);
+    configChain = run.catch(() => {});
+    return run;
   }
 
   // The `config` event is NOT sent here: config-op sends it after the op's
@@ -522,7 +546,9 @@ function initDeviceSync(deps) {
     clearInterval(busyTimer);
     clearTimeout(prewarmTimer);
     clearTimeout(replanTimer);
-    busyTimer = prewarmTimer = replanTimer = null;
+    clearTimeout(discoverTimer);
+    busyTimer = prewarmTimer = replanTimer = discoverTimer = null;
+    discoverUntil = 0;
     for (const rt of rts.values()) {
       clearTimeout(rt.settleTimer);
       rt.settleTimer = null;
@@ -534,6 +560,9 @@ function initDeviceSync(deps) {
     autoBatches.clear();
     for (const q of jobs.snapshot().queue) jobs.dropTarget(q.targetId);
     devices = [];
+    // The library may change while sync is off (notifyLibraryChanged is a
+    // no-op then), so a status cached before the stop is stale after it.
+    libStatus = null;
     if (hashPool) {
       await hashPool.flush().catch(() => {});
       hashPool.close();
@@ -557,7 +586,11 @@ function initDeviceSync(deps) {
   function _syncWatchers() {
     if (!started) return;
     const adbTargets = _targets().filter((t) => t.kind === "adb");
-    if (adbTargets.length && !tracker) {
+    // The tracker runs while an adb target exists OR a discovery lease from
+    // list-devices is live (R1). Without the lease nothing listed devices
+    // until an adb target existed, so the first one could never be added.
+    const wantTracker = adbTargets.length > 0 || discoverUntil > now();
+    if (wantTracker && !tracker) {
       tracker = new mon.DeviceTracker({
         client,
         timers: T.timers,
@@ -567,7 +600,7 @@ function initDeviceSync(deps) {
       });
       tracker.start();
       _emitAdb();
-    } else if (!adbTargets.length && tracker) {
+    } else if (!wantTracker && tracker) {
       tracker.stop();
       tracker = null;
       _onDevices([], { source: "lost" });
@@ -685,15 +718,21 @@ function initDeviceSync(deps) {
     const t = _target(targetId);
     if (!t) return null;
     const r = summary && summary.refusal;
-    if (r) return { targetId, targetName: t.name || null, code: r.code, message: r.message || null, firstSync: r.firstSync == null ? null : !!r.firstSync, folders: r.folders || null, bytes: r.bytes == null ? null : r.bytes };
+    if (r) return { targetId, targetName: t.name || null, code: r.code, message: r.message || null, cause: r.cause || null, folder: r.folder || null, firstSync: r.firstSync == null ? null : !!r.firstSync, folders: r.folders || null, bytes: r.bytes == null ? null : r.bytes };
     if (status === "failed") return { targetId, targetName: t.name || null, code: "failed", message: (summary && (summary.message || summary.reason)) || null, reason: (summary && summary.reason) || null };
     return null;
   }
 
-  /** The target's current plan offers nothing to do and holds no refusal. */
+  /**
+   * The target's current plan offers nothing to do and holds no refusal.
+   * A target whose LAST plan job didn't complete (failed internally with no
+   * refusal, so rt.plan is still the older plan) has something to say: the
+   * card lists that failure, so it must not be withdrawn over the old plan.
+   */
   function _nothingToDo(targetId) {
     const rt = rts.get(targetId);
     if (!rt || !rt.plan || rt.refusal) return false;
+    if (rt.lastPlan && rt.lastPlan.status === "failed") return false;
     return planner.promptSummary(rt.plan, _selection(rt), rt.prep && rt.prep.device).nothingToDo;
   }
 
@@ -1152,7 +1191,10 @@ function initDeviceSync(deps) {
     rt.settleTimer = null;
     const at = rt.plan && rt.plan.settleAt;
     if (at == null) return;
-    const ms = Math.max(0, at - now()) + SETTLE_REPLAN_SLACK_MS;
+    // Clamped: the planner bounds settleAt to now + 2 x SETTLE_MS, but a
+    // setTimeout delay past 2^31-1 ms fires after 1 ms, and that loop
+    // (adopt → arm → fire → re-plan → adopt) never ends (review R4).
+    const ms = Math.min(Math.max(0, at - now()) + SETTLE_REPLAN_SLACK_MS, SETTLE_TIMER_MAX_MS);
     rt.settleTimer = setTimeout(() => {
       rt.settleTimer = null;
       if (started && rts.get(rt.id) === rt) _replanSoon(rt.id);
@@ -1341,6 +1383,8 @@ function initDeviceSync(deps) {
     if (!started) return;
     _computeLibraryStatus().then(
       (s) => {
+        // A walk that outlived a stop describes a library sync no longer watches.
+        if (!started) return;
         libStatus = s;
         emit("library-status", { status: s });
       },
@@ -1393,8 +1437,11 @@ function initDeviceSync(deps) {
     return { ok: true, ...labelPreview({ name: p.name, folderName: p.folderName, patterns }) };
   };
 
-  H.cancel = async () => {
+  // runId (optional): the job the caller showed. A Cancel clicked as that job
+  // ended must not abort the next queued job, maybe another target's.
+  H.cancel = async (p) => {
     if (!current) return { ok: true, wasRunning: false };
+    if (p && p.runId != null && p.runId !== current.runId) return { ok: true, wasRunning: false };
     current.ac.abort();
     return { ok: true, wasRunning: true };
   };
@@ -1439,8 +1486,20 @@ function initDeviceSync(deps) {
     const id = profiles.recordIdentity(cfg);
     if (cfg.kind === "folder") {
       // The header pins the volume measured now (prepare.js compares it).
+      // Bounded: this runs inside _configTxn, and realpath/stat on a dead
+      // network path can hang for long; every other config edit (and
+      // apply's _clearEvictionMarks) would wait behind it. 3 s like
+      // FolderTransport.checkPresence; on a timeout the old volume stands
+      // and prepare.js measures the real one on the next plan.
       const tp = new FolderTransport({ root: cfg.root });
-      const pr = await tp.probe().catch(() => null);
+      let probeTimer = null;
+      const pr = await Promise.race([
+        tp.probe().catch(() => null),
+        new Promise((r) => {
+          probeTimer = setTimeout(() => r(null), T.identityProbeMs != null ? T.identityProbeMs : 3000);
+        }),
+      ]);
+      clearTimeout(probeTimer);
       id.volumeId = pr && pr.volumeId != null ? String(pr.volumeId) : keep ? keep.volumeId || null : null;
     }
     await rt.store.clear({
@@ -1454,6 +1513,12 @@ function initDeviceSync(deps) {
     rt.prep = rt.plan = rt.summary = rt.refusal = rt.gen = null;
     rt.selOps = null;
     rt.selRebinds = {};
+    // A new identity owes nothing to the old one's failed plan or settle
+    // countdown; config-op's _replanSoon then plans it if it is reachable.
+    rt.autoHold = false;
+    rt.lastPlan = null;
+    if (rt.settleTimer) clearTimeout(rt.settleTimer);
+    rt.settleTimer = null;
     if (findSources) await findSources.forget(targetId);
     _planChanged(targetId);
   }
@@ -1495,7 +1560,10 @@ function initDeviceSync(deps) {
     if (errors.length) return refuse("invalid", errors[0].message, { errors });
     const identity = profiles.recordIdentityChanged(_cfg(t), _cfg(next));
     if (identity && _jobOn(t.id)) return refuse("busy", "that target's job is running");
-    return { next: { ...config, targets: _targets().map((x) => (x.id === t.id ? next : x)) }, after: identity ? () => _identityClear(t.id, _cfg(next)) : null, targetId: t.id, replan: !identity };
+    // replan either way: an identity edit clears the record, and a target
+    // re-pointed at a root it can reach must plan again (review R10: with
+    // replan:false a target whose last plan failed stayed autoHold forever).
+    return { next: { ...config, targets: _targets().map((x) => (x.id === t.id ? next : x)) }, after: identity ? () => _identityClear(t.id, _cfg(next)) : null, targetId: t.id, replan: true };
   };
 
   OPS["remove-target"] = async (p) => {
@@ -1530,6 +1598,13 @@ function initDeviceSync(deps) {
     return { next: { ...config, adbPath: v } };
   };
 
+  // Deep equality for stored list entries (strings or flat objects).
+  const _sameEntry = (a, b) => {
+    if (!_isObj(a) || !_isObj(b)) return a === b;
+    const ka = Object.keys(a).filter((k) => a[k] != null);
+    const kb = Object.keys(b).filter((k) => b[k] != null);
+    return ka.length === kb.length && ka.every((k) => a[k] === b[k]);
+  };
   const _seriesRef = (e) => _isObj(e) && (typeof e.identityKey === "string" || typeof e.url === "string" || typeof e.pcFolder === "string");
   const _pick = (e, keys) => Object.fromEntries(keys.filter((k) => typeof e[k] === "string" && e[k]).map((k) => [k, e[k]]));
 
@@ -1542,10 +1617,15 @@ function initDeviceSync(deps) {
       list.push(_pick(a, ["identityKey", "url", "pcFolder", "deviceFolder"]));
       return list;
     });
+  // Removals name the ENTRY, not its index (review R12): ops are queued and
+  // sent with the newest config version, so an index taken from a render
+  // before the previous removal landed pointed at the wrong entry. A missing
+  // entry is a no-op, so a double click removes one.
   OPS["remove-alias"] = async (p) =>
     _listEdit(p, "aliases", (list) => {
-      if (!Number.isInteger(p.index) || p.index < 0 || p.index >= list.length) return refuse("invalid", "no alias at that index");
-      list.splice(p.index, 1);
+      if (!_isObj(p.entry)) return refuse("invalid", "entry required");
+      const i = list.findIndex((x) => _sameEntry(x, p.entry));
+      if (i >= 0) list.splice(i, 1);
       return list;
     });
   OPS["add-exclude"] = async (p) =>
@@ -1556,12 +1636,39 @@ function initDeviceSync(deps) {
       list.push(e);
       return list;
     });
+  // An exclude can change under the chip that names it (_clearEvictionMarks
+  // strips removeFiles after an apply), so an exact match falls back to the
+  // same series: the click meant that series, whatever its flags are now.
   OPS["remove-exclude"] = async (p) =>
     _listEdit(p, "excludes", (list) => {
-      if (!Number.isInteger(p.index) || p.index < 0 || p.index >= list.length) return refuse("invalid", "no exclude at that index");
-      list.splice(p.index, 1);
+      if (!_isObj(p.entry)) return refuse("invalid", "entry required");
+      let i = list.findIndex((x) => _sameEntry(x, p.entry));
+      if (i < 0 && _seriesRef(p.entry)) i = list.findIndex((x) => _sameSeries(x, _pick(p.entry, ["identityKey", "url", "pcFolder"])));
+      if (i >= 0) list.splice(i, 1);
       return list;
     });
+
+  /**
+   * One add or remove on a list field (R12): formats, sidecars and
+   * cleanupNames go through update-target's validation and custom seeding;
+   * `only` through set-selection-mode's cleaning. The base is the stored
+   * list (or, for a custom field, what the profile resolves), never a copy
+   * the renderer rendered, so two quick chip clicks both land.
+   */
+  OPS["edit-list"] = async (p) => {
+    const t = _target(p.targetId);
+    if (!t) return refuse("invalid", "unknown target");
+    const field = p.field;
+    if (!["formats", "sidecars", "cleanupNames", "only"].includes(field)) return refuse("invalid", "that field isn't a list");
+    if (("add" in p) === ("remove" in p)) return refuse("invalid", "one of add or remove");
+    const base = field === "only" ? t.only || [] : _cfg(t)[field] || [];
+    const has = (v) => base.some((x) => _sameEntry(x, v));
+    let next = base.slice();
+    if ("add" in p && !has(p.add)) next.push(p.add);
+    if ("remove" in p) next = next.filter((x) => !_sameEntry(x, p.remove));
+    if (field === "only") return OPS["set-selection-mode"]({ targetId: t.id, mode: _cfg(t).selection, only: next });
+    return OPS["update-target"]({ targetId: t.id, patch: { [field]: next } });
+  };
   /** The series a plan names as a stored list entry (excludes, only). */
   function _planSeriesRef(targetId, seriesKey) {
     const rt = rts.get(targetId);
@@ -1634,7 +1741,8 @@ function initDeviceSync(deps) {
   OPS["ignore-suggestion"] = _idList("ignoredSuggestions", "suggestionId", true);
   OPS["unignore-suggestion"] = _idList("ignoredSuggestions", "suggestionId", false);
 
-  H["config-op"] = async (p) => {
+  H["config-op"] = (p) => _configTxn(() => _configOp(p));
+  async function _configOp(p) {
     const fn = OPS[p.op];
     if (!fn) return refuse("invalid", `unknown config op ${p.op}`);
     if (p.expectVersion != null && p.expectVersion !== config.version) {
@@ -1652,7 +1760,7 @@ function initDeviceSync(deps) {
     if (r.next) emit("config", { config: _publicConfig() });
     if (r.targetId && r.replan) _replanSoon(r.targetId);
     return { ok: true, config: _publicConfig(), ...(r.targetId && p.op === "add-target" ? { targetId: r.targetId } : {}) };
-  };
+  }
 
   // --- adb
 
@@ -1666,14 +1774,28 @@ function initDeviceSync(deps) {
     return { ok: true, candidates: adbInfo.candidates || [], resolved: adbInfo.binary, serverVersion, error: adbInfo.error };
   };
 
+  /** R1: keep the tracker up for DISCOVER_MS with no adb target (see _syncWatchers). */
+  function _discover() {
+    discoverUntil = now() + (T.discoverMs != null ? T.discoverMs : DISCOVER_MS);
+    clearTimeout(discoverTimer);
+    discoverTimer = setTimeout(() => {
+      discoverTimer = null;
+      _syncWatchers();
+    }, discoverUntil - now() + 50);
+    if (discoverTimer.unref) discoverTimer.unref();
+    _syncWatchers();
+  }
+
   H["list-devices"] = async () => {
     const s = await _ensureServer();
     if (!s.ok) return refuse("disconnected", `no adb server: ${adbInfo.error}`);
+    _discover();
     const rows = await client.devices();
     // U3-7: "I've allowed it" / "Re-check" on the connect card. A full list
     // is as authoritative as a poll, so it feeds the same diff (a tablet
-    // just authorized connects now, not on the tracker's next frame).
-    if (tracker) _onDevices(rows, { source: "manual" });
+    // just authorized connects now, not on the tracker's next frame). The
+    // tracker is always up here (_discover), so the list never goes stale.
+    _onDevices(rows, { source: "manual" });
     return { ok: true, devices: rows.map((d) => ({ serial: d.serial, state: d.state, stateKind: d.stateKind, model: d.model, product: d.product, transportId: d.transportId, targetable: d.targetable })) };
   };
 
@@ -1819,6 +1941,10 @@ function initDeviceSync(deps) {
     return {
       ...planner.planReview(rt.plan, sel),
       gen: rt.gen,
+      // The selection this review describes (U2-11): apply {selSeq} must
+      // name it, so a toggle that lands after the review was read can't
+      // ride on its Start (review R6).
+      selSeq: rt.selSeq,
       stale: rt.stale,
       capacity: _capacity(rt, sel),
       policy: _policyOf(rt),
@@ -1829,7 +1955,9 @@ function initDeviceSync(deps) {
 
   H["set-selection"] = async (p) => {
     const rt = rts.get(p.targetId);
-    if (!rt || !rt.plan) return refuse("invalid", "no plan for that target");
+    // !summary: the target is refused (_refused keeps plan/gen but nulls the
+    // summary); a toggle must not rebuild a summary beside the refusal.
+    if (!rt || !rt.plan || !rt.summary) return refuse("invalid", "no plan for that target");
     // An apply/prune/rename on this target has already taken its op list:
     // a toggle now would show as applied and do nothing (UI-pass decision 9).
     // A plan job may run: its adopt keeps the selection (same epoch).
@@ -1932,6 +2060,10 @@ function initDeviceSync(deps) {
     // After the await: a rebind may have swapped the plan meanwhile.
     const changed = _genMismatch(rt, p.gen);
     if (changed) return changed;
+    // Optional so in-process callers needn't track it; the renderer always sends it.
+    if (p.selSeq !== undefined && p.selSeq !== rt.selSeq) {
+      return refuse("blocked", "the selection changed since the review", { blocking: [{ kind: "plan-changed", gen: rt.gen }] });
+    }
     const acks = _ackArgs(p);
     // Against the reviewed plan first: what the user can fix without a re-plan.
     const pre2 = planner.reconcileForApply({ reviewed: rt.plan, fresh: rt.plan, storedOps: rt.selOps, ...acks });
@@ -1974,7 +2106,10 @@ function initDeviceSync(deps) {
    * (the series stays off the target) but loses removeFiles, so a folder of
    * that name appearing later isn't offered for deletion on the old click.
    */
-  async function _clearEvictionMarks(targetId, plan, evictions) {
+  function _clearEvictionMarks(targetId, plan, evictions) {
+    return _configTxn(() => _clearEvictionMarksNow(targetId, plan, evictions));
+  }
+  async function _clearEvictionMarksNow(targetId, plan, evictions) {
     const done = (evictions || []).filter((x) => x.removed);
     const t = _target(targetId);
     if (!done.length || !t) return;

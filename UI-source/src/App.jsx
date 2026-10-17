@@ -314,7 +314,10 @@ export default function App() {
               onFindSearched={(token) => setFindFor((x) => (x && x.token === token ? { ...x, searched: true } : x))}
               onDismissFind={() => setFindFor(null)}
               onStartDownload={(url, args) => {
-                if (findFor) {
+                // Linked only once the find's own search has started
+                // (SearchTab defers it behind a running search, R13);
+                // before that the results on screen belong to another query.
+                if (findFor && findFor.searched) {
                   startFoundDownload(findFor, url, args);
                   return;
                 }

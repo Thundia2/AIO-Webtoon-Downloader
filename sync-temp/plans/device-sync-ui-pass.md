@@ -511,3 +511,98 @@ planning this time"). Built on the backend P4 already shipped: `sync:library-sta
 **U4 stop-point E2E:** `tools/_e2e_device_sync_find.js` (fake python backend for search +
 download; batch skip / search / pin / queue-2, single find via the Search banner, Library chip +
 Open in Sync).
+
+## Adversarial review of U1–U4 (2026-10-17, before the live tablet run)
+
+A 4-slice review over `git diff ca6009e 62e41fa` (backend, renderer state, Sync tab,
+settings/prompt/library/tests), with one refuting verifier per slice. 45 raw findings, 2 refuted,
+3 plausible, the rest confirmed. The main session re-read the code behind every high and medium.
+**Fix pass done and committed 2026-10-17; see "Fix pass" below.** Each item: what breaks → fix direction.
+
+**High (block the live run):**
+- R1 First adb target can't be added. `devices` is fed only by the tracker, which starts only once
+  an adb target exists (service.js `_syncWatchers`); list-devices feeds the diff only `if (tracker)`;
+  the renderer never calls locateAdb on mount, so the adb section says "No adb found". → run device
+  discovery whenever sync is on, and test adding the first adb target from zero.
+- R2 Re-check → Read back sends no `mode:'read-back'` (SyncTab.jsx `recheck`), against U2-9: an
+  adopt-size target reads nothing back; a non-hashing tablet with no stored mode gets needs-mode.
+- R3 Loss ticks are keyed by seriesKey, and applyPayload sends the CURRENT lossOpIds (syncView.js
+  `applyPayload`), against U2-2: a tick covers losses added after it at the same gen.
+- R4 A PC file with a future mtime counts as settling forever (planner `_settling`); past ~24.8 days
+  the `_armSettle` delay overflows setTimeout to 1 ms → endless re-plan loop. → future mtime is not
+  settling; clamp the delay.
+
+**Medium:**
+- R5 Rename-only selections can't start: totals.files skips renames; the dock and reviewGate ignore
+  totals.rename.
+- R6 Review keeps the previous review on reopen and the gate ignores selSeq (U2-11 not built):
+  Start can apply a selection the dialog isn't showing. → clear on open, return selSeq from review.
+- R7 No "The plan changed. Review it again." notice: a background re-plan swaps the dialog content
+  and re-enables Start.
+- R8 The active target follows `targets[0]` while view.targetId is null, so a connect re-sorts and
+  jumps targets, closing open Review/detail/prune.
+- R9 The connected-target settings sheet survives a target switch and TargetEditor isn't keyed by
+  id: a pending identity draft or an armed Remove carries over to another target.
+- R10 `_identityClear` leaves rt.autoHold set, so a re-pointed target never auto-plans (contract
+  service.js:95-97).
+- R11 RemoteBrowser and PatternPreview depend on the whole `sync` object (new every App render):
+  the browser snaps back to its start folder and re-lists over adb on every log line. → depend on
+  `sync.actions`.
+- R12 useConfigOps sends the latest version with a payload built from a stale render; remove-exclude
+  and remove-alias go by index → a fast second ✕ removes the wrong exclude. → remove by key.
+- R13 Single Find source while another search runs marks the request searched without running it;
+  a download from the old results is aliased to the device folder (SearchTab find effect).
+
+**Low:** a removing series is sorted into the dimmed section (U2-12) · Include offered for every
+held reason · apply `dropped` and prune `notOrphaned` never shown · apply/prune refusal shown twice
+(U2-13) · mass-repush ack says "files" for a series count · LedgerRow memo defeated (`ops` identity)
+· Dialog/Sheet have no focus trap, and Escape in the rename input closes the sheet · a globals.css
+comment claims a gen-keyed ledger · Cancel isn't bound to the dock's runId ·
+device-listing-suspect copy is one text for three causes · useConfigOps version only goes up ·
+selection-queue marks stamped by an earlier request · invalid-name-* skip reasons show raw ·
+library-status events after sync-off survive · main.jsx comment claims a dist grep check that
+doesn't exist · the copy test's series-states check never calls copy.js · set-selection on a
+refused target revives the summary · one slow folder check counted as two misses ·
+connect card withdrawn as "nothing to do" while it lists a failed plan · the transfer lane shows the
+previous series during renames · the find-sources `only` test would pass without `only` · the
+connect card's refusal copy uses the card title as the target name, and Review / Not now refusals
+are dropped · the plan-changed E2E only goes through raw IPC · the find-sheet checkbox label reads
+"Skip X" when checked means included.
+Plausible: separate useConfigOps instances don't serialize; a pinned URL the downloader
+normalises never binds; the prompt E2E's "hidden" check can pass vacuously.
+Refuted: an enabled flip during hydrate; the mass-ack equality rule (deliberate, U2-2).
+
+### Fix pass (2026-10-17)
+
+All R1–R13 and every low above are fixed as their fix direction says, each with a test where a
+unit or E2E can reach it (service tests named `R1 …`, `R3/R11 …`, `R4 …`, `R10 …`, `R12 …`; view
+checks for R3/R5/R6/R7; the tab E2E's plan-changed step now drives the dialog). Plausible items:
+- separate useConfigOps instances: fixed by design (one app-wide `actions.configOp` queue in
+  useDeviceSync) and, found while testing R12, the SERVICE had the same lost update for any two
+  callers: `_configTxn` now serializes every config read-modify-write (config-op and
+  `_clearEvictionMarks`).
+- pinned URL never binds: refuted. aio-dl persists the URL it was given (`args.comic_url`,
+  unchanged between argparse and the `.aio_series.json` writer for a direct URL), and
+  `normalizeSeriesUrl` covers host case and a trailing slash on both sides.
+- prompt E2E "hidden" vacuous: confirmed (count taken before the renderer had the card); the E2E
+  now waits for the renderer's own `prompt show` event first.
+
+Decisions made while fixing (not in the review):
+- F1 "The plan changed" fires only when what the review SHOWS changed (`syncView.reviewSig`); a
+  re-plan that only moves gen asks nothing and keeps the ticks. Ticks are cleared only with the
+  notice; the user's own selection changes keep them (they self-validate).
+- F2 ReviewDialog clears its review on close too: clearing only on open let the "seen" effect read
+  the previous open's review in the same commit, so every reopen after a re-plan showed the notice.
+- F3 A rebind suppresses the notice only if the next review's selSeq moved (a refused rebind
+  doesn't advance it). Residual: after a refused rebind, a later own toggle can still mask one
+  automatic change in that open.
+- F4 `applyPayload` sends a null selSeq too (null = "no change yet"), so a first review is checked.
+- F5 `remove-exclude` falls back to the same series when the stored entry changed under the chip.
+- F6 `_identityClear`'s folder probe is bounded at 3 s (it runs inside `_configTxn`).
+- F7 The draft target card starts device discovery on open, not only on choosing "tablet".
+- F8 Overlay Tab trap: the topmost TRAPPING overlay owns Tab (a Popover can't let it escape a
+  Sheet); a field that already handled Tab wins.
+
+Open after the fix pass (user's call): (a) a selection toggle inside the dialog that lands with an
+automatic re-plan raises the notice (noise, harmless); (b) a "copy back N folders" tick survives the
+user's own rebind (the count doesn't change).

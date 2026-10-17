@@ -26,7 +26,7 @@
 //
 // Loaded only through src/dev/SyncGallery.jsx, which main.jsx imports
 // dynamically under import.meta.env.DEV, so none of this reaches dist
-// (the build check greps dist for "__aioSyncFixture").
+// (tools/_check_sync_dist.js greps dist for "__aioSyncFixture" after a build).
 // ============================================================
 
 import stateOn from "./sync-fixtures/state-on.json";
@@ -71,6 +71,7 @@ export function makeSyncSource(spec = {}) {
   const ok = (x) => Promise.resolve({ ok: true, ...x });
 
   const target = (id) => (snap.config.targets || []).find((t) => t.id === id);
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   const listOp = (p, field, edit) => {
     const t = target(p.targetId);
     if (t) t[field] = edit((t[field] || []).slice());
@@ -99,10 +100,13 @@ export function makeSyncSource(spec = {}) {
         listOp(p, "excludes", (l) => [...l, p.entry]);
         return null;
       case "remove-alias":
-        listOp(p, "aliases", (l) => l.filter((_, i) => i !== p.index));
+        listOp(p, "aliases", (l) => l.filter((x) => !same(x, p.entry)));
         return null;
       case "remove-exclude":
-        listOp(p, "excludes", (l) => l.filter((_, i) => i !== p.index));
+        listOp(p, "excludes", (l) => l.filter((x) => !same(x, p.entry)));
+        return null;
+      case "edit-list":
+        listOp(p, p.field, (l) => ("remove" in p ? l.filter((x) => !same(x, p.remove)) : l.some((x) => same(x, p.add)) ? l : [...l, p.add]));
         return null;
       case "set-selection-mode":
         Object.assign(target(p.targetId) || {}, { selection: p.mode, ...(Array.isArray(p.only) ? { only: p.only } : {}) });

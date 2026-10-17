@@ -150,6 +150,22 @@ function AdbSection({ sync, ops, host }) {
     const p = await api.pickFile(isWin ? [{ name: "adb", extensions: ["exe"] }] : []);
     if (p) choose(p);
   };
+  // Detect once when the section first shows with no answer yet (R1):
+  // candidates stay null until something asks, and the section read
+  // "No adb found" on a PC that has one.
+  // A failed ask is kept, so the line says why instead of "Looking…" for good.
+  const asked = useRef(false);
+  const [lookErr, setLookErr] = useState(null);
+  const unknown = adb.candidates == null;
+  useEffect(() => {
+    if (!unknown || asked.current) return;
+    asked.current = true;
+    setBusy(true);
+    sync.actions
+      .locateAdb({})
+      .then((r) => setLookErr(r && r.ok === false ? r.message || "it failed" : null))
+      .finally(() => setBusy(false));
+  }, [unknown, sync.actions]);
   const redetect = async () => {
     setBusy(true);
     try {
@@ -184,7 +200,7 @@ function AdbSection({ sync, ops, host }) {
             </label>
           );
         })}
-        {!cands.length && <div className="border-b px-2.5 py-2 text-xs text-muted-foreground">No adb found on this PC.</div>}
+        {!cands.length && <div className="border-b px-2.5 py-2 text-xs text-muted-foreground">{unknown && lookErr ? `Couldn't look for adb: ${lookErr}. Try Re-detect.` : unknown ? "Looking for adb…" : "No adb found on this PC."}</div>}
         <div className="flex items-center gap-1.5 px-2.5 py-2">
           <Button size="sm" variant="outline" className="h-7" disabled={busy} onClick={browse}>
             <FolderOpen className="h-3.5 w-3.5" />
@@ -294,6 +310,31 @@ function DraftTarget({ sync, ops, host, onAdded, onCancel }) {
   const autoName = kind === "adb" ? (dev ? deviceLabel(dev) : "") : root.split(/[\\/]/).filter(Boolean).slice(-2).join(" ");
   const valid = !!root && (kind !== "adb" || !!serial);
 
+  // Device discovery while this card is open (R1): list-devices keeps
+  // main's device tracker up for a couple of minutes even with no adb
+  // target yet (service.js _discover), and its `device` events fill
+  // sync.devices. Started on open, not on choosing "tablet", so a plugged-in
+  // tablet is already listed when the user gets there; renewed every minute.
+  const actions = sync.actions;
+  const [listErr, setListErr] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const ask = () =>
+      actions.listDevices({}).then((r) => {
+        if (alive) setListErr(r && r.ok === false ? r.message || "adb isn't running" : null);
+      });
+    ask();
+    const h = setInterval(ask, 60 * 1000);
+    return () => {
+      alive = false;
+      clearInterval(h);
+    };
+  }, [actions]);
+  // The first tablet to become ready is picked for the user.
+  useEffect(() => {
+    if (kind === "adb" && !serial && firstReady) setSerial(firstReady.serial);
+  }, [kind, serial, firstReady]);
+
   const add = async () => {
     const r = await ops.run("add-target", { target: { name: name.trim() || autoName || "Sync target", kind, serial: kind === "adb" ? serial : null, root, profile } });
     if (r && r.ok === false) setErr({ field: refusalField(r), text: configRefusalCopy(r) });
@@ -318,7 +359,11 @@ function DraftTarget({ sync, ops, host, onAdded, onCancel }) {
         />
       </Field>
       {kind === "adb" && (
-        <Field label="Tablet" error={errFor("serial")} hint={!devices.length ? "Plug in a tablet with USB debugging on; it appears here." : null}>
+        <Field
+          label="Tablet"
+          error={errFor("serial") || (listErr && !devices.length ? `Can't list tablets: ${listErr}. Check the adb section above.` : null)}
+          hint={!devices.length ? "Plug in a tablet with USB debugging on; it appears here." : null}
+        >
           <Select value={serial} onChange={(e) => setSerial(e.target.value)} className="h-8 text-[13px]">
             {!serial && <option value="">Pick a tablet…</option>}
             {devices.map((d) => (
@@ -354,6 +399,7 @@ function DraftTarget({ sync, ops, host, onAdded, onCancel }) {
       {browsing && kind === "adb" && ready && (
         <div className="mb-2">
           <RemoteBrowser
+            key={serial}
             sync={sync}
             serial={serial}
             startPath={root || "/sdcard"}
@@ -435,6 +481,9 @@ function labelText(r) {
 }
 
 function PatternPreview({ sync, patterns }) {
+  // sync.actions, not sync (R11): `sync` is new every App render, which
+  // restarted the 250 ms debounce on every log line.
+  const actions = sync.actions;
   const [test, setTest] = useState("");
   const [rows, setRows] = useState([]);
   const [errors, setErrors] = useState([]);
@@ -446,12 +495,12 @@ function PatternPreview({ sync, patterns }) {
       const out = [];
       let errs = [];
       for (const name of names) {
-        const custom = await sync.actions.labelPreview({ name, folderName: "", patterns });
+        const custom = await actions.labelPreview({ name, folderName: "", patterns });
         if (custom && Array.isArray(custom.error)) {
           errs = custom.error;
           break;
         }
-        const builtin = patterns.trim() ? await sync.actions.labelPreview({ name, folderName: "", patterns: "" }) : custom;
+        const builtin = patterns.trim() ? await actions.labelPreview({ name, folderName: "", patterns: "" }) : custom;
         const a = labelText(custom);
         out.push({ name, label: a, source: a === "Not a chapter" ? "—" : patterns.trim() && a !== labelText(builtin) ? "custom" : "built-in" });
       }
@@ -460,7 +509,7 @@ function PatternPreview({ sync, patterns }) {
       setRows(errs.length ? [] : out);
     }, 250);
     return () => clearTimeout(h);
-  }, [sync, patterns, names]);
+  }, [actions, patterns, names]);
   return (
     <div className="overflow-hidden rounded-lg border">
       {errors.map((e) => (

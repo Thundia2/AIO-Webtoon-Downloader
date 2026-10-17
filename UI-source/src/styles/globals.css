@@ -194,8 +194,10 @@
     background: repeating-linear-gradient(135deg, hsl(var(--destructive) / 0.35) 0 2px, transparent 2px 4px);
   }
   /* The one orchestrated motion (spec §6): when a NEW plan lands, rows rise
-     and strips sweep in, staggered by --d. SyncTab keys the ledger on the
-     plan generation, so a filter or selection change never replays it. */
+     and strips sweep in, staggered by --d. SyncTab sets an `animating` flag
+     for ANIM_MS when the plan gen changes while it is mounted (grep ANIM_MS);
+     rows are keyed by seriesKey, so a filter or selection change outside
+     that window never replays it. */
   .sync-row-in { animation: sync-row-in 320ms ease-out both; animation-delay: var(--d, 0ms); }
   .sync-strip-in { animation: sync-strip-in 600ms cubic-bezier(0.2, 0.7, 0.2, 1) both; animation-delay: var(--d, 0ms); }
   @keyframes sync-row-in {

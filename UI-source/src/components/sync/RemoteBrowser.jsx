@@ -11,7 +11,7 @@
 // design: spec §4 TargetEditor, mockup `remoteBrowser()`.
 // ============================================================
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/primitives";
 import { Folder, Loader2, Tablet, Undo2 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -21,21 +21,34 @@ export default function RemoteBrowser({ sync, serial, startPath, profile, onUse,
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
 
+  // Depends on sync.actions (memoised for the hook's life), never on `sync`
+  // itself: that object is new on every App render, and depending on it
+  // snapped the browser back to startPath and re-listed over adb on every
+  // log line (review R11). `seq` drops a listing a later click superseded.
+  const actions = sync.actions;
+  const seq = useRef(0);
   const go = useCallback(
     async (p) => {
+      const my = ++seq.current;
       setLoading(true);
       setError(null);
-      const r = await sync.actions.browseRemote({ serial, path: p });
+      const r = await actions.browseRemote({ serial, path: p });
+      if (my !== seq.current) return;
       setLoading(false);
       if (r && r.ok !== false) setView(r);
       else setError((r && r.message) || "Couldn't list that folder");
     },
-    [sync, serial]
+    [actions, serial]
   );
 
+  // The start folder is read once per mount: typing in the root field
+  // behind an open browser must not move it. "Once per tablet" holds because
+  // both callers key this component by serial (SyncSettings DraftTarget,
+  // TargetEditor), so another tablet remounts it from its own start.
+  const start = useRef(startPath);
   useEffect(() => {
-    go(startPath || "/sdcard");
-  }, [go, startPath]);
+    go(start.current || "/sdcard");
+  }, [go]);
 
   const presets = (view && view.presets) || [];
   const here = view ? view.path : startPath || "/sdcard";

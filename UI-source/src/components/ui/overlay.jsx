@@ -7,8 +7,10 @@
 // sources) and an anchored Popover (the Re-check / target settings menus).
 //
 // Contract shared by all three:
-//   * Escape closes (onClose). Dialog and Sheet also close on a scrim click and
-//     return focus to whatever held it when they opened.
+//   * Escape closes (onClose), unless a field inside already handled it
+//     (preventDefault, e.g. cancelling an inline rename). Dialog and Sheet
+//     also close on a scrim click, keep Tab inside the panel (focus trap),
+//     and return focus to whatever held it when they opened.
 //   * `contained` swaps `fixed` for `absolute`, so the DEV gallery
 //     (src/dev/SyncGallery.jsx) can render one inside a framed mock window.
 //     The parent must then be `relative` and clip its overflow.
@@ -26,15 +28,40 @@ import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // Escape closes the topmost open overlay only: each open overlay pushes itself
-// here and the key handler acts only when it is last.
+// here and the key handler acts only when it is last. Tab is different: the
+// topmost TRAPPING overlay owns it, so a Popover (trap:false) open inside a
+// Sheet doesn't let Tab leave the Sheet.
 const STACK = [];
 
-function useOverlayLifecycle(open, onClose, panelRef, { restoreFocus = true } = {}) {
+const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
+/** Wrap Tab / Shift+Tab inside `panel`, so a modal's ledger behind it can't take focus. */
+function trapTab(e, panel) {
+  if (!panel) return;
+  const list = [...panel.querySelectorAll(FOCUSABLE)].filter((el) => el.offsetParent !== null || el === document.activeElement);
+  if (!list.length) {
+    e.preventDefault();
+    panel.focus({ preventScroll: true });
+    return;
+  }
+  const first = list[0];
+  const last = list[list.length - 1];
+  const a = document.activeElement;
+  if (e.shiftKey && (a === first || a === panel || !panel.contains(a))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (a === last || !panel.contains(a))) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+function useOverlayLifecycle(open, onClose, panelRef, { restoreFocus = true, trap = true } = {}) {
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   useEffect(() => {
     if (!open) return undefined;
-    const token = {};
+    const token = { trap };
     STACK.push(token);
     const prevFocus = restoreFocus ? document.activeElement : null;
     // Focus the panel itself (tabIndex -1) so Tab starts inside it and screen
@@ -42,7 +69,15 @@ function useOverlayLifecycle(open, onClose, panelRef, { restoreFocus = true } = 
     const panel = panelRef.current;
     if (panel && !panel.contains(document.activeElement)) panel.focus({ preventScroll: true });
     const onKey = (e) => {
-      if (e.key !== "Escape" || STACK[STACK.length - 1] !== token) return;
+      if (e.key === "Tab") {
+        // A field that handles Tab itself (accepting a suggestion) wins.
+        if (!trap || e.defaultPrevented) return;
+        const owner = [...STACK].reverse().find((t) => t.trap);
+        if (owner === token) trapTab(e, panelRef.current);
+        return;
+      }
+      if (STACK[STACK.length - 1] !== token) return;
+      if (e.key !== "Escape" || e.defaultPrevented) return;
       e.stopPropagation();
       closeRef.current?.();
     };
@@ -55,7 +90,7 @@ function useOverlayLifecycle(open, onClose, panelRef, { restoreFocus = true } = 
         prevFocus.focus({ preventScroll: true });
       }
     };
-  }, [open, panelRef, restoreFocus]);
+  }, [open, panelRef, restoreFocus, trap]);
 }
 
 /**
@@ -168,7 +203,7 @@ export function Sheet({ open, onClose, title, description, children, footer, wid
 export function Popover({ open, onClose, trigger, children, align = "end", width = 300, className }) {
   const wrapRef = useRef(null);
   const panelRef = useRef(null);
-  useOverlayLifecycle(open, onClose, panelRef, { restoreFocus: false });
+  useOverlayLifecycle(open, onClose, panelRef, { restoreFocus: false, trap: false });
   useEffect(() => {
     if (!open) return undefined;
     const onDown = (e) => {

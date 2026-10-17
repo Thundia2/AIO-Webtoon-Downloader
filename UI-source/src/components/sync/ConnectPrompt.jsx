@@ -177,12 +177,21 @@ export default function ConnectPrompt({ sync, hiddenTargetId, onReview }) {
   });
   if (!sync.enabled || !cards.length) return null;
 
-  const run = async (card, fn) => {
+  // The NAME refusal copy interpolates: the action's target, or the card's
+  // only target, else a neutral word. card.title is a sentence ("X
+  // connected"), so it read "X connected isn't connected" (review low).
+  const configTargets = (sync.config && sync.config.targets) || [];
+  const nameFor = (card, a) => {
+    const id = (a && a.targetId) || ((card.targetIds || []).length === 1 ? card.targetIds[0] : null);
+    const t = id ? configTargets.find((x) => x.id === id) : null;
+    return (t && t.name) || "the tablet";
+  };
+  const run = async (card, fn, a) => {
     setBusy((b) => ({ ...b, [card.key]: true }));
     setErrors((e) => ({ ...e, [card.key]: null }));
     try {
       const r = await fn();
-      if (r && r.ok === false) setErrors((e) => ({ ...e, [card.key]: configRefusalCopy(r, card.title) }));
+      if (r && r.ok === false) setErrors((e) => ({ ...e, [card.key]: configRefusalCopy(r, nameFor(card, a)) }));
     } finally {
       setBusy((b) => ({ ...b, [card.key]: false }));
     }
@@ -190,14 +199,20 @@ export default function ConnectPrompt({ sync, hiddenTargetId, onReview }) {
 
   const onAction = (card, a) => {
     if (a.action === "review") {
-      return run(card, async () => {
-        await sync.actions.promptResponse({ promptId: card.promptId, action: "review" });
-        onReview(a.targetId);
-        return null;
-      });
+      return run(
+        card,
+        async () => {
+          // Open the tab either way (the user asked to look); a refused
+          // answer (the prompt already closed) still shows on the card.
+          const r = await sync.actions.promptResponse({ promptId: card.promptId, action: "review" });
+          onReview(a.targetId);
+          return r;
+        },
+        a,
+      );
     }
-    if (a.action === "setup") return run(card, () => ops.run("update-target", { targetId: a.targetId, patch: { verifyMode: "read-back" } }));
-    if (a.action === "recheck") return run(card, () => sync.actions.listDevices());
+    if (a.action === "setup") return run(card, () => ops.run("update-target", { targetId: a.targetId, patch: { verifyMode: "read-back" } }), a);
+    if (a.action === "recheck") return run(card, () => sync.actions.listDevices(), a);
     return null;
   };
 
@@ -206,10 +221,7 @@ export default function ConnectPrompt({ sync, hiddenTargetId, onReview }) {
       setDismissedDevices((s) => new Set([...s, card.key]));
       return null;
     }
-    return run(card, async () => {
-      await sync.actions.promptResponse({ promptId: card.promptId, action: "not-now" });
-      return null;
-    });
+    return run(card, () => sync.actions.promptResponse({ promptId: card.promptId, action: "not-now" }));
   };
 
   return (

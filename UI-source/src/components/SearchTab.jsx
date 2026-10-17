@@ -246,16 +246,24 @@ export default function SearchTab({
   const isRunning = searchState?.status === "running";
   const hasResults = searchState?.status === "done" && searchState.results;
 
-  // Single find: prefill and search once per request. A search already
-  // running is left alone (the query is filled in for the next press).
+  // Single find: prefill once per request, and run the find's own search
+  // once nothing else is running. A search already running is left to
+  // finish (it may be the user's), and the request stays un-searched until
+  // its own search starts: App links a download to the device folder only
+  // after that (review R13), so results of the OTHER search can't be linked.
   const findToken = findFor && !findFor.searched ? findFor.token : null;
+  const prefilled = useRef(null);
   useEffect(() => {
     if (findToken == null) return;
-    setQuery(findFor.query);
-    if (!isRunning) runSearch(findFor.query, opts);
+    if (prefilled.current !== findToken) {
+      prefilled.current = findToken;
+      setQuery(findFor.query);
+    }
+    if (isRunning) return;
+    runSearch(findFor.query, opts);
     onFindSearched?.(findToken);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [findToken]);
+  }, [findToken, isRunning]);
 
   // Auto-focus on mount so users can type immediately when they switch tabs.
   useEffect(() => {

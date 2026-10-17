@@ -165,15 +165,19 @@ export const CUSTOM_DEFAULTS = Object.freeze({
 });
 
 // ── Ledger (planner.js SERIES_STATES / HELD_REASONS, analysis.js TAG_KINDS) ──
-// null = the state shows no badge.
+// null = the state shows no badge. The map is exported so the copy drift
+// test (tools/_test_device_sync_copy.js) checks its OWN keys against
+// planner.SERIES_STATES.
+export const SERIES_STATE_COPY = Object.freeze({
+  bound: null,
+  "needs-verify": () => "Needs a check",
+  new: () => "New series",
+  gone: (tn) => `Removed on ${tn}`,
+  held: null,
+});
 export function seriesStateCopy(state, tn) {
-  return {
-    bound: null,
-    "needs-verify": "Needs a check",
-    new: "New series",
-    gone: `Removed on ${tn}`,
-    held: null,
-  }[state];
+  const f = SERIES_STATE_COPY[state];
+  return typeof f === "function" ? f(tn) : f;
 }
 export function heldReasonCopy(reason, tn) {
   const there = tn ? `on ${tn}` : "there";
@@ -299,8 +303,57 @@ export const PREWARM_PAUSE_COPY = Object.freeze({
   "sync-job": "paused while a sync job runs",
 });
 
-// ── Refusal titles (contract.js REFUSAL_CODES; bodies are built per surface) ──
-export function refusalTitle(code, tn) {
+// ── device-listing-suspect, worded by its `cause` (prepare.js / planner.js
+// set it; one text for every cause misled when the root itself was missing).
+// {title, short (a connect-card row), body}. ──
+export function listingSuspectCopy(r, tn) {
+  const f = r && r.folder ? ` (${r.folder})` : "";
+  const keep = "Nothing will be removed until a listing can be trusted.";
+  switch (r && r.cause) {
+    case "root-unlistable":
+      return {
+        title: `The sync folder on ${tn} can't be opened`,
+        short: "its sync folder can't be opened",
+        body: `The folder this target syncs to can't be listed on ${tn}. It may have been renamed or removed, the SD card may be out, or a storage permission prompt may be waiting on ${tn}. ${keep} Check the folder in this target's settings.`,
+      };
+    case "missed-folder":
+      return {
+        title: `${tn}'s listing left out a folder`,
+        short: "its listing left out a folder",
+        body: `A folder missing from ${tn}'s listing exists when checked directly${f}. ${keep} Re-check; if it happens again, unplug ${tn} and plug it back in.`,
+      };
+    case "stat-failed":
+      return {
+        title: `Couldn't check a folder on ${tn}`,
+        short: "a folder couldn't be checked",
+        body: `${tn} couldn't say whether a synced folder is still there${f}. ${keep} Re-check; if it happens again, unplug ${tn} and plug it back in.`,
+      };
+    case "listings-differ":
+      return {
+        title: `Two listings of ${tn} disagree`,
+        short: "its listings disagree",
+        body: `${tn} listed its folders differently twice in a row, which usually means storage is still mounting. ${keep} Re-check in a moment.`,
+      };
+    case "empty-root":
+      return {
+        title: `${tn} shows no series folders`,
+        short: "shows no series folders",
+        body: `${tn} shows no series folders, but its sync history lists some. A half-mounted SD card, a locked tablet or a storage permission prompt can cause this. ${keep}`,
+      };
+    default:
+      // few-files (planner device.trusted === false) and any older refusal.
+      return {
+        title: `${tn} listed far fewer files than expected`,
+        short: "listed fewer files than expected",
+        body: `${tn} listed far fewer files than its sync history. A half-mounted SD card or a storage permission prompt can cause this. ${keep}`,
+      };
+  }
+}
+
+// ── Refusal titles (contract.js REFUSAL_CODES; bodies are built per surface).
+// `r` (optional) is the refusal itself, for codes worded by their cause. ──
+export function refusalTitle(code, tn, r) {
+  if (code === "device-listing-suspect") return listingSuspectCopy(r || { code }, tn).title;
   return {
     disabled: "Device Sync is off",
     busy: "Another sync job is running",
@@ -323,11 +376,11 @@ export function blockingCopy(b, tn) {
     case "mass-delete":
       return `Confirm removing ${b.count} files from ${tn}`;
     case "mass-repush":
-      return `Confirm copying ${b.count} files back to ${tn}`;
+      return `Confirm copying ${b.count} ${b.count === 1 ? "folder" : "folders"} back to ${tn}`;
     case "listing-sanity":
       return `Re-check: ${tn} listed fewer files than its history says`;
     case "refused":
-      return refusalTitle(b.refusal && b.refusal.code, tn) || "The plan was refused";
+      return refusalTitle(b.refusal && b.refusal.code, tn, b.refusal) || "The plan was refused";
     case "plan-changed":
       return "The plan changed since you reviewed it. Review again.";
     case "free-space":
@@ -372,6 +425,25 @@ export function jobReasonCopy(reason, tn) {
   if (r.startsWith("invalid-name-") || r.startsWith("invalid-folder-")) return `a name isn't allowed on ${tn}`;
   return r || "it stopped";
 }
+/**
+ * A skipped file's reason in words. The executor templates some reasons
+ * (`invalid-name-${segmentProblem}`, executor.js _guard), so a lookup in
+ * SKIP_REASON_COPY alone printed them raw.
+ */
+export function skipReasonCopy(r, tn) {
+  const k = String(r || "");
+  if (SKIP_REASON_COPY[k]) return SKIP_REASON_COPY[k];
+  if (k === "invalid-name-segment-too-long") return `the name is too long for ${tn || "the target"}`;
+  if (k.startsWith("invalid-name-")) return `the name isn't allowed on ${tn || "the target"}`;
+  return k || "skipped";
+}
+// Why reconcileForApply dropped a reviewed op before the apply ran
+// (planner.js reconcileForApply `dropped[].reason`).
+export const DROPPED_REASON_COPY = Object.freeze({
+  vanished: "no longer in the plan",
+  changed: "changed after you reviewed it",
+  "no-chapter": "only extra files were left to copy",
+});
 export const SKIP_REASON_COPY = Object.freeze({
   downloading: "still downloading",
   "changed-since-review": "changed after you reviewed it",
@@ -445,14 +517,7 @@ export function refusalCardCopy(r, tn) {
         body: `The sync history on ${tn} was written for a different ${r && Array.isArray(r.fields) && r.fields.includes("serial") ? "tablet" : "folder"}. It may have been restored, moved or copied from somewhere else, so nothing is changed until you choose.`,
       };
     case "device-listing-suspect":
-      return {
-        tone: "warn",
-        icon: "file-warning",
-        body:
-          r && r.detail === "empty-root"
-            ? `${tn} shows no series folders, but its sync history lists some. A half-mounted SD card, a locked tablet or a storage permission prompt can cause this, so nothing will be removed.`
-            : `${tn} listed far fewer files than its sync history. A half-mounted SD card or a storage permission prompt can cause this, so nothing will be removed.`,
-      };
+      return { tone: "warn", icon: "file-warning", body: listingSuspectCopy(r, tn).body };
     case "disconnected":
       return { tone: "muted", icon: "unlink", body: "Plug it back in (and unlock it). The plan picks up when it reappears." };
     case "busy":

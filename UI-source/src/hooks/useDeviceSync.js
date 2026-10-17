@@ -41,6 +41,17 @@
 // pending marks must outlive that. state.selection[targetId] is that queue;
 // selectionQueue.isSettled() says when Review's Start may run.
 //
+// CONFIG-OP CLIENT (review R12 + the plausible "one client per surface"
+// finding): actions.configOp is THE app's one config-op client. Ops are
+// serialized (one in flight, the rest queued in call order) across every
+// surface, and each is sent with the newest config version known here:
+// assigned (not max'd) from every `config` event, snapshot and reply, so a
+// service whose config went backwards (file deleted, sync toggled) doesn't
+// lock edits out. Sending the newest version is safe because every op is an
+// intent (an entry-named removal, an edit-list add/remove, a scalar patch),
+// not a list rebuilt from a render. useConfigOps.js only counts pending ops
+// for its surface's buttons.
+//
 // Read by: App.jsx (grep useDeviceSync). Depends on: preload.js sync* wrappers and
 // onSyncEvent. The event kinds below duplicate sync/contract.js EVENT_KINDS;
 // tools/_test_device_sync_contract.js keeps them equal, and
@@ -150,6 +161,8 @@ function applySyncEvent(s, ev) {
     case "prewarm":
       return { ...s, prewarm: ev.prewarm || null };
     case "library-status":
+      // A late event from a walk that began before sync went off is stale.
+      if (!s.enabled) return s;
       return { ...s, libraryStatus: ev.status || null };
     case "plans": {
       if (typeof ev.targetId !== "string") return s;
@@ -216,6 +229,12 @@ export function useDeviceSync(opts) {
   const selTimers = useRef({});
   const stateRef = useRef(state);
   stateRef.current = state;
+  // CONFIG-OP CLIENT (header): newest known config version + the op chain.
+  const cfgVersionRef = useRef(0);
+  const cfgChainRef = useRef(Promise.resolve());
+  const _seeVersion = (cfg) => {
+    if (cfg && typeof cfg.version === "number") cfgVersionRef.current = cfg.version;
+  };
 
   function _selPut(targetId, next) {
     if (selRef.current[targetId] === next) return;
@@ -249,9 +268,12 @@ export function useDeviceSync(opts) {
       .then((snap) => {
         if (seq === refreshSeqRef.current && snap && snap.ok !== false) {
           enabledRef.current = !!snap.enabled;
+          _seeVersion(snap.config);
           // Library status survives a re-read while sync stays on (only its
           // own events and the load below replace it); off drops it.
-          setState((s) => ({ ...fromSnapshot(snap), findRows: s.findRows, libraryStatus: snap.enabled ? s.libraryStatus : null }));
+          // An enabled FLIP (s.enabled differs) drops it too: a status from
+          // before sync was off describes a library that may have changed.
+          setState((s) => ({ ...fromSnapshot(snap), findRows: s.findRows, libraryStatus: snap.enabled && s.enabled ? s.libraryStatus : null }));
         }
         return snap;
       })
@@ -265,6 +287,7 @@ export function useDeviceSync(opts) {
         return;
       }
       setState((s) => applySyncEvent(s, ev));
+      if (ev && ev.kind === "config") _seeVersion(ev.config);
       if (ev && ev.kind === "plans" && selRef.current[ev.targetId]) _selPut(ev.targetId, SQ.onView(selRef.current[ev.targetId], ev.selSeq));
       if (ev && ev.kind === "settings" && !!ev.enabled !== enabledRef.current) {
         enabledRef.current = !!ev.enabled;
@@ -291,6 +314,7 @@ export function useDeviceSync(opts) {
       let s = snap && snap.ok !== false ? fromSnapshot(snap) : { ...INITIAL, loaded: true };
       for (const ev of buffered) s = applySyncEvent(s, ev);
       enabledRef.current = s.enabled;
+      _seeVersion(s.config);
       setState(() => s);
     };
     Promise.resolve()
@@ -351,6 +375,22 @@ export function useDeviceSync(opts) {
       clearTimeout(selTimers.current[targetId]);
       selTimers.current[targetId] = setTimeout(() => pumpSel(targetId), SQ.BATCH_MS);
       return true;
+    };
+    // CONFIG-OP CLIENT (header): serialized, newest version.
+    const sendOp = out.configOp;
+    out.configOp = (payload) => {
+      const next = cfgChainRef.current.then(async () => {
+        let r;
+        try {
+          r = await sendOp({ ...(payload || {}), expectVersion: cfgVersionRef.current });
+        } catch (e) {
+          r = { ok: false, code: "invalid", message: (e && e.message) || "the request failed" };
+        }
+        if (r && r.config) _seeVersion(r.config);
+        return r || { ok: false, code: "invalid", message: "no answer" };
+      });
+      cfgChainRef.current = next.catch(() => {});
+      return next;
     };
     out.clearSelectionError = (targetId) => {
       const cur = selRef.current[targetId];

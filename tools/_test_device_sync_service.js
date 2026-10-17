@@ -384,7 +384,7 @@ test("config ops: validation incl. root containment, versioning, broadcast", asy
     const onDisk = JSON.parse(fs.readFileSync(path.join(a.userData, "sync-targets.json"), "utf8"));
     assert.strictEqual(onDisk.version, v + 1);
     assert.strictEqual(onDisk.targets[0].aliases.length, 1);
-    assert.ok((await a.call("config-op", { op: "remove-alias", targetId: id, index: 0 })).ok);
+    assert.ok((await a.call("config-op", { op: "remove-alias", targetId: id, entry: { pcFolder: "A", deviceFolder: "A dev" } })).ok);
     assert.ok((await a.call("config-op", { op: "ignore-suggestion", targetId: id, suggestionId: "link:x=>y" })).ok);
     assert.ok((await a.call("config-op", { op: "set-selection-mode", targetId: id, mode: "only", only: [{ pcFolder: "A" }] })).ok);
     assertRefusal(await a.call("config-op", { op: "set-selection-mode", targetId: id, mode: "some" }), "invalid");
@@ -927,23 +927,26 @@ test("find-sources: top 5 per row, waits while Check All runs, edited query re-q
     // U4: rows follow the device-only folders. A folder that appears gets a
     // queued row from get() alone (editable before any search), and a start
     // narrowed to it keeps the other rows.
-    for (const n of ["Mu", "Nu"]) {
+    for (const n of ["Mu", "Nu", "Xi"]) {
       fs.mkdirSync(path.join(a.dir, "device", n), { recursive: true });
       fs.writeFileSync(path.join(a.dir, "device", n, "Ch.001.cbz"), "x");
     }
     await a.call("plan", { targetId: id });
     await a.idle();
     got = await a.call("find-sources:get", { targetId: id });
-    assert.deepStrictEqual(got.rows.map((x) => [x.folder, x.state]).sort(), [["Kappa_(hid=abc)", "done"], ["Lambda", "done"], ["Mu", "queued"], ["Nu", "queued"]]);
-    const skip = await a.call("find-sources:update-row", { targetId: id, folder: "Nu", patch: { skip: true } });
+    assert.deepStrictEqual(got.rows.map((x) => [x.folder, x.state]).sort(), [["Kappa_(hid=abc)", "done"], ["Lambda", "done"], ["Mu", "queued"], ["Nu", "queued"], ["Xi", "queued"]]);
+    const skip = await a.call("find-sources:update-row", { targetId: id, folder: "Xi", patch: { skip: true } });
     assert.strictEqual(skip.ok, true, "an unsearched row takes edits");
+    // Nu stays queued AND unskipped, so only the `folders` filter keeps it
+    // out of this start (without it, start would search Mu and Nu).
     const from3 = a.since();
     await a.call("find-sources:start", { targetId: id, folders: ["Mu"] });
     await a.waitEvent((e) => e.kind === "find" && e.state === "done", 8000, from3, "done 3");
     assert.deepStrictEqual(a.search.calls.slice(3), ["Mu"]);
     got = await a.call("find-sources:get", { targetId: id });
-    assert.strictEqual(got.rows.length, 4, "a narrowed start keeps every row");
-    assert.strictEqual(got.rows.find((x) => x.folder === "Nu").skip, true);
+    assert.strictEqual(got.rows.length, 5, "a narrowed start keeps every row");
+    assert.strictEqual(got.rows.find((x) => x.folder === "Nu").state, "queued", "a row outside `folders` isn't searched");
+    assert.strictEqual(got.rows.find((x) => x.folder === "Xi").skip, true);
   } finally {
     await a.close();
   }
@@ -1991,6 +1994,147 @@ test("U2 mass acknowledgement over IPC: `true` is not accepted, the shown count 
     await a.close();
   }
 });
+// ---------------------------------------------------------------- review fix pass (R1–R13, 2026-10-17)
+
+test("R12 list edits name the entry: entry removes, a missing entry is a no-op, edit-list add/remove land back to back", async () => {
+  const a = await app();
+  try {
+    const id = await a.addFolderTarget();
+    await a.idle();
+    for (const d of ["A dev", "B dev"]) assert.ok((await a.call("config-op", { op: "add-alias", targetId: id, alias: { pcFolder: d[0], deviceFolder: d } })).ok);
+    assertRefusal(await a.call("config-op", { op: "remove-alias", targetId: id, index: 0 }), "invalid");
+    const rm = await a.call("config-op", { op: "remove-alias", targetId: id, entry: { pcFolder: "B", deviceFolder: "B dev" } });
+    assert.deepStrictEqual(rm.config.targets[0].aliases, [{ pcFolder: "A", deviceFolder: "A dev" }]);
+    const again = await a.call("config-op", { op: "remove-alias", targetId: id, entry: { pcFolder: "B", deviceFolder: "B dev" } });
+    assert.ok(again.ok, "a second click on the same row is a no-op, not a wrong-row removal");
+    assert.strictEqual(again.config.targets[0].aliases.length, 1);
+    assert.ok((await a.call("config-op", { op: "add-exclude", targetId: id, entry: { pcFolder: "Ex1" } })).ok);
+    assert.ok((await a.call("config-op", { op: "add-exclude", targetId: id, entry: { pcFolder: "Ex2" } })).ok);
+    const rx = await a.call("config-op", { op: "remove-exclude", targetId: id, entry: { pcFolder: "Ex1" } });
+    assert.deepStrictEqual(rx.config.targets[0].excludes, [{ pcFolder: "Ex2" }]);
+    // The chip still shows removeFiles the service has since stripped (_clearEvictionMarks): same series, removed.
+    const rx2 = await a.call("config-op", { op: "remove-exclude", targetId: id, entry: { pcFolder: "Ex2", removeFiles: true } });
+    assert.deepStrictEqual(rx2.config.targets[0].excludes, []);
+    assert.ok((await a.call("config-op", { op: "update-target", targetId: id, patch: { profile: "custom" } })).ok);
+    assertRefusal(await a.call("config-op", { op: "edit-list", targetId: id, field: "formats", add: "pdf", remove: "zip" }), "invalid");
+    assertRefusal(await a.call("config-op", { op: "edit-list", targetId: id, field: "name", add: "x" }), "invalid");
+    assertRefusal(await a.call("config-op", { op: "edit-list", targetId: id, field: "formats", add: "exe" }), "invalid");
+    // Two chip clicks sent together: each is an intent on the stored list, so both land.
+    const [r1, r2] = await Promise.all([
+      a.call("config-op", { op: "edit-list", targetId: id, field: "formats", add: "pdf" }),
+      a.call("config-op", { op: "edit-list", targetId: id, field: "formats", remove: "zip" }),
+    ]);
+    assert.ok(r1.ok && r2.ok, JSON.stringify([r1, r2]));
+    const t = (await a.state()).config.targets[0];
+    assert.deepStrictEqual(t.formats.slice().sort(), ["cbr", "cbz", "epub", "pdf", "rar"]);
+    assert.ok((await a.call("config-op", { op: "set-selection-mode", targetId: id, mode: "only", only: [{ pcFolder: "A" }] })).ok);
+    assert.ok((await a.call("config-op", { op: "edit-list", targetId: id, field: "only", add: { pcFolder: "B" } })).ok);
+    assert.ok((await a.call("config-op", { op: "edit-list", targetId: id, field: "only", remove: { pcFolder: "A" } })).ok);
+    assert.deepStrictEqual((await a.state()).config.targets[0].only, [{ pcFolder: "B" }]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("R1 list-devices with no adb target starts device tracking and reports the device", async () => {
+  const a = await adbApp();
+  try {
+    await a.idle();
+    assert.ok(!a.svc._debug().tracker, "no adb target: no tracker yet");
+    const from = a.since();
+    const ld = await a.call("list-devices");
+    assert.ok(ld.ok, JSON.stringify(ld));
+    assert.deepStrictEqual(ld.devices.map((d) => d.serial), [SERIAL]);
+    assert.ok(ld.devices[0].stateKind, "list-devices carries stateKind");
+    assert.ok(a.svc._debug().tracker, "the discovery lease keeps a tracker up");
+    await a.waitEvent((e) => e.kind === "device" && JSON.stringify(e).includes(SERIAL), 3000, from, "device event naming the serial");
+  } finally {
+    await a.close();
+  }
+});
+
+test("R4 a far-future mtime is not settling; a near-future one is", async () => {
+  const planner = require(path.join(SYNC, "planner.js"));
+  const now = Date.now();
+  assert.strictEqual(planner.isSettling(now - 1000, now), true);
+  assert.strictEqual(planner.isSettling(now + 1000, now), true);
+  assert.strictEqual(planner.isSettling(now - planner.SETTLE_MS - 1, now), false);
+  assert.strictEqual(planner.isSettling(now + 365 * 864e5, now), false);
+  const a = await app();
+  try {
+    series(a.lib, "Phi", { "Ch.001.cbz": 1000 });
+    writeOld(path.join(a.lib, "Phi", "Ch.002.cbz"), bytes("Ch.002.cbz", 1000), Date.now() / 1000 + 400 * 86400);
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const s = await a.summary(id);
+    assert.strictEqual(s.settleAt, null, "a stamp a year ahead holds nothing");
+    assert.strictEqual(s.totals.push.count, 2);
+    const ap = await a.apply({ targetId: id });
+    assert.strictEqual((await a.job(ap.runId)).status, "completed");
+    assert.deepStrictEqual(devNames(a, "Phi").filter((n) => n.startsWith("Ch.")), ["Ch.001.cbz", "Ch.002.cbz"], "the executor's guard agrees with the planner");
+  } finally {
+    await a.close();
+  }
+});
+
+test("R10 an identity edit after a held (cancelled) plan re-plans", async () => {
+  const a = await app({ adb: true });
+  try {
+    a.dev = a.srv.addDevice({ serial: SERIAL, inject: { symlinks: { "/sdcard": "/storage/emulated/0" }, shellDelayMs: 150 } });
+    a.dev.fs.mkdirs(CANON);
+    a.dev.fs.mkdirs("/storage/emulated/0/Other");
+    series(a.lib, "Chi", { "Ch.001.cbz": 1000 });
+    const id = (await a.call("config-op", { op: "add-target", target: { name: "Tab", kind: "adb", serial: SERIAL, root: "/sdcard/Komikku/local", profile: "komikku" } })).targetId;
+    await waitFor(() => a.svc._debug().current, 8000, "auto plan running");
+    await a.call("cancel");
+    await a.idle();
+    assert.strictEqual((await a.call("plan", { targetId: id, ifNeeded: true })).why, "held");
+    a.dev.inject.shellDelayMs = 0;
+    const from = a.since();
+    assert.ok((await a.call("config-op", { op: "update-target", targetId: id, patch: { root: "/sdcard/Other" } })).ok);
+    const done = await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, from, "re-plan after identity edit");
+    assert.strictEqual(done.status, "completed");
+  } finally {
+    await a.close();
+  }
+});
+
+test("R3/R11 apply refuses a stale selSeq; cancel ignores another job's runId; set-selection with no summary is invalid", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Psi", { "Ch.001.cbz": 1000, "Ch.002.cbz": 1000 });
+    series(a.lib, "Omega", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const s0 = await a.summary(id);
+    const rv = await a.call("review", { targetId: id });
+    assert.ok(rv.ok && "selSeq" in rv, "the review carries the selSeq it showed");
+    const row = s0.series[0];
+    assert.ok((await a.call("set-selection", { targetId: id, gen: s0.gen, seq: 5, bulk: "series", seriesKey: row.seriesKey, selected: false })).ok);
+    const stale = await a.call("apply", { targetId: id, gen: s0.gen, selSeq: rv.selSeq });
+    assertRefusal(stale, "blocked");
+    assert.strictEqual(stale.blocking[0].kind, "plan-changed");
+    assert.ok(!a.svc._debug().current, "nothing started");
+    const ok = await a.call("apply", { targetId: id, gen: s0.gen, selSeq: 5 });
+    assert.ok(ok.ok, JSON.stringify(ok));
+    const c = await a.call("cancel", { runId: "not-this-one" });
+    assert.deepStrictEqual([c.ok, c.wasRunning], [true, false]);
+    assert.strictEqual((await a.job(ok.runId)).status, "completed");
+    // A target whose plan was refused has no summary: a selection is refused, not applied to nothing.
+    await a.idle();
+    fs.rmSync(a.target, { recursive: true, force: true });
+    const from = a.since();
+    const pr = await a.call("plan", { targetId: id });
+    if (pr.ok) await a.job(pr.runId);
+    await a.idle();
+    const v = await lastPlans(a, id, from);
+    assert.ok(v && !v.summary, `expected no summary once the root is gone: ${JSON.stringify(v && v.refusal)}`);
+    assertRefusal(await a.call("set-selection", { targetId: id, gen: s0.gen, seq: 6, changes: [] }), "invalid");
+  } finally {
+    await a.close();
+  }
+});
+
 
 (async () => {
   const only = process.env.TEST_ONLY ? new RegExp(process.env.TEST_ONLY) : null;

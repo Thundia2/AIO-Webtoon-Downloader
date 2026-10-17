@@ -225,7 +225,10 @@ export const LedgerRow = memo(
           {v.held ? (
             <>
               {row.removing && <Pills v={v} row={row} />}
-              {!row.removing && (
+              {/* Include only undoes an exclude (service.js include-series edits
+                  the exclude / only lists); other held reasons (image-only, a
+                  name problem, fork…) aren't the user's choice to undo here. */}
+              {!row.removing && row.heldReason === "excluded" && (
                 <Button size="sm" variant="ghost" className={XS} onClick={(e) => { e.stopPropagation(); onInclude(row.seriesKey); }} disabled={locked}>
                   Include
                 </Button>

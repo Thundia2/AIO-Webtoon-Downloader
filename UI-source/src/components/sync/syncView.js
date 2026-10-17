@@ -19,7 +19,7 @@
 // ============================================================
 
 import { formatBytes } from "@/lib/utils";
-import { DEVICE_STATE_COPY, HASH_MODE_COPY, jobReasonCopy, lastRunTitle, SKIP_REASON_COPY } from "./copy";
+import { DEVICE_STATE_COPY, DROPPED_REASON_COPY, HASH_MODE_COPY, jobReasonCopy, lastRunTitle, skipReasonCopy } from "./copy";
 
 export const TILE_IDS = Object.freeze(["push", "delete", "synced", "only", "attn"]);
 export const SORTS = Object.freeze([
@@ -130,7 +130,10 @@ export function ledgerRows(summary, { tile = null, query = "", sort = "copy" } =
   const rows = ((summary && summary.series) || []).filter((r) => rowMatchesTile(r, tile) && matchesQuery(r, query.trim()));
   const active = [];
   const held = [];
-  for (const r of rows) (r.state === "held" ? held : active).push(r);
+  // A series being removed (design D7) is held 'excluded' by the planner but
+  // has work pending, so it stays in the main list where the user looks for
+  // pending removals (U2-12), not in the dimmed section.
+  for (const r of rows) (r.state === "held" && !r.removing ? held : active).push(r);
   const key = {
     copy: (r) => [rowView(r).writes, (r.counts && r.counts.bytes) || 0],
     remove: (r) => [rowView(r).deletes, 0],
@@ -158,7 +161,16 @@ export function dockTotals(summary) {
     files: t.files || 0,
     bytes: t.bytes || 0,
     removals: (t.delete && t.delete.count) || 0,
+    // Renames move no bytes and aren't in `files`, but they are work: a
+    // rename-only selection must still reach Review (review R5).
+    renames: (t.rename && t.rename.count) || 0,
   };
+}
+
+/** Everything Start would run: files written, removals and renames. */
+export function workCount(totals) {
+  const t = totals || {};
+  return (t.files || 0) + ((t.delete && t.delete.count) || 0) + ((t.rename && t.rename.count) || 0);
 }
 
 /**
@@ -304,8 +316,15 @@ export function lastRunView(run, tn, titleOf) {
     action = s.reason === "no-space" ? "recheck-space" : "recheck";
   }
   const skippedSeries = (s.skippedSeries || []).map((x) => `${name(x.seriesKey || x.folder)} (${jobReasonCopy(x.reason, tn)})`);
-  const skippedFiles = Object.entries(s.skippedReasons || {}).map(([r, n]) => `${count(n, "file")} ${SKIP_REASON_COPY[r] || r}`);
-  const skipped = [...skippedSeries.length ? [`${count(skippedSeries.length, "series", "series")} skipped: ${skippedSeries.join(", ")}`] : [], ...skippedFiles];
+  const skippedFiles = Object.entries(s.skippedReasons || {}).map(([r, n]) => `${count(n, "file")} ${skipReasonCopy(r, tn)}`);
+  // Reviewed work the apply never ran (service.js H.apply `dropped`,
+  // reconcileForApply) and prune folders that weren't orphaned any more
+  // (`notOrphaned`): both were in the review, so their absence must show.
+  const droppedBy = {};
+  for (const d of s.dropped || []) droppedBy[d.reason] = (droppedBy[d.reason] || 0) + 1;
+  const droppedLines = Object.entries(droppedBy).map(([r, n]) => `${count(n, "reviewed change")} not run: ${DROPPED_REASON_COPY[r] || r}`);
+  const notOrphaned = (s.notOrphaned || []).length ? [`${count(s.notOrphaned.length, "folder")} kept, no longer unused: ${s.notOrphaned.join(", ")}`] : [];
+  const skipped = [...(skippedSeries.length ? [`${count(skippedSeries.length, "series", "series")} skipped: ${skippedSeries.join(", ")}`] : []), ...skippedFiles, ...droppedLines, ...notOrphaned];
   return {
     tone,
     icon,
@@ -338,29 +357,52 @@ export function laneFills(job, memo) {
   return { memo: next, fills };
 }
 
+/** A loss tick's identity: the sorted op ids it was ticked over. */
+export function lossSig(ids) {
+  return (ids || []).map(String).sort().join("\n");
+}
+
+/**
+ * Is series `l`'s loss tick still valid? `acks.losses` is a Map(seriesKey →
+ * lossSig at tick time); it counts only while the series' CURRENT loss ids
+ * are exactly those (U2-2, review R3): a selection change that adds a loss
+ * to a ticked series re-opens its tick instead of riding on it.
+ */
+export function lossAcked(acks, l) {
+  const m = acks && acks.losses;
+  return !!m && typeof m.get === "function" && m.get(l.seriesKey) === lossSig(l.lossOpIds);
+}
+
 /**
  * Review footer state (spec §4 Review): which acknowledgements are still
- * open. `acks` = {losses:Set<seriesKey>, massDelete:number|null,
+ * open. `acks` = {losses:Map<seriesKey, lossSig>, massDelete:number|null,
  * massRepush:number|null} as ticked; a mass tick counts only while it equals
  * the review's current count (U2-2: the service checks the same).
+ * viewSelSeq: the pushed plan view's selSeq; a review answered before the
+ * latest selection change landed (review.selSeq behind it) can't start
+ * (U2-11, review R6). changedNotice: an undismissed "the plan changed"
+ * notice (R7).
  */
-export function reviewGate(review, acks, { stale, settled, busy, viewGen } = {}) {
+export function reviewGate(review, acks, { stale, settled, busy, viewGen, viewSelSeq, changedNotice } = {}) {
   if (!review || !review.ok) return { left: 0, canStart: false, why: "loading" };
   const a = acks || {};
   let left = 0;
-  for (const l of review.losses || []) if (!(a.losses && a.losses.has(l.seriesKey))) left += 1;
+  for (const l of review.losses || []) if (!lossAcked(a, l)) left += 1;
   if (review.massDelete && review.massDelete.required && a.massDelete !== review.massDelete.count) left += 1;
   if (review.massRepush && review.massRepush.required && a.massRepush !== review.massRepush.count) left += 1;
-  const files = review.totals ? (review.totals.files || 0) + ((review.totals.delete && review.totals.delete.count) || 0) : 0;
+  const files = workCount(review.totals);
+  const selBehind = viewSelSeq != null && review.selSeq !== viewSelSeq;
   const why = stale || review.stale
     ? "stale"
     : busy || review.busy
       ? "busy"
       : !settled
         ? "saving"
-        : viewGen != null && viewGen !== review.gen
+        : (viewGen != null && viewGen !== review.gen) || selBehind
           ? "changed"
-          : review.capacity && review.capacity.fits === false
+          : changedNotice
+            ? "notice"
+            : review.capacity && review.capacity.fits === false
             ? "space"
             : !files
               ? "empty"
@@ -370,12 +412,49 @@ export function reviewGate(review, acks, { stale, settled, busy, viewGen } = {})
   return { left, canStart: !why, why };
 }
 
+/**
+ * What a review SHOWS the user, as a string: every offered op with its tick,
+ * size and blockers, the losses, the mass counts, rebinds, the policy and
+ * whether it fits. Two reviews with equal signatures ask the user the same
+ * question, so a re-plan that only bumps `gen` (a library notify or settle
+ * re-plan that found nothing new) must not raise "The plan changed" or clear
+ * the ticks: found by the tab E2E, where such a re-plan landed between the
+ * loss tick and Start. ReviewDialog keys both on this (grep reviewSig).
+ * `asOf`, `gen`, `selSeq` and capacity bytes are left out on purpose: they
+ * move on every plan without changing what Start would do.
+ */
+export function reviewSig(review) {
+  if (!review || !review.ok) return null;
+  const ops = [];
+  for (const g of review.groups || []) {
+    for (const o of g.ops || []) ops.push([g.kind, g.reason, o.opId, !!o.selected, o.size, (o.blockedBy || []).length, !!o.loss]);
+  }
+  const md = review.massDelete || {};
+  const mr = review.massRepush || {};
+  return JSON.stringify([
+    ops,
+    (review.losses || []).map((l) => [l.seriesKey, lossSig(l.lossOpIds)]),
+    [!!md.required, md.count || 0, !!mr.required, mr.count || 0],
+    review.rebinds || null,
+    review.policy || null,
+    !!(review.capacity && review.capacity.fits !== false),
+    !!review.needsVerify,
+  ]);
+}
+
 /** The apply payload for a review and its ticks (service.js H.apply / _ackArgs). */
 export function applyPayload(targetId, review, acks) {
   const a = acks || {};
   const ackLosses = [];
-  for (const l of review.losses || []) if (a.losses && a.losses.has(l.seriesKey)) ackLosses.push(...l.lossOpIds);
+  // Only a still-valid tick sends ids, and they are the ids it was ticked
+  // over (equal to the current ones by lossAcked), never a later list.
+  for (const l of review.losses || []) if (lossAcked(a, l)) ackLosses.push(...l.lossOpIds);
   const out = { targetId, gen: review.gen, ackLosses };
+  // The selection the review showed (U2-11): the service refuses
+  // plan-changed when the target's selSeq has moved past it. null is sent
+  // too: it is the "no selection change yet" value the service starts from
+  // (service.js _rt), and dropping it skipped the check for a first review.
+  if (review.selSeq !== undefined) out.selSeq = review.selSeq;
   if (review.massDelete && review.massDelete.required && a.massDelete != null) out.ackMassDelete = a.massDelete;
   if (review.massRepush && review.massRepush.required && a.massRepush != null) out.ackMassRepush = a.massRepush;
   return out;

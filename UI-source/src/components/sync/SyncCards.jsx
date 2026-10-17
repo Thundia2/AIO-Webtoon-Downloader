@@ -126,7 +126,7 @@ export function RefusalCard({ refusal: r, tn, onAction, onDismiss, compact, clas
   const { armed, arm, disarm } = useArm();
   if (!r) return null;
   const c = refusalCardCopy(r, tn);
-  const title = r.internal ? "Something went wrong inside sync" : r.code === "blocked" ? blockedTitle(r) : refusalTitle(r.code, tn) || "Sync stopped";
+  const title = r.internal ? "Something went wrong inside sync" : r.code === "blocked" ? blockedTitle(r) : refusalTitle(r.code, tn, r) || "Sync stopped";
   const act = (kind, arg) => onAction && onAction(kind, arg);
   const btn = (label, kind, variant = "outline", Icon = null, arg) => (
     <Button key={kind + label} size="sm" variant={variant} className={XS} onClick={() => act(kind, arg)}>

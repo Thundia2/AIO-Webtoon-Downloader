@@ -239,6 +239,11 @@ export default function TargetEditor({ target: t, sync, ops, library, host }) {
     return r;
   };
   const patch = (p, field) => send("update-target", { patch: p }, field);
+  // List fields change by ONE add or remove (service.js edit-list / the
+  // entry-named removes), never by a whole array or an index taken from
+  // this render: a second click queued behind the first would otherwise
+  // undo it or hit the wrong entry (review R12).
+  const toggle = (field, value, on) => send("edit-list", { field, [on ? "remove" : "add"]: value }, field);
   const errFor = (f) => (err && err.field === f ? err.text : null);
 
   // ── identity draft ──
@@ -360,6 +365,7 @@ export default function TargetEditor({ target: t, sync, ops, library, host }) {
       {browsing && id.kind === "adb" && deviceReady && (
         <div className="mb-2">
           <RemoteBrowser
+            key={id.serial}
             sync={sync}
             serial={id.serial}
             startPath={id.root || "/sdcard"}
@@ -435,7 +441,7 @@ export default function TargetEditor({ target: t, sync, ops, library, host }) {
                       on={on}
                       disabled={on && formats.length === 1}
                       title={on && formats.length === 1 ? "A Custom reader needs at least one file type" : undefined}
-                      onClick={() => patch({ formats: on ? formats.filter((x) => x !== f) : [...formats, f] }, "formats")}
+                      onClick={() => toggle("formats", f, on)}
                     >
                       {f}
                     </Chip>
@@ -448,7 +454,7 @@ export default function TargetEditor({ target: t, sync, ops, library, host }) {
                 {SIDECAR_NAMES.map((s) => {
                   const on = sidecars.includes(s);
                   return (
-                    <Chip key={s} mono on={on} onClick={() => patch({ sidecars: on ? sidecars.filter((x) => x !== s) : [...sidecars, s] }, "sidecars")}>
+                    <Chip key={s} mono on={on} onClick={() => toggle("sidecars", s, on)}>
                       {s}
                     </Chip>
                   );
@@ -485,7 +491,7 @@ export default function TargetEditor({ target: t, sync, ops, library, host }) {
           <Field label="Clean-up names" error={errFor("cleanupNames")} hint={`Removed from each synced folder on ${tn} before copying. Dot-files only.`}>
             <div className="flex flex-wrap items-center gap-1">
               {cleanup.map((n) => (
-                <Chip key={n} mono onRemove={() => patch({ cleanupNames: cleanup.filter((x) => x !== n) }, "cleanupNames")}>
+                <Chip key={n} mono onRemove={() => toggle("cleanupNames", n, true)}>
                   {n}
                 </Chip>
               ))}
@@ -495,7 +501,7 @@ export default function TargetEditor({ target: t, sync, ops, library, host }) {
                   e.preventDefault();
                   const n = cleanupInput.trim();
                   if (!n || cleanup.includes(n)) return;
-                  patch({ cleanupNames: [...cleanup, n] }, "cleanupNames").then((r) => r && r.ok !== false && setCleanupInput(""));
+                  toggle("cleanupNames", n, false).then((r) => r && r.ok !== false && setCleanupInput(""));
                 }}
               >
                 <Input value={cleanupInput} onChange={(e) => setCleanupInput(e.target.value)} placeholder=".name" aria-label="Add a clean-up name" className="h-6 w-28 px-2 font-mono text-[11.5px]" />
@@ -518,19 +524,19 @@ export default function TargetEditor({ target: t, sync, ops, library, host }) {
           <div className="flex flex-wrap items-center gap-1">
             {selection === "all-except"
               ? excludes.map((e, i) => (
-                  <Chip key={`${refLabel(e)}:${i}`} title={e.removeFiles ? `Its files are being removed from ${tn}` : undefined} onRemove={() => send("remove-exclude", { index: i }, "excludes")}>
+                  <Chip key={`${refLabel(e)}:${i}`} title={e.removeFiles ? `Its files are being removed from ${tn}` : undefined} onRemove={() => send("remove-exclude", { entry: e }, "excludes")}>
                     {refLabel(e)}
                   </Chip>
                 ))
               : only.map((e, i) => (
-                  <Chip key={`${refLabel(e)}:${i}`} onRemove={() => send("set-selection-mode", { mode: "only", only: only.filter((_, j) => j !== i) }, "selection")}>
+                  <Chip key={`${refLabel(e)}:${i}`} onRemove={() => toggle("only", e, true)}>
                     {refLabel(e)}
                   </Chip>
                 ))}
             {selection === "all-except" ? (
               <SeriesPicker label="Exclude a series" library={library} taken={excludes} onPick={(ref) => send("add-exclude", { entry: ref }, "excludes")} />
             ) : (
-              <SeriesPicker label="Add a series" library={library} taken={only} onPick={(ref) => send("set-selection-mode", { mode: "only", only: [...only, ref] }, "selection")} />
+              <SeriesPicker label="Add a series" library={library} taken={only} onPick={(ref) => toggle("only", ref, false)} />
             )}
           </div>
           {selection === "only" && !only.length && <div className="text-[11px] text-warn-fg">Nothing is synced to {tn} until you add a series.</div>}
@@ -552,7 +558,7 @@ export default function TargetEditor({ target: t, sync, ops, library, host }) {
                     {dangling && <AlertTriangle className="mr-1 inline h-3 w-3 align-[-2px]" />}
                     {dangling ? `${refLabel(a)} (not in your library)` : refLabel(a)}
                   </span>
-                  <button type="button" aria-label="Remove link" onClick={() => send("remove-alias", { index: i }, "aliases")} className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground">
+                  <button type="button" aria-label="Remove link" onClick={() => send("remove-alias", { entry: a }, "aliases")} className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground">
                     <X className="h-3.5 w-3.5" />
                   </button>
                 </div>

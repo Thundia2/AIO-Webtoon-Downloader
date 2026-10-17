@@ -177,14 +177,25 @@ function series(lib, folder, chapters) {
     // Two absent polls (U3-8) before it counts as unplugged: ≥ 10 s.
     await step("unplug is seen", () => win.getByText("Folder not found").first().waitFor({ timeout: 30_000 }));
     chapter(path.join(LIB, "Alpha"), "Ch.004.cbz", 4010);
+    // Positive control for the "hidden" check below: main having the card
+    // says nothing about the renderer, so a count() taken before the
+    // renderer's `prompt` event lands passes whether or not the tab hides
+    // it. This listener sits beside useDeviceSync's on the same "sync-event"
+    // channel and was added after it, so once it has seen the show, the
+    // hook's reducer has too; two frames then let React commit.
+    await win.evaluate(() => {
+      window.__e2ePromptShows = 0;
+      window.electronAPI.onSyncEvent((e) => {
+        if (e && e.kind === "prompt" && e.action === "show") window.__e2ePromptShows += 1;
+      });
+    });
     fs.renameSync(parked, DEV);
     await step("re-plug: hidden while the Sync tab shows the target", async () => {
       await win.getByText("Connected").first().waitFor({ timeout: 30_000 });
-      // The card exists in main; the tab shows its target, so nothing draws.
-      await win.waitForFunction(async () => {
-        const st = await window.electronAPI.syncGetState();
-        return st.prompts && st.prompts.length === 1;
-      }, null, { timeout: 30_000, polling: 500 });
+      await win.waitForFunction(() => window.__e2ePromptShows >= 1, null, { timeout: 30_000, polling: 200 });
+      await win.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+      if ((await tabTitle()) !== "Sync") throw new Error(`tab ${await tabTitle()}`);
+      // The renderer holds the card; the tab shows its target, so nothing draws.
       if (await card().count()) throw new Error("card drawn over the Sync tab");
     });
     await step("re-plug: the card is back on another tab", async () => {

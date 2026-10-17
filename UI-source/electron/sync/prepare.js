@@ -19,6 +19,9 @@
 //    6. gone detection: planner.goneCandidates → STA2 of every name (all
 //       ENOENT) → on adb, the rc-checked `find -type d` must list the same
 //       directories as LIS2; anything else refuses device-listing-suspect
+//       (every such refusal names its `cause`: root-unlistable, empty-root,
+//       missed-folder, stat-failed, listings-differ; the UI words each,
+//       copy.js listingSuspectCopy — `detail` stays the raw error)
 //       → every device refusal is decided: the `device-ready` progress line
 //         (also sent by a refusal at steps 2-6; grep deviceReady)
 //       → free space, read once for the capacity gauge (grep _readFreeSpace)
@@ -171,17 +174,17 @@ async function preparePlan(c) {
   // 4. root listing
   progress({ phase: "listing", done: 0, total: null });
   let root = await dev(() => transport.listRoot());
-  if (!root.ok) return refused(refuse("device-listing-suspect", "the target folder can't be listed", { detail: root.error }));
+  if (!root.ok) return refused(refuse("device-listing-suspect", "the target folder can't be listed", { detail: root.error, cause: "root-unlistable" }));
   if (root.undecodable.length) warnings.push({ kind: "undecodable-names", folder: null, names: root.undecodable.map((u) => u.display) });
   const visibleDirs = (l) => l.dirs.filter((d) => !d.name.startsWith("."));
   if (view.shards.length && !visibleDirs(root).length) {
-    return refused(refuse("device-listing-suspect", "the device lists no folders while this target has synced series (locked or not mounted?)", { detail: "empty-root" }));
+    return refused(refuse("device-listing-suspect", "the device lists no folders while this target has synced series (locked or not mounted?)", { detail: "empty-root", cause: "empty-root" }));
   }
 
   // 5. folder rename intents
   if (await _folderIntents(view, root, { dev, transport, store, warnings })) {
     root = await dev(() => transport.listRoot());
-    if (!root.ok) return refused(refuse("device-listing-suspect", "the target folder can't be listed", { detail: root.error }));
+    if (!root.ok) return refused(refuse("device-listing-suspect", "the target folder can't be listed", { detail: root.error, cause: "root-unlistable" }));
   }
   checkCancel();
 
@@ -197,14 +200,14 @@ async function preparePlan(c) {
       }
       const st = await dev(() => transport.stat(name));
       if (st.exists && st.type === "dir") {
-        return refused(refuse("device-listing-suspect", "a folder the device listing left out exists", { detail: "listing-missed-folder", folder: name }));
+        return refused(refuse("device-listing-suspect", "a folder the device listing left out exists", { detail: "listing-missed-folder", cause: "missed-folder", folder: name }));
       }
       if (st.exists) {
         absent = false; // something else holds the name: not gone, held
         break;
       }
       if (st.error !== ENOENT) {
-        return refused(refuse("device-listing-suspect", "a folder's state can't be read", { detail: `stat-errno-${st.error}`, folder: name }));
+        return refused(refuse("device-listing-suspect", "a folder's state can't be read", { detail: `stat-errno-${st.error}`, cause: "stat-failed", folder: name }));
       }
     }
     if (absent) gone.add(cand.shardId);
@@ -220,7 +223,7 @@ async function preparePlan(c) {
       alt = { ok: false, error: "find-failed" };
     }
     if (!alt.ok || !_sameKeys(alt.keys, root.dirKeys)) {
-      return refused(refuse("device-listing-suspect", "two listings of the device disagree", { detail: alt.ok ? "listings-differ" : alt.error }));
+      return refused(refuse("device-listing-suspect", "two listings of the device disagree", { detail: alt.ok ? "listings-differ" : alt.error, cause: "listings-differ" }));
     }
   }
 

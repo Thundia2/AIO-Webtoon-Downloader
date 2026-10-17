@@ -80,7 +80,9 @@ function FindRow({ row, cover, busy, result, onPatch, onUnlink }) {
         checked={!row.skip && !linked}
         locked={linked}
         disabled={busy || linked}
-        aria-label={row.skip ? `Include ${row.folder}` : `Skip ${row.folder}`}
+        // A stable name that matches what "checked" means (included), so a
+        // screen reader says "Include X, not checked" for a skipped row.
+        aria-label={`Include ${row.folder}`}
         onCheckedChange={(on) => onPatch({ skip: !on })}
         className="mt-0.5"
       />
@@ -267,10 +269,9 @@ export default function FindSourcesSheet({ open, onClose, target, tn, items, wid
   };
 
   const unlink = async (row) => {
-    const list = (target && target.aliases) || [];
-    const index = list.indexOf(aliasFor(target, row.folder));
-    if (index < 0) return;
-    const r = await ops.run("remove-alias", { targetId: tid, index });
+    const entry = aliasFor(target, row.folder);
+    if (!entry) return;
+    const r = await ops.run("remove-alias", { targetId: tid, entry });
     setResults((x) => ({ ...x, [row.folder]: r && r.ok === false ? { ok: false, text: configRefusalCopy(r, tn) } : null }));
   };
 

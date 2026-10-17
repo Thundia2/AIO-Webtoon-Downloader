@@ -21,7 +21,7 @@
 // ============================================================
 
 import { formatBytes } from "@/lib/utils";
-import { deviceLabel, refusalTitle, jobReasonCopy } from "./copy";
+import { deviceLabel, listingSuspectCopy, refusalTitle, jobReasonCopy } from "./copy";
 import { rowView, targetStatus } from "./syncView";
 
 // A Preparing card or a spinner card appears only after this long, so a
@@ -34,7 +34,7 @@ export const MAX_CARDS = 2;
 // refusalTitle is the row's tooltip and the single-target body).
 const ATTENTION_SHORT = Object.freeze({
   "record-mismatch": "a different sync history",
-  "device-listing-suspect": "listed fewer files than expected",
+  // device-listing-suspect: copy.js listingSuspectCopy(r).short, by cause.
   "library-missing": "the library isn't reachable",
   blocked: "waiting on you",
   failed: "couldn't check it",
@@ -129,8 +129,9 @@ export function targetLine({ targetId, name, entry, attention, plan, job }) {
     return { targetId, name: tn, kind: "setup", bytes: refusal.bytes == null ? null : refusal.bytes, folders: Array.isArray(refusal.folders) ? refusal.folders.length : null, firstSync: !!refusal.firstSync };
   }
   if (refusal) {
-    const title = refusal.code === "failed" ? `Couldn't check ${tn}: ${jobReasonCopy(refusal.reason, tn) || refusal.message || "it stopped"}` : refusalTitle(refusal.code, tn) || refusal.message || "Needs attention";
-    return { targetId, name: tn, kind: "attention", title, short: ATTENTION_SHORT[refusal.code] || "needs a look" };
+    const title = refusal.code === "failed" ? `Couldn't check ${tn}: ${jobReasonCopy(refusal.reason, tn) || refusal.message || "it stopped"}` : refusalTitle(refusal.code, tn, refusal) || refusal.message || "Needs attention";
+    const short = refusal.code === "device-listing-suspect" ? listingSuspectCopy(refusal, tn).short : ATTENTION_SHORT[refusal.code];
+    return { targetId, name: tn, kind: "attention", title, short: short || "needs a look" };
   }
   const n = liveOk ? liveNumbers(pv.summary) : entry ? frozenNumbers(entry) : null;
   if (!n) return { targetId, name: tn, kind: "unknown" };

@@ -60,7 +60,7 @@ const { slotKey } = require("./naming");
 const { labelFile } = require("./chapter-labels");
 const { isChapterFormat, recordIdentity } = require("./profiles");
 const { classifyDeviceFile, resolvePending, mergeVerify, verifyFailed } = require("./provenance");
-const { pcSeriesKey, EVICT_REASON } = require("./planner");
+const { pcSeriesKey, EVICT_REASON, isSettling } = require("./planner");
 const { newEpoch, newShardId } = require("./store");
 const { segmentProblem } = require("./transports");
 const { refuse } = require("./contract");
@@ -69,9 +69,9 @@ const { refuse } = require("./contract");
 // a file unlinked while Komikku holds it open, which frees nothing yet
 // (review #16).
 const RESERVE_BYTES = 1024 * 1024 * 1024;
-// Apply's re-stat refuses files younger than this; the planner offers them
-// as `settling` (deviation 9).
-const SETTLE_MS = 30 * 1000;
+// Apply's re-stat refuses a settling file (planner isSettling, one rule for
+// plan and apply); the planner offers it as `settling` (deviation 9).
+const { SETTLE_MS } = require("./planner");
 const CONNECT_WAIT_MS = 60 * 1000;
 const DEFAULT_BUDGET = 3;
 
@@ -504,6 +504,10 @@ class Executor {
     const writes = sOps.filter((o) => o.kind === "push" || o.kind === "update" || o.kind === "replace");
     const deletes = sOps.filter((o) => o.kind === "delete");
 
+    // The lane names THIS series from its first step (renames and early
+    // deletes run before _writes); left alone it carried the previous
+    // series' lane through them (review low).
+    this.lane = { seriesKey: sp.seriesKey, landed: 0, total: writes.length };
     if (!creating) await this._cleanup(folder);
     for (const op of renames) {
       this._checkCancel();
@@ -730,7 +734,7 @@ class Executor {
 
   /**
    * Apply's re-stat guard: the PC file still has the inventory's size and
-   * mtime, is older than SETTLE_MS, and no running download writes its
+   * mtime, is not settling (planner isSettling), and no running download writes its
    * folder. Returns the stat, or null (the file is skipped, uncharged).
    */
   async _guard(sp, op, rec) {
@@ -753,7 +757,7 @@ class Executor {
       rec.reason = "changed-since-review";
       return null;
     }
-    if (this.now() - st.mtimeMs < SETTLE_MS) {
+    if (isSettling(Number(st.mtimeMs), this.now())) {
       rec.outcome = "skipped";
       rec.reason = "settling";
       return null;

@@ -26,16 +26,19 @@
 
 export const BATCH_MS = 150;
 
-export const EMPTY = Object.freeze({ queue: [], inflight: null, nextSeq: 1, ops: {}, series: {}, error: null });
+export const EMPTY = Object.freeze({ queue: [], inflight: null, nextSeq: 1, nextEntry: 1, ops: {}, series: {}, error: null });
 
 /**
- * Mark: {desired, seq, seriesKey?}; seq 0 = queued, not yet sent. Op marks
- * carry their row's seriesKey (pendingRows reads it) instead of the request
- * holding a series list: a later bulk on the same row owns the row's own
- * mark, and sending the op batch must not stamp it.
+ * Mark: {desired, seq, entry, seriesKey?}; seq 0 = queued, not yet sent.
+ * `entry` is the id of the queue entry that owns it: only sending THAT entry
+ * stamps it. Stamping any seq-0 mark for the item's keys let an earlier
+ * request stamp (and its view then clear) a later click's mark for the same
+ * op, so the row showed the wrong state un-pended (review low).
+ * Op marks carry their row's seriesKey (pendingRows reads it) instead of the
+ * request holding a series list.
  */
-function _mark(map, key, desired, seriesKey) {
-  return { ...map, [key]: seriesKey ? { desired, seq: 0, seriesKey } : { desired, seq: 0 } };
+function _mark(map, key, desired, seriesKey, entry) {
+  return { ...map, [key]: seriesKey ? { desired, seq: 0, entry, seriesKey } : { desired, seq: 0, entry } };
 }
 
 /**
@@ -47,26 +50,28 @@ export function enqueueChanges(st, changes, gen, seriesKey) {
   if (!changes || !changes.length) return st;
   const queue = st.queue.slice();
   let last = queue[queue.length - 1];
+  let nextEntry = st.nextEntry || 1;
   if (last && last.type === "changes" && last.gen === gen) {
     last = { ...last, changes: { ...last.changes } };
     queue[queue.length - 1] = last;
   } else {
-    last = { type: "changes", gen, changes: {} };
+    last = { type: "changes", gen, changes: {}, id: nextEntry++ };
     queue.push(last);
   }
   let ops = st.ops;
   for (const c of changes) {
     last.changes[c.opId] = !!c.selected;
-    ops = _mark(ops, c.opId, !!c.selected, seriesKey);
+    ops = _mark(ops, c.opId, !!c.selected, seriesKey, last.id);
   }
-  return { ...st, queue, ops, error: null };
+  return { ...st, queue, ops, nextEntry, error: null };
 }
 
 /** Queue one bulk request (its own entry). `desired` drives the row box. */
 export function enqueueBulk(st, req, gen, seriesKey) {
-  const item = { type: "bulk", gen, req, series: seriesKey ? [seriesKey] : [] };
-  const series = seriesKey ? _mark(st.series, seriesKey, req.selected !== false) : st.series;
-  return { ...st, queue: [...st.queue, item], series, error: null };
+  const id = st.nextEntry || 1;
+  const item = { type: "bulk", gen, req, series: seriesKey ? [seriesKey] : [], id };
+  const series = seriesKey ? _mark(st.series, seriesKey, req.selected !== false, undefined, id) : st.series;
+  return { ...st, queue: [...st.queue, item], series, nextEntry: id + 1, error: null };
 }
 
 /**
@@ -79,7 +84,7 @@ export function takeNext(st, viewSelSeq) {
   const seq = Math.max(st.nextSeq, (Number.isInteger(viewSelSeq) ? viewSelSeq : 0) + 1);
   const stamp = (map, keys) => {
     let out = map;
-    for (const k of keys) if (out[k] && out[k].seq === 0) out = { ...out, [k]: { ...out[k], seq } };
+    for (const k of keys) if (out[k] && out[k].seq === 0 && out[k].entry === item.id) out = { ...out, [k]: { ...out[k], seq } };
     return out;
   };
   const ops = item.type === "changes" ? stamp(st.ops, Object.keys(item.changes)) : st.ops;

@@ -74,7 +74,9 @@ const scrape = (text, re) => [...text.matchAll(re)].map((m) => m[1]);
     check(`custom default ${k}`, same, `got ${JSON.stringify(a)}, want ${JSON.stringify(e)}`);
   }
   sameSet("refusal titles", keysOf(c.refusalTitle, contract.REFUSAL_CODES, "T"), contract.REFUSAL_CODES);
-  sameSet("series states (every state known)", Object.keys({ bound: 1, "needs-verify": 1, new: 1, gone: 1, held: 1 }), planner.SERIES_STATES);
+  // copy.js's own map (null = no badge), not a literal here: a state dropped
+  // or renamed there must fail this.
+  sameSet("series states (every state known)", Object.keys(c.SERIES_STATE_COPY), planner.SERIES_STATES);
   sameSet("held reasons", keysOf(c.heldReasonCopy, planner.HELD_REASONS, "T"), planner.HELD_REASONS);
   sameSet("tags", Object.keys(c.TAG_COPY), analysis.TAG_KINDS);
   sameSet("anomaly kinds", keysOf(c.anomalyCopy, Object.keys(analysis.ANOMALY_KINDS), "T"), Object.keys(analysis.ANOMALY_KINDS));

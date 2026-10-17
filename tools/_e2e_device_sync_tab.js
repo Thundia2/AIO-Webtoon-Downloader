@@ -23,7 +23,9 @@
 //      sheet; Start stays disabled until the loss (and the mass-removal, when
 //      the plan requires it) is confirmed; the file is gone afterwards
 //   5. plan-changed: a re-plan while Review is open moves the dialog to the
-//      new plan; an apply with the old gen is refused `blocked {plan-changed}`
+//      new plan; an identical re-plan asks nothing, while one with a new PC
+//      chapter raises "The plan changed" notice, which holds Start until
+//      dismissed (R7); an apply with the old gen is refused `blocked {plan-changed}`
 //   6. record-mismatch: the record's header names another folder → its card;
 //      restored → gone
 //   7. device-listing-suspect: the target folder suddenly empty → its card,
@@ -129,8 +131,14 @@ function findFile(root, name) {
     } catch (e) {
       check(label, false, String(e && e.message).split("\n")[0]);
       const shot = path.join(REPO, "tools", `_e2e_sync_fail_${label.replace(/\W+/g, "_")}.png`);
-      await win.screenshot({ path: shot }).catch(() => {});
-      console.log(`  ..  screenshot: ${shot}`);
+      const shotErr = await win.screenshot({ path: shot }).then(() => null, (x) => x);
+      console.log(`  ..  screenshot: ${shotErr ? `FAILED (${String(shotErr.message).split("\n")[0]})` : shot}`);
+      // An open dialog's text says which gate held Start (footer WHY copy).
+      const dlg = await win.evaluate(() => {
+        const d = document.querySelector("[role=dialog]");
+        return d ? d.innerText.replace(/\s+/g, " ").slice(0, 600) : null;
+      }).catch(() => null);
+      if (dlg) console.log(`  ..  dialog: ${dlg}`);
       throw e;
     }
   };
@@ -238,11 +246,30 @@ function findFile(root, name) {
       await dialog().getByText(/^plan \d+/).waitFor();
     });
     const genOf = async () => Number(((await dialog().getByText(/^plan \d+/).textContent()) || "").match(/plan (\d+)/)[1]);
+    // Waits until the dialog shows a plan newer than g. No catch: a re-plan
+    // the dialog never shows is the failure.
+    const pastGen = (g) =>
+      win.waitForFunction((x) => [...document.querySelectorAll("[role=dialog] *")].some((e) => e.children.length === 0 && /^plan (\d+)\b/.test(e.textContent) && Number(e.textContent.match(/^plan (\d+)/)[1]) > x), g, { timeout: 30_000 });
+    const notice = () => dialog().getByRole("button", { name: "I've reviewed it" });
     const g0 = await genOf();
+    // (a) A re-plan that finds nothing new moves the gen but asks nothing
+    // (syncView.reviewSig): the dialog follows it quietly.
     await win.evaluate((id) => window.electronAPI.syncPlan({ targetId: id }), tid);
-    await win.waitForFunction((g) => [...document.querySelectorAll("[role=dialog] *")].some((e) => e.children.length === 0 && new RegExp(`^plan ${g + 1}\\b`).test(e.textContent)), g0, { timeout: 30_000 }).catch(() => {});
+    await step("an open Review follows an identical re-plan", () => pastGen(g0));
     const g1 = await genOf();
-    check("an open Review follows the re-plan", g1 > g0, `${g0} → ${g1}`);
+    await sleep(500);
+    check("an identical re-plan raises no notice", (await notice().count()) === 0);
+    // (b) A re-plan that changes what Start would do (a new PC chapter) is
+    // announced and holds Start until acknowledged (R7).
+    chapter(path.join(LIB, "Beta"), "Ch.009.cbz", 4010);
+    await win.evaluate((id) => window.electronAPI.syncPlan({ targetId: id }), tid);
+    await step("an open Review follows a changed re-plan", () => pastGen(g1));
+    await step("plan-changed notice shows and holds Start", async () => {
+      await dialog().getByText("The plan changed. Review it again.").first().waitFor({ timeout: 10_000 });
+      if (!(await startBtn.isDisabled())) throw new Error("Start enabled under the notice");
+      await dialog().getByRole("button", { name: "I've reviewed it" }).click();
+      await dialog().getByRole("button", { name: "I've reviewed it" }).waitFor({ state: "detached", timeout: 5_000 });
+    });
     const stale = await win.evaluate((p) => window.electronAPI.syncApply(p), { targetId: tid, gen: g0 });
     check("apply with the reviewed-before gen is refused plan-changed", stale && stale.code === "blocked" && stale.blocking && stale.blocking[0].kind === "plan-changed", JSON.stringify(stale));
     await win.keyboard.press("Escape");
@@ -272,7 +299,7 @@ function findFile(root, name) {
     fs.writeFileSync(path.join(DEV, ".nomedia"), "");
     await step("listing-suspect card", async () => {
       await recheck();
-      await text(`${TN} listed far fewer files than expected`, 30_000);
+      await text(`${TN} shows no series folders`, 30_000);
     });
     check("device-listing-suspect card", true);
     check("listing-suspect removed nothing", fs.existsSync(path.join(parked, "Alpha", "Ch.001.cbz")));
@@ -280,7 +307,7 @@ function findFile(root, name) {
     fs.renameSync(parked, DEV);
     await step("listing-suspect clears", async () => {
       await recheck();
-      await gone(`${TN} listed far fewer files than expected`, 30_000);
+      await gone(`${TN} shows no series folders`, 30_000);
       await box("Sync Alpha").waitFor({ timeout: 30_000 }).catch(() => {});
     });
     check("device-listing-suspect clears once restored", true);

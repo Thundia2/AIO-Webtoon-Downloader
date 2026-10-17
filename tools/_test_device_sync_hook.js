@@ -482,7 +482,7 @@ function deferred(value) {
       select({ changes: [{ opId: "b", selected: false }, { opId: "a", selected: true }] });
       select({ bulk: "series", seriesKey: "S", selected: false });
     });
-    eq("marks show at once", h.mounted.state.selection.t1.ops, { a: { desired: true, seq: 0 }, b: { desired: false, seq: 0 } });
+    eq("marks show at once", h.mounted.state.selection.t1.ops, { a: { desired: true, seq: 0, entry: 1 }, b: { desired: false, seq: 0, entry: 1 } });
     eq("the row with pending ops reads pending", [...SQX.pendingRows(h.mounted.state.selection.t1)], ["S"]);
     await h.mounted.actAsync(() => sleep(200));
     eq("one request in flight: the merged changes", replies.length, 1);

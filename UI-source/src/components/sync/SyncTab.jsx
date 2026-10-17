@@ -119,6 +119,13 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
 
   const targets = useMemo(() => pickTargets((sync.config && sync.config.targets) || [], sync.devices, sync.folderPresence), [sync.config, sync.devices, sync.folderPresence]);
   const picked = targets.find((x) => x.target.id === view.targetId) || targets[0] || null;
+  // The first target shown becomes the picked one (review R8): pickTargets
+  // re-sorts on every connect, so falling back to targets[0] each render
+  // switched targets (and closed open overlays) without the user choosing.
+  const fallbackId = picked ? picked.target.id : null;
+  useEffect(() => {
+    if (fallbackId && fallbackId !== view.targetId && !targets.some((x) => x.target.id === view.targetId)) setView({ targetId: fallbackId });
+  }, [fallbackId, view.targetId, targets, setView]);
   const target = picked ? picked.target : null;
   const status = picked ? picked.status : { connected: false, tone: "muted", label: "No target" };
   const tid = target ? target.id : null;
@@ -149,6 +156,8 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
     setReviewOpen(false);
     setPruneOpen(false);
     setFindOpen(false);
+    // The settings sheet too (R9): its editor's draft belongs to the old target.
+    setEditOpen(false);
     setActionRefusal(null);
   }, [tid]);
 
@@ -241,11 +250,17 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
     if (r && r.ok === false && !r.cancelled) setActionRefusal(r);
     return r;
   };
-  const onInclude = useCallback((k) => ops.run("include-series", { targetId: tid, seriesKey: k }).then(reply), [ops, tid]);
+  // ops.run is stable (useConfigOps), so LedgerRow's memo holds across renders.
+  const opsRun = ops.run;
+  const onInclude = useCallback((k) => opsRun("include-series", { targetId: tid, seriesKey: k }).then(reply), [opsRun, tid]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const recheck = ({ hashMode, readBack }) => {
     setActionRefusal(null);
-    const p = readBack ? sync.actions.verify({ targetId: tid, hashMode }) : sync.actions.plan({ targetId: tid, overrides: { hashMode } });
+    // Read back is always mode read-back (U2-9): with no mode the service
+    // falls back to the target's stored verifyMode, which for adopt-size
+    // reads nothing back, and on a non-hashing tablet with none refuses
+    // needs-mode (review R2).
+    const p = readBack ? sync.actions.verify({ targetId: tid, hashMode, mode: "read-back" }) : sync.actions.plan({ targetId: tid, overrides: { hashMode } });
     return p.then(reply);
   };
   const onAction = (kind, arg) => {
@@ -297,7 +312,11 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
 
   // The previous run's card hides while a new job writes here: the dock is
   // the live result then, and the old card would read as this run's.
-  const lastRun = pv && pv.lastRun && view.dismissed[tid] !== pv.lastRun.runId && !(run && run.writing) ? lastRunView(pv.lastRun, tn, titleOf) : null;
+  const lastRun0 = pv && pv.lastRun && view.dismissed[tid] !== pv.lastRun.runId && !(run && run.writing) ? lastRunView(pv.lastRun, tn, titleOf) : null;
+  // A refused apply leaves the same refusal as the plan view's and the run's
+  // (service.js _refused): draw it once, from the plan view (U2-13).
+  const lastRun =
+    lastRun0 && lastRun0.refusal && pv.refusal && lastRun0.refusal.code === pv.refusal.code && lastRun0.refusal.message === pv.refusal.message ? { ...lastRun0, refusal: null } : lastRun0;
   const selError = sel.error && sel.error.ok === false ? sel.error : null;
   const deviceOnly = (summary && summary.deviceOnly) || [];
   const showLedger = view.tile !== "only";
@@ -313,7 +332,7 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
   else if (settleNow) dockStatus = { kind: "settle", text: settleLine(settleNow) };
   else if (sync.job && sync.job.state === "running" && sync.job.targetId !== tid) dockStatus = { kind: "busy", text: "Another target's sync is running; Start waits for it." };
   else if (summary) dockStatus = { kind: "ok", text: `Plan ${pv.gen} · built ${clock(summary.asOf)}` };
-  const anything = totals.files + totals.removals > 0 || !!(summary && summary.massRepush && summary.massRepush.required);
+  const anything = totals.files + totals.removals + totals.renames > 0 || !!(summary && summary.massRepush && summary.massRepush.required);
   const canReview = !!summary && status.connected && !(run && run.writing) && anything;
 
   const body = !summary ? (
@@ -441,7 +460,7 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
           cancelling={cancelling}
           onCancel={() => {
             setCancelling(true);
-            sync.actions.cancel({}).then(reply);
+            sync.actions.cancel({ runId: run.job.runId }).then(reply);
           }}
         />
       ) : summary ? (
@@ -506,7 +525,7 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
         title={`${tn} settings`}
         description="Only the target you're looking at appears here. Every target is in Settings → Sync."
       >
-        <TargetEditor target={target} sync={sync} ops={ops} library={{ entries: libraryEntries || [], loading: false, load: loadLibrary || null }} />
+        <TargetEditor key={target.id} target={target} sync={sync} ops={ops} library={{ entries: libraryEntries || [], loading: false, load: loadLibrary || null }} />
       </Sheet>
     </div>
   );
