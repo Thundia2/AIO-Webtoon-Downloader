@@ -38,7 +38,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 from . import fuzzy_match
-from .base import BaseSiteHandler, SearchHit
+from .base import BaseSiteHandler, SearchHit, SiteBusyError
 
 
 # ─── ML rating gate ────────────────────────────────────────────────────
@@ -5597,7 +5597,9 @@ def search_all(
         pattern as probe_failure_cache / img_quality_cache / fetch_memo). When
         provided, search_all fills diagnostics["site_health"] (a list of
         {site, display_name, host, status, reason, fanout_s, probe_s} for every
-        slow/down participating site), ["eligible_count"], and ["phase_times"].
+        slow/down participating site, plus status "busy" for a site whose
+        search raised SiteBusyError — a notice, not a verdict),
+        ["eligible_count"], ["tested_sites"] and ["phase_times"].
         Assembled at return under the fan-out/probe locks (stragglers may still
         be mutating the timing containers). See _classify_site_health.
 
@@ -5630,6 +5632,10 @@ def search_all(
     probe_inflight: Dict[Tuple[str, str], float] = {}
     probe_track_lock = threading.Lock()
     errored_names: Set[str] = set()
+    # name -> reason for sites whose search raised SiteBusyError: THIS machine
+    # kept them from answering (mangafire's browser profile held by another AIO
+    # process). Neither errored nor tested — see _emit_site_health.
+    busy_names: Dict[str, str] = {}
     blocked_skipped: List[Tuple[str, str, str]] = []  # (name, display_name, host)
 
     cache = probe_failure_cache  # may be None
@@ -5793,6 +5799,15 @@ def search_all(
                 # zero-hit site. Exceptions still record_failure below.
                 cache.record_success(host)
             return hits
+        except SiteBusyError as e:
+            # Not the site's fault, so no ProbeFailureCache strike and no
+            # errored_names entry — either would push the site toward a block
+            # or a "disable this site" recommendation for our own contention.
+            with fanout_lock:
+                busy_names[handler.name] = getattr(e, "reason", None) or "busy"
+            if on_status:
+                on_status(f"[!] {handler.name}: {e}")
+            return []
         except Exception:
             # Attribute this run's failure to the site for the health signal —
             # under fanout_lock so the return-time set(errored_names) snapshot
@@ -5903,6 +5918,7 @@ def search_all(
             _errored = set(errored_names)
             _never = set(late_pending)
             _blocked = list(blocked_skipped)
+            _busy = dict(busy_names)
         with probe_track_lock:
             _stuck = {site for (site, _u) in probe_inflight}
             _probe_by_site: Dict[str, float] = {}
@@ -5921,6 +5937,8 @@ def search_all(
             name = h.name
             if _exclude and name.lower() in _exclude:
                 continue
+            if name in _busy:
+                continue  # reported as "busy" below, never classified
             host = (h.domains[0] if getattr(h, "domains", None) else "") or ""
             fo = _ft.get(name)
             pr = _probe_by_site.get(name)
@@ -6010,6 +6028,23 @@ def search_all(
                 "fanout_s": None,
                 "probe_s": None,
             })
+        # Busy sites: status "busy" is a NOTICE, not a verdict. The UI shows it
+        # but adds no strike (useDownloader.js, grep `"busy"`), and they are
+        # left out of tested_sites below so a busy run doesn't decay a strike
+        # either — the site simply wasn't measured this time.
+        for h in eligible:
+            if h.name not in _busy or (_exclude and h.name.lower() in _exclude):
+                continue
+            fo = _ft.get(h.name)
+            _health.append({
+                "site": h.name,
+                "display_name": getattr(h, "display_name", h.name),
+                "host": (h.domains[0] if getattr(h, "domains", None) else "") or "",
+                "status": "busy",
+                "reason": _busy[h.name],
+                "fanout_s": round(fo, 1) if fo is not None else None,
+                "probe_s": None,
+            })
         if on_status and _reach:
             on_status(
                 f"[*] reachability: probed {len(_reach)} flagged site(s), "
@@ -6025,7 +6060,7 @@ def search_all(
         # untouched. Without this the UI can't tell "tested & ok" from "not
         # tested", so recovered sites would never drop off the recommend list.
         # Cross-file: useDownloader.js setSearchSiteHealth fold (grep tested_sites).
-        diagnostics["tested_sites"] = [h.name for h in eligible]
+        diagnostics["tested_sites"] = [h.name for h in eligible if h.name not in _busy]
         diagnostics["phase_times"] = {
             "fanout": round(_fanout_elapsed, 1),
             "probe": round(_probe_elapsed, 1),

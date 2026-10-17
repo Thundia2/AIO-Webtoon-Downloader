@@ -162,12 +162,17 @@ class ProfileLock:
 
     # ---------------------------------------------------------------
 
-    def acquire(self, timeout_s: float) -> bool:
+    def acquire(self, timeout_s: float, *, strict: bool = False) -> bool:
         """Take the lock, waiting up to *timeout_s*. True when held.
 
         A reentrant acquire succeeds immediately and does NOT re-take the OS
         lock: Windows byte-range locks conflict with the same process on a
         second handle, so re-taking would self-deadlock.
+
+        ``strict`` refuses the unwritable-location degrade below: True then
+        means "the OS lock is really ours", never "we could not tell". Callers
+        that DELETE things on a True (mangafire_vrf's temporary-profile sweep,
+        grep _sweep_ephemeral_profiles) must pass it.
         """
         with self._guard:
             if self._depth > 0:
@@ -177,6 +182,8 @@ class ProfileLock:
                 os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
                 fd = os.open(self.path, os.O_RDWR | os.O_CREAT)
             except Exception:
+                if strict:
+                    return False
                 # An unwritable lock location must not make the browser
                 # unusable — degrade to "no cross-process exclusion", which is
                 # exactly the old behaviour, rather than failing the run.

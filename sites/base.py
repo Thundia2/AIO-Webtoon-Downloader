@@ -156,6 +156,26 @@ except Exception:
     _PROBE_TIMEOUT_EXCEPTIONS = (socket.timeout,)
 
 
+class SiteBusyError(Exception):
+    """Raised by a handler's search() when THIS MACHINE, not the site, kept it
+    from answering — today only mangafire, whose browser profile another AIO
+    process was holding and whose temporary-profile fallback also failed
+    (sites/mangafire_vrf.py, grep profile_contended).
+
+    The search orchestrator treats it as neither success nor failure: no
+    ProbeFailureCache strike (a busy profile says nothing about the host), and a
+    site-health entry with status "busy" that the UI shows as a notice but never
+    counts toward recommending the site be disabled (grep `"busy"` in
+    sites/search_orchestrator.py and UI-source/src/hooks/useDownloader.js).
+
+    ``reason`` is a short machine token for the payload; the message is for logs.
+    """
+
+    def __init__(self, message: str, reason: str = "busy") -> None:
+        super().__init__(message)
+        self.reason = reason or "busy"
+
+
 class IncompleteChapterError(Exception):
     """Raised by handlers when a chapter cannot be fully fetched after the
     handler's own retry logic (e.g. MangaDex's MD@H node-swap loop has

@@ -104,6 +104,9 @@ _BOOTSTRAP_TIMEOUT_S = 120.0
 # signer for a network-level block. Nothing here probes the DOM until
 # _ensure_cleared says the page is real.
 _CF_AUTO_CLEAR_TIMEOUT_S = 20.0
+# After moving from a temporary profile to the shared one: how long to let the
+# saved clearance take effect. Grep _move_to_shared_profile.
+_CF_SAVED_SESSION_SETTLE_S = 5.0
 _CF_SOLVE_TIMEOUT_ENV = "AIO_MANGAFIRE_CF_SOLVE_TIMEOUT"
 _CF_DEFAULT_SOLVE_TIMEOUT_S = 180.0
 # Set by tests so a regression into prompting fails instead of hanging; mirrors
@@ -172,6 +175,44 @@ _CHANNEL_RETRY_DELAY_S = 0.75
 _PROFILE_WAIT_ENV = "AIO_MANGAFIRE_PROFILE_WAIT_S"
 _PROFILE_WAIT_DEFAULT_S = 25.0
 
+# ---------------------------------------------------------------------------
+# TEMPORARY PROFILES — what happens when the shared profile is busy.
+#
+# The wait above cannot help the case that actually happens: a DOWNLOAD holds the
+# profile for its whole run (minutes), so a search or an update check behind it
+# used to wait 25s and then fail. Signing does not need the shared profile's
+# saved session — tokens are session-independent (see the module header) — so a
+# loser now launches on a private, throwaway profile instead (grep
+# _acquire_ephemeral). Measured 2026-10-17: a full search on a brand-new profile
+# cleared Cloudflare on its own and returned the right hits, ~1.5s slower than on
+# the shared profile.
+#
+#   who                                      waits for the shared profile, then
+#   background (search, --list-chapters:     0s                  temporary profile
+#     may not ask a human to solve anything)
+#   foreground (a download)                  _PROFILE_WAIT_DEFAULT_S  temporary profile
+#
+# Background ops do not wait at all because waiting rarely pays: the holder is
+# usually a download that will outlast any budget, while the fallback costs about
+# a second and a half.
+#
+# The ONE thing a temporary profile lacks is a saved Cloudflare clearance. So when
+# a temporary profile meets a check that does not clear on its own, the session
+# moves to the shared profile (waiting the full budget) before giving up or
+# asking a human — grep _move_to_shared_profile. A solve is therefore always
+# earned by, and saved into, the shared profile.
+#
+# IDENTITY IS UNCHANGED: the temporary launch is the same channel launch with the
+# same UA pin (seeded from the shared profile's UA cache). That is the property
+# sites/profile_lock.py exists to protect; it was never the folder that leaked
+# HeadlessChrome, it was the channel-less fallback binary.
+#
+# Temporary profiles live in _ephemeral_root(), one folder per session, each
+# guarded by its own profile_lock. A folder whose lock is free belongs to a dead
+# process and is swept before the next one is made — so a crash or a kill (the
+# Electron app kills these processes on cancel) never leaks one for long.
+_PROFILE_WAIT_BACKGROUND_S = 0.0
+
 # Navigate+scan attempts before the signer is declared unavailable. The document
 # can be REPLACED under the scan (Cloudflare clearing does exactly that), which
 # no in-page wait can survive — only a fresh navigation can. Two is enough: the
@@ -231,6 +272,13 @@ _INTERACTIVE_VIEWPORT = {"width": 1280, "height": 720}
 # raised error names the actual cause (missing browser binary, disabled by env,
 # …) instead of a generic "unavailable". Plain str assignment — no lock needed.
 _LAST_UNAVAILABLE_REASON: Optional[str] = None
+
+# Did this process ever find the shared profile held by a peer? Sticky for the
+# process: a search or an update check is one short process, and the question
+# its caller asks afterwards is "was a failure here caused by contention?" —
+# read through profile_contended() by sites/mangafire.py:search, which turns a
+# contended failure into SiteBusyError (no strike against the site).
+_PROFILE_CONTENDED = False
 
 
 class MangaFireSigningError(RuntimeError):
@@ -433,7 +481,72 @@ def _profile_dir() -> str:
 
 
 def _cache_path() -> str:
+    # Always the SHARED profile's file, also for a session on a temporary
+    # profile: tokens are session-independent, so every process may read and
+    # merge into one cache (see _flush_cache for why concurrent writers are safe).
     return os.path.join(_profile_dir(), "vrf-cache.json")
+
+
+def _ephemeral_root() -> str:
+    """Parent of the temporary profiles. A sibling of the shared profile, so it
+    follows AIO_MANGAFIRE_PROFILE_DIR and never lives inside a user-data-dir
+    Chromium may rewrite."""
+    return _profile_dir().rstrip("\\/") + "-tmp"
+
+
+def _interactive_allowed() -> bool:
+    """May the CURRENT call ask a human to solve a challenge? On the worker
+    thread this reads the caller's permission, which _worker_loop re-enters
+    around every call (see _call)."""
+    try:
+        from .crawlee_utils import interactive_solve_allowed
+    except Exception:
+        return False
+    return bool(interactive_solve_allowed())
+
+
+def _remove_profile_dir(path: str) -> None:
+    """Delete a temporary profile and its lock file. Best effort: on Windows a
+    just-closed Chromium can hold files for a moment, and whatever survives is
+    swept by the next process (its lock is free by then)."""
+    import shutil
+
+    shutil.rmtree(path, ignore_errors=True)
+    if not os.path.exists(path):
+        try:
+            os.remove(_profile_lock.lock_path_for(path))
+        except OSError:
+            pass
+
+
+def _sweep_ephemeral_profiles() -> None:
+    """Delete temporary profiles whose owner is gone.
+
+    Ownership is the profile's own lock, which the kernel releases when the
+    holder dies — so "lock acquirable" means "nobody owns this", with no pid
+    bookkeeping to get wrong. `strict=True` is what makes that inference safe:
+    the lock's non-strict mode answers True when it cannot open the lock file
+    at all. Folders this process holds are skipped (the lock is reentrant, so
+    acquiring would succeed and delete a live profile).
+    """
+    root = _ephemeral_root()
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+        except OSError:
+            continue
+        lock = _profile_lock.get(entry.path)
+        if lock.held():
+            continue
+        if not lock.acquire(0.0, strict=True):
+            continue
+        lock.release()
+        _remove_profile_dir(entry.path)
 
 
 # Distinguishes "no argument" from "the argument None" in _SignerSession._eval.
@@ -499,6 +612,11 @@ class _SignerSession:
         # a peer cannot steal the profile between a mode switch and its
         # relaunch. See sites/profile_lock.py's header.
         self._profile_held = False
+        # The user-data-dir this hold is on: the shared profile, or a temporary
+        # one (then _ephemeral is True) — see the TEMPORARY PROFILES block.
+        # Fixed for the length of one hold; _start launches on whatever it says.
+        self._profile_path: Optional[str] = None
+        self._ephemeral = False
         # True when the LIVE context came from the channel-less fallback, i.e.
         # chromium_headless_shell rather than full Chromium. Describes the
         # current context only (reset per launch). Read where a degraded
@@ -525,12 +643,34 @@ class _SignerSession:
         except Exception:
             self._cache = {}
 
-    def _flush_cache(self) -> None:
+    def _flush_cache(self, *, merge: bool = True) -> None:
+        """Write the cache, MERGING with what is on disk now.
+
+        Two processes can write this file at once since temporary profiles exist
+        (a session on one is not holding the shared profile's lock). The merge
+        keeps a writer from dropping tokens a peer minted after we loaded, and
+        the per-writer tmp name keeps two writers from interleaving into one tmp
+        file; os.replace makes each write atomic. Last writer still wins on a
+        true race, which can only lose tokens — a re-mint, never a wrong token.
+
+        ``merge=False`` is purge_namespace's: it is DELETING entries, and a
+        merge would read them straight back from disk.
+        """
         if not self._cache_dirty:
             return
         try:
+            if merge and self._namespace:
+                try:
+                    with open(_cache_path(), "r", encoding="utf-8") as fh:
+                        disk = json.load(fh)
+                except Exception:
+                    disk = {}
+                theirs = disk.get(self._namespace) if isinstance(disk, dict) else None
+                if isinstance(theirs, dict):
+                    ours = self._cache.get(self._namespace) or {}
+                    self._cache[self._namespace] = {**theirs, **ours}
             os.makedirs(_profile_dir(), exist_ok=True)
-            tmp = _cache_path() + ".tmp"
+            tmp = f"{_cache_path()}.{os.getpid()}.{threading.get_ident()}.tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(self._cache, fh)
             os.replace(tmp, _cache_path())
@@ -574,7 +714,7 @@ class _SignerSession:
         if self._namespace and self._namespace in self._cache:
             self._cache.pop(self._namespace, None)
             self._cache_dirty = True
-            self._flush_cache()
+            self._flush_cache(merge=False)
         self._namespace = None
 
     # ----------------------------- browser -----------------------------
@@ -597,24 +737,40 @@ class _SignerSession:
 
     # ------------------------ profile ownership ------------------------
 
-    def _acquire_profile(self) -> bool:
-        """Claim the shared profile dir for this process, waiting for a peer.
+    def _acquire_profile(self, *, allow_ephemeral: bool = True) -> bool:
+        """Claim a user-data-dir for this process: the shared profile if a peer
+        gives it up in time, else a temporary one (TEMPORARY PROFILES block).
 
         Idempotent: once held, later calls are free, so the teardown+relaunch
         paths stay inside one continuous hold.
 
-        Returns False only when a peer kept it for the whole budget. That is
-        NOT marked via _mark_unavailable, because it is the one launch failure
-        that is purely transient — the peer exits and the next call succeeds,
-        and a sticky verdict would disable the signer for the rest of a run
-        that is about to be fine.
+        ``allow_ephemeral=False`` insists on the shared profile and always waits
+        the full budget — _move_to_shared_profile's call, which needs the
+        shared profile's saved Cloudflare clearance and nothing else will do.
+
+        Returns False only when neither could be had. That is NOT marked via
+        _mark_unavailable, because it is the one launch failure that is purely
+        transient — the peer exits and the next call succeeds, and a sticky
+        verdict would disable the signer for the rest of a run that is about to
+        be fine.
         """
+        global _LAST_UNAVAILABLE_REASON, _PROFILE_CONTENDED
         if self._profile_held:
             return True
-        lock = _profile_lock.get(_profile_dir())
+        shared = _profile_dir()
+        if allow_ephemeral and not _interactive_allowed():
+            budget = _PROFILE_WAIT_BACKGROUND_S
+        else:
+            budget = _profile_wait_budget()
+        lock = _profile_lock.get(shared)
         waited_from = time.monotonic()
-        if lock.acquire(_profile_wait_budget()):
+        if lock.acquire(budget):
             self._profile_held = True
+            self._profile_path = shared
+            self._ephemeral = False
+            # Reclaim folders a killed or crashed process left behind — on
+            # every claim, so it does not depend on contention recurring.
+            _sweep_ephemeral_profiles()
             waited = time.monotonic() - waited_from
             if waited >= 1.0:
                 print(
@@ -623,27 +779,93 @@ class _SignerSession:
                 )
             return True
         owner = lock.peek_owner()
-        who = f" (held by pid {owner})" if owner else ""
+        who = f" (pid {owner})" if owner else ""
+        _PROFILE_CONTENDED = True
+        if allow_ephemeral and self._acquire_ephemeral(who):
+            return True
         print(
-            f"[!] MangaFire: another AIO process is using the browser profile"
-            f"{who} and did not release it within "
-            f"{_profile_wait_budget():.0f}s."
+            f"[!] MangaFire: another AIO process{who} is using the browser profile "
+            f"and did not release it within {budget:.0f}s."
         )
-        global _LAST_UNAVAILABLE_REASON
         _LAST_UNAVAILABLE_REASON = (
             "the MangaFire browser profile is held by another AIO process; "
             "re-run this one on its own"
         )
         return False
 
+    def _acquire_ephemeral(self, who: str) -> bool:
+        """Make, lock and claim a fresh temporary profile. False if the folder
+        or its lock cannot be created (an unwritable profile location)."""
+        import tempfile
+
+        _sweep_ephemeral_profiles()
+        try:
+            root = _ephemeral_root()
+            os.makedirs(root, exist_ok=True)
+            path = tempfile.mkdtemp(prefix=f"{os.getpid()}-", dir=root)
+        except Exception as e:
+            print(f"[!] MangaFire: could not create a temporary browser profile: {e}")
+            return False
+        lock = _profile_lock.get(path)
+        if not lock.acquire(0.0, strict=True):
+            _remove_profile_dir(path)
+            return False
+        # Seed the UA pin so the first launch already presents the shared
+        # profile's identity, instead of probing and relaunching once.
+        seeded = _bid.cached_stable_user_agent(_profile_dir())
+        if seeded:
+            _bid.remember_stable_user_agent(path, seeded)
+        self._profile_held = True
+        self._profile_path = path
+        self._ephemeral = True
+        print(
+            f"[*] MangaFire: the browser profile is in use by another AIO "
+            f"process{who}; using a temporary profile for this run."
+        )
+        return True
+
     def _release_profile(self) -> None:
         if not self._profile_held:
             return
+        path, ephemeral = self._profile_path, self._ephemeral
         self._profile_held = False
+        self._profile_path = None
+        self._ephemeral = False
+        if not path:
+            return
         try:
-            _profile_lock.get(_profile_dir()).release()
+            _profile_lock.get(path).release()
         except Exception:
             pass
+        if ephemeral:
+            _remove_profile_dir(path)
+
+    def _move_to_shared_profile(self) -> bool:
+        """Swap a temporary profile for the shared one, waiting for its holder.
+
+        Called only when the temporary profile is facing a Cloudflare check that
+        did not clear on its own — the one thing the shared profile can do and a
+        temporary one cannot is present a saved clearance. Leaves the shared
+        profile's page loaded on success; on failure leaves NO browser up, which
+        callers already handle (the next _start acquires afresh).
+        """
+        headless = self._headless
+        self._cleanup()
+        self._release_profile()
+        print(
+            "[*] MangaFire: the temporary profile hit a Cloudflare check; "
+            "switching to the shared profile, which keeps the saved session."
+        )
+        if not self._acquire_profile(allow_ephemeral=False):
+            return False
+        if not self._start(headless):
+            return False
+        try:
+            self._goto(_BASE_URL + "/")
+        except Exception as e:
+            print(f"[!] MangaFire: could not load {_BASE_URL} on the shared profile: {e}")
+            return False
+        return True
 
     def _start(self, headless: Optional[bool] = None, *, _ua_relaunch: bool = False) -> bool:
         """Bring up (or reuse) the persistent Patchright context.
@@ -723,7 +945,7 @@ class _SignerSession:
             self._release_profile()
             return False
 
-        profile = _profile_dir()
+        profile = self._profile_path or _profile_dir()
         ctx_kwargs: Dict[str, Any] = {}
         cf_ua: Optional[str] = None
         try:
@@ -1159,6 +1381,18 @@ class _SignerSession:
         if self._await_auto_clear():
             return True
 
+        # On a temporary profile, the shared one's saved clearance may pass
+        # this check with nobody's help — try that before declaring the site
+        # blocked or interrupting anyone. Grep TEMPORARY PROFILES.
+        # A short settle rather than the full auto-clear wait: a valid saved
+        # clearance passes at once or after one JS round, and the long wait was
+        # already spent on the temporary profile — a background update check is
+        # killed at 60s (see _PROFILE_WAIT_DEFAULT_S).
+        if self._ephemeral and self._move_to_shared_profile():
+            if not self._challenged() or self._await_auto_clear(_CF_SAVED_SESSION_SETTLE_S):
+                print("[*] MangaFire: the shared profile's saved session passed the check.")
+                return True
+
         # A human is the only thing left, so BOTH gates apply: does this process
         # own a solver at all (capability), and may it interrupt someone right
         # now (permission)? The permission is context-scoped, so search,
@@ -1466,6 +1700,7 @@ class _SignerSession:
 _REQUEST_QUEUE: "queue.Queue" = queue.Queue()
 _WORKER_STARTED = False
 _WORKER_LOCK = threading.Lock()
+_WORKER_THREAD: Optional[threading.Thread] = None
 _SESSION: Optional[_SignerSession] = None  # owned by the worker thread
 _SHUTDOWN_SENTINEL = object()
 
@@ -1485,7 +1720,7 @@ def _worker_loop() -> None:
             finally:
                 return
         try:
-            fut, fn_name, args, kwargs = item
+            fut, fn_name, args, kwargs, interactive = item
         except (TypeError, ValueError):
             continue
         if fut.cancelled():
@@ -1493,7 +1728,8 @@ def _worker_loop() -> None:
         try:
             if _SESSION is None:
                 _SESSION = _SignerSession()
-            result = getattr(_SESSION, fn_name)(*args, **kwargs)
+            with _caller_permission(interactive):
+                result = getattr(_SESSION, fn_name)(*args, **kwargs)
         except BaseException as exc:  # noqa: BLE001 — propagate to the caller
             try:
                 fut.set_exception(exc)
@@ -1513,14 +1749,40 @@ def _ensure_worker() -> None:
     with _WORKER_LOCK:
         if _WORKER_STARTED:
             return
-        threading.Thread(target=_worker_loop, name="mangafire-pw", daemon=True).start()
+        global _WORKER_THREAD
+        _WORKER_THREAD = threading.Thread(
+            target=_worker_loop, name="mangafire-pw", daemon=True
+        )
+        _WORKER_THREAD.start()
         _WORKER_STARTED = True
+
+
+def _caller_permission(interactive: bool):
+    """Re-enter the CALLER's "may a human be asked to solve a challenge"
+    permission on the worker thread.
+
+    WHY: the permission is a ContextVar (sites/crawlee_utils.py,
+    _INTERACTIVE_SOLVE), and a Python thread starts with an EMPTY context — it
+    does not inherit the spawner's (verified on 3.13: set True on the main thread,
+    a new thread reads False). The worker is a long-lived thread, so without this
+    every check in _SignerSession read the default False: a desktop download
+    could never reach the verification window, and nothing here could tell a
+    search from a download. Scoped per call, so one caller's grant never leaks
+    into the next caller's request.
+    """
+    try:
+        from .crawlee_utils import interactive_solving
+    except Exception:
+        import contextlib
+
+        return contextlib.nullcontext()
+    return interactive_solving(bool(interactive))
 
 
 def _call(fn_name: str, *args, _timeout_s: float = _SIGN_TIMEOUT_S, **kwargs):
     _ensure_worker()
     fut: _futures.Future = _futures.Future()
-    _REQUEST_QUEUE.put((fut, fn_name, args, kwargs))
+    _REQUEST_QUEUE.put((fut, fn_name, args, kwargs, _interactive_allowed()))
     try:
         return fut.result(timeout=_timeout_s)
     except _futures.TimeoutError:
@@ -1585,6 +1847,13 @@ def fetch_api_json(url: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def profile_contended() -> bool:
+    """True once this process has found the shared browser profile held by
+    another AIO process. A failure after that may be the contention's doing
+    rather than the site's — sites/mangafire.py:search reports it as busy."""
+    return _PROFILE_CONTENDED
+
+
 def invalidate() -> None:
     """Forget every cached token for the current bundle and force the next call
     to re-bootstrap. Called by sites/mangafire.py when the server rejects a
@@ -1595,15 +1864,33 @@ def invalidate() -> None:
         pass
 
 
+# How long interpreter exit waits for a session on a TEMPORARY profile to close
+# and delete its folder. Measured 2026-10-17: without the wait the daemon died
+# mid-close and left a ~17 MB folder per contended process (a Check All burst
+# would leave one per check until the next fallback swept them).
+_SHUTDOWN_JOIN_S = 5.0
+
+
 def _shutdown() -> None:
     """Best-effort at-exit close. The daemon dies with the interpreter either
-    way; this just gives Chromium a chance to exit cleanly. No join."""
+    way; this gives Chromium a chance to exit cleanly.
+
+    Joins (bounded) ONLY for a temporary profile, whose close() also deletes
+    the folder. The shared profile keeps the old no-wait exit: its folder is
+    meant to persist, and a slow close must not delay every process exit.
+    Reading _SESSION from this thread is a benign race — the worst case is one
+    skipped or one unnecessary wait, and _sweep_ephemeral_profiles is the
+    backstop for a folder that still survives.
+    """
     if not _WORKER_STARTED:
         return
     try:
         _REQUEST_QUEUE.put_nowait(_SHUTDOWN_SENTINEL)
     except queue.Full:
         pass
+    session = _SESSION
+    if session is not None and getattr(session, "_ephemeral", False) and _WORKER_THREAD:
+        _WORKER_THREAD.join(timeout=_SHUTDOWN_JOIN_S)
 
 
 atexit.register(_shutdown)

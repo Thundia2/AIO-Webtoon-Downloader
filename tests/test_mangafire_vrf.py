@@ -645,10 +645,11 @@ def test_a_real_block_stays_sticky(monkeypatch):
 # 2026-08-20.
 # ────────────────────────────────────────────────────────────────────────
 
-def _fake_patchright(monkeypatch, outcomes):
+def _fake_patchright(monkeypatch, outcomes, launches=None):
     """Drive _start against a fake Playwright. *outcomes* is one entry per
     launch call: an Exception to raise, or None to succeed. Returns the list
-    that records the `channel` kwarg of each attempt."""
+    that records the `channel` kwarg of each attempt. *launches*, when given,
+    also receives (profile_dir, kwargs) per attempt."""
     attempts = []
 
     class _Page:
@@ -668,6 +669,8 @@ def _fake_patchright(monkeypatch, outcomes):
     class _Chromium:
         def launch_persistent_context(self, profile, **kw):
             attempts.append(kw.get("channel"))
+            if launches is not None:
+                launches.append((profile, kw))
             outcome = outcomes[len(attempts) - 1]
             if isinstance(outcome, BaseException):
                 raise outcome
@@ -869,7 +872,9 @@ def test_contention_error_names_the_real_cause(monkeypatch, tmp_path):
     monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_DIR", str(tmp_path))
 
     class _BusyLock:
-        def acquire(self, _timeout):
+        # Every lock busy — the shared profile AND any temporary one — so this
+        # is the "no fallback possible either" case.
+        def acquire(self, _timeout, strict=False):
             return False
 
         def peek_owner(self):
@@ -1013,3 +1018,222 @@ def test_both_launch_binaries_stabilize_to_one_user_agent():
     # makes applying it unconditionally safe for comix too.
     assert bid.stabilize_user_agent(headed) == headed
     assert bid.stabilize_user_agent(bid.FALLBACK_UA) == bid.FALLBACK_UA
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Temporary profiles (2026-10-17)
+#
+# The reported bug: a Search-tab search silently lost mangafire whenever another
+# AIO process held the browser profile — the search waited 25s, gave up, and
+# counted against mangafire as a "slow" site. A download holds the profile for
+# minutes, so no wait could ever fix that. Now a background op (search, update
+# check) launches on a private temporary profile instead, a download waits and
+# then does the same, and a contended failure reports "busy" instead of
+# nothing. See the TEMPORARY PROFILES block in sites/mangafire_vrf.py.
+#
+# Contention has to come from ANOTHER process: the lock is reentrant within one,
+# so a same-process "peer" would simply be granted the lock.
+# ────────────────────────────────────────────────────────────────────────
+
+import contextlib
+import os
+import subprocess
+import sys
+import time
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@pytest.fixture(autouse=True)
+def _fresh_contention_flag(monkeypatch):
+    # Sticky per process by design, so a test that contends would leak into
+    # every later one without this.
+    monkeypatch.setattr(mangafire_vrf, "_PROFILE_CONTENDED", False)
+
+
+@contextlib.contextmanager
+def _peer_holds(profile_dir):
+    """Hold *profile_dir*'s lock from a separate Python process."""
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[2]);"
+        "from sites import profile_lock;"
+        "assert profile_lock.get(sys.argv[1]).acquire(10);"
+        "print('held', flush=True); sys.stdin.read()"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, str(profile_dir), _ROOT],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        assert proc.stdout.readline().strip() == "held"
+        yield proc
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=15)
+
+
+def _shared(monkeypatch, tmp_path):
+    shared = tmp_path / "shared"
+    monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_DIR", str(shared))
+    monkeypatch.delenv("AIO_MANGAFIRE_NO_SIGNER", raising=False)
+    return shared
+
+
+def test_background_op_uses_a_temporary_profile_when_shared_is_held(monkeypatch, tmp_path):
+    """THE fix. Same channel launch (identity unchanged), on a temp folder, with
+    the shared profile's UA pin seeded in; close() deletes the folder."""
+    shared = _shared(monkeypatch, tmp_path)
+    shared.mkdir()
+    pinned = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/147.0.0.0 Safari/537.36"
+    (shared / "aio-stable-ua.txt").write_text(pinned, encoding="utf-8")
+    launches = []
+    attempts = _fake_patchright(monkeypatch, [None], launches)
+
+    with _peer_holds(shared):
+        session = mangafire_vrf._SignerSession()
+        t0 = time.monotonic()
+        assert session._start() is True
+        assert time.monotonic() - t0 < 5, "a background op waited for the peer"
+        temp = session._profile_path
+        assert session._ephemeral is True
+        assert os.path.dirname(temp) == mangafire_vrf._ephemeral_root()
+        assert launches[0][0] == temp
+        assert attempts == ["chromium"], "temporary profile changed the launch identity"
+        assert launches[0][1].get("user_agent") == pinned
+        assert mangafire_vrf.profile_contended() is True
+        session.close()
+
+    assert not os.path.exists(temp), "temporary profile outlived its session"
+    assert session._profile_held is False
+
+
+def test_background_op_takes_the_shared_profile_when_free(monkeypatch, tmp_path):
+    shared = _shared(monkeypatch, tmp_path)
+    launches = []
+    _fake_patchright(monkeypatch, [None], launches)
+
+    session = mangafire_vrf._SignerSession()
+    assert session._start() is True
+    assert session._ephemeral is False
+    assert launches[0][0] == str(shared)
+    assert mangafire_vrf.profile_contended() is False
+    session.close()
+
+
+def test_download_waits_for_the_shared_profile_before_falling_back(monkeypatch, tmp_path):
+    """A download may need the saved Cloudflare session, so it still waits the
+    budget — and then falls back instead of failing the run."""
+    from sites.crawlee_utils import interactive_solving
+
+    shared = _shared(monkeypatch, tmp_path)
+    monkeypatch.setenv("AIO_MANGAFIRE_PROFILE_WAIT_S", "0.6")
+    _fake_patchright(monkeypatch, [None])
+
+    with _peer_holds(shared):
+        session = mangafire_vrf._SignerSession()
+        with interactive_solving(True):
+            t0 = time.monotonic()
+            assert session._start() is True
+            waited = time.monotonic() - t0
+        assert waited >= 0.6, f"a download did not wait for the shared profile ({waited:.2f}s)"
+        assert session._ephemeral is True
+        session.close()
+
+
+def test_sweep_removes_only_orphaned_temporary_profiles(monkeypatch, tmp_path):
+    _shared(monkeypatch, tmp_path)
+    root = mangafire_vrf._ephemeral_root()
+    orphan = os.path.join(root, "111-orphan")
+    live = os.path.join(root, "222-live")
+    os.makedirs(orphan)
+    os.makedirs(live)
+
+    with _peer_holds(live):
+        mangafire_vrf._sweep_ephemeral_profiles()
+        assert not os.path.exists(orphan), "a dead process's profile was not swept"
+        assert os.path.exists(live), "swept a profile a live process owns"
+
+
+def test_sweep_never_deletes_a_profile_this_process_holds(monkeypatch, tmp_path):
+    """The lock is reentrant, so without the held() check the sweep would
+    'acquire' our own live profile and delete it from under the browser."""
+    _shared(monkeypatch, tmp_path)
+    mine = os.path.join(mangafire_vrf._ephemeral_root(), "333-mine")
+    os.makedirs(mine)
+    lock = mangafire_vrf._profile_lock.get(mine)
+    assert lock.acquire(0.0, strict=True)
+    try:
+        mangafire_vrf._sweep_ephemeral_profiles()
+        assert os.path.exists(mine)
+    finally:
+        lock.release()
+
+
+def test_callers_permission_reaches_the_worker_thread(monkeypatch):
+    """The permission is a ContextVar and threads start with an EMPTY context,
+    so without the bridge re-entering it the worker always read False: a
+    download could never reach the verification window, and the signer could
+    not tell a search from a download."""
+    from sites.crawlee_utils import interactive_solving
+
+    monkeypatch.setattr(
+        mangafire_vrf._SignerSession, "_probe_permission",
+        lambda self: mangafire_vrf._interactive_allowed(), raising=False,
+    )
+    with interactive_solving(True):
+        assert mangafire_vrf._call("_probe_permission", _timeout_s=10) is True
+    with interactive_solving(False):
+        assert mangafire_vrf._call("_probe_permission", _timeout_s=10) is False
+    # The grant is per call — it must not stick to the worker.
+    assert mangafire_vrf._call("_probe_permission", _timeout_s=10) is False
+
+
+def test_cache_flush_merges_tokens_a_peer_wrote(monkeypatch, tmp_path):
+    """Temporary-profile sessions write the shared cache without holding the
+    shared lock, so a flush must not drop a peer's newer tokens."""
+    _shared(monkeypatch, tmp_path)
+    a, b = mangafire_vrf._SignerSession(), mangafire_vrf._SignerSession()
+    for s in (a, b):
+        s._namespace = "ns1"
+        s._load_cache()
+    a._remember("k_a", {"vrf": "A", "query": "q=a"})
+    b._remember("k_b", {"vrf": "B", "query": "q=b"})
+    a._flush_cache()
+    b._flush_cache()
+    fresh = mangafire_vrf._SignerSession()
+    fresh._namespace = "ns1"
+    assert fresh._cached("k_a") == {"vrf": "A", "query": "q=a"}
+    assert fresh._cached("k_b") == {"vrf": "B", "query": "q=b"}
+
+
+def test_purge_is_not_undone_by_the_merge(monkeypatch, tmp_path):
+    _shared(monkeypatch, tmp_path)
+    s = mangafire_vrf._SignerSession()
+    s._namespace = "ns1"
+    s._remember("k", {"vrf": "V", "query": "q"})
+    s._flush_cache()
+    s.purge_namespace()
+    fresh = mangafire_vrf._SignerSession()
+    fresh._namespace = "ns1"
+    assert fresh._cached("k") is None, "purged tokens came back from disk"
+
+
+def test_search_reports_busy_when_contention_defeated_it(handler, monkeypatch):
+    from sites.base import SiteBusyError
+
+    def _boom(path, pairs=()):
+        raise mangafire_vrf.MangaFireSigningError("profile held")
+
+    monkeypatch.setattr(mangafire_vrf, "sign_api_query", _boom)
+    monkeypatch.setattr(mangafire_vrf, "_PROFILE_CONTENDED", True)
+    with pytest.raises(SiteBusyError) as exc:
+        handler.search("frieren", object(), Recorder([]), limit=5)
+    assert exc.value.reason == "profile_busy"
+
+
+def test_search_reports_busy_when_a_contended_read_fails(handler, fake_signer, monkeypatch):
+    from sites.base import SiteBusyError
+
+    monkeypatch.setattr(mangafire_vrf, "_PROFILE_CONTENDED", True)
+    with pytest.raises(SiteBusyError):
+        handler.search("frieren", object(), Recorder([FakeResponse(500, {})]), limit=5)

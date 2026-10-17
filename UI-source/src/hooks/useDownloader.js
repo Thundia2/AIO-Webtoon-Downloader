@@ -1097,6 +1097,11 @@ export function useDownloader() {
       //   site_health  → STRIKES (down +2, slow +1, capped 4)
       //   tested_sites → the DECAY roster (tested-and-healthy this run → −1)
       // A site in neither list wasn't measured this run, so it's left untouched.
+      // status "busy" is the exception inside site_health: THIS machine kept the
+      // site from answering (mangafire's browser held by another AIO process —
+      // grep SiteBusyError in sites/base.py). It is a notice SearchTab shows
+      // from the result itself (grep BusySitesNotice), never a strike, and
+      // Python leaves busy sites out of tested_sites so they don't decay either.
       const health = Array.isArray(result?.site_health) ? result.site_health : [];
       const tested = Array.isArray(result?.tested_sites) ? result.tested_sites : [];
       if (health.length || tested.length) {
@@ -1107,7 +1112,7 @@ export function useDownloader() {
           // 1) Strike the sites flagged slow/down this run.
           for (const h of health) {
             const key = h?.site;
-            if (!key) continue;
+            if (!key || h.status === "busy") continue;
             flagged.add(key);
             const prevStrikes = next[key]?.strikes || 0;
             const delta = h.status === "down" ? 2 : 1; // down clears the 2-strike bar alone

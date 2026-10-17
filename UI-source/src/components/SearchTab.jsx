@@ -32,6 +32,7 @@ import {
   Gauge,
   AlertTriangle,
   ArrowRight,
+  Info,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LANGUAGES } from "@/lib/constants";
@@ -808,6 +809,9 @@ export default function SearchTab({
           />
         )}
 
+        {/* ── Sites skipped because of THIS machine, not the site ── */}
+        {hasResults && <BusySitesNotice health={searchState.results.site_health} />}
+
         {/* ── Results ── */}
         {hasResults && (
           <SearchResults
@@ -826,6 +830,31 @@ export default function SearchTab({
           onConfirm={confirmSearchDownload}
         />
       )}
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────
+// BUSY-SITES NOTICE
+//
+// One info line naming the sites this search skipped because another AIO
+// process had their browser (site_health entries with status "busy" — today
+// only mangafire; grep SiteBusyError in sites/base.py). Deliberately NOT part of
+// SlowSitesCallout: busy is our contention, not the site's health, so it gets no
+// strike, no checkbox and no "disable" offer (useDownloader.js skips it in the
+// strike fold). Renders nothing when no site was busy.
+// ────────────────────────────────────────────────────────────
+function BusySitesNotice({ health }) {
+  const busy = (Array.isArray(health) ? health : []).filter((h) => h?.status === "busy");
+  if (busy.length === 0) return null;
+  const names = busy.map((h) => h.display_name || h.site).join(", ");
+  return (
+    <div className="flex items-start gap-2 rounded-lg border border-info/25 bg-info/10 px-3 py-2 text-xs text-info-fg animate-slide-up">
+      <Info className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+      <span>
+        Skipped {names}: its browser was in use by another download or update check. Search
+        again once that finishes to include it.
+      </span>
     </div>
   );
 }

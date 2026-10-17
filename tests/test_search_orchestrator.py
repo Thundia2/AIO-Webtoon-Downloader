@@ -262,3 +262,54 @@ def test_base_handler_defaults_official_publisher_to_false():
     otherwise every handler in the registry would be marked official."""
     from sites.base import BaseSiteHandler
     assert getattr(BaseSiteHandler, "OFFICIAL_PUBLISHER", None) is False
+
+
+# ────────────────────────────────────────────────────────────────────────
+# SiteBusyError (2026-10-17). A site whose search was blocked by THIS machine —
+# mangafire's browser profile held by another AIO process — must be reported as
+# a "busy" notice, never as a failure: no ProbeFailureCache strike (that path
+# blocklists the host for an hour after two), and no tested_sites entry (that
+# would decay a real strike the UI is tracking). Cross-file: sites/base.py
+# SiteBusyError, sites/mangafire.py:search, useDownloader.js strike fold.
+# ────────────────────────────────────────────────────────────────────────
+
+def test_busy_site_is_a_notice_not_a_failure():
+    from sites.base import BaseSiteHandler, SearchHit, SiteBusyError
+    from sites.search_orchestrator import ProbeFailureCache
+
+    class _Busy(BaseSiteHandler):
+        name = "busysite"
+        domains = ("busy.example",)
+
+        def search(self, *a, **kw):
+            raise SiteBusyError("profile held", reason="profile_busy")
+
+    class _Ok(BaseSiteHandler):
+        name = "oksite"
+        domains = ("ok.example",)
+
+        def search(self, query, *a, **kw):
+            return [SearchHit(site=self.name, title=query, url="https://ok.example/s",
+                              cover=None, alt_titles=[], year=None, language=None,
+                              chapter_count_hint=5, raw_score=1.0)]
+
+    cache = ProbeFailureCache(threshold=1, ttl_s=3600)
+    diagnostics = {}
+    with patch("sites.iter_search_capable_handlers", lambda: iter([_Busy(), _Ok()])):
+        with patch("sites.get_handler_by_name", lambda _: None):
+            result = search_all(
+                "Some Series",
+                MagicMock(return_value=MagicMock()),
+                MagicMock(),
+                probe_failure_cache=cache,
+                diagnostics=diagnostics,
+            )
+
+    assert [s.site for c in result for s in c.sources] == ["oksite"]
+    busy = [h for h in diagnostics["site_health"] if h["site"] == "busysite"]
+    assert len(busy) == 1 and busy[0]["status"] == "busy", diagnostics["site_health"]
+    assert busy[0]["reason"] == "profile_busy"
+    assert "busysite" not in diagnostics["tested_sites"]
+    assert "oksite" in diagnostics["tested_sites"]
+    assert cache.is_blocked("busy.example") is False, "contention struck the host"
+

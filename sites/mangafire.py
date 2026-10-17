@@ -10,7 +10,7 @@ import time
 from typing import Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
-from .base import BaseSiteHandler, SearchHit, SiteComicContext
+from .base import BaseSiteHandler, SearchHit, SiteBusyError, SiteComicContext
 # _CURL_CFFI_AVAILABLE gates SUPPORTS_FAST_DOWNLOAD (curl_cffi async image path
 # lives on BaseSiteHandler.fast_download_images). Re-exported for back-compat
 # with anything that grepped this symbol on mangafire.py historically.
@@ -244,6 +244,21 @@ class MangaFireSiteHandler(BaseSiteHandler):
         if "." in path:
             return path.split(".")[-1].split("/")[0]
         return ""
+
+    @staticmethod
+    def _busy(exc: Optional[Exception]) -> SiteBusyError:
+        """search()'s contention outcome. Raised rather than returned as [] so
+        the orchestrator can tell "another AIO process had the browser" from "no
+        matches" and from "site down" — the first must neither strike the site
+        nor count toward recommending it be disabled (see SiteBusyError).
+        Raising does not reach the ProbeFailureCache: _run_one catches this type
+        before its generic failure branch."""
+        detail = f": {exc}" if exc else ""
+        return SiteBusyError(
+            "MangaFire skipped — another AIO process was using its browser and "
+            f"the temporary-profile fallback did not get through{detail}",
+            reason="profile_busy",
+        )
 
     def _warn_signing_unavailable_once(self, exc: Exception) -> None:
         """One warning per process. Search fan-out probes several candidates and
@@ -586,6 +601,11 @@ class MangaFireSiteHandler(BaseSiteHandler):
         # deliberate override of base.py:search's "let errors propagate" rule
         # that sites/comix.py:search makes, for the same reason. Genuine HTTP
         # errors from make_request still propagate.
+        #
+        # The one exception raised ON PURPOSE is SiteBusyError, when another AIO
+        # process held the browser profile (mangafire_vrf.profile_contended):
+        # the orchestrator catches that type before its ProbeFailureCache
+        # branch, so it costs no blocklist strike.
         try:
             data = self._api_get(
                 "/titles",
@@ -595,8 +615,15 @@ class MangaFireSiteHandler(BaseSiteHandler):
                 label="search",
             )
         except mangafire_vrf.MangaFireSigningError as e:
+            if mangafire_vrf.profile_contended():
+                raise self._busy(e) from e
             self._warn_signing_unavailable_once(e)
             return []
+        if data is None and mangafire_vrf.profile_contended():
+            # Signed fine, but the read failed — on a temporary profile that is
+            # typically a Cloudflare check only the shared profile's saved
+            # session passes. Still contention, not the site.
+            raise self._busy(None)
         items = data.get("items") if isinstance(data, dict) else None
         if not isinstance(items, list) or not items:
             return []
