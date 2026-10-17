@@ -1408,7 +1408,7 @@ test("verify progress counts series folders and their device bytes, in both devi
         sizes[f] = (sizes[f] || 0) + b.length;
       }
       const evs = [];
-      const p = await w.prepare({ onProgress: (ev) => ev.phase === "verify" && evs.push(ev), opts: inject ? { verifyMode: "read-back" } : {} });
+      const p = await w.prepare({ runId: 42, onProgress: (ev) => ev.phase === "verify" && evs.push(ev), opts: inject ? { verifyMode: "read-back" } : {} });
       assert.ok(p.ok, p.code);
       const label = inject ? "read-back" : "device-hash";
       assert.ok(evs.length, `${label}: verify progress sent`);
@@ -1426,6 +1426,7 @@ test("verify progress counts series folders and their device bytes, in both devi
       if (inject) assert.ok(evs.some((e) => e.current && e.current.name && e.bytesDone > 0 && e.bytesDone < total), "read-back: per-file steps");
       assert.ok(evs.every((e) => e.current && typeof e.current.folder === "string"), `${label}: current names the folder`);
       assert.deepStrictEqual([p.verify.filesDone, p.verify.filesTotal], [2, 2], `${label}: the run result counts series`);
+      assert.strictEqual(p.verify.runId, "42", `${label}: the job's runId reaches the run log`);
     } finally {
       await w.close();
     }

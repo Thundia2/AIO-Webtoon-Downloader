@@ -56,7 +56,8 @@
 // Throttle (deviation 3): one hash worker while a download or Check All runs.
 //
 // SERVICE LOG (deviation 15; diag-log.js): userData/sync/logs/service.log
-// gets a `start`, `prewarm` (done / error), `stop` or `quit-now` line and a
+// gets a `start`, `prewarm` (done / error), `stop` or `quit-now` line, a
+// `job-start` / `job-step` / `job-end` line per job (grep _jobLog), and a
 // copy of every [deviceSync] stderr line, while sync is on and
 // syncDiagnosticLog is true. The installed app has no console; this is
 // where its sync faults can be read, and P5's packaged smoke reads it as
@@ -909,6 +910,64 @@ function initDeviceSync(deps) {
     return new FolderTransport({ root: cfg.root, hashPool });
   }
 
+  // ---- Job lines in the service log (diag-log.js; settings.syncDiagnosticLog)
+  // job-start / job-end bracket every job; job-step closes each progress step
+  // (probe, listing, hashing, planning, verify, apply…) with its duration and
+  // its last counts, so a slow first check or a stalled plan can be read off
+  // a user's log. Steps come from _progressOf; a step that repeats (a verify
+  // job prepares twice) logs once per run of it. Target NAMES stay out (the
+  // log is meant to be attached to a bug report): id and kind only.
+  const stepClocks = new Map(); // runId → {step, at, last}
+
+  function _counts(p) {
+    const o = {};
+    if (p && p.filesTotal != null) Object.assign(o, { done: p.filesDone || 0, total: p.filesTotal });
+    if (p && p.bytesTotal > 0) Object.assign(o, { bytesDone: p.bytesDone || 0, bytesTotal: p.bytesTotal });
+    return o;
+  }
+  function _stepMark(runId, p) {
+    // A late event after the job ended (its end line closed the last step)
+    // must not open a clock nothing will close.
+    if (!current || current.runId !== runId) return;
+    const c = stepClocks.get(runId);
+    if (c && c.step === p.step) {
+      c.last = p;
+      return;
+    }
+    const t = now();
+    if (c) slog.event("job-step", { runId, step: c.step, ms: t - c.at, ..._counts(c.last) });
+    stepClocks.set(runId, { step: p.step, at: t, last: p });
+  }
+  function _jobLog(ev, job, extra) {
+    const t = _target(job.targetId);
+    slog.event(ev, { runId: job.runId, phase: job.phase, targetId: job.targetId, kind: t ? t.kind : null, auto: !!job.auto, ...extra });
+  }
+  /** job-end's fields from a job's status and summary (any phase's shape). */
+  function _jobEndFields(job, status, summary, t0) {
+    const s = summary || {};
+    const o = { status, ms: now() - t0 };
+    const refusal = s.refusal && s.refusal.code;
+    if (refusal) o.refusal = refusal;
+    if (s.reason) o.reason = s.reason;
+    if (s.filesTotal != null || s.filesDone != null) Object.assign(o, { done: s.filesDone || 0, total: s.filesTotal || 0, bytesDone: s.bytesDone || 0, bytesTotal: s.bytesTotal || 0 });
+    if (s.charged) o.charged = s.charged;
+    if (Array.isArray(s.skipped) && s.skipped.length) o.skipped = s.skipped.length;
+    if (Array.isArray(s.failed) && s.failed.length) o.failed = s.failed.length;
+    // A plan's result: what it offers (planner.planSummary totals).
+    const pt = s.plan && s.plan.totals;
+    if (pt) {
+      o.plan = {
+        gen: s.plan.gen != null ? s.plan.gen : null,
+        files: pt.files || 0,
+        bytes: pt.bytes || 0,
+        deletes: (pt.delete && pt.delete.count) || 0,
+        renames: (pt.rename && pt.rename.count) || 0,
+        needsVerify: s.plan.needsVerify || 0,
+      };
+    }
+    return o;
+  }
+
   /**
    * Run `fn(runId, signal, transport)` as the lane's one job. Answers
    * {ok, runId} at once; the job ends with status completed / cancelled /
@@ -925,6 +984,8 @@ function initDeviceSync(deps) {
     const transport = _transportFor(cfg);
     const job = { runId, phase: spec.phase, targetId: spec.targetId, ac, transport, promise: null, auto: !!spec.auto };
     current = job;
+    const t0 = now();
+    _jobLog("job-start", job);
     job.promise = (async () => {
       let status = "completed";
       let summary = null;
@@ -946,6 +1007,10 @@ function initDeviceSync(deps) {
         transport.destroy();
       }
       if (ac.signal.aborted && status === "completed") status = "cancelled";
+      const sc = stepClocks.get(runId);
+      if (sc) slog.event("job-step", { runId, step: sc.step, ms: now() - sc.at, ..._counts(sc.last) });
+      stepClocks.delete(runId);
+      _jobLog("job-end", job, _jobEndFields(job, status, summary, t0));
       jobs.finish(runId, { status, summary });
       if (current === job) current = null;
       _afterJob(job, status, summary);
@@ -1062,6 +1127,7 @@ function initDeviceSync(deps) {
       const p = { step: ev.phase || null, at: now() };
       if (ev.filesDone != null) Object.assign(p, { filesDone: ev.filesDone, filesTotal: ev.filesTotal, bytesDone: ev.bytesDone, bytesTotal: ev.bytesTotal, current: ev.current || null, lane: ev.lane || null });
       else if (ev.done != null) Object.assign(p, { filesDone: ev.done, filesTotal: ev.total, bytesDone: ev.bytesDone || 0, bytesTotal: ev.bytesTotal || 0, current: ev.folder || null });
+      _stepMark(runId, p);
       jobs.progress(runId, p);
     };
   }
@@ -1091,6 +1157,7 @@ function initDeviceSync(deps) {
       opts,
       signal,
       onProgress: _progressOf(runId),
+      runId,
       now,
       connectWaitMs: T.connectWaitMs,
       executorDeps: T.executorDeps,

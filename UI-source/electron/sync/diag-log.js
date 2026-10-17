@@ -16,9 +16,10 @@
 //     answers false while sync is off and when syncDiagnosticLog is false
 //     (sync-settings.js; the UI pass exposes the toggle), so "off means
 //     inert" holds;
-//   * synchronous appends: lines are rare (start, pre-warm end, stop, error
-//     lines) and shutdownNow() runs inside app.on("quit"), where an async
-//     write would never land;
+//   * synchronous appends: lines are few (start, pre-warm end, stop, error
+//     lines, and a handful per sync job: start, one per progress step, end)
+//     and shutdownNow() runs inside app.on("quit"), where an async write
+//     would never land;
 //   * bounded: past MAX_BYTES the file becomes service.1.log (replacing the
 //     previous one) and a new file starts, so at most ~2 × MAX_BYTES.
 //

@@ -1159,6 +1159,58 @@ test("service log: syncDiagnosticLog false writes no file at all, and switching 
   }
 });
 
+// A bug report's log must show what each job did and where its time went:
+// job-start / job-step / job-end per run (service.js _jobLog, _stepMark).
+test("service log: every job gets start, per-step timing and an end with status, counts and refusal code", async () => {
+  const a = await app({ tag: "slog-jobs" });
+  try {
+    series(a.lib, "Upsilon", { "Ch.001.cbz": 3000, "Ch.002.cbz": 3000 });
+    const id = await a.addFolderTarget();
+    await a.waitEvent((e) => e.kind === "prompt" && e.action === "show", 15000, 0, "connect prompt");
+    await a.idle();
+    const ap = await a.apply({ targetId: id });
+    assert.strictEqual((await a.job(ap.runId)).status, "completed");
+    await a.idle();
+    const vr = await a.call("verify", { targetId: id });
+    assert.strictEqual((await a.job(vr.runId)).status, "completed");
+    await a.idle();
+    for (const n of fs.readdirSync(a.target)) fs.rmSync(path.join(a.target, n), { recursive: true, force: true });
+    const rf = await a.call("plan", { targetId: id });
+    assert.strictEqual((await a.job(rf.runId)).status, "failed");
+    await a.idle();
+    const lines = slogLines(a);
+    const of = (runId) => lines.filter((l) => l.runId === runId);
+    const evs = (runId) => of(runId).map((l) => l.ev);
+    const end = (runId) => of(runId).find((l) => l.ev === "job-end");
+    for (const r of [ap.runId, vr.runId, rf.runId]) {
+      const e = evs(r);
+      assert.strictEqual(e[0], "job-start", `run ${r}: ${e}`);
+      assert.strictEqual(e[e.length - 1], "job-end", `run ${r}: ${e}`);
+      assert.ok(e.includes("job-step"), `run ${r} has steps: ${e}`);
+      assert.deepStrictEqual([end(r).targetId, end(r).kind], [id, "folder"]);
+      assert.ok(Number.isInteger(end(r).ms) && end(r).ms >= 0);
+      for (const st of of(r).filter((l) => l.ev === "job-step")) assert.ok(typeof st.step === "string" && st.ms >= 0, JSON.stringify(st));
+    }
+    // apply: status + file/byte counts.
+    assert.deepStrictEqual([end(ap.runId).phase, end(ap.runId).status, end(ap.runId).done, end(ap.runId).total], ["apply", "completed", 2, 2]);
+    assert.strictEqual(end(ap.runId).bytesDone, 6000);
+    // verify: series counts (executor.js verify) and its re-plan's offer.
+    assert.deepStrictEqual([end(vr.runId).phase, end(vr.runId).done, end(vr.runId).total], ["verify", 1, 1]);
+    assert.ok(of(vr.runId).some((l) => l.ev === "job-step" && l.step === "verify" && l.total === 1), JSON.stringify(of(vr.runId)));
+    assert.ok(end(vr.runId).plan && end(vr.runId).plan.files === 0, JSON.stringify(end(vr.runId)));
+    // A refused plan names the code.
+    assert.deepStrictEqual([end(rf.runId).phase, end(rf.runId).status, end(rf.runId).refusal], ["plan", "failed", "device-listing-suspect"]);
+    // No target names in the log (it's attached to bug reports).
+    const tName = (await a.state()).config.targets[0].name;
+    if (tName) assert.ok(!lines.some((l) => JSON.stringify(l).includes(tName)), "no target name");
+    // A completed plan job logs its offer.
+    const planEnds = lines.filter((l) => l.ev === "job-end" && l.phase === "plan" && l.status === "completed");
+    assert.ok(planEnds.length && planEnds.every((l) => l.plan && Number.isInteger(l.plan.files)), JSON.stringify(planEnds));
+  } finally {
+    await a.close();
+  }
+});
+
 test("service log: shutdownNow with the service up writes quit-now naming the running job", async () => {
   const g = gate();
   const a = await app({ tag: "slog-now", executorDeps: { hooks: (pt) => (pt === "rename-before-mv" ? (g._hit(), new Promise(() => {})) : undefined) } });

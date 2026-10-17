@@ -77,6 +77,8 @@ const PROBE_PASSES = 4;
  * @param {'cached'|'rehash'} [c.opts.hashMode]           default settings.syncHashMode
  * @param {AbortSignal} [c.signal]
  * @param {(ev:object)=>void} [c.onProgress]  {phase:'probe'|'hashing'|'listing'|'verify'|'planning', ...}
+ * @param {number|string} [c.runId]   the job's id, stamped on the coverage Verify's run log
+ *                                    (targets/<id>/logs) so it matches service.log's job lines
  * @param {() => number} [c.now]
  * @param {Function} [c.walk]         walkLibrary, injectable
  * @param {object} [c.executorDeps]   extra Executor deps for the coverage Verify (tests: hooks)
@@ -325,6 +327,7 @@ async function preparePlan(c) {
       ...(c.executorDeps || {}),
     });
     verify = await ex.verify({
+      runId: c.runId != null ? String(c.runId) : undefined,
       mode,
       folders: plan.needsVerify.map((v) => {
         const s = pcByKey.get(v.seriesKey);
