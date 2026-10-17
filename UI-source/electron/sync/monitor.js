@@ -10,7 +10,8 @@
 //                  frame again. No adb.exe child: adb/client.js speaks the
 //                  protocol (the parent's CLI `track-devices` is gone).
 //   FolderWatcher  folder targets: FolderTransport.checkPresence() (3 s
-//                  timeout, one in flight per target) every POLL_MS.
+//                  timeout, one in flight per target) every POLL_MS; a
+//                  present folder leaves after ABSENT_POLLS_TO_LEAVE misses.
 //   PromptMarks    userData/sync/prompted.json: "prompted once per
 //                  connection" (parent rule 10) survives an app restart.
 //   PromptMachine  rule 10's focus-aware state machine:
@@ -18,6 +19,10 @@
 //                    the next focus while still connected; a disconnect
 //                    withdraws it. One prompt per device (it lists every
 //                    target on that device); one per folder target.
+//                  The machine decides only whether a card is open; the
+//                  renderer fills it from the live plans (UI-pass U3-3,
+//                  sync-temp/plans/device-sync-ui-pass.md). pending() is the
+//                  planning list behind its "Preparing" card.
 //
 // CONNECTION KEYS. adb: `serial#transportId` — the server hands a re-plugged
 // device a new transport id, so a re-plug is a new connection. folder:
@@ -47,6 +52,7 @@ const BACKOFF_MIN_MS = 2000;
 const BACKOFF_MAX_MS = 60000;
 const TRACK_FAILS_BEFORE_POLL = 3;
 const POLL_MS = 5000;
+const ABSENT_POLLS_TO_LEAVE = 2;
 const MARK_TTL_MS = 30 * 60 * 1000;
 const MARKS_FILE = "prompted.json";
 
@@ -277,8 +283,15 @@ class FolderWatcher {
         }
         const cur = this.targets.get(id);
         if (!cur || cur !== t) return;
+        // UI-pass U3-8: a present folder reads gone only after
+        // ABSENT_POLLS_TO_LEAVE misses in a row. checkPresence's 3 s
+        // timeout reads absent, and a leave deletes the prompt mark, so one
+        // slow poll of a network share used to re-prompt it.
+        if (present) t.misses = 0;
+        else if (t.present === true && (t.misses = (t.misses || 0) + 1) < ABSENT_POLLS_TO_LEAVE) return;
         if (t.present !== present) {
           t.present = present;
+          t.misses = 0;
           this._notify(id, present);
         }
       }),
@@ -381,51 +394,63 @@ class PromptMachine {
    * @param {object} d
    * @param {PromptMarks} d.marks
    * @param {() => boolean} d.isFocused
-   * @param {(ev:{action:'show'|'withdraw', prompt:object}) => void} d.onPrompt
+   * @param {(ev:{action:'show'|'withdraw', prompt:object, reason?:string}) => void} d.onPrompt
+   * @param {(pending:object[]) => void} [d.onPending]  the planning list changed
+   *   (UI-pass U3-3: the renderer's "Preparing" card); never fires through
+   *   onPrompt, so the show/withdraw sequence stays what it was
    * @param {() => number} [d.now]
    */
   constructor(d) {
     this.marks = d.marks;
     this.isFocused = d.isFocused;
     this.onPrompt = d.onPrompt;
+    this.onPending = d.onPending || (() => {});
     this.now = d.now || Date.now;
-    this.conns = new Map(); // connKey → {state, serial, targetIds, prompt}
+    this.conns = new Map(); // connKey → {state, serial, targetIds, promptId, since, prompt}
     this.seq = 0;
   }
 
   /**
    * A connection appeared. Returns true when the caller should run the quick
    * plans (one per target) and report them with planned().
-   * States: planning → waiting-focus | shown → answered; marked (an honored
+   * States: planning → waiting-focus | shown → answered | resolved;
+   * planning → answered (Not now on the Preparing card); marked (an honored
    * mark: no prompt this connection); quiet (nothing to report).
+   * The promptId exists from `planning` on (U3-3), so the Preparing card the
+   * renderer draws from pending() can be answered before the plans land.
    */
   connected({ connKey, serial = null, targetIds }) {
     if (this.conns.has(connKey)) return false;
     if (this.marks.honored(connKey)) {
-      this.conns.set(connKey, { state: "marked", serial, targetIds: [...targetIds], prompt: null });
+      this.conns.set(connKey, { state: "marked", serial, targetIds: [...targetIds], promptId: null, since: this.now(), prompt: null });
       return false;
     }
-    this.conns.set(connKey, { state: "planning", serial, targetIds: [...targetIds], prompt: null });
+    this.seq += 1;
+    this.conns.set(connKey, { state: "planning", serial, targetIds: [...targetIds], promptId: `p${this.seq}-${this.now()}`, since: this.now(), prompt: null });
+    this._pendingChanged();
     return true;
   }
 
   /**
    * The quick plans finished. `card` is planner.promptCard() over the
-   * connection's targets; an empty card (nothing to do anywhere) is quiet,
-   * but marked, so the same connection doesn't plan again on every refocus.
+   * connection's targets; an empty card (nothing to do anywhere, nothing
+   * refused) is quiet, but marked, so the same connection doesn't plan
+   * again on every refocus. A connection answered while planning stays
+   * silent.
    */
   planned(connKey, card) {
     const c = this.conns.get(connKey);
     if (!c || c.state !== "planning") return null;
-    if (!card || card.empty || !(card.targets || []).length) {
+    if (!card || card.empty || !((card.targets || []).length || (card.attention || []).length)) {
       c.state = "quiet";
       this.marks.set(connKey);
+      this._pendingChanged();
       return null;
     }
-    this.seq += 1;
-    c.prompt = { promptId: `p${this.seq}-${this.now()}`, connKey, serial: c.serial, targetIds: [...c.targetIds], card, createdAt: this.now() };
+    c.prompt = { promptId: c.promptId, connKey, serial: c.serial, targetIds: [...c.targetIds], card, createdAt: this.now() };
     if (this._focused()) this._show(c);
     else c.state = "waiting-focus";
+    this._pendingChanged();
     return c.prompt;
   }
 
@@ -442,6 +467,7 @@ class PromptMachine {
     if (c && c.prompt && (c.state === "shown" || c.state === "waiting-focus")) {
       this._emit({ action: "withdraw", prompt: c.prompt });
     }
+    if (c && c.state === "planning") this._pendingChanged();
   }
 
   /** Every adb connection is unknown (tracking socket lost). */
@@ -450,20 +476,66 @@ class PromptMachine {
     this.marks.removeAdb();
   }
 
-  /** The user answered. Returns the prompt, or null for an unknown/stale id. */
+  /**
+   * The user answered (a shown card, or the Preparing card of a connection
+   * still planning). Returns the prompt, or null for an unknown/stale id.
+   */
   respond(promptId) {
     for (const c of this.conns.values()) {
-      if (c.prompt && c.prompt.promptId === promptId && c.state === "shown") {
+      if (c.promptId !== promptId) continue;
+      if (c.state === "shown") {
         c.state = "answered";
         return c.prompt;
+      }
+      if (c.state === "planning") {
+        const connKey = this._keyOf(c);
+        c.state = "answered";
+        this.marks.set(connKey);
+        this._pendingChanged();
+        return { promptId: c.promptId, connKey, serial: c.serial, targetIds: [...c.targetIds], card: null, createdAt: c.since };
       }
     }
     return null;
   }
 
+  /**
+   * U3-6: the plans moved on and nothing is left to do on this connection.
+   * A shown or waiting card is withdrawn with `reason`; a waiting one is
+   * marked like a quiet connection. Returns true when it closed a card.
+   */
+  resolve(connKey, reason) {
+    const c = this.conns.get(connKey);
+    if (!c || !c.prompt || (c.state !== "shown" && c.state !== "waiting-focus")) return false;
+    if (c.state === "waiting-focus") this.marks.set(connKey);
+    c.state = "resolved";
+    this._emit({ action: "withdraw", prompt: c.prompt, reason });
+    return true;
+  }
+
+  /** Connection keys with an open (shown or waiting) card listing targetId. */
+  openFor(targetId) {
+    const out = [];
+    for (const [k, c] of this.conns) if ((c.state === "shown" || c.state === "waiting-focus") && c.targetIds.includes(targetId)) out.push(k);
+    return out;
+  }
+
+  /** The open card of a connection (shown or waiting), or null. */
+  promptOf(connKey) {
+    const c = this.conns.get(connKey);
+    return c && (c.state === "shown" || c.state === "waiting-focus") ? c.prompt : null;
+  }
+
   /** Shown prompts, oldest first (get-state's `prompt` is the first). */
   shown() {
     return [...this.conns.values()].filter((c) => c.state === "shown").map((c) => c.prompt).sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  /** Connections still planning, oldest first: the renderer's Preparing cards. */
+  pending() {
+    return [...this.conns]
+      .filter(([, c]) => c.state === "planning")
+      .map(([k, c]) => ({ promptId: c.promptId, connKey: k, serial: c.serial, targetIds: [...c.targetIds], since: c.since }))
+      .sort((a, b) => a.since - b.since);
   }
 
   pendingConn(connKey) {
@@ -473,6 +545,11 @@ class PromptMachine {
 
   connKeys() {
     return [...this.conns.keys()];
+  }
+
+  _keyOf(c) {
+    for (const [k, x] of this.conns) if (x === c) return k;
+    return null;
   }
 
   _focused() {
@@ -496,6 +573,14 @@ class PromptMachine {
       // a listener fault must not wedge the machine
     }
   }
+
+  _pendingChanged() {
+    try {
+      this.onPending(this.pending());
+    } catch (_) {
+      // a listener fault must not wedge the machine
+    }
+  }
 }
 
 module.exports = {
@@ -503,6 +588,7 @@ module.exports = {
   BACKOFF_MAX_MS,
   TRACK_FAILS_BEFORE_POLL,
   POLL_MS,
+  ABSENT_POLLS_TO_LEAVE,
   MARK_TTL_MS,
   MARKS_FILE,
   bootEpochNow,

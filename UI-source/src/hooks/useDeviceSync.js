@@ -63,6 +63,9 @@ const INITIAL = Object.freeze({
   plans: {},
   prompt: null,
   prompts: [],
+  // UI-pass U3-3: connections still planning (the Preparing card), from
+  // every `prompt` event and get-state.
+  pending: [],
   find: null,
   findRows: {},
   prewarm: null,
@@ -124,7 +127,8 @@ function applySyncEvent(s, ev) {
       return { ...s, config: ev.config || null };
     case "prompt": {
       const prompts = Array.isArray(ev.prompts) ? ev.prompts : s.prompts;
-      return { ...s, prompts, prompt: prompts[0] || null };
+      const pending = Array.isArray(ev.pending) ? ev.pending : s.pending;
+      return { ...s, prompts, prompt: prompts[0] || null, pending };
     }
     case "find": {
       // Batch events carry done/total; a row edit (find-sources updateRow)
@@ -185,6 +189,7 @@ function fromSnapshot(snap) {
     plans: snap.plans || {},
     prompt: snap.prompt || null,
     prompts: Array.isArray(snap.prompts) ? snap.prompts : [],
+    pending: Array.isArray(snap.pending) ? snap.pending : [],
     find: snap.find || null,
     prewarm: snap.prewarm || null,
     logDir: typeof snap.logDir === "string" ? snap.logDir : null,

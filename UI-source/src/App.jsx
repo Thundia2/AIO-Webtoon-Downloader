@@ -10,6 +10,9 @@ import LibraryTab from "@/components/LibraryTab";
 import ResumeBar from "@/components/ResumeBar";
 import ConfirmQuitDialog from "@/components/ConfirmQuitDialog";
 import SyncTab from "@/components/sync/SyncTab";
+import ConnectPrompt, { RailBadge } from "@/components/sync/ConnectPrompt";
+import { railBadge } from "@/components/sync/connectView";
+import { pickTargets } from "@/components/sync/syncView";
 import appIcon from "../build-resources/icon.png";
 import {
   Download,
@@ -58,6 +61,21 @@ export default function App() {
   // on every switch (UI-pass U2-14; components/sync/SyncTab.jsx `view`).
   const [syncView, setSyncView] = useState({ targetId: null, tile: null, query: "", sort: "copy", dismissed: {} });
   const patchSyncView = React.useCallback((patch) => setSyncView((v) => ({ ...v, ...patch })), []);
+  // The Sync rail badge (UI-pass U3-14, components/sync/connectView.js
+  // railBadge): series count on connected targets + red / pulsing dot.
+  const syncBadge = useMemo(
+    () => (sync.enabled ? railBadge({ targets: (sync.config && sync.config.targets) || [], plans: sync.plans, devices: sync.devices, folderPresence: sync.folderPresence, job: sync.job, dismissed: syncView.dismissed }) : null),
+    [sync.enabled, sync.config, sync.plans, sync.devices, sync.folderPresence, sync.job, syncView.dismissed]
+  );
+  // The target the Sync tab is showing, resolved the way SyncTab resolves it
+  // (pickTargets, else the first): connect cards for it stay hidden while the
+  // tab is open, so they don't cover its dock (U3-13).
+  const syncShownTarget = useMemo(() => {
+    if (activeTab !== "sync" || !sync.enabled) return null;
+    const list = pickTargets((sync.config && sync.config.targets) || [], sync.devices, sync.folderPresence);
+    const picked = list.find((x) => x.target.id === syncView.targetId) || list[0] || null;
+    return picked ? picked.target.id : null;
+  }, [activeTab, sync.enabled, sync.config, sync.devices, sync.folderPresence, syncView.targetId]);
   const tabs = useMemo(() => {
     if (!sync.enabled) return BASE_TABS;
     const at = BASE_TABS.findIndex((t) => t.id === "settings");
@@ -165,6 +183,9 @@ export default function App() {
                   {activeCount}
                 </div>
               )}
+
+              {/* Sync: series count, plus a red (problem) or pulsing (job) dot. */}
+              {tab.id === "sync" && <RailBadge badge={syncBadge} />}
 
               {/* Red dot on logs tab when there's a recent error */}
               {/* UIR-2: skip trailing 'divider' entries (a completion divider is
@@ -325,6 +346,20 @@ export default function App() {
           "confirm-quit" push, renders null the rest of the time). Sits outside
           the tab-content area so it overlays whatever tab is open. */}
       <ConfirmQuitDialog />
+
+      {/* Device Sync connect cards (UI-pass U3): bottom-right over any tab,
+          non-blocking. Review lands on the Sync tab's series list for that
+          target (U3-2). */}
+      {sync.enabled && (
+        <ConnectPrompt
+          sync={sync}
+          hiddenTargetId={syncShownTarget}
+          onReview={(targetId) => {
+            if (targetId) patchSyncView({ targetId, tile: null });
+            setActiveTab("sync");
+          }}
+        />
+      )}
     </div>
   );
 }

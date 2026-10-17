@@ -74,7 +74,7 @@
       "adbPath": null,
       "targets": [
         {
-          "id": "ta04a6a7d40",
+          "id": "t160c740ad5",
           "deletePolicy": "guarded",
           "excludes": [
             {
@@ -96,7 +96,7 @@
           "profile": "komikku"
         },
         {
-          "id": "tf123a9409e",
+          "id": "ta2b656b04d",
           "deletePolicy": "guarded",
           "excludes": [],
           "aliases": [],
@@ -108,7 +108,7 @@
           "profile": "everything"
         },
         {
-          "id": "ta639c4d7b4",
+          "id": "tf427d7cc09",
           "deletePolicy": "guarded",
           "excludes": [],
           "aliases": [],
@@ -153,7 +153,7 @@
       ],
       "tracking": "tracking",
       "trackingError": null,
-      "at": 1792184438862
+      "at": 1792224799180
     },
     "devices": [
       {
@@ -176,17 +176,17 @@
       }
     ],
     "folderPresence": {
-      "tf123a9409e": true
+      "ta2b656b04d": true
     },
     "job": {
       "job": {
         "runId": 1,
         "phase": "plan",
-        "targetId": "ta04a6a7d40",
+        "targetId": "t160c740ad5",
         "serial": "R5CW71ABCDE",
         "auto": true,
         "state": "running",
-        "startedAt": 1792184438882,
+        "startedAt": 1792224799193,
         "finishedAt": null,
         "progress": {
           "bytesDone": 0,
@@ -196,26 +196,26 @@
           "current": null,
           "preflight": null,
           "step": "probe",
-          "at": 1792184438883
+          "at": 1792224799194
         },
         "status": null,
         "summary": null
       },
       "queue": [
         {
-          "targetId": "tf123a9409e",
+          "targetId": "ta2b656b04d",
           "serial": null,
-          "queuedAt": 1792184438892
+          "queuedAt": 1792224799200
         },
         {
-          "targetId": "ta04a6a7d40",
+          "targetId": "t160c740ad5",
           "serial": "R5CW71ABCDE",
-          "queuedAt": 1792184438903
+          "queuedAt": 1792224799209
         }
       ]
     },
     "plans": {
-      "ta04a6a7d40": {
+      "t160c740ad5": {
         "summary": null,
         "refusal": null,
         "stale": true,
@@ -224,7 +224,7 @@
         "selSeq": null,
         "lastPlan": null
       },
-      "tf123a9409e": {
+      "ta2b656b04d": {
         "summary": null,
         "refusal": null,
         "stale": false,
@@ -233,7 +233,7 @@
         "selSeq": null,
         "lastPlan": null
       },
-      "ta639c4d7b4": {
+      "tf427d7cc09": {
         "summary": null,
         "refusal": null,
         "stale": false,
@@ -245,6 +245,26 @@
     },
     "prompt": null,
     "prompts": [],
+    "pending": [
+      {
+        "promptId": "p1-1792224799192",
+        "connKey": "R5CW71ABCDE#1",
+        "serial": "R5CW71ABCDE",
+        "targetIds": [
+          "t160c740ad5"
+        ],
+        "since": 1792224799192
+      },
+      {
+        "promptId": "p2-1792224799200",
+        "connKey": "folder:ta2b656b04d",
+        "serial": null,
+        "targetIds": [
+          "ta2b656b04d"
+        ],
+        "since": 1792224799200
+      }
+    ],
     "find": null,
     "prewarm": {
       "state": "idle",

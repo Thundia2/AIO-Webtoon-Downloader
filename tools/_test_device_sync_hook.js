@@ -285,6 +285,11 @@ function deferred(value) {
     eq("buffered device event wins over the snapshot", s.devices.map((d) => d.serial), ["S2"]);
     eq("buffered progress folds into the snapshot's job", s.job.progress, { filesDone: 4, filesTotal: 9 });
     eq("buffered prompt applied", s.prompt, { promptId: "p1" });
+    // U3-3: `pending` rides prompt events; a `pending` action keeps the shown list.
+    h.mounted.act(() => h.emit({ kind: "prompt", action: "pending", prompts: [{ promptId: "p1" }], pending: [{ promptId: "p2", connKey: "folder:t", targetIds: ["t"], since: 1 }] }));
+    eq("pending applied, shown list kept", [h.mounted.state.pending.map((p) => p.promptId), h.mounted.state.prompt.promptId], [["p2"], "p1"]);
+    h.mounted.act(() => h.emit({ kind: "prompt", action: "show", prompt: { promptId: "p2" }, prompts: [{ promptId: "p1" }, { promptId: "p2" }] }));
+    eq("an event without `pending` keeps the last list", h.mounted.state.pending.length, 1);
   }
 
   console.log("\n[3] stale runId");

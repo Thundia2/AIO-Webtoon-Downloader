@@ -298,6 +298,10 @@ async function preparePlan(c) {
         ...refuse("needs-mode", "this device can't hash files: choose how to verify", {
           folders: plan.needsVerify.map((v) => v.folder),
           modes: ["read-back", "adopt-size"],
+          // UI-pass U3-4: the connect card's "Set up (reads ~N GB)" and the
+          // Sync tab's chooser read these off the refusal.
+          bytes: planner.verifyBytesOf(device, plan.needsVerify.map((v) => v.folder)),
+          firstSync: !!plan.firstSync,
         }),
         warnings,
       };

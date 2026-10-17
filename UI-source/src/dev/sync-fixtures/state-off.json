@@ -77,12 +77,12 @@
       "job": {
         "runId": 1,
         "phase": "plan",
-        "targetId": "ta04a6a7d40",
+        "targetId": "t160c740ad5",
         "serial": "R5CW71ABCDE",
         "auto": true,
         "state": "done",
-        "startedAt": 1792184438882,
-        "finishedAt": 1792184439016,
+        "startedAt": 1792224799193,
+        "finishedAt": 1792224799305,
         "progress": {
           "bytesDone": 0,
           "bytesTotal": 0,
@@ -111,7 +111,7 @@
             "refusal": null
           },
           "step": "verify",
-          "at": 1792184438982,
+          "at": 1792224799269,
           "lane": null
         },
         "status": "cancelled",
@@ -125,6 +125,7 @@
     "plans": {},
     "prompt": null,
     "prompts": [],
+    "pending": [],
     "find": null,
     "prewarm": null
   }

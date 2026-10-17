@@ -34,11 +34,16 @@
 // caseMeasured, canHash, mayNeedMode, refusal|null} (deviation 14; grep
 // preflightSent, prepare.js deviceReady).
 //
-// CONNECT FLOW (rule 10): a device or folder appearing → PromptMachine →
-// one automatic plan per target, queued FIFO behind any running job
-// (job-record enqueueAuto) → promptCard → shown now if focused, else on
-// the next focus. The prompt offers Review or Not now, never a one-click
-// apply (approved design D2): every apply goes through Review's Start.
+// CONNECT FLOW (rule 10): a device or folder appearing → one automatic
+// plan per target, ALWAYS (UI-pass U3-1), queued FIFO behind any running job
+// (job-record enqueueAuto). With prompt-on-connect on and no honored mark,
+// PromptMachine also opens a card: planning (the renderer's Preparing card,
+// from `pending`) → promptCard over the plans that landed plus the targets
+// refused or failed (`attention`) → shown now if focused, else on the next
+// focus → withdrawn by main once nothing is left to do (U3-6). The prompt
+// offers Review or Not now, never a one-click apply (approved design D2):
+// every apply goes through Review's Start. The renderer draws the card's
+// numbers from the live plans, not the frozen card (U3-9).
 //
 // LINK (P4 decision): sync:link {targetId, suggestionIds} binds each
 // suggestion's device folder to its series (RecordStore.bindFolder), refused
@@ -438,7 +443,9 @@ function initDeviceSync(deps) {
       marks,
       now,
       isFocused: () => deps.isFocused(),
-      onPrompt: (ev) => emit("prompt", { action: ev.action, prompt: ev.prompt, prompts: prompts.shown() }),
+      onPrompt: (ev) => emit("prompt", { action: ev.action, prompt: ev.prompt, ...(ev.reason ? { reason: ev.reason } : null), prompts: prompts.shown(), pending: prompts.pending() }),
+      // U3-3: the planning list behind the renderer's Preparing card.
+      onPending: (pending) => emit("prompt", { action: "pending", prompts: prompts.shown(), pending }),
     });
     client = new AdbClient({ ...(T.clientOpts || {}) });
     findSources = new FindSources({
@@ -521,7 +528,8 @@ function initDeviceSync(deps) {
       rt.settleTimer = null;
     }
     if (prewarmAc) prewarmAc.abort();
-    if (prompts) for (const p of prompts.shown()) emit("prompt", { action: "withdraw", prompt: p, prompts: [] });
+    if (prompts) for (const p of prompts.shown()) emit("prompt", { action: "withdraw", prompt: p, prompts: [], pending: [] });
+    if (prompts && prompts.pending().length) emit("prompt", { action: "pending", prompts: [], pending: [] });
     for (const k of ["adb", "folder"]) connected[k].clear();
     autoBatches.clear();
     for (const q of jobs.snapshot().queue) jobs.dropTarget(q.targetId);
@@ -629,16 +637,76 @@ function initDeviceSync(deps) {
     emit("device", _devicePayload());
   }
 
+  /**
+   * A connection appeared. Every target on it gets an automatic, read-only
+   * plan (UI-pass U3-1, user decision: the rail count needs one), also with
+   * prompt-on-connect off or a mark honored; the prompt rules only decide
+   * whether a card follows. A prompting connection collects its targets'
+   * plan outcomes in autoBatches until each has ended (_afterJob) or been
+   * dropped (_batchDrop).
+   */
   function _connected(connKey, serial, targetIds) {
     for (const id of targetIds) {
       const crt = rts.get(id);
       if (crt) crt.autoHold = false;
     }
-    if (!settings.syncPromptOnConnect) return;
-    if (!prompts.connected({ connKey, serial, targetIds })) return;
-    autoBatches.set(connKey, { serial, waiting: new Set(targetIds), summaries: [] });
+    if (settings.syncPromptOnConnect && prompts.connected({ connKey, serial, targetIds })) {
+      autoBatches.set(connKey, { serial, waiting: new Set(targetIds), summaries: [], attention: [] });
+    }
     for (const id of targetIds) jobs.enqueueAuto({ targetId: id, serial });
     _pump();
+  }
+
+  /** Every target of the batch has reported: hand the card to the machine. */
+  function _batchSettle(connKey, batch) {
+    autoBatches.delete(connKey);
+    prompts.planned(connKey, planner.promptCard(batch.serial, batch.summaries, batch.attention));
+  }
+
+  /**
+   * U3-5: a batch waits for a plan that will never run when its target is
+   * removed, edited off the device, or skipped by _pump. Stop waiting for
+   * it, so the rest of the connection's card still arrives.
+   */
+  function _batchDrop(targetId) {
+    for (const [k, batch] of [...autoBatches]) {
+      if (!batch.waiting.delete(targetId)) continue;
+      if (!batch.waiting.size) _batchSettle(k, batch);
+    }
+  }
+
+  /**
+   * The card's entry for a connect plan that didn't land (U3-4): the job's
+   * OWN refusal (rt.refusal may already belong to a later plan), or
+   * `failed` with its reason. A cancelled plan (the user's Cancel, a
+   * disconnect) asks nothing.
+   */
+  function _attentionOf(targetId, status, summary) {
+    const t = _target(targetId);
+    if (!t) return null;
+    const r = summary && summary.refusal;
+    if (r) return { targetId, targetName: t.name || null, code: r.code, message: r.message || null, firstSync: r.firstSync == null ? null : !!r.firstSync, folders: r.folders || null, bytes: r.bytes == null ? null : r.bytes };
+    if (status === "failed") return { targetId, targetName: t.name || null, code: "failed", message: (summary && (summary.message || summary.reason)) || null, reason: (summary && summary.reason) || null };
+    return null;
+  }
+
+  /** The target's current plan offers nothing to do and holds no refusal. */
+  function _nothingToDo(targetId) {
+    const rt = rts.get(targetId);
+    if (!rt || !rt.plan || rt.refusal) return false;
+    return planner.promptSummary(rt.plan, _selection(rt), rt.prep && rt.prep.device).nothingToDo;
+  }
+
+  /**
+   * U3-6: after a plan lands, an open card whose every target has nothing
+   * left to do (the user synced from the tab, a download settled into
+   * place) is withdrawn by main; the renderer never answers for the user.
+   */
+  function _resolvePrompts(targetId) {
+    for (const k of prompts.openFor(targetId)) {
+      const p = prompts.promptOf(k);
+      if (p && p.targetIds.every((id) => !_target(id) || _nothingToDo(id))) prompts.resolve(k, "nothing-to-do");
+    }
   }
 
   /** Is this target's device or folder attached now? */
@@ -863,20 +931,22 @@ function initDeviceSync(deps) {
       lrt.autoHold = status !== "completed";
     }
     _planChanged(job.targetId);
-    // Prompt bookkeeping for automatic connect plans.
+    // Prompt bookkeeping for automatic connect plans. Any plan of a waiting
+    // target counts (a manual Re-check that ran first included).
     if (job.phase === "plan") {
-      for (const [k, batch] of autoBatches) {
+      for (const [k, batch] of [...autoBatches]) {
         if (!batch.waiting.has(job.targetId)) continue;
         batch.waiting.delete(job.targetId);
         const rt = rts.get(job.targetId);
         if (status === "completed" && rt && rt.plan) {
           batch.summaries.push({ ...planner.promptSummary(rt.plan, _selection(rt), rt.prep && rt.prep.device), gen: rt.gen });
+        } else {
+          const a = _attentionOf(job.targetId, status, summary);
+          if (a) batch.attention.push(a);
         }
-        if (!batch.waiting.size) {
-          autoBatches.delete(k);
-          prompts.planned(k, planner.promptCard(batch.serial, batch.summaries));
-        }
+        if (!batch.waiting.size) _batchSettle(k, batch);
       }
+      if (status === "completed" && prompts) _resolvePrompts(job.targetId);
       _refreshLibraryStatus();
     }
     // A selection change made during this job on a header-less target.
@@ -893,9 +963,13 @@ function initDeviceSync(deps) {
       const next = jobs.takeNextAuto();
       if (!next) return;
       const t = _target(next.targetId);
-      if (!t || !_isConnected(t)) continue;
+      if (!t || !_isConnected(t)) {
+        _batchDrop(next.targetId);
+        continue;
+      }
       const r = _startPlan(next.targetId, { auto: true });
       if (r.ok) return;
+      _batchDrop(next.targetId);
     }
   }
 
@@ -1086,6 +1160,21 @@ function initDeviceSync(deps) {
     if (rt.settleTimer.unref) rt.settleTimer.unref();
   }
 
+  /**
+   * needs-mode for a Verify-first on a device that can't hash: the bound
+   * folders a read-back would read, with their bytes, like prepare.js's
+   * own needs-mode (UI-pass U3-4), so every chooser can name the cost.
+   */
+  function _needsMode(prep) {
+    const folders = prep && prep.plan ? prep.plan.series.filter((sp) => sp.shardId && sp.deviceFolder && sp.state !== "gone" && sp.state !== "held").map((sp) => sp.deviceFolder) : [];
+    return refuse("needs-mode", "this device can't hash files: choose how to verify", {
+      modes: ["read-back", "adopt-size"],
+      folders,
+      bytes: prep && prep.device ? planner.verifyBytesOf(prep.device, folders) : null,
+      firstSync: !!(prep && prep.plan && prep.plan.firstSync),
+    });
+  }
+
   function _refused(rt, r) {
     rt.refusal = r;
     rt.summary = null;
@@ -1105,7 +1194,7 @@ function initDeviceSync(deps) {
       if (overrides.verifyFirst) {
         const v = await _verifyFolders(rt, prep, transport, signal, runId, overrides.verifyMode || cfg.verifyMode, null);
         // needs-mode is a refusal the Sync tab answers (U2-1), not a failed run.
-        if (v.status === "failed" && v.reason === "needs-mode") return _refused(rt, refuse("needs-mode", "this device can't hash files: choose how to verify", { modes: ["read-back", "adopt-size"] }));
+        if (v.status === "failed" && v.reason === "needs-mode") return _refused(rt, _needsMode(prep));
         if (v.status !== "completed") return { status: v.status, summary: { reason: v.reason } };
         prep = await _prepare(rt, cfg, transport, signal, runId, opts);
         if (!prep.ok) return _refused(rt, prep);
@@ -1271,12 +1360,13 @@ function initDeviceSync(deps) {
 
   H["get-state"] = async () => {
     if (!enabled) {
-      return { ok: true, enabled: false, settings: _publicSettings(), specs: SYNC_SETTING_SPECS, config: null, adb: null, devices: [], folderPresence: {}, job: jobs.snapshot(), plans: {}, prompt: null, prompts: [], find: null, prewarm: null };
+      return { ok: true, enabled: false, settings: _publicSettings(), specs: SYNC_SETTING_SPECS, config: null, adb: null, devices: [], folderPresence: {}, job: jobs.snapshot(), plans: {}, prompt: null, prompts: [], pending: [], find: null, prewarm: null };
     }
     if (!(await _ensureStarted())) return refuse("disabled", "sync could not start");
     const plans = {};
     for (const t of _targets()) plans[t.id] = _planView(t.id);
     const shown = prompts.shown();
+    const pending = prompts.pending();
     return {
       ok: true,
       enabled: true,
@@ -1289,6 +1379,7 @@ function initDeviceSync(deps) {
       plans,
       prompt: shown[0] || null,
       prompts: shown,
+      pending,
       find: findSources.status(),
       prewarm,
       // Settings → Sync → Advanced "Open log folder" (openFolder IPC). Only
@@ -1415,6 +1506,7 @@ function initDeviceSync(deps) {
       next: { ...config, targets: _targets().filter((x) => x.id !== t.id) },
       after: async () => {
         jobs.dropTarget(t.id);
+        _batchDrop(t.id);
         rts.delete(t.id);
         _planChanged(t.id); // → {removed:true}
         if (findSources) await findSources.forget(t.id);
@@ -1578,6 +1670,10 @@ function initDeviceSync(deps) {
     const s = await _ensureServer();
     if (!s.ok) return refuse("disconnected", `no adb server: ${adbInfo.error}`);
     const rows = await client.devices();
+    // U3-7: "I've allowed it" / "Re-check" on the connect card. A full list
+    // is as authoritative as a poll, so it feeds the same diff (a tablet
+    // just authorized connects now, not on the tracker's next frame).
+    if (tracker) _onDevices(rows, { source: "manual" });
     return { ok: true, devices: rows.map((d) => ({ serial: d.serial, state: d.state, stateKind: d.stateKind, model: d.model, product: d.product, transportId: d.transportId, targetable: d.targetable })) };
   };
 
@@ -1668,7 +1764,7 @@ function initDeviceSync(deps) {
     const rt = _rt(pre.t.id);
     const stored = _cfg(pre.t).verifyMode;
     if (rt.prep && rt.prep.probe && pre.t.kind === "adb" && !(rt.prep.probe.caps || {}).sha256sum && overrides.verifyFirst && !overrides.verifyMode && !stored) {
-      return refuse("needs-mode", "this device can't hash files: choose how to verify", { modes: ["read-back", "adopt-size"] });
+      return _needsMode(rt.prep);
     }
     return _startPlan(pre.t.id, { overrides });
   };
@@ -1798,7 +1894,7 @@ function initDeviceSync(deps) {
     // No mode named: the target's stored needs-mode answer.
     const mode = p.mode != null ? p.mode : _cfg(pre.t).verifyMode || undefined;
     if (pre.t.kind === "adb" && caps && !caps.sha256sum && (!mode || mode === "device-hash")) {
-      return refuse("needs-mode", "this device can't hash files: choose how to verify", { modes: ["read-back", "adopt-size"] });
+      return _needsMode(rt.prep);
     }
     const folders = Array.isArray(p.folders) ? p.folders.map(String) : null;
     // Re-check's "Re-hash" + "Read back" together (design D4, U2-9): the
@@ -1809,7 +1905,7 @@ function initDeviceSync(deps) {
       let prep = await _prepare(rt, cfg, transport, signal, runId, vopts);
       if (!prep.ok) return _refused(rt, prep);
       const v = await _verifyFolders(rt, prep, transport, signal, runId, mode, folders);
-      if (v.status === "failed" && v.reason === "needs-mode") return _refused(rt, refuse("needs-mode", "this device can't hash files: choose how to verify", { modes: ["read-back", "adopt-size"] }));
+      if (v.status === "failed" && v.reason === "needs-mode") return _refused(rt, _needsMode(prep));
       if (v.status !== "completed") return { status: v.status, summary: _runSummary(v) };
       prep = await _prepare(rt, cfg, transport, signal, runId, { verifyMode: vopts.verifyMode });
       if (!prep.ok) return _refused(rt, prep);
@@ -1970,13 +2066,15 @@ function initDeviceSync(deps) {
   };
 
   // Review opens the Sync tab on the prompt's targets (renderer side);
-  // Not now only closes the prompt. Neither starts a job (design D2).
+  // Not now only closes the prompt. Neither starts a job (design D2). A
+  // connection still planning can be answered from its Preparing card
+  // (U3-3): its card then never shows.
   H["prompt-response"] = async (p) => {
     if (!["review", "not-now"].includes(p.action)) return refuse("invalid", "unknown action");
     const id = String(p.promptId);
     const pr = prompts.respond(id);
     if (!pr) return refuse("invalid", "that prompt is no longer open");
-    emit("prompt", { action: "answered", prompt: pr, response: p.action, prompts: prompts.shown() });
+    emit("prompt", { action: "answered", prompt: pr, response: p.action, prompts: prompts.shown(), pending: prompts.pending() });
     return { ok: true };
   };
 
@@ -2259,7 +2357,7 @@ function initDeviceSync(deps) {
 
     // For tools/ tests: the state get-state reports, without IPC.
     _debug() {
-      return { started, enabled, current: current ? { runId: current.runId, phase: current.phase, targetId: current.targetId, signal: current.ac.signal } : null, rts, prompts, tracker, findSources, hashPool };
+      return { started, enabled, current: current ? { runId: current.runId, phase: current.phase, targetId: current.targetId, signal: current.ac.signal } : null, rts, prompts, tracker, findSources, hashPool, autoBatches };
     },
   };
   return facade;

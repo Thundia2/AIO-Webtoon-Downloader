@@ -6,7 +6,8 @@
 // sync backends (./syncFixtureSource.js), each case in a light and a `.dark`
 // frame at a fixed width. Phase U1 of sync-temp/plans/device-sync-ui-pass.md
 // added the Settings cases; U2 adds the Sync tab ("tab-*", the fake source's
-// TAB MODE) and the card sheet ("cards").
+// TAB MODE) and the card sheet ("cards"); U3 the connect cards ("connect-*")
+// and the rail badge ("rail").
 //
 // URL: ?gallery=sync                      index of cases
 //      ?gallery=sync&case=<id>            one case, light above dark
@@ -28,6 +29,9 @@ import { useDeviceSync } from "@/hooks/useDeviceSync";
 import SyncTab from "@/components/sync/SyncTab";
 import { LastRunCard, RefusalCard } from "@/components/sync/SyncCards";
 import { lastRunView } from "@/components/sync/syncView";
+import ConnectPrompt, { ConnectCard, RailBadge } from "@/components/sync/ConnectPrompt";
+import { connectCards } from "@/components/sync/connectView";
+import { FolderSync } from "lucide-react";
 import { FIXTURES, makeSyncSource } from "./syncFixtureSource";
 
 const savedFrom = (snap, over) => {
@@ -206,11 +210,125 @@ function OverlaysCase() {
   );
 }
 
+// ── Connect cards + rail badge (phase U3) ──
+// Every card variant through the REAL connectCards() + ConnectCard, from the
+// recorded prompts.json (ready / needs-mode, get-state at the card). What is
+// synthetic, and why: the Preparing card's job progress (the recorded plan
+// finished before reporting a file count), the read-back progress, the
+// second target of the two-target card, the refusal entries, and every
+// tablet state but `device` (one fake server can't be all of them at once).
+const P = FIXTURES.prompts;
+const RS = P.ready.state;
+const NS = P.needsMode.state;
+const readyP = RS.prompts[0];
+const readyTid = readyP.targetIds[0];
+const needP = NS.prompts[0];
+const needTid = needP.targetIds[0];
+const NOW = readyP.createdAt + 60000;
+const withCard = (p, card, ids) => ({ ...p, targetIds: ids || p.targetIds, card: { ...p.card, ...card } });
+const devRow = (stateKind) => ({ ...(NS.devices[0] || { serial: "R5CW71ABCDE", model: "SM-T290" }), state: stateKind === "no-permissions" ? "unauthorized" : stateKind, stateKind });
+const devCtx = (stateKind) => ({ targets: NS.config.targets, devices: [devRow(stateKind)], deviceSince: { [`dev:${devRow(stateKind).serial}:${stateKind}`]: NOW - 10000 } });
+const secondTarget = { id: "tsecond", name: "Komikku folder", kind: "folder", root: "D:/Komikku" };
+const CONNECT_VARIANTS = [
+  ["Ready (recorded)", { targets: RS.config.targets, prompts: RS.prompts, plans: RS.plans }],
+  ["Ready with removals (frozen card, before the plan push)", { targets: RS.config.targets, prompts: [withCard(readyP, { targets: [{ ...readyP.card.targets[0], deletions: 4, losses: 1 }] })], plans: {} }],
+  ["First sync: needs a read-back (recorded)", { targets: NS.config.targets, prompts: NS.prompts, plans: NS.plans, devices: NS.devices }],
+  [
+    "Needs a check, not a first sync",
+    { targets: NS.config.targets, prompts: [withCard(needP, { attention: [{ ...needP.card.attention[0], firstSync: false }] })], plans: { [needTid]: { ...NS.plans[needTid], refusal: { ...NS.plans[needTid].refusal, firstSync: false } } }, devices: NS.devices },
+  ],
+  [
+    "After Set up: reading back",
+    { targets: NS.config.targets, prompts: NS.prompts, plans: {}, devices: NS.devices, job: { state: "running", runId: 9, phase: "plan", auto: true, targetId: needTid, progress: { step: "verify", filesDone: 31, filesTotal: 50 } } },
+  ],
+  [
+    "Preparing (after the 2 s grace)",
+    { targets: RS.config.targets, prompts: [], pending: P.ready.pending.pending, plans: {}, now: P.ready.pending.pending[0].since + 3000, job: { ...(P.ready.job || {}), state: "running", targetId: readyTid, progress: { step: "hashing", filesDone: 62, filesTotal: 100 } } },
+  ],
+  ["Needs attention: a refusal", { targets: RS.config.targets, prompts: [withCard(readyP, { targets: [], attention: [{ targetId: readyTid, code: "device-listing-suspect" }] })], plans: {} }],
+  ["Couldn't check: the plan failed", { targets: RS.config.targets, prompts: [withCard(readyP, { targets: [], attention: [{ targetId: readyTid, code: "failed", reason: "internal" }] })], plans: {} }],
+  [
+    "Two targets, one needing attention",
+    { targets: [...RS.config.targets, secondTarget], prompts: [withCard(readyP, { attention: [{ targetId: "tsecond", code: "record-mismatch" }] }, [readyTid, "tsecond"])], plans: RS.plans },
+  ],
+  ["Tablet: unauthorized", devCtx("unauthorized")],
+  ["Tablet: no permissions", devCtx("no-permissions")],
+  ["Tablet: authorizing", devCtx("authorizing")],
+  ["Tablet: connecting", devCtx("connecting")],
+];
+function ConnectCardsCase() {
+  return (
+    <div className="grid h-full content-start gap-3 overflow-auto p-4" style={{ gridTemplateColumns: "repeat(auto-fill, 340px)" }}>
+      {CONNECT_VARIANTS.map(([label, ctx]) => {
+        const { cards } = connectCards({ devices: [], pending: [], prompts: [], plans: {}, job: null, now: NOW, ...ctx });
+        return (
+          <div key={label} className="flex flex-col gap-1">
+            <span className="text-[11px] text-muted-foreground">{label}</span>
+            {cards.length ? (
+              cards.map((card) => (
+                <div key={card.key} className="overflow-hidden rounded-xl border bg-card shadow-[0_16px_40px_rgb(0_0_0/0.22)]">
+                  <ConnectCard card={card} onAction={() => {}} onClose={() => {}} />
+                </div>
+              ))
+            ) : (
+              <span className="text-xs text-destructive">no card</span>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// The live corner card over a placeholder tab: Review and Not now answer
+// through the fake source (the card closes; nothing re-plans).
+function ConnectLiveCase({ spec }) {
+  const sync = useDeviceSync({ source: makeSyncSource(spec) });
+  const [said, setSaid] = useState(null);
+  return (
+    <div className="relative h-full">
+      <div className="p-4 text-sm text-muted-foreground">Any tab. {said ? `Review → open Sync on ${said}.` : "The card sits bottom-right, 16 px in."}</div>
+      <ConnectPrompt sync={sync} hiddenTargetId={null} onReview={(t) => setSaid(t)} />
+    </div>
+  );
+}
+
+const RAIL_STATES = [
+  [{ count: 9, dot: null }, "9 series to sync"],
+  [{ count: 9, dot: "pulse" }, "Copying"],
+  [{ count: 0, dot: "red" }, "Needs attention"],
+  [{ count: 3, dot: "red" }, "Count + attention"],
+  [{ count: 140, dot: null }, "99+"],
+  [{ count: 0, dot: null }, "Nothing to do"],
+];
+function RailCase() {
+  return (
+    <div className="flex items-start gap-5 p-4">
+      {RAIL_STATES.map(([b, label]) => (
+        <div key={label} className="flex flex-col items-center gap-1.5">
+          <div className="flex w-16 justify-center border-r bg-card/50 py-2">
+            <div className="relative flex h-12 w-12 flex-col items-center justify-center rounded-lg text-muted-foreground">
+              <FolderSync className="h-[18px] w-[18px]" />
+              <span className="mt-0.5 text-[9px] font-medium">Sync</span>
+              <RailBadge badge={b} />
+            </div>
+          </div>
+          <span className="text-[11px] text-muted-foreground">{label}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 const ALL = [
   ...CASES,
   { id: "overlays", title: "Overlay primitives", note: "Dialog over a Sheet, both contained.", render: () => <OverlaysCase /> },
   ...TAB_CASES.map((c) => ({ ...c, render: () => <TabCase c={c} /> })),
   { id: "cards", title: "Tab: every refusal and last-run card", height: 2600, render: () => <CardsCase /> },
+  { id: "connect-cards", title: "Connect prompt: every card variant", note: "Recorded ready / needs-mode cards plus the synthetic states (see the gallery source).", height: 1100, render: () => <ConnectCardsCase /> },
+  { id: "connect-ready", title: "Connect prompt: live corner card (ready)", note: "Review / Not now answer through the fake source.", render: () => <ConnectLiveCase spec={{ prompt: "ready" }} /> },
+  { id: "connect-needs-mode", title: "Connect prompt: live corner card (first sync)", note: "Set up stores read-back (the fake source only bumps the config).", render: () => <ConnectLiveCase spec={{ prompt: "needsMode" }} /> },
+  { id: "rail", title: "Rail badge", note: "Count · pulse while a job runs · red on a problem · 99+ · none.", height: 160, render: () => <RailCase /> },
 ];
 
 function Frame({ theme, width, height = 640, children }) {

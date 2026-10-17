@@ -24,7 +24,7 @@
       ],
       "tracking": "tracking",
       "trackingError": null,
-      "at": 1792184438862
+      "at": 1792224799180
     },
     "connecting": {
       "binary": "C:\\platform-tools\\adb.exe",
@@ -48,7 +48,7 @@
       ],
       "tracking": "connecting",
       "trackingError": null,
-      "at": 1792184438862
+      "at": 1792224799180
     },
     "polling": {
       "binary": "C:\\platform-tools\\adb.exe",
@@ -72,7 +72,7 @@
       ],
       "tracking": "polling",
       "trackingError": null,
-      "at": 1792184438862
+      "at": 1792224799180
     },
     "stopped": {
       "binary": "C:\\platform-tools\\adb.exe",
@@ -96,7 +96,7 @@
       ],
       "tracking": "stopped",
       "trackingError": null,
-      "at": 1792184438862
+      "at": 1792224799180
     },
     "error": {
       "binary": "C:\\platform-tools\\adb.exe",
@@ -120,7 +120,7 @@
       ],
       "tracking": "stopped",
       "trackingError": "connect ECONNREFUSED 127.0.0.1:5037",
-      "at": 1792184438862
+      "at": 1792224799180
     },
     "missing": {
       "binary": null,
@@ -129,7 +129,7 @@
       "candidates": [],
       "tracking": "stopped",
       "trackingError": null,
-      "at": 1792184438862
+      "at": 1792224799180
     }
   }
 }

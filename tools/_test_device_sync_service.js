@@ -1518,6 +1518,111 @@ test("U0b prompt: Review or Not now only (design D2); anything else is refused a
   }
 });
 
+test("U3 connect: the Preparing list carries the card's promptId, and empties when the card shows", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Xi", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    const pend = await a.waitEvent((e) => e.kind === "prompt" && e.action === "pending" && e.pending.length === 1, 15000, 0, "pending");
+    assert.deepStrictEqual(pend.pending[0].targetIds, [id]);
+    assert.strictEqual(pend.pending[0].connKey, `folder:${id}`);
+    const shown = await a.waitEvent((e) => e.kind === "prompt" && e.action === "show", 15000, 0, "prompt");
+    assert.strictEqual(shown.prompt.promptId, pend.pending[0].promptId, "one id from planning to the card");
+    assert.deepStrictEqual(shown.pending, []);
+    const st = await a.state();
+    assert.deepStrictEqual(st.pending, []);
+    assert.deepStrictEqual(shown.prompt.card.attention, []);
+  } finally {
+    await a.close();
+  }
+});
+
+test("U3 connect: with prompt-on-connect off a connect still plans, and no card opens", async () => {
+  const a = await app({ settings: { syncPromptOnConnect: false } });
+  try {
+    series(a.lib, "Xi", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    const done = await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan" && e.job.targetId === id, 15000, 0, "connect plan");
+    assert.strictEqual(done.status, "completed");
+    await a.idle();
+    assert.ok((await a.summary(id)).totals.series >= 1);
+    assert.ok(!a.events.some((e) => e.kind === "prompt"), "no prompt event at all");
+  } finally {
+    await a.close();
+  }
+});
+
+test("U3 connect: an open card whose target is synced from the tab is withdrawn `nothing-to-do`", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Xi", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    const shown = await a.waitEvent((e) => e.kind === "prompt" && e.action === "show", 15000, 0, "prompt");
+    await a.idle();
+    const from = a.since();
+    assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
+    const w = await a.waitEvent((e) => e.kind === "prompt" && e.action === "withdraw", 15000, from, "withdraw");
+    assert.strictEqual(w.prompt.promptId, shown.prompt.promptId);
+    assert.strictEqual(w.reason, "nothing-to-do");
+    assert.deepStrictEqual((await a.state()).prompts, []);
+    assertRefusal(await a.call("prompt-response", { promptId: shown.prompt.promptId, action: "review" }), "invalid");
+  } finally {
+    await a.close();
+  }
+});
+
+test("U3 connect: a target removed while its connect plan waits doesn't hold back the device's card", async () => {
+  // Two adb targets on one tablet share one card. The lane is busy (a held
+  // apply on a folder target) when the tablet connects, so both connect
+  // plans queue; removing one must not leave the card waiting for a plan
+  // that will never run (the device stays connected, so no disconnect
+  // clears the batch).
+  const g = gate();
+  const a = await app({ adb: true, executorDeps: { hooks: (pt) => (pt === "before-send" ? (g._hit(), g.wait) : undefined) } });
+  try {
+    series(a.lib, "Rho", { "Ch.001.cbz": 1000 });
+    const fid = await a.addFolderTarget();
+    await a.idle();
+    const ap = await a.apply({ targetId: fid });
+    await g.reached; // the lane is held by this apply
+    const ta = await a.call("config-op", { op: "add-target", target: { name: "TabA", kind: "adb", serial: SERIAL, root: "/sdcard/Komikku/local", profile: "komikku" } });
+    const tb = await a.call("config-op", { op: "add-target", target: { name: "TabB", kind: "adb", serial: SERIAL, root: "/sdcard/Mihon/local", profile: "komikku" } });
+    assert.ok(ta.ok && tb.ok, JSON.stringify([ta, tb]));
+    a.dev = a.srv.addDevice({ serial: SERIAL, inject: { symlinks: { "/sdcard": "/storage/emulated/0" } } });
+    a.dev.fs.mkdirs(CANON);
+    a.dev.fs.mkdirs("/storage/emulated/0/Mihon/local");
+    await waitFor(() => [...a.svc._debug().autoBatches.keys()].some((k) => k.startsWith(`${SERIAL}#`)), 5000, "the tablet's connect batch");
+    const rm = await a.call("config-op", { op: "remove-target", targetId: tb.targetId });
+    assert.ok(rm.ok, JSON.stringify(rm));
+    const from = a.since();
+    g.open();
+    assert.strictEqual((await a.job(ap.runId)).status, "completed");
+    const shown = await a.waitEvent((e) => e.kind === "prompt" && e.action === "show" && e.prompt.serial === SERIAL, 15000, from, "the tablet's card");
+    assert.deepStrictEqual(shown.prompt.card.targets.map((x) => x.targetId), [ta.targetId]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("U3 needs-mode on connect: the card lists the target for attention with the read-back bytes", async () => {
+  const a = await app({ adb: true });
+  try {
+    a.dev = a.srv.addDevice({ serial: SERIAL, inject: { symlinks: { "/sdcard": "/storage/emulated/0" }, tools: { sha256sum: false } } });
+    a.dev.fs.mkdirs(CANON);
+    a.dev.fs.writeFile(`${CANON}/Nu/Ch.001.cbz`, bytes("Ch.001.cbz", 1500), { mtime: OLD_S });
+    series(a.lib, "Nu", { "Ch.001.cbz": 1500 });
+    const t = await a.call("config-op", { op: "add-target", target: { name: "Tab", kind: "adb", serial: SERIAL, root: "/sdcard/Komikku/local", profile: "komikku" } });
+    const shown = await a.waitEvent((e) => e.kind === "prompt" && e.action === "show", 15000, 0, "prompt");
+    const att = shown.prompt.card.attention;
+    assert.strictEqual(att.length, 1, JSON.stringify(shown.prompt.card));
+    assert.deepStrictEqual([att[0].targetId, att[0].code, att[0].targetName, att[0].firstSync, att[0].bytes], [t.targetId, "needs-mode", "Tab", true, 1500]);
+    assert.deepStrictEqual(att[0].folders, ["Nu"]);
+    assert.strictEqual((await a.state()).plans[t.targetId].refusal.bytes, 1500, "the plan view's refusal names the bytes too");
+  } finally {
+    await a.close();
+  }
+});
+
 test("U0 download guard: a running download's folder is skipped with reason `downloading` (series-dir, then url)", async () => {
   const a = await app();
   try {

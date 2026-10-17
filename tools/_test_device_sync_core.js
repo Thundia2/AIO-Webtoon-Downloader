@@ -1236,6 +1236,17 @@ test("one prompt covers several targets on one device", () => {
   assert.deepStrictEqual(card.targets.map((t) => t.targetId), ["a", "b"]);
   assert.ok(!("syncNow" in card));
   assert.strictEqual(planner.promptCard("S1", [c]).empty, true);
+  // U3-4: a refused target is reason enough to ask.
+  const att = planner.promptCard("S1", [c], [{ targetId: "c", code: "needs-mode" }]);
+  assert.strictEqual(att.empty, false);
+  assert.deepStrictEqual(att.attention.map((x) => x.code), ["needs-mode"]);
+  assert.deepStrictEqual(planner.promptCard("S1", [c]).attention, []);
+});
+
+test("verifyBytesOf sums the listed folders' device sizes; unknown folders add 0", () => {
+  const device = { folders: new Map([["A", { ok: true, files: [{ size: 10 }, { size: 5 }] }], ["B", { ok: false, files: [] }]]) };
+  assert.strictEqual(planner.verifyBytesOf(device, ["A", "B", "C"]), 15);
+  assert.strictEqual(planner.verifyBytesOf(null, ["A"]), 0);
 });
 
 test("rule 13: a series that just finished downloading never shows synced", () => {

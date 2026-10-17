@@ -37,6 +37,7 @@ import labelPreview from "./sync-fixtures/label-preview.json";
 import adbStates from "./sync-fixtures/adb-states.json";
 import refusals from "./sync-fixtures/refusals.json";
 import tab from "./sync-fixtures/tab.json";
+import prompts from "./sync-fixtures/prompts.json";
 
 const clone = (x) => (x == null ? x : JSON.parse(JSON.stringify(x)));
 export const FIXTURES = {
@@ -49,17 +50,19 @@ export const FIXTURES = {
   adbStates: adbStates.data,
   refusals: refusals.data,
   tab: tab.data,
+  prompts: prompts.data,
 };
 
 /**
- * @param {{base?:"on"|"off", tab?:string, adb?:string, mutate?:(snap)=>void, hold?:boolean}} spec
+ * @param {{base?:"on"|"off", tab?:string, prompt?:string, adb?:string, mutate?:(snap)=>void, hold?:boolean}} spec
  *   base picks the recorded snapshot (tab, when set, wins: a tab.json
- *   snapshot name); adb swaps in one recorded adb state; mutate edits the
+ *   snapshot name; prompt, a prompts.json recording's get-state at its card,
+ *   wins over both); adb swaps in one recorded adb state; mutate edits the
  *   snapshot copy before the hook sees it; hold leaves every set-selection
  *   unanswered (the pending state).
  */
 export function makeSyncSource(spec = {}) {
-  const snap = clone(spec.tab ? FIXTURES.tab.snapshots[spec.tab] : spec.base === "off" ? FIXTURES.stateOff : FIXTURES.stateOn);
+  const snap = clone(spec.prompt ? FIXTURES.prompts[spec.prompt].state : spec.tab ? FIXTURES.tab.snapshots[spec.tab] : spec.base === "off" ? FIXTURES.stateOff : FIXTURES.stateOn);
   if (spec.adb && FIXTURES.adbStates[spec.adb]) snap.adb = clone(FIXTURES.adbStates[spec.adb]);
   if (spec.mutate) spec.mutate(snap);
   const listeners = new Set();
@@ -126,6 +129,17 @@ export function makeSyncSource(spec = {}) {
     },
     syncLocateAdb: () => Promise.resolve(clone(FIXTURES.locateAdb)),
     syncListDevices: () => Promise.resolve(clone(FIXTURES.devices)),
+    // The connect card's answers (U3): the prompt closes the way main's
+    // `answered` event closes it. Nothing else happens (no re-plan).
+    syncPromptResponse: ({ promptId, action }) => {
+      const p = (snap.prompts || []).find((x) => x.promptId === promptId) || (snap.pending || []).find((x) => x.promptId === promptId);
+      if (!p) return Promise.resolve({ ok: false, code: "invalid", message: "that prompt is no longer open" });
+      snap.prompts = (snap.prompts || []).filter((x) => x.promptId !== promptId);
+      snap.pending = (snap.pending || []).filter((x) => x.promptId !== promptId);
+      snap.prompt = snap.prompts[0] || null;
+      emit({ kind: "prompt", action: "answered", prompt: clone(p), response: action, prompts: clone(snap.prompts), pending: clone(snap.pending) });
+      return ok({});
+    },
     syncBrowseRemote: ({ path }) => {
       const r = FIXTURES.browseRemote[path] || Object.values(FIXTURES.browseRemote).find((v) => v.path === path);
       return Promise.resolve(r ? clone(r) : { ok: false, code: "invalid", message: `no fixture for ${path}` });
@@ -148,7 +162,7 @@ export function makeSyncSource(spec = {}) {
     // Not used by Settings → Sync; answered so a stray call can't throw.
     ...Object.fromEntries(
       ["syncPlan", "syncSeriesDetail", "syncSetSelection", "syncVerify", "syncApply", "syncPrune", "syncRenameDeviceFolder", "syncCancel",
-        "syncPromptResponse", "syncLibraryStatus", "syncExportReport", "syncDeviceCover", "syncFindSourcesStart", "syncFindSourcesCancel",
+        "syncLibraryStatus", "syncExportReport", "syncDeviceCover", "syncFindSourcesStart", "syncFindSourcesCancel",
         "syncFindSourcesGet", "syncFindSourcesUpdateRow", "syncLink", "syncReview"].map((k) => [k, () => Promise.resolve({ ok: false, code: "disabled", message: "not in the gallery" })]),
     ),
     ...tabApi,

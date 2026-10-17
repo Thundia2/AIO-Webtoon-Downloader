@@ -370,3 +370,76 @@ the draft; every load-bearing claim below was re-read in the code first.
 - **U2-15 fixtures record real set-selection replies and the `plans` pushes that follow them**, so
   the gallery shows pending → settled and ack resets; the E2E reaches `plan-changed` by sending an
   old-gen apply through `page.evaluate` and asserts the UI's notice separately.
+
+## Phase U3 design (2026-10-17)
+
+Built from a draft, an independent design agent (goal + evidence only) and an adversarial review of
+the draft; load-bearing claims re-read in the code. The plan's U3 bullets predate D2 and are
+superseded where they differ: there is no Sync now (Review → the tab's Start), and "Preparing" reads
+the connect plan's own job progress, not the pre-warm (`_runJob` pauses the pre-warm).
+
+**User decisions (2026-10-17):**
+- **U3-1 a connect always plans.** Every target that connects gets an automatic, read-only plan,
+  also with "Ask when a target connects" off and on a connection whose mark is honored. The prompt
+  rules (marks, focus) only decide whether a card shows. Why: the rail count needs a plan.
+- **U3-2 Review lands on the Sync tab's series list** for that target (not the Review dialog). It
+  answers the prompt `review`.
+
+**Backend:**
+- **U3-3 the prompt is live, the machine only decides open/closed.** PromptMachine allocates the
+  promptId at connect (state `planning`), so a Preparing card can be answered: `respond()` accepts
+  `planning` (the later `planned()` then stays silent, mark set). `pending()` lists planning
+  connections `{promptId, connKey, serial, targetIds, since}`; they ride every `prompt` event and
+  get-state (`pending`), and a `prompt {action:'pending'}` event goes out when the list changes.
+- **U3-4 refused and failed plans are on the card.** promptCard takes the batch's `attention`
+  entries `{targetId, targetName, code, message, firstSync, folders, bytes}` (code = the job's own
+  `summary.refusal.code`, or `failed` with the reason; a cancelled plan is left out). A card with
+  attention is not empty. prepare's needs-mode refusal gains `bytes` (planner `verifyBytesOf`) and
+  `firstSync`.
+- **U3-5 a batch can't hang.** `_batchDrop(targetId)` settles a batch when `_pump` skips a target
+  (removed / disconnected / serial edited away), a plan can't begin, or `remove-target` runs.
+- **U3-6 nothing left to do closes the card.** After a plan adopts, a shown or waiting prompt whose
+  every target now has nothing to do and no refusal is withdrawn `{reason:'nothing-to-do'}`
+  (PromptMachine `resolve`). The renderer never answers on the user's behalf.
+- **U3-7 `list-devices` feeds the device diff** (`_onDevices`, source `manual`) when tracking is
+  live, so "I've allowed it" / "Re-check" refresh what the card shows.
+- **U3-8 a folder must be absent on two polls in a row** before a present folder counts as gone
+  (FolderWatcher). A checkPresence timeout reads absent, so one slow poll re-prompted.
+
+**Renderer:**
+- **U3-9 the card** (`components/sync/ConnectPrompt.jsx`, mounted in App outside the tab area):
+  bottom-right, 340 px, 16 px in, z above content; at most 2 cards, then "+N more". Lines come
+  from the live `plans[tid].summary` when its gen ≥ the card's gen, else the frozen card summary
+  (pure `promptView()` in syncView.js). Variant precedence per target: device state > preparing >
+  needs-mode (Set up) > other refusal / failed ("needs attention") > ready.
+- **U3-10 Set up** stores `verifyMode: 'read-back'` (config-op update-target; its replan reads
+  back) and does not answer the prompt: the card shows "Reading back N%" from the job, then ready.
+- **U3-11 Preparing** shows after a 2 s grace (fast plans don't flash) with the plan job's step and
+  files done/total; its only button is Not now.
+- **U3-12 device cards are renderer-derived** for configured adb targets whose device is
+  unauthorized / no-permissions (red, guidance, "I've allowed it" / "Re-check" → listDevices) or
+  authorizing / connecting (spinner), gated on prompt-on-connect; dismissed per serial + state.
+- **U3-13 a card whose target the Sync tab is showing is hidden** (it would cover the dock's
+  Review and start); it is not answered, so it returns on another tab until answered or withdrawn.
+- **U3-14 rail badge** (pure `railBadge()` in syncView.js) over CONNECTED targets: count = distinct
+  series with ticked changes (rows with a selected push/replace/rename/delete, union over targets;
+  a stale summary still counts, so it doesn't flicker across re-plans; "99+"); red dot = a plan-view
+  refusal other than needs-mode, a connected target's tablet unauthorized / no-permissions, or a
+  failed / disconnected last run not dismissed and not a `plan-changed` block; pulse = a job running
+  that isn't an automatic plan. Red wins over pulse; the count shows alongside either.
+
+**U3 deviations recorded while coding (2026-10-17):**
+- The pure card and rail logic lives in a new `components/sync/connectView.js` (`connectCards()`,
+  `railBadge()`), not in syncView.js as U3-9 / U3-14 say: it is the corner card's own view model,
+  and keeping it out of syncView.js keeps that file the Sync tab's. Unit tests bundle it separately
+  (`tools/_test_device_sync_view.js`).
+- Per-target precedence as built: running work (plan / read-back progress) > needs-mode (Set up)
+  > other refusal / failed > ready / up to date / unknown. Device-state cards are their own cards,
+  not a per-target variant, and a Preparing card is its own card kind.
+- Red dot also fires for a connected target whose last automatic plan failed with nothing to show,
+  and for ANY configured tablet that is unauthorized / no-permissions (it isn't "connected" in
+  that state, so the connected-only filter would have hidden exactly the case it exists for).
+- The rail dot moves to the top-left corner when a count pill shows (the approved mockup stacked
+  both top-right and overlapped them).
+- The card's ✕ is labelled "Dismiss" (same effect as Not now for a prompt card; for a device card
+  it hides that serial + state locally) so the two controls don't announce the same name.

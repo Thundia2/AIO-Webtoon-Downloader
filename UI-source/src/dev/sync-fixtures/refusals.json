@@ -8,7 +8,7 @@
         "adbPath": null,
         "targets": [
           {
-            "id": "ta04a6a7d40",
+            "id": "t160c740ad5",
             "deletePolicy": "guarded",
             "excludes": [
               {
@@ -30,7 +30,7 @@
             "profile": "komikku"
           },
           {
-            "id": "tf123a9409e",
+            "id": "ta2b656b04d",
             "deletePolicy": "guarded",
             "excludes": [],
             "aliases": [],
@@ -42,7 +42,7 @@
             "profile": "everything"
           },
           {
-            "id": "ta639c4d7b4",
+            "id": "tf427d7cc09",
             "deletePolicy": "guarded",
             "excludes": [],
             "aliases": [],

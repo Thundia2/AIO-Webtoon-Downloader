@@ -257,6 +257,24 @@ test("FolderWatcher: a presence check that throws reads absent", async () => {
   assert.deepStrictEqual(seen, ["x:false"]);
 });
 
+test("FolderWatcher: a present folder leaves only after two absent polls in a row (U3-8)", async () => {
+  const seq = [true, false, true, false, false];
+  let i = 0;
+  const seen = [];
+  const w = new mon.FolderWatcher({ onChange: (id, p) => seen.push(`${id}:${p}`), timers: { setInterval: () => 1, clearInterval: () => {} } });
+  const tp = { checkPresence: async () => ({ present: seq[Math.min(i++, seq.length - 1)] }) };
+  w.setTargets([{ targetId: "f", transport: tp }]);
+  await waitFor(() => seen.length === 1, 1000, "first answer");
+  await w.checkAll(); // one miss: still present
+  assert.deepStrictEqual(seen, ["f:true"]);
+  await w.checkAll(); // back: the miss count resets
+  await w.checkAll(); // miss 1
+  assert.deepStrictEqual(seen, ["f:true"]);
+  await w.checkAll(); // miss 2: gone
+  assert.deepStrictEqual(seen, ["f:true", "f:false"]);
+  w.stop();
+});
+
 // ---------------------------------------------------------------- marks
 
 test("marks: honored for the same connection and boot epoch, for 30 minutes only", async () => {
@@ -459,6 +477,59 @@ test("prompt: two devices give two prompts, oldest first", async () => {
   c.t += 1;
   const pb = pm.planned("B#2", CARD);
   assert.deepStrictEqual(pm.shown().map((x) => x.promptId), [pa.promptId, pb.promptId]);
+});
+
+test("prompt: pending lists planning connections through onPending, never onPrompt (U3-3)", async () => {
+  const marks = new mon.PromptMarks({ dir: mkdir(), bootEpoch: 1 });
+  await marks.load();
+  const ev = [];
+  const pend = [];
+  const pm = new mon.PromptMachine({ marks, isFocused: () => true, onPrompt: (e) => ev.push(e), onPending: (l) => pend.push(l.map((x) => x.connKey)) });
+  pm.connected({ connKey: "SER1#1", serial: "SER1", targetIds: ["t1"] });
+  const [p0] = pm.pending();
+  assert.ok(p0.promptId, "the promptId exists while planning");
+  assert.deepStrictEqual(pend, [["SER1#1"]]);
+  const p = pm.planned("SER1#1", CARD);
+  assert.strictEqual(p.promptId, p0.promptId, "the card keeps the planning id");
+  assert.deepStrictEqual(pend, [["SER1#1"], []]);
+  assert.deepStrictEqual(ev.map((e) => e.action), ["show"]);
+});
+
+test("prompt: Not now while planning answers it; the plans then show nothing (U3-3)", async () => {
+  const { pm, ev, marks } = await machine();
+  pm.connected({ connKey: "SER1#1", targetIds: ["t1"] });
+  const [pd] = pm.pending();
+  const r = pm.respond(pd.promptId);
+  assert.strictEqual(r.promptId, pd.promptId);
+  assert.strictEqual(r.card, null);
+  assert.strictEqual(marks.honored("SER1#1"), true, "answered = asked once this connection");
+  assert.deepStrictEqual(pm.pending(), []);
+  assert.strictEqual(pm.planned("SER1#1", CARD), null);
+  assert.deepStrictEqual(ev, []);
+  assert.strictEqual(pm.respond(pd.promptId), null, "answered once");
+});
+
+test("prompt: a card with only attention entries is not quiet (U3-4)", async () => {
+  const { pm, ev } = await machine();
+  pm.connected({ connKey: "SER1#1", targetIds: ["t1"] });
+  const p = pm.planned("SER1#1", { serial: "SER1", targets: [], attention: [{ targetId: "t1", code: "needs-mode" }], empty: false });
+  assert.ok(p);
+  assert.deepStrictEqual(ev.map((e) => e.action), ["show"]);
+});
+
+test("prompt: resolve withdraws an open card with its reason; a waiting one is marked (U3-6)", async () => {
+  const { pm, ev, st, marks } = await machine({ focused: false });
+  pm.connected({ connKey: "A#1", targetIds: ["t1"] });
+  pm.planned("A#1", CARD);
+  assert.deepStrictEqual(pm.openFor("t1"), ["A#1"]);
+  assert.strictEqual(pm.resolve("A#1", "nothing-to-do"), true);
+  assert.deepStrictEqual(ev.map((e) => [e.action, e.reason]), [["withdraw", "nothing-to-do"]]);
+  assert.strictEqual(marks.honored("A#1"), true);
+  st.focused = true;
+  pm.focus();
+  assert.strictEqual(ev.length, 1, "a resolved card never shows");
+  assert.strictEqual(pm.resolve("A#1", "x"), false);
+  assert.deepStrictEqual(pm.openFor("t1"), []);
 });
 
 test("prompt: a throwing focus check counts as unfocused", async () => {

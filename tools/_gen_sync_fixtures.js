@@ -351,6 +351,106 @@ async function recordTab(tmp) {
   }
   return out;
 }
+/**
+ * prompts.json (UI pass U3): the connect card's inputs as main sends them.
+ *   ready     a folder target appearing with prompt-on-connect on: the
+ *             `pending` event (Preparing card), the running connect plan's
+ *             job with its progress, the `show` event and get-state at show
+ *   needsMode a non-hashing tablet's first connect: the card carries it as
+ *             an `attention` entry with the read-back bytes
+ * The device-state cards (unauthorized, no-permissions, authorizing,
+ * connecting) need no recording: they are devices[] rows (devices.json)
+ * with another stateKind.
+ */
+async function recordPrompts(tmp) {
+  const lib = path.join(tmp, "prompt-manga");
+  const root = path.join(tmp, "Tablet3", "Komikku");
+  fs.mkdirSync(root, { recursive: true });
+  const ch = (title, from, to, size = 3000) => {
+    const o = {};
+    for (let i = from; i <= to; i += 1) o[`Ch.${String(i).padStart(3, "0")} - ${title}.cbz`] = size + i;
+    return o;
+  };
+  series(lib, "Eleceed", ch("Eleceed", 1, 6));
+  series(lib, "Frieren", ch("Frieren", 1, 4));
+  series(lib, "Kagurabachi", ch("Kagurabachi", 1, 3));
+  const events = [];
+  const handlers = new Map();
+  const settings = { syncEnabled: true, cpuLimit: "unlimited", syncPromptOnConnect: true };
+  const baseTest = {
+    clientOpts: { port: 1, recheckMs: 20, idleMs: 5000, connectTimeoutMs: 500 },
+    locateAdb: async () => ({ resolved: null, candidates: [] }),
+    ensureServer: async () => ({ ok: false, error: new Error("no adb in this recording"), started: false }),
+    prewarmDelayMs: 60 * 60 * 1000,
+    replanDebounceMs: 30,
+    busyPollMs: 40,
+    bootEpoch: 1,
+    connectWaitMs: 2000,
+  };
+  const deps = {
+    ipcMain: { handle: (c, fn) => handlers.set(c, fn) },
+    send: (c, p) => events.push(p),
+    userDataDir: path.join(tmp, "prompt-ud", "sync"),
+    getSettings: () => settings,
+    getLibraryRoot: () => lib,
+    getRunningDownloads: () => [],
+    isCheckAllRunning: () => false,
+    isSearchRunning: () => false,
+    resolveSpawnPaths: () => ({ pythonCmd: "python", scriptPath: "aio-dl.py", workingDir: tmp }),
+    extraEnv: {},
+    onFocus: () => {},
+    isFocused: () => true,
+    getWindow: () => null,
+    showSaveDialog: async () => ({ canceled: true }),
+    _test: baseTest,
+  };
+  const out = {};
+  const svc = service.initDeviceSync(deps);
+  try {
+    const r = await handlers.get("sync:config-op")({}, { op: "add-target", target: { name: "Galaxy Tab", kind: "folder", root, profile: "komikku" } });
+    assert.ok(r.ok, JSON.stringify(r));
+    const show = await waitFor(() => events.find((e) => e.kind === "prompt" && e.action === "show"), 30000, "ready prompt");
+    out.ready = {
+      pending: events.find((e) => e.kind === "prompt" && e.action === "pending" && e.pending.length),
+      show,
+      state: await handlers.get("sync:get-state")({}, {}),
+    };
+    // The connect plan's job as the hook holds it mid-run: the begin event's
+    // job with the last progress that carried a file count.
+    const begin = events.find((e) => e.kind === "job" && e.job && e.job.phase === "plan" && e.job.state === "running");
+    const prog = events.filter((e) => e.kind === "job" && begin && e.runId === begin.runId && e.progress && e.progress.filesTotal);
+    out.ready.job = begin ? { ...begin.job, progress: { ...(begin.job.progress || {}), ...((prog[Math.floor(prog.length / 2)] || {}).progress || {}) } } : null;
+  } finally {
+    await svc.shutdown({ timeoutMs: 2000 });
+  }
+
+  const srv = new FakeAdbServer();
+  const port = await srv.listen();
+  const d2 = srv.addDevice({ serial: SERIAL, model: "SM-T290", inject: { symlinks: { "/sdcard": "/storage/emulated/0" }, tools: { sha256sum: false } } });
+  d2.fs.mkdirs(CANON);
+  for (const [n, s] of Object.entries(ch("Eleceed", 1, 3))) d2.fs.writeFile(`${CANON}/Eleceed/${n}`, bytes(n, s), { mtime: OLD_S });
+  const ev2 = [];
+  const h2 = new Map();
+  const svc2 = service.initDeviceSync({
+    ...deps,
+    userDataDir: path.join(tmp, "prompt-ud2", "sync"),
+    ipcMain: { handle: (c, fn) => h2.set(c, fn) },
+    send: (c, p) => ev2.push(p),
+    _test: { ...baseTest, clientOpts: { port, recheckMs: 20, idleMs: 5000, connectTimeoutMs: 500 }, ensureServer: async (client) => ({ ok: true, version: await client.version(), started: false }) },
+  });
+  try {
+    const r = await h2.get("sync:config-op")({}, { op: "add-target", target: { name: "Old tablet", kind: "adb", serial: SERIAL, root: "/sdcard/Komikku/local", profile: "komikku" } });
+    assert.ok(r.ok, JSON.stringify(r));
+    const show = await waitFor(() => ev2.find((e) => e.kind === "prompt" && e.action === "show"), 30000, "needs-mode prompt");
+    assert.ok(show.prompt.card.attention.length, JSON.stringify(show.prompt.card));
+    out.needsMode = { show, state: await h2.get("sync:get-state")({}, {}) };
+  } finally {
+    await svc2.shutdown({ timeoutMs: 2000 });
+    await srv.close();
+  }
+  return out;
+}
+
 async function main() {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "aio-sync-fixtures-"));
   const lib = path.join(tmp, "manga");
@@ -457,6 +557,7 @@ async function main() {
     await srv.close();
   }
   out.tab = await recordTab(tmp);
+  out.prompts = await recordPrompts(tmp);
 
   const adb = out.stateOn.adb;
   out.adbStates = {
@@ -480,6 +581,7 @@ async function main() {
     "adb-states.json": out.adbStates,
     "events.json": out.events,
     "tab.json": out.tab,
+    "prompts.json": out.prompts,
   };
   for (const [name, data] of Object.entries(files)) {
     const body = { [SYNC_FIXTURE_MARKER]: name, generatedBy: "tools/_gen_sync_fixtures.js", data: scrub(data, tmp) };

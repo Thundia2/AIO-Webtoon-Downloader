@@ -197,6 +197,104 @@ function eq(label, actual, expected) {
   const copySrc = fs.readFileSync(path.join(UI, "src", "components", "sync", "copy.js"), "utf8");
   const stripStates = [...((copySrc.match(/STRIP_STATE_COPY = Object\.freeze\(\{([\s\S]*?)\}\)/) || [])[1] || "").matchAll(/^\s*"?(\w+)"?:/gm)].map((m) => m[1]);
   eq("SEG_CLASS covers every strip state", segKeys.map((m) => m[1]).sort(), [...stripStates].sort());
+  // ── Connect cards + rail badge (connectView.js, UI pass U3) ──
+  const out2 = path.join(os.tmpdir(), `aio-connectview-${process.pid}.mjs`);
+  await esbuild.build({
+    entryPoints: [path.join(UI, "src", "components", "sync", "connectView.js")],
+    bundle: true,
+    format: "esm",
+    platform: "neutral",
+    outfile: out2,
+    alias: { "@": path.join(UI, "src") },
+    logLevel: "error",
+  });
+  const C = await import(pathToFileURL(out2).href);
+  fs.rmSync(out2, { force: true });
+  {
+    const T0 = 1_000_000;
+    const tgt = (id, extra = {}) => ({ id, name: id === "a" ? "Tab" : "Folder", kind: "folder", root: "/x", ...extra });
+    const live = { ...S, gen: 5 };
+    const frozen = { targetId: "a", gen: 5, series: 9, files: 452, bytes: 6.8e9, deletions: 4, renames: 0, losses: 0, verifyFolders: 0, nothingToDo: false };
+    const prompt = (card, ids = ["a"]) => ({ promptId: "p1", connKey: "folder:a", serial: null, targetIds: ids, card, createdAt: T0 });
+    const base = { targets: [tgt("a")], devices: [], plans: {}, job: null, now: T0, pending: [], prompts: [] };
+
+    // Frozen card until the live plan arrives; then the live one (gen floor).
+    let r = C.connectCards({ ...base, prompts: [prompt({ targets: [frozen], attention: [] })] });
+    eq("card: frozen numbers before the plan push", [r.cards[0].title, r.cards[0].rows[0].v, r.cards[0].primary.label], ["Tab connected", "452 chapters in 9 series", "Review"]);
+    check("card: deletions get the Review note", /4 files would be removed/.test(r.cards[0].note || ""), r.cards[0].note);
+    const liveFiles = live.totals.files;
+    r = C.connectCards({ ...base, prompts: [prompt({ targets: [frozen], attention: [] })], plans: { a: { summary: live } } });
+    check("card: live summary at the card's gen wins", r.cards[0].rows[0].v.startsWith(`${liveFiles} chapter`), r.cards[0].rows[0].v);
+    r = C.connectCards({ ...base, prompts: [prompt({ targets: [frozen], attention: [] })], plans: { a: { summary: { ...live, gen: 4 } } } });
+    eq("card: an older live summary than the card is ignored", r.cards[0].rows[0].v, "452 chapters in 9 series");
+
+    // needs-mode → Set up with the bytes; the card follows the read-back job.
+    const att = { targetId: "a", targetName: "Tab", code: "needs-mode", firstSync: true, folders: ["A", "B"], bytes: 9.4e9 };
+    r = C.connectCards({ ...base, prompts: [prompt({ targets: [], attention: [att] })] });
+    eq("card: first sync → Set up (reads ~N)", [r.cards[0].title, r.cards[0].primary.action, r.cards[0].primary.label, r.cards[0].rows[0].v], ["Tab is new here", "setup", "Set up (reads ~9.4 GB)", "2 folders already on it"]);
+    r = C.connectCards({ ...base, prompts: [prompt({ targets: [], attention: [{ ...att, firstSync: false }] })] });
+    eq("card: a non-first needs-mode says Check", r.cards[0].primary.label, "Check (reads ~9.4 GB)");
+    const verifying = { state: "running", runId: 3, phase: "plan", auto: true, targetId: "a", progress: { step: "verify", filesDone: 31, filesTotal: 50 } };
+    r = C.connectCards({ ...base, prompts: [prompt({ targets: [], attention: [att] })], job: verifying });
+    eq("card: Set up's re-plan shows the read-back progress", [r.cards[0].body, r.cards[0].progress, r.cards[0].primary], ["Reading back what's already there (62%)", 62, null]);
+    r = C.connectCards({ ...base, prompts: [prompt({ targets: [], attention: [att] })], plans: { a: { summary: live } } });
+    check("card: after the read-back the live plan makes it ready", r.cards[0].primary && r.cards[0].primary.label === "Review", JSON.stringify(r.cards[0].primary));
+
+    // Other refusals and failures: attention, Open Sync.
+    r = C.connectCards({ ...base, prompts: [prompt({ targets: [], attention: [{ targetId: "a", code: "device-listing-suspect" }] })] });
+    eq("card: a refusal → attention + Open Sync", [r.cards[0].tone, r.cards[0].primary.label, r.cards[0].body], ["bad", "Open Sync", "Tab listed far fewer files than expected"]);
+
+    // Two targets: one row each; Review lands on the one with changes.
+    const two = { ...base, targets: [tgt("a"), tgt("b")] };
+    r = C.connectCards({ ...two, prompts: [prompt({ targets: [frozen], attention: [{ targetId: "b", code: "record-mismatch" }] }, ["a", "b"])] });
+    eq("card: two targets → a row each, warn on the refused one", r.cards[0].rows.map((x) => [x.k, !!x.warn]), [["Tab", false], ["Folder", true]]);
+    eq("card: Review lands on the target with changes", r.cards[0].primary, { action: "review", targetId: "a", label: "Review" });
+
+    // Preparing: only after the grace, with the job's step.
+    const pd = { promptId: "p2", connKey: "folder:a", serial: null, targetIds: ["a"], since: T0 };
+    eq("preparing: hidden inside the grace", C.connectCards({ ...base, pending: [pd], now: T0 + 500 }).cards.length, 0);
+    r = C.connectCards({ ...base, pending: [pd], now: T0 + C.PREPARE_GRACE_MS, job: { ...verifying, progress: { step: "hashing", filesDone: 1, filesTotal: 4 } } });
+    eq("preparing: after the grace, with progress", [r.cards[0].kind, r.cards[0].body, r.cards[0].progress], ["preparing", "Preparing: fingerprinting PC files (25%)", 25]);
+
+    // Tablet cards: configured tablets only; spinners wait out the grace.
+    const adbBase = { ...base, targets: [tgt("a", { kind: "adb", serial: "S1" })] };
+    const dev = (stateKind) => ({ serial: "S1", state: stateKind === "no-permissions" ? "unauthorized" : stateKind, stateKind, model: "SM_X710" });
+    r = C.connectCards({ ...adbBase, devices: [dev("unauthorized")] });
+    eq("tablet: unauthorized → red card + I've allowed it", [r.cards[0].tone, r.cards[0].title, r.cards[0].primary.label], ["bad", "Tab needs permission", "I've allowed it"]);
+    r = C.connectCards({ ...adbBase, devices: [dev("no-permissions")] });
+    eq("tablet: no-permissions → Re-check", [r.cards[0].title, r.cards[0].primary.label], ["Tab can't be reached", "Re-check"]);
+    eq("tablet: an unconfigured tablet gets no card", C.connectCards({ ...base, devices: [dev("unauthorized")] }).cards.length, 0);
+    eq("tablet: prompt-on-connect off → no tablet card", C.connectCards({ ...adbBase, devices: [dev("unauthorized")], promptOnConnect: false }).cards.length, 0);
+    eq("tablet: dismissed per serial + state", C.connectCards({ ...adbBase, devices: [dev("unauthorized")], dismissedDevices: new Set(["dev:S1:unauthorized"]) }).cards.length, 0);
+    eq("tablet: connecting inside the grace → nothing", C.connectCards({ ...adbBase, devices: [dev("connecting")], deviceSince: { "dev:S1:connecting": T0 - 100 } }).cards.length, 0);
+    r = C.connectCards({ ...adbBase, devices: [dev("authorizing")], deviceSince: { "dev:S1:authorizing": T0 - 5000 } });
+    eq("tablet: authorizing past the grace → spinner", r.cards[0].spinner, "Waiting for you to allow USB debugging on the tablet…");
+
+    // The Sync tab's own target hides its cards; stacking caps at MAX_CARDS.
+    eq("hidden: the target the Sync tab shows", C.connectCards({ ...base, prompts: [prompt({ targets: [frozen], attention: [] })], hiddenTargetId: "a" }).cards.length, 0);
+    const many = ["p1", "p2", "p3"].map((id, i) => ({ ...prompt({ targets: [frozen], attention: [] }), promptId: id, createdAt: T0 + i }));
+    r = C.connectCards({ ...base, prompts: many });
+    eq("stack: two cards and +1 more", [r.cards.length, r.more], [2, 1]);
+
+    // Rail badge.
+    const conn = { targets: [tgt("a")], folderPresence: { a: true }, devices: [], job: null, dismissed: {} };
+    const sel = S.series.filter((x) => V.rowView(x).selected > 0).length;
+    check("rail: the fixture has ticked series", sel > 0, String(sel));
+    eq("rail: count = series with ticked changes on connected targets", C.railBadge({ ...conn, plans: { a: { summary: S } } }), { count: sel, dot: null });
+    eq("rail: a disconnected target doesn't count", C.railBadge({ ...conn, folderPresence: { a: false }, plans: { a: { summary: S } } }).count, 0);
+    eq("rail: a stale summary still counts", C.railBadge({ ...conn, plans: { a: { summary: S, stale: true } } }).count, sel);
+    eq("rail: an automatic plan doesn't pulse", C.railBadge({ ...conn, plans: {}, job: { state: "running", phase: "plan", auto: true } }).dot, null);
+    eq("rail: a user's job pulses", C.railBadge({ ...conn, plans: {}, job: { state: "running", phase: "plan", auto: false } }).dot, "pulse");
+    eq("rail: a refusal is red (and beats the pulse)", C.railBadge({ ...conn, plans: { a: { refusal: { code: "record-mismatch" } } }, job: { state: "running", phase: "apply" } }).dot, "red");
+    eq("rail: needs-mode is a question, not red", C.railBadge({ ...conn, plans: { a: { refusal: { code: "needs-mode" } } } }).dot, null);
+    const failedRun = { runId: 7, phase: "apply", status: "failed", summary: { reason: "no-space" } };
+    eq("rail: a failed last run is red", C.railBadge({ ...conn, plans: { a: { lastRun: failedRun } } }).dot, "red");
+    eq("rail: …until dismissed", C.railBadge({ ...conn, plans: { a: { lastRun: failedRun } }, dismissed: { a: 7 } }).dot, null);
+    eq("rail: a plan-changed block isn't red", C.railBadge({ ...conn, plans: { a: { lastRun: { ...failedRun, summary: { refusal: { code: "blocked", blocking: [{ kind: "plan-changed" }] } } } } } }).dot, null);
+    eq("rail: an unauthorized configured tablet is red", C.railBadge({ ...conn, targets: [tgt("a", { kind: "adb", serial: "S1" })], devices: [dev("unauthorized")], plans: {} }).dot, "red");
+    eq("rail: 99+", [C.badgeText(99), C.badgeText(100)], ["99", "99+"]);
+  }
+
   const built = [];
   const walk = (d) => {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {

@@ -1584,12 +1584,7 @@ function promptSummary(plan, selected, device) {
       bytes: pushes.reduce((n, op) => n + op.size, 0),
     });
   }
-  let verifyBytes = 0;
-  const dev = device || {};
-  for (const nv of plan.needsVerify) {
-    const f = dev.folders instanceof Map ? dev.folders.get(nv.folder) : null;
-    if (f && f.files) verifyBytes += f.files.reduce((n, x) => n + (x.size || 0), 0);
-  }
+  const verifyBytes = verifyBytesOf(device, plan.needsVerify.map((nv) => nv.folder));
   return {
     targetId: plan.targetId,
     targetName: plan.targetName,
@@ -1612,12 +1607,36 @@ function promptSummary(plan, selected, device) {
  * One prompt per device listing each of its targets (rule 10). The prompt
  * offers Review, never a one-click apply (approved design D2).
  */
-function promptCard(serial, summaries) {
+/**
+ * Bytes a read-back of `folders` would read: the device listing's sizes.
+ * The prompt's "Set up (reads ~N GB)" and prepare's needs-mode refusal both
+ * use it, so the card and the Sync tab's chooser name one number.
+ */
+function verifyBytesOf(device, folders) {
+  const dev = device || {};
+  let n = 0;
+  for (const name of folders || []) {
+    const f = dev.folders instanceof Map ? dev.folders.get(name) : null;
+    if (f && f.files) n += f.files.reduce((m, x) => m + (x.size || 0), 0);
+  }
+  return n;
+}
+
+/**
+ * The connect prompt's card (service.js _afterJob, one per connection).
+ * `attention` = the connection's targets whose connect plan was refused or
+ * failed ({targetId, targetName, code, message, firstSync, folders, bytes};
+ * UI-pass U3-4): a target that needs an answer is reason enough to ask, so
+ * the card is empty only when nothing is to do AND nothing needs attention.
+ */
+function promptCard(serial, summaries, attention) {
   const targets = (summaries || []).filter((s) => s && !s.nothingToDo);
+  const att = (attention || []).filter(Boolean);
   return {
     serial,
     targets,
-    empty: targets.length === 0,
+    attention: att,
+    empty: targets.length === 0 && att.length === 0,
   };
 }
 
@@ -1969,6 +1988,7 @@ module.exports = {
   reconcileForApply,
   promptSummary,
   promptCard,
+  verifyBytesOf,
   libraryStatus,
   chapterStrip,
   seriesDetail,
