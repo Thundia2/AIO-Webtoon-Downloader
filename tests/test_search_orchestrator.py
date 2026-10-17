@@ -406,3 +406,50 @@ def test_anchored_hits_do_not_chain():
     })
     assert _where(cands, "beta") is not None
     assert _where(cands, "gamma") is None
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Verified zero count sinks (plan sync-temp/plans/mangadex-link-outs.md).
+# MangaDex Goblin Slayer: 203 rows, all publisher link-outs; its search()
+# counts with includeExternalUrl=0, so the count is 0. No peer hint or
+# lastChapter is needed for the sink.
+# ────────────────────────────────────────────────────────────────────────
+
+def test_source_sinks_on_verified_zero_count_only():
+    from sites.search_orchestrator import SourceEntry, _source_sinks
+
+    def src(count):
+        return SourceEntry(site="s", url="u", title="t", cover=None,
+                           title_match=1.0, seed_quality=0.9,
+                           actual_chapter_count=count)
+
+    assert _source_sinks(src(0)) is True
+    assert _source_sinks(src(None)) is False  # unmeasured never sinks
+    assert _source_sinks(src(5)) is False
+
+
+def test_zero_count_source_sinks_below_peers_without_a_peer_hint():
+    """The zero-count site is an official publisher (would otherwise rank
+    first) and no site exposes a chapter_count_hint, so the cross-site
+    dmca/count-outlier check can't fire; the zero count alone sinks it."""
+    from sites.base import BaseSiteHandler, SearchHit
+
+    def _make(name, count, official):
+        class _H(BaseSiteHandler):
+            OFFICIAL_PUBLISHER = official
+
+            def search(self, query, *a, **kw):
+                return [SearchHit(site=name, title=query, url=f"https://{name}.example/s",
+                                  cover=None, alt_titles=[], year=None, language=None,
+                                  chapter_count_hint=None, raw_score=1.0,
+                                  actual_chapter_count=count)]
+        _H.name = name
+        _H.domains = (f"{name}.example",)
+        return _H()
+
+    handlers = [_make("zerosite", 0, True), _make("realsite", 113, False)]
+    with patch("sites.iter_search_capable_handlers", lambda: iter(handlers)):
+        with patch("sites.get_handler_by_name", lambda _: None):
+            cands = search_all("Goblin Slayer", MagicMock(return_value=MagicMock()), MagicMock())
+    sites = [s.site for s in cands[0].sources]
+    assert sites == ["realsite", "zerosite"]

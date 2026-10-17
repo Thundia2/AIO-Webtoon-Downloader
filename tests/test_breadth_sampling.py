@@ -515,3 +515,41 @@ def test_probe_aggregate_genuine_failures_still_return_zero_not_none():
     assert metadata["samples_succeeded"] == 0
     assert metadata["samples_timed_out"] == 0
     assert metadata["cdn_reliability"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Placeholder chapters in the probe (plan sync-temp/plans/mangadex-link-outs.md)
+# ---------------------------------------------------------------------------
+
+def test_probe_all_mangadex_link_outs_scores_measured_zero_without_network():
+    """A MangaDex list made only of publisher link-outs must score a MEASURED
+    0.0 (ranks last), not None (None falls to the cover probe, then the 0.93
+    seed, and would rank it HIGHER). The real get_chapter_images short-circuits
+    each pick with IncompleteChapterError, so no request is ever made."""
+    from sites.mangadex import MangaDexSiteHandler
+
+    rows = [
+        {"hid": f"x{i}", "url": f"x{i}", "chap": str(i), "_locked": True,
+         "_locked_kind": "external", "_external_host": "global.manga-up.com",
+         "_pages": 1}
+        for i in range(1, 21)
+    ]
+
+    class _LinkOutOnly(MangaDexSiteHandler):
+        def fetch_comic_context(self, url, scraper, make_request):
+            return MagicMock(comic={}, title="t", identifier="t")
+
+        def get_chapters(self, context, scraper, language, make_request):
+            return rows
+
+    no_net = MagicMock(side_effect=AssertionError("network used"))
+    scraper = MagicMock()
+    scraper.get.side_effect = AssertionError("network used")
+    hit = SearchHit(site="mangadex", title="Goblin Slayer", url="https://mangadex.org/title/gs")
+    result = _LinkOutOnly()._probe_chapter_aggregate(hit, scraper, no_net)
+    assert result is not None
+    score, metadata = result
+    assert score == 0.0
+    assert metadata["samples_succeeded"] == 0
+    assert metadata["samples_attempted"] > 0
+    assert no_net.call_count == 0 and scraper.get.call_count == 0

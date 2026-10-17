@@ -4,6 +4,7 @@ import logging
 import queue
 import random
 import re
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -168,6 +169,40 @@ def _enqueue_report(url: str, payload: dict) -> None:
         # make the actual download slower). No log: silent drop matches
         # the worker's silent POST-failure handling.
         pass
+
+
+# --- Publisher link-out chapters ---------------------------------------------
+# Licensed publishers (MangaPlus, Manga UP!, K MANGA, Viz, ...) list chapters on
+# MangaDex that live on THEIR site: `attributes.externalUrl` is set and the row
+# has no real pages. Two shapes, both measured live 2026-10-17:
+#   - pages 0: /at-home/server returns no images at all;
+#   - pages 1: it serves exactly one image, an "EXTERNAL CHAPTER ... open the
+#     source link" card, which used to download as a 1-page chapter.
+# A row with externalUrl AND real pages (one bilibili row, 136 pages) is a
+# normal chapter. Link-outs become tapas-style `_locked` placeholders: they stay
+# in the list, numbered, so the ranker can prefer a readable version of that
+# number and --multi-source can fill it from another site, but they are never
+# downloaded as content (get_chapter_images raises reason "external_link").
+# Consumers: grep is_placeholder_chapter / readable_chapters (sites/base.py).
+_LINK_OUT_MAX_PAGES = 1
+
+
+def _is_link_out(external_url, page_count) -> bool:
+    """True for a publisher-hosted row (see the block above). A missing or
+    non-int page count counts as no pages: nothing downloadable is known."""
+    if not external_url:
+        return False
+    if isinstance(page_count, bool) or not isinstance(page_count, int):
+        return True
+    return page_count <= _LINK_OUT_MAX_PAGES
+
+
+def _external_host(external_url: str) -> str:
+    try:
+        host = urlparse(str(external_url)).netloc.lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
 
 
 class MangaDexSiteHandler(BaseSiteHandler):
@@ -398,6 +433,7 @@ class MangaDexSiteHandler(BaseSiteHandler):
             params["translatedLanguage[]"] = languages
 
         chapters: List[Dict] = []
+        link_out_hosts: Dict[str, int] = {}
         offset = 0
         while True:
             query_params = []
@@ -479,36 +515,48 @@ class MangaDexSiteHandler(BaseSiteHandler):
                     )
                 page_count = attr.get("pages")
                 external_url = attr.get("externalUrl")
-                chapters.append(
-                    {
-                        "hid": chapter_id,
-                        "chap": attr.get("chapter") or attr.get("title") or attr.get("volume"),
-                        "title": attr.get("title"),
-                        "url": chapter_id,
-                        "_groups": groups,
-                        "group_name": ", ".join(
-                            g.name for g in groups if g.name
-                        ) or None,
-                        "language": attr.get("translatedLanguage"),
-                        "uploaded": self._parse_timestamp(attr.get("publishAt")),
-                        "is_official": is_official,
-                        "publisher": publisher_canonical,
-                        "_pages": page_count if isinstance(page_count, int) else None,
-                        "_external_url": external_url,
-                        # Licensed publishers (MangaPlus, Viz…) publish chapters
-                        # that live on THEIR site: pages:0 + externalUrl set.
-                        # /at-home/server returns no images for these, so
-                        # get_chapter_images raises "chapter has no pages".
-                        # They are RANKED DOWN, never filtered out — filtering
-                        # would empty the list entirely for a DMCA'd series like
-                        # One Piece, whose every English chapter is this shape.
-                        # Grep _undownloadable: sites/base.py:_rank_version.
-                        "_undownloadable": bool(external_url) and page_count == 0,
-                    }
-                )
+                row = {
+                    "hid": chapter_id,
+                    "chap": attr.get("chapter") or attr.get("title") or attr.get("volume"),
+                    "title": attr.get("title"),
+                    "url": chapter_id,
+                    "_groups": groups,
+                    "group_name": ", ".join(
+                        g.name for g in groups if g.name
+                    ) or None,
+                    "language": attr.get("translatedLanguage"),
+                    "uploaded": self._parse_timestamp(attr.get("publishAt")),
+                    "is_official": is_official,
+                    "publisher": publisher_canonical,
+                    "_pages": page_count if isinstance(page_count, int) else None,
+                    "_external_url": external_url,
+                }
+                if _is_link_out(external_url, page_count):
+                    # Kept, never filtered: filtering would empty a series like
+                    # One Piece (every English row is a link-out) and leave its
+                    # numbers unfillable from other sites. See the block above
+                    # _LINK_OUT_MAX_PAGES.
+                    host = _external_host(external_url) or "unknown host"
+                    row["_locked"] = True
+                    row["_locked_kind"] = "external"
+                    row["_external_host"] = host
+                    link_out_hosts[host] = link_out_hosts.get(host, 0) + 1
+                chapters.append(row)
             offset += len(data)
             if offset >= total or not data:
                 break
+        if link_out_hosts:
+            # stderr, not stdout: search processes print their JSON on stdout.
+            by_host = ", ".join(
+                f"{host}: {n}"
+                for host, n in sorted(link_out_hosts.items(), key=lambda kv: -kv[1])
+            )
+            print(
+                f"[i] mangadex: {sum(link_out_hosts.values())} of {len(chapters)} "
+                f"chapter rows are publisher links ({by_host}); they can't be "
+                f"downloaded from MangaDex.",
+                file=sys.stderr,
+            )
         return chapters
 
     # ---------------------------------------------- chapter image download
@@ -764,6 +812,20 @@ class MangaDexSiteHandler(BaseSiteHandler):
             downloader/downloader.py and the MangaDex docs (api.mangadex
             .org/docs/04-chapter/retrieving-chapter/).
         """
+        if chapter.get("_locked"):
+            # Publisher link-out flagged at list time (see _is_link_out).
+            # Short-circuit BEFORE any request: /at-home/server would serve no
+            # pages or the one-page "EXTERNAL CHAPTER" card. The reason is a
+            # permanent skip (aio-dl.py _PERMANENT_SKIP_REASONS), so the
+            # downloader fills the number from an alternative site or skips
+            # it, never retries; the search probe scores it as a failed sample.
+            raise IncompleteChapterError(
+                pages_ok=0,
+                pages_total=0,
+                host=chapter.get("_external_host") or "mangadex.org",
+                reason="external_link",
+            )
+
         chapter_id = chapter.get("url") or chapter.get("hid")
         if not chapter_id:
             raise RuntimeError("MangaDex chapter missing identifier.")
@@ -1134,7 +1196,12 @@ class MangaDexSiteHandler(BaseSiteHandler):
         for hit in hits[:_DMCA_PROBE_MAX_HITS]:
             manga_id = hit.url.rsplit("/", 1)[-1]
             try:
-                params = [("manga", manga_id), ("limit", "1")]
+                # includeExternalUrl=0: publisher link-outs (see _is_link_out)
+                # are rows MangaDex can't serve; counting them read Goblin
+                # Slayer as 203 chapters when it has none readable. Same
+                # request, server-side filter. It also drops the rare real
+                # externalUrl row with pages (accepted: count only).
+                params = [("manga", manga_id), ("limit", "1"), ("includeExternalUrl", "0")]
                 for lang in languages:
                     params.append(("translatedLanguage[]", lang))
                 ch_url = f"{self._API_BASE}/chapter?" + "&".join(

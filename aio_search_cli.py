@@ -58,7 +58,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 from sites import get_handler_by_name
-from sites.base import SearchHit
+from sites.base import SearchHit, readable_chapters
 from sites.chapter_merger import _classify_main_chapters, align_chapter_lists
 from sites.fetch_memo import FetchMemo
 from sites.search_orchestrator import (
@@ -421,17 +421,16 @@ def _fetch_chapters_for_winner(
         if not isinstance(chapters, list):
             chapters = []
         # An ALT source must never OFFER a chapter it can't serve. tapas emits
-        # premium/wait-to-unlock episodes as `_locked` placeholders — meaningful
-        # only when tapas is the PRIMARY (where --multi-source fills them from
-        # peers). Acting as an alternative here, tapas can't deliver those pages,
-        # so drop them; otherwise the aligner would advertise a tapas-alt locked
-        # placeholder as a "fallback" that always fails when tried. Cross-file:
-        # grep _locked / _process_chapter_strict in aio-dl.py. No-op for sites
-        # that never emit _locked.
-        chapters = [
-            c for c in chapters
-            if not (isinstance(c, dict) and c.get("_locked"))
-        ]
+        # premium/wait-to-unlock episodes and MangaDex emits publisher link-outs
+        # as placeholders — meaningful only on the PRIMARY (where --multi-source
+        # fills them from peers). Acting as an alternative, such a site can't
+        # deliver those pages, so drop them; otherwise the aligner would
+        # advertise a placeholder as a "fallback" that always fails when tried
+        # (or, for a MangaDex `pages: 1` link-out, "rescue" a chapter with the
+        # EXTERNAL CHAPTER card). An empty list after this means the site has
+        # nothing readable — the primary switch reads that via readable_sites.
+        # Cross-file: sites/base.py is_placeholder_chapter.
+        chapters = readable_chapters(chapters)
         return {
             "site": source.site, "url": source.url,
             "chapters": chapters, "scraper": scraper, "handler": handler, "context": ctx,
@@ -476,6 +475,16 @@ def _fetch_chapters_for_winner(
             f"sources in {time.monotonic() - _fetch_started:.1f}s{slow_str}"
         )
     return [r for r in results if r is not None]
+
+
+def _readable_sites(source_records: list) -> list:
+    """Sites from _fetch_chapters_for_winner records that can serve as a
+    download primary: a context and a non-empty list (placeholders are
+    already stripped there, so non-empty means readable chapters exist)."""
+    return [
+        r["site"] for r in source_records
+        if r.get("chapters") and r.get("context") is not None and r.get("handler") is not None
+    ]
 
 
 def run_search_mode(
@@ -992,6 +1001,7 @@ def find_alternatives_for_direct_url(
         "consensus_set": None,
         "consensus_max": None,
         "resolved_sources": [],
+        "readable_sites": [],
     }
     # Step 1: title.
     title = (
@@ -1173,6 +1183,9 @@ def find_alternatives_for_direct_url(
              "cover": getattr(s, "cover", None)}
             for s in alt_sources
         ],
+        # Sites whose fetched list had readable chapters, in fetch order. The
+        # primary switch in aio-dl.py reads it (grep _pick_primary_switch).
+        "readable_sites": _readable_sites(source_records),
     }
 
 
@@ -1231,6 +1244,7 @@ def build_alternatives_from_prefetched(
         "consensus_set": None,
         "consensus_max": None,
         "resolved_sources": [],
+        "readable_sites": [],
     }
 
     if not prefetched_path or not _os.path.exists(prefetched_path):
@@ -1295,6 +1309,7 @@ def build_alternatives_from_payload(
         "consensus_set": None,
         "consensus_max": None,
         "resolved_sources": [],
+        "readable_sites": [],
     }
 
     if not isinstance(payload, dict):
@@ -1452,6 +1467,9 @@ def build_alternatives_from_payload(
              "cover": getattr(s, "cover", None)}
             for s in alt_sources
         ],
+        # Sites whose fetched list had readable chapters, in fetch order. The
+        # primary switch in aio-dl.py reads it (grep _pick_primary_switch).
+        "readable_sites": _readable_sites(source_records),
     }
 
 

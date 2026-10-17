@@ -104,6 +104,19 @@ export default function SearchSourceCard({
   // tooltip, and the ⚠ icon next to the score when an outlier flag is set.
   const m = source.img_quality_metadata;
   const formatLabel = m?.format ? m.format.toLowerCase() : null;
+  // Chapter count: the VERIFIED count when the site measured one, else its
+  // metadata claim. MangaDex's verified count excludes publisher link-outs
+  // (sites/mangadex.py, grep includeExternalUrl), so Goblin Slayer reads 0,
+  // not the 203 rows it lists. Same rule as Device Sync's Find sources
+  // (electron/sync/find-sources.js, grep actual_chapter_count) and Android
+  // (SearchModels.kt chapterCount).
+  const chapterCount = source.actual_chapter_count ?? source.chapter_count_hint ?? null;
+  const chapterCountTitle =
+    source.actual_chapter_count != null &&
+    source.chapter_count_hint != null &&
+    source.actual_chapter_count !== source.chapter_count_hint
+      ? `${source.actual_chapter_count} downloadable · the site's info claims ${source.chapter_count_hint}`
+      : undefined;
   const displayCover = source.cover && !imgErr
     ? source.cover
     : (fallbackCover && !fallbackImgErr ? fallbackCover : null);
@@ -166,7 +179,10 @@ export default function SearchSourceCard({
 
         {/* DMCA overlay — top-right corner, tucked over cover */}
         {source.dmca_likely && (
-          <div className="absolute top-1.5 right-1.5">
+          <div
+            className="absolute top-1.5 right-1.5"
+            title="Most chapters this site lists can't be downloaded from it: taken down (DMCA) or hosted by the publisher (a link out, no pages)."
+          >
             <Badge variant="destructive" className="text-[9px] px-1.5 py-0 leading-tight">
               DMCA
             </Badge>
@@ -238,9 +254,12 @@ export default function SearchSourceCard({
               {formatLabel}
             </span>
           )}
-          {source.chapter_count_hint != null && (
-            <span className="text-[10px] text-muted-foreground tabular-nums shrink-0 ml-auto">
-              {source.chapter_count_hint}ch
+          {chapterCount != null && (
+            <span
+              className="text-[10px] text-muted-foreground tabular-nums shrink-0 ml-auto"
+              title={chapterCountTitle}
+            >
+              {chapterCount}ch
             </span>
           )}
         </div>
@@ -267,7 +286,7 @@ export default function SearchSourceCard({
               ? ` · ${m.samples_succeeded ?? 0}/${m.samples_attempted} samples` +
                 ((m?.samples_timed_out ?? 0) > 0 ? ` (${m.samples_timed_out} timed out)` : "")
               : "") +
-            (source.dmca_likely ? " · DMCA-flagged" : "")
+            (source.dmca_likely ? " · DMCA / publisher-hosted" : "")
           }
         >
           <div

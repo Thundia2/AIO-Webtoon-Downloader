@@ -314,3 +314,110 @@ def test_extension_from_filename_recognizes_png_jpg_webp():
     assert handler._extension_from_filename("noext") == ".jpg"
     # Trailing dot → fallback
     assert handler._extension_from_filename("trailing.") == ".jpg"
+
+
+# --- Publisher link-outs (plan sync-temp/plans/mangadex-link-outs.md, L1) ---
+# MangaDex lists licensed chapters that live on the publisher's site as rows
+# with `externalUrl` and pages 0 or 1 (the 1 page is an "EXTERNAL CHAPTER"
+# card). get_chapters must keep them as `_locked` placeholders, and
+# get_chapter_images must refuse them before any request.
+
+from sites.base import IncompleteChapterError, SiteComicContext  # noqa: E402
+
+
+def _chapter_row(cid, chap, *, pages, external=None, unavailable=False):
+    attrs = {
+        "chapter": chap,
+        "title": None,
+        "translatedLanguage": "en",
+        "publishAt": "2024-01-01T00:00:00+00:00",
+        "pages": pages,
+        "externalUrl": external,
+    }
+    if unavailable:
+        attrs["isUnavailable"] = True
+    return {"id": cid, "attributes": attrs, "relationships": []}
+
+
+def _list_chapters(rows):
+    handler = MangaDexSiteHandler()
+    ctx = SiteComicContext(comic={"_manga_id": "m1"}, title="T", identifier="m1")
+    resp = MagicMock()
+    resp.json.return_value = {"data": rows, "total": len(rows)}
+    make_request = MagicMock(return_value=resp)
+    return handler.get_chapters(ctx, MagicMock(), "en", make_request)
+
+
+def test_link_out_rows_become_external_placeholders(capsys):
+    rows = [
+        _chapter_row("hosted", "1", pages=20),
+        _chapter_row("ext0", "2", pages=0, external="https://mangaplus.shueisha.co.jp/viewer/1"),
+        _chapter_row("ext1", "2.1", pages=1, external="https://www.global.manga-up.com/x"),
+        _chapter_row("extreal", "3", pages=136, external="https://www.bilibilicomics.com/x"),
+        _chapter_row("extnone", "4", pages=None, external="https://viz.com/x"),
+        _chapter_row("gone", "5", pages=10, unavailable=True),
+    ]
+    by_id = {c["hid"]: c for c in _list_chapters(rows)}
+
+    assert "gone" not in by_id  # isUnavailable rows stay dropped
+    assert not by_id["hosted"].get("_locked")
+    assert not by_id["extreal"].get("_locked")  # real pages: a normal chapter
+    for cid, host in (
+        ("ext0", "mangaplus.shueisha.co.jp"),
+        ("ext1", "global.manga-up.com"),
+        ("extnone", "viz.com"),
+    ):
+        row = by_id[cid]
+        assert row["_locked"] is True
+        assert row["_locked_kind"] == "external"
+        assert row["_external_host"] == host
+        assert row["_external_url"]
+    err = capsys.readouterr().err
+    assert "3 of 5 chapter rows are publisher links" in err
+
+
+def test_no_link_outs_prints_nothing(capsys):
+    _list_chapters([_chapter_row("a", "1", pages=12)])
+    assert "publisher links" not in capsys.readouterr().err
+
+
+def test_get_chapter_images_refuses_link_out_before_any_request():
+    handler = MangaDexSiteHandler()
+    scraper = MagicMock()
+    scraper.get.side_effect = AssertionError("no request for a link-out")
+    make_request = MagicMock(side_effect=AssertionError("no request for a link-out"))
+    chapter = {
+        "hid": "ext1", "url": "ext1", "chap": "2.1",
+        "_locked": True, "_locked_kind": "external",
+        "_external_host": "global.manga-up.com",
+    }
+    with pytest.raises(IncompleteChapterError) as exc:
+        handler.get_chapter_images(chapter, scraper, make_request)
+    assert exc.value.reason == "external_link"
+    assert exc.value.host == "global.manga-up.com"
+    assert scraper.get.call_count == 0 and make_request.call_count == 0
+
+
+def test_search_count_excludes_external_rows():
+    """The per-hit count request carries includeExternalUrl=0, and a zero
+    verified count lands on the hit (the orchestrator sinks it)."""
+    handler = MangaDexSiteHandler()
+    calls = []
+
+    def make_request(url, scraper):
+        calls.append(url)
+        resp = MagicMock()
+        if "/manga?" in url:
+            resp.json.return_value = {"data": [{
+                "id": "gs",
+                "attributes": {"title": {"en": "Goblin Slayer"}, "lastChapter": None},
+                "relationships": [],
+            }]}
+        else:
+            resp.json.return_value = {"total": 0, "data": []}
+        return resp
+
+    hits = handler.search("Goblin Slayer", MagicMock(), make_request)
+    count_urls = [u for u in calls if "/chapter?" in u]
+    assert count_urls and all("includeExternalUrl=0" in u for u in count_urls)
+    assert hits[0].actual_chapter_count == 0

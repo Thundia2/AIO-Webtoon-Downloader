@@ -392,7 +392,8 @@ class GroupSelectionPolicy:
       - census:        group match_key -> number of DISTINCT chapter numbers
                        that group supplies for THIS series. The strongest
                        zero-cost "is this the real TL or a filler dump" signal.
-      - census_total:  distinct chapter numbers in the series, the denominator.
+      - census_total:  distinct chapter numbers with a readable version, the
+                       denominator (build_group_census).
       - mtl:           "avoid" (default: rank last, still use when it's the only
                        version) | "allow" (ignore MTL entirely) | "exclude"
                        (skip chapters whose every version is CONFIRMED MTL).
@@ -486,6 +487,29 @@ def _coerce_pages(version: Dict) -> Optional[int]:
     return None
 
 
+def is_placeholder_chapter(chapter: Any) -> bool:
+    """True for a chapter row that is listed but can never be downloaded as
+    content: a `_locked` placeholder (tapas premium episodes; MangaDex
+    publisher link-outs, `_locked_kind="external"`) or a row a handler marked
+    `_undownloadable`.
+
+    Placeholders stay in chapter lists on purpose: the number is still known,
+    so the version ranker can prefer a readable version of it and
+    --multi-source can fill it from another site. Everything that must not
+    treat one as content goes through this helper or readable_chapters:
+    select_best_chapter_version, build_group_census, aio_search_cli's alt
+    chapter lists, the search T3 pairwise sampler (grep both names).
+    """
+    if not isinstance(chapter, dict):
+        return False
+    return bool(chapter.get("_locked")) or chapter.get("_undownloadable") is True
+
+
+def readable_chapters(chapters: Optional[List[Dict]]) -> List[Dict]:
+    """The rows of `chapters` that are real content (see is_placeholder_chapter)."""
+    return [c for c in (chapters or []) if not is_placeholder_chapter(c)]
+
+
 def build_group_census(
     handler: "BaseSiteHandler", chapters_by_num: Dict[str, List[Dict]]
 ) -> Tuple[Dict[str, int], int]:
@@ -501,18 +525,27 @@ def build_group_census(
 
     Runtime-only: never persisted, never an argparse dest, never in
     gating_hash, so it cannot desync a resume.
+
+    Placeholders (is_placeholder_chapter) are not a group's work: a publisher
+    whose every row is a MangaDex link-out supplies nothing. The total counts
+    only numbers with a readable version, so a series that is half link-outs
+    doesn't push its real translator out of the top band.
     """
     census: Dict[str, int] = {}
+    readable_total = 0
     for versions in chapters_by_num.values():
+        readable = readable_chapters(versions)
+        if readable:
+            readable_total += 1
         seen_here: set = set()
-        for version in versions:
+        for version in readable:
             for info in handler.get_group_infos(version):
                 key = handler.get_group_match_key(info.name)
                 if key:
                     seen_here.add(key)
         for key in seen_here:
             census[key] = census.get(key, 0) + 1
-    return census, len(chapters_by_num)
+    return census, readable_total
 
 
 # --- Search image-quality probe: breadth-sample concurrency -----------------
@@ -1468,12 +1501,13 @@ class BaseSiteHandler:
                            pre-filtered so an excluded-but-only version still
                            obeys the allow_group_fallback contract instead of
                            silently vanishing.
-         1 downloadable    A MangaDex external chapter (pages:0 + externalUrl)
-                           is metadata, not a chapter — ranking it first trades
-                           a working download for a guaranteed abort. This tier
-                           is what makes the official tier safe at all. Set
-                           ONLY from an explicit handler flag, never inferred
-                           from a missing field.
+         1 downloadable    A placeholder (is_placeholder_chapter: a MangaDex
+                           publisher link-out, a tapas locked episode) is
+                           metadata, not a chapter. select_best_chapter_version
+                           already ranks among readable versions only when any
+                           exist, so this tier is a backstop for an
+                           all-placeholder pool. Set ONLY from an explicit
+                           handler flag, never inferred from a missing field.
          2 mtl_rank        The headline fix. Above official because an
                            official-looking MTL doesn't exist, but a
                            high-upvote MTL demonstrably does.
@@ -1525,7 +1559,7 @@ class BaseSiteHandler:
 
         return (
             0 if sig["excluded"] else 1,
-            0 if version.get("_undownloadable") is True else 1,
+            0 if is_placeholder_chapter(version) else 1,
             sig["mtl_rank"] if ctx["mtl_live"] else 2,
             not_placeholder,
             official_rank,
@@ -1573,22 +1607,46 @@ class BaseSiteHandler:
             if log_debug_fn:
                 log_debug_fn(msg)
 
+        # Readable first: when any version of this number is real content,
+        # placeholders (is_placeholder_chapter: MangaDex publisher link-outs,
+        # tapas locked episodes) leave the pool entirely, so they can't win on
+        # official/census, can't skew the page-count median, and a --group
+        # naming the publisher finds no match here and takes the normal group
+        # fallback (user decision 2026-10-17, plan
+        # sync-temp/plans/mangadex-link-outs.md). A placeholder-only number
+        # keeps its placeholders, so the downloader can still fill that number
+        # from another site.
+        readable = readable_chapters(versions)
+        placeholders_dropped = len(versions) - len(readable) if readable else 0
+        pool = readable or versions
+
         # --mtl exclude: drop CONFIRMED machine translations outright. Never
         # `suspect` — hard-dropping real chapters on a heuristic is not a
-        # trade the flag is allowed to make.
-        pool = versions
+        # trade the flag is allowed to make. Runs over the readable pool. When
+        # every readable version is MTL but the number also has placeholders,
+        # the placeholders come back instead of a skip, so the downloader can
+        # fill the number from another site exactly as for a placeholder-only
+        # number (user decision 2026-10-17, plan mangadex-link-outs.md L3).
         excluded_mtl = 0
         if policy.mtl == "exclude":
-            probe_ctx = self._build_rank_context(versions, policy)
+            probe_ctx = self._build_rank_context(pool, policy)
             keep = [
-                v for i, v in enumerate(versions)
+                v for i, v in enumerate(pool)
                 if probe_ctx["signals"][i]["mtl_verdict"] != MTL_CONFIRMED
             ]
-            excluded_mtl = len(versions) - len(keep)
-            if not keep:
+            excluded_mtl = len(pool) - len(keep)
+            if not keep and placeholders_dropped:
                 _debug(
-                    f"    Ch {versions[0].get('chap', '?')}: every version is "
-                    f"machine-translated and --mtl exclude is set. Skipping."
+                    f"    Ch {pool[0].get('chap', '?')}: every readable version "
+                    f"is machine-translated and --mtl exclude is set; keeping "
+                    f"the placeholder so another site can supply it."
+                )
+                keep = [v for v in versions if is_placeholder_chapter(v)]
+                placeholders_dropped = 0
+            elif not keep:
+                _debug(
+                    f"    Ch {pool[0].get('chap', '?')}: every readable version "
+                    f"is machine-translated and --mtl exclude is set. Skipping."
                 )
                 return None
             pool = keep
@@ -1629,7 +1687,9 @@ class BaseSiteHandler:
                 bits.append(sig["mtl_verdict"] + " MTL")
             if sig["is_official"]:
                 bits.append("official")
-            if version.get("_undownloadable") is True:
+            if version.get("_locked_kind") == "external":
+                bits.append("publisher link")
+            elif is_placeholder_chapter(version):
                 bits.append("no pages")
             return f"'{name}'" + (f" [{', '.join(bits)}]" if bits else "")
 
@@ -1680,7 +1740,13 @@ class BaseSiteHandler:
                 more = f" +{len(losers) - 3} more" if len(losers) > 3 else ""
                 tail = f" over {shown}{more}"
             reason = f" [on {why}]" if why else ""
-            _debug(f"    Ch {chap_label}: {prefix}{_describe(winner)}{tail}{reason}.")
+            dropped = (
+                f" ({placeholders_dropped} unreadable version(s) set aside)"
+                if placeholders_dropped else ""
+            )
+            _debug(
+                f"    Ch {chap_label}: {prefix}{_describe(winner)}{tail}{reason}{dropped}."
+            )
 
         if not preferred_groups:
             winner, why = _pick(pool)

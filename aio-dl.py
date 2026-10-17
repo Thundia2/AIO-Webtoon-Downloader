@@ -63,6 +63,8 @@ from sites.base import (
     IncompleteChapterError,
     GroupSelectionPolicy,
     build_group_census,
+    is_placeholder_chapter,
+    readable_chapters,
 )
 from sites.group_quality import MTL_CONFIRMED, classify_mtl
 from sites._image_io import (
@@ -255,10 +257,31 @@ class ChapterPermanentSkipError(Exception):
 #     still reaches the alt-source loop first, and that is the point — the
 #     rescue that works is an ALTERNATE SOURCE serving a format this build can
 #     read, not a retry.
+#   - "external_link" (sites/mangadex.py): a publisher link-out row (MangaPlus,
+#     Manga UP!, …) emitted as a `_locked` placeholder, same mechanism as tapas
+#     "locked". MangaDex hosts no pages for it, so only an alternative site can
+#     supply the number.
+# The end-of-run missed replay skips every reason in this set (grep
+# _replayable_missed): replaying re-runs the same alternatives and only sleeps.
 _PERMANENT_SKIP_REASONS = frozenset({
     "mature_login_required", "locked", "comix_pages_stalled",
-    "decode_dropped_pages",
+    "decode_dropped_pages", "external_link",
 })
+
+
+def _replayable_missed(entries: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split missed-chapter entries into (replay, keep_as_missed).
+
+    An entry whose reason is a permanent skip already went through the alt
+    loop and failed deterministically; replaying it at end-of-run costs the
+    backoff sleeps (min(60, 2**attempt) per attempt) and cannot change the
+    outcome — on a series with many placeholders the replay was mostly sleep.
+    """
+    replay: List[Dict[str, Any]] = []
+    keep: List[Dict[str, Any]] = []
+    for e in entries:
+        (keep if e.get("reason") in _PERMANENT_SKIP_REASONS else replay).append(e)
+    return replay, keep
 
 # Seconds to wait before the ONE quick primary retry a near-miss chapter gets
 # ahead of --multi-source (grep NEAR-MISS in _process_chapter_strict). Short on
@@ -1341,6 +1364,220 @@ def _chap_as_float(chap) -> Optional[float]:
     # valid chapter numbers — inf/nan would crash int(cf) in _is_numeric_partial
     # and poison the (is-None, value) sort keys. Residual follow-up.
     return f if math.isfinite(f) else None
+
+
+def _placeholder_kind(ch: Dict[str, Any]) -> str:
+    """'publisher-hosted' for a MangaDex link-out (or the legacy
+    `_undownloadable` flag, which meant the same thing), else 'premium/locked'
+    (tapas WAIT_OR_MUST_PAY). Only meaningful when is_placeholder_chapter(ch)."""
+    if ch.get("_locked_kind") == "external" or ch.get("_undownloadable") is True:
+        return "publisher-hosted"
+    return "premium/locked"
+
+
+def _split_listable_and_locked(
+    pool: List[Dict[str, Any]],
+) -> Tuple[Dict[str, List[Dict[str, Any]]], List[str]]:
+    """--list-chapters' split of a raw chapter pool.
+
+    Returns (versions_by_label, locked_labels):
+    - versions_by_label: readable versions bucketed by the normalized label the
+      download path uses (`:g` for numbers, "Oneshot" → "1", non-numeric
+      labels dropped — grep chapters_by_num). Each dict carries the normalized
+      "chap".
+    - locked_labels: sorted labels of numbers that have ONLY placeholders
+      (tapas premium, MangaDex publisher links). A number with a readable
+      version is listed in versions_by_label and NOT here: the download takes
+      the readable version, so calling it locked would be wrong.
+
+    Placeholders never enter versions_by_label, which feeds the UI's "+N new"
+    diff. The `locked_chapters` output is informational: no consumer reads it
+    (rg over UI-source/src, UI-source/electron and android finds none).
+    """
+    by_label: Dict[str, List[Dict[str, Any]]] = {}
+    locked: Dict[float, str] = {}
+    for ch in pool:
+        num = ch.get("chap")
+        if num is None:
+            continue
+        if isinstance(num, (int, float)):
+            num = f"{num:g}"
+        else:
+            num = str(num)
+        if is_placeholder_chapter(ch):
+            cf = _chap_as_float(num)
+            if cf is not None:
+                locked.setdefault(cf, num)
+            continue
+        # Mirror the download path's "Oneshot"→"1" remap (grep
+        # chapters_by_num) so --list-chapters and the .aio_series.json writer
+        # agree on the label. manganato's _chapter_number returns the raw title
+        # as its no-numeric-token fallback, so a chapter literally titled
+        # "Oneshot" would otherwise LIST as "Oneshot" but RECORD as "1" → a
+        # perpetual "+1 new". Runs before bucketing so a real Ch.1 + a "Oneshot"
+        # collapse to one "1", as the download path buckets them.
+        if num.lower() in ("oneshot", "one-shot"):
+            num = "1"
+        # Mirror the download path's numeric gate: bucketing drops non-numeric
+        # labels, so best_chapters is numeric-only and a "Special"/"Omake" that
+        # never downloads must not list as "+N new" either.
+        if _chap_as_float(num) is None:
+            continue
+        # Carry the dict shape (group_chapters_for_download needs it) with the
+        # normalized label injected so its `_extract_chapter_num` parse and the
+        # UI's diff target both see the same string.
+        by_label.setdefault(num, []).append({**ch, "chap": num})
+    readable_nums = {_chap_as_float(k) for k in by_label}
+    locked_labels = sorted(
+        (lbl for cf, lbl in locked.items() if cf not in readable_nums),
+        key=float,
+    )
+    return by_label, locked_labels
+
+
+def _drop_placeholder_chapters(
+    chapters: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Drop chapters that are, or contain, a placeholder (no multi-source path).
+
+    Runs AFTER collapse-splits grouping: a collapsed cluster (`_merged_parts`)
+    with any placeholder part is dropped whole, because saving its readable
+    parts alone would label a partial chapter as complete (readable 2.1 +
+    publisher-hosted 2.2 → a "complete" Ch. 2). Returns (kept, counts by
+    _placeholder_kind).
+    """
+    kept: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {}
+    for c in chapters:
+        parts = c.get("_merged_parts") or [c]
+        bad = [p for p in parts if is_placeholder_chapter(p)]
+        if not bad and not is_placeholder_chapter(c):
+            kept.append(c)
+            continue
+        kind = _placeholder_kind(bad[0] if bad else c)
+        counts[kind] = counts.get(kind, 0) + 1
+    return kept, counts
+
+
+# ── Placeholder-only primary: switch to a readable site, or exit early ──
+#
+# A primary whose EVERY chapter is a placeholder (Goblin Slayer on MangaDex:
+# 203 Manga UP! link-outs, nothing hosted) can't be served by per-number fill:
+# rescue looks alternatives up by the primary's exact number, and such series
+# are often numbered in halves (2.1, 2.2) that no other site uses unless
+# --collapse-splits is on. So main() hands the whole series to the best
+# readable alternative instead — re-entering itself with that URL, so the
+# folder, .aio_series.json source, tmp_<hid> resume folder and future update
+# checks all belong to the site that actually has the pages. Without
+# --multi-source (or with no readable alternative) it exits before any folder
+# exists. User decisions 1 and 3, plan sync-temp/plans/mangadex-link-outs.md.
+
+def _primary_all_placeholders(pool: List[Dict[str, Any]]) -> bool:
+    """True when the list is non-empty and every row is a placeholder."""
+    return bool(pool) and all(is_placeholder_chapter(c) for c in pool)
+
+
+def _existing_series_folder(
+    root: Optional[str], *, hid: str, site: str, url: Optional[str],
+) -> Optional[str]:
+    """Name of a library folder that already holds this series' chapters, if any.
+
+    Gates the primary switch: a series already in the library never switches
+    (user decision 2026-10-17, plan mangadex-link-outs.md L3). The switched run
+    would carry another site's identity, so allocate_series_output_dir would
+    not match the existing folder and would fork `<title> (hid=…)` beside it;
+    switching INTO that folder instead would mix two sites' chapter numbering,
+    which the update check diffs by number. An identity-matched folder with no
+    files is not "existing": the switched run reclaims it without a fork.
+    Read-only (find_matching_series_folders).
+    """
+    if not root:
+        return None
+    for record in find_matching_series_folders(root, hid=hid, site=site, url=url):
+        if record.get("n_files"):
+            return record.get("name") or record.get("folder")
+    return None
+
+
+def _describe_placeholder_pool(pool: List[Dict[str, Any]]) -> str:
+    """'publisher links (global.manga-up.com)', 'premium/locked episodes', or
+    both joined — for the switch and early-exit lines."""
+    hosts = sorted({
+        str(c.get("_external_host") or "unknown host")
+        for c in pool if _placeholder_kind(c) == "publisher-hosted"
+    })
+    parts = []
+    if hosts:
+        parts.append(f"publisher links ({', '.join(hosts)})")
+    if any(_placeholder_kind(c) == "premium/locked" for c in pool):
+        parts.append("premium/locked episodes")
+    return " and ".join(parts) or "placeholders"
+
+
+def _pick_primary_switch(
+    discovery: Optional[Dict[str, Any]], primary_site: str,
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Choose the new primary from a discovery result.
+
+    `discovery` is {"resolved_sources": [...ranked {site, url, title, cover}],
+    "readable_sites": [site, ...]} (grep _ms_discovery_result). The target is
+    the best-ranked source whose list had readable chapters; the rest (minus
+    the old primary's site) ride along as the new run's alternatives.
+    Returns (None, []) when no source qualifies.
+    """
+    if not discovery:
+        return None, []
+    readable = set(discovery.get("readable_sites") or [])
+    sources = [
+        s for s in (discovery.get("resolved_sources") or [])
+        if isinstance(s, dict) and s.get("site") and s.get("url")
+        and s.get("site") != primary_site
+    ]
+    target = next((s for s in sources if s["site"] in readable), None)
+    if target is None:
+        return None, []
+    return target, [s for s in sources if s is not target]
+
+
+# Flags dropped from the re-entry argv, by whether they take a value. --search
+# and --auto-pick go because the re-entry is a direct-URL run; the prefetched
+# file and the guard are replaced with this switch's own.
+_SWITCH_DROP_VALUE_FLAGS = frozenset({
+    "--search", "--multi-source-prefetched", "--primary-switched-from",
+})
+_SWITCH_DROP_BARE_FLAGS = frozenset({"--auto-pick"})
+
+
+def _argv_for_primary_switch(
+    argv: List[str], old_url: str, new_url: str, prefetched_path: str, from_site: str,
+) -> List[str]:
+    """The argv (without argv[0]) for main()'s re-entry on `new_url`.
+
+    Every other flag the user passed is kept, so the switched run downloads
+    with the same settings. The old URL token is removed and `new_url` goes
+    last, after the guard flag, where the positional parser picks it up.
+    """
+    out: List[str] = []
+    skip_value = False
+    for tok in argv:
+        if skip_value:
+            skip_value = False
+            continue
+        if tok.startswith("--"):
+            name = tok.split("=", 1)[0].replace("_", "-")
+            if name in _SWITCH_DROP_VALUE_FLAGS:
+                skip_value = "=" not in tok
+                continue
+            if name in _SWITCH_DROP_BARE_FLAGS:
+                continue
+        if tok == old_url:
+            continue
+        out.append(tok)
+    return out + [
+        "--multi-source-prefetched", prefetched_path,
+        "--primary-switched-from", from_site,
+        new_url,
+    ]
 
 
 def _chap_label_str(chap) -> str:
@@ -6432,6 +6669,9 @@ _RESUME_TRANSIENT_DESTS = frozenset({
     # transient and the multi-source path re-runs the lookup.
     "multi_source_prefetched", "list_chapters", "build_final_file",
     "prompt_urls",
+    # Internal re-entry guard set by the placeholder-only primary switch
+    # (grep _argv_for_primary_switch); describes one spawn, never a setting.
+    "primary_switched_from",
     # Multi-URL orchestrator — children get these re-passed by the
     # parent via child_base; not meaningful for the single-URL resume
     # path. net_min_gap is also orchestrator-gated (only consumed when
@@ -8752,6 +8992,16 @@ def main():
              "Quietly falls back to the search path if the file is missing/"
              "malformed.",
     )
+    # Internal: set on the re-entry when a placeholder-only primary (every
+    # chapter a MangaDex publisher link or tapas premium episode) hands the
+    # series to a readable alternative. Its presence forbids a second switch,
+    # so two all-placeholder sites can never bounce the run between them.
+    # Grep _argv_for_primary_switch.
+    p.add_argument(
+        "--primary-switched-from",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     p.add_argument(
         "--multi-source-lazy",
         action="store_true",
@@ -9806,6 +10056,14 @@ def main():
     # helpers _read/_persist/_build_multi_source_cache*.
     _ms_resume_cache_payload: Optional[Dict[str, Any]] = None
 
+    # The last direct-URL discovery's ranked sources and which of them listed
+    # readable chapters ({"resolved_sources": [...], "readable_sites": [...]}),
+    # set by _discover_multi_source_alternatives. Read only by the primary
+    # switch (grep _primary_all_placeholders): the per-number alternatives dict
+    # is keyed on the PRIMARY's numbers, so it cannot say whether an
+    # alternative has chapters the primary lacks.
+    _ms_discovery_result: Optional[Dict[str, Any]] = None
+
     if getattr(args, "search", None):
         from aio_search_cli import run_search_mode, take_latest_multi_source_state
         winner_url = run_search_mode(
@@ -10438,7 +10696,7 @@ def main():
         for a direct-URL --multi-source run. Never raises: any discovery
         failure degrades to standard single-source behavior."""
         nonlocal _multi_source_alternatives, _multi_source_consensus_set
-        nonlocal _ms_resume_cache_payload
+        nonlocal _ms_resume_cache_payload, _ms_discovery_result
         # Source of alternatives, in priority order:
         #   1. UI-supplied --multi-source-prefetched file (authoritative for
         #      THIS spawn; the search-tab writes it just before launch, saving
@@ -10534,6 +10792,14 @@ def main():
                     ]
                     if not _ms_alts[_cf]:
                         del _ms_alts[_cf]
+            if isinstance(_ms_result, dict):
+                _ms_discovery_result = {
+                    "resolved_sources": [
+                        _s for _s in (_ms_result.get("resolved_sources") or [])
+                        if (_s.get("site", "") or "").lower() not in _disable_set
+                    ],
+                    "readable_sites": list(_ms_result.get("readable_sites") or []),
+                }
             if _ms_alts:
                 _multi_source_alternatives = _ms_alts
                 _multi_source_consensus_set = _ms_consensus
@@ -10626,57 +10892,15 @@ def main():
         # handlers that emit 4.0 (mangathemesia subclasses) don't split
         # from "4"-emitting peers; we mirror that here so the dedupe and
         # the optional collapse pass see the same canonical keys.
-        list_chapters_by_num: Dict[str, List[Dict[str, Any]]] = {}
         deduped_pool: List[Dict[str, Any]] = []
-        # Premium/locked placeholders (tapas.get_chapters emits them for
-        # WAIT_OR_MUST_PAY episodes) are surfaced SEPARATELY as locked_chapters
-        # so the UI can badge them + nudge multi-source — but they are NEVER
-        # folded into `chapters`, which drives the UI's "+N new" update diff.
-        # They don't download without --multi-source (and even with it, only if
-        # an alt carries them), so counting them there would show a perpetual
-        # "+N new". Cross-file: consumed by UI-source (grep locked_chapters).
-        locked_labels: List[str] = []
-        for ch in pool:
-            if ch.get("_locked"):
-                lk = ch.get("chap")
-                if isinstance(lk, (int, float)):
-                    lk = f"{lk:g}"
-                elif lk is not None:
-                    lk = str(lk)
-                if lk is not None and _chap_as_float(lk) is not None:
-                    locked_labels.append(lk)
-                continue
-            num = ch.get("chap")
-            if num is None:
-                continue
-            if isinstance(num, (int, float)):
-                num = f"{num:g}"
-            else:
-                num = str(num)
-            # Mirror the download path's "Oneshot"→"1" remap (grep
-            # chapters_by_num, ~line 9237) so --list-chapters and the
-            # .aio_series.json writer agree on the label. manganato's
-            # _chapter_number returns the raw title as its no-numeric-token
-            # fallback, so a chapter literally titled "Oneshot" would otherwise
-            # LIST as "Oneshot" but RECORD as "1" → the UI update-check shows it
-            # as a perpetual "+1 new". Must run BEFORE the seen_nums dedup so a
-            # real Ch.1 + a "Oneshot" collapse to one "1" (as the download path
-            # buckets them). XF-1 follow-up.
-            if num.lower() in ("oneshot", "one-shot"):
-                num = "1"
-            # Mirror the download path's numeric gate: bucketing (grep
-            # chapters_by_num) does float(num_str) and DROPS non-numeric labels,
-            # so best_chapters — everything the download actually fetches — is
-            # numeric-only. --list-chapters must drop them too, else the UI
-            # update-check surfaces a "Special"/"Extra"/"Omake" that never
-            # downloads as a perpetual "+N new". Extends the Oneshot fix above to
-            # ALL non-numeric labels. Residual follow-up.
-            if _chap_as_float(num) is None:
-                continue
-            # Carry the dict shape (group_chapters_for_download needs it) but
-            # with the normalized label injected so its `_extract_chapter_num`
-            # parse and our diff target both see the same string.
-            list_chapters_by_num.setdefault(num, []).append({**ch, "chap": num})
+        # Placeholders (tapas premium episodes, MangaDex publisher links) are
+        # surfaced SEPARATELY as locked_chapters and NEVER folded into
+        # `chapters`, which drives the UI's "+N new" update diff: they don't
+        # download without --multi-source (and even with it, only if an alt
+        # carries them), so counting them there would show a perpetual "+N
+        # new". A number that also has a readable version is in `chapters`
+        # only. See _split_listable_and_locked.
+        list_chapters_by_num, locked_labels = _split_listable_and_locked(pool)
 
         # Collapse each number to ONE version with the SAME selector the
         # download path uses. This used to be a plain first-wins `seen_nums`
@@ -10721,7 +10945,7 @@ def main():
         except (ValueError, TypeError):
             pass
 
-        locked_chapters = sorted(set(locked_labels), key=lambda x: float(x))
+        locked_chapters = locked_labels
 
         # Scanlation groups available for this series, most-prolific first, so
         # the UI can show what exists and let the user pick instead of typing a
@@ -10788,9 +11012,9 @@ def main():
             "genres": comic_data.get("genres", []),
             "total": len(unique_chapters),
             "chapters": unique_chapters,
-            # Premium/locked placeholders surfaced for the UI (badge + multi-source
-            # nudge). Empty for every non-tapas site today. NOT part of `total`
-            # or the "+N new" diff — see the locked_labels comment above.
+            # Placeholder-only numbers (tapas premium, MangaDex publisher
+            # links). NOT part of `total` or the "+N new" diff — see the
+            # locked_labels comment above.
             "locked_chapters": locked_chapters,
             "collapse_applied": collapse_splits_enabled,
             "groups": group_rows,
@@ -10798,27 +11022,102 @@ def main():
         print(json.dumps(result))
         sys.exit(0)
 
-    # Download path only (--list-chapters exited above): drop premium/locked
-    # placeholders unless --multi-source can fill them. tapas.get_chapters emits
-    # WAIT_OR_MUST_PAY episodes as bare `_locked` placeholders so the multi-
-    # source alt-rescue can fetch them from another site; with multi-source OFF
-    # there is no rescue path, so each would only attempt → short-circuit
-    # ("locked") → clean-skip, and be re-attempted every run. Dropping them here
-    # restores the clean single-source behavior (matches the pre-feature "N
-    # locked skipped" outcome). Kept when multi-source is on so the alignment
-    # includes their chapter numbers and _process_chapter_strict can rescue
-    # them (grep aux_veto / _PERMANENT_SKIP_REASONS). Non-tapas pools have no
-    # `_locked` entries, so this is a no-op there.
-    if not getattr(args, "multi_source", False):
-        _locked_dropped = sum(1 for c in pool if c.get("_locked"))
-        if _locked_dropped:
-            pool = [c for c in pool if not c.get("_locked")]
-            print(
-                f"[i] {_locked_dropped} premium/locked chapter(s) skipped — "
-                f"they need a site login we don't have. Enable --multi-source "
-                f"to fetch them from an alternative site.",
-                file=sys.stderr,
+    # Placeholder-only primary (see the block above _primary_all_placeholders):
+    # switch the whole series to a readable alternative, or stop before any
+    # folder exists. Volumes are never placeholders. A resumed run does not
+    # switch: its tmp_<hid> belongs to this site, and the re-entry would look
+    # for the other site's.
+    if not getattr(args, "download_volumes", False) and _primary_all_placeholders(pool):
+        _ph_what = _describe_placeholder_pool(pool)
+        _switched_from = getattr(args, "primary_switched_from", None)
+        _sw_target: Optional[Dict[str, Any]] = None
+        _sw_remaining: List[Dict[str, Any]] = []
+        # Library updates force multi-source, so this is the check that keeps
+        # an existing series from switching (see _existing_series_folder).
+        _sw_existing = (
+            _existing_series_folder(
+                args.output_dir, hid=hid, site=handler.name, url=args.comic_url,
             )
+            if getattr(args, "multi_source", False)
+            and not _switched_from
+            and not args.restore_parameters
+            else None
+        )
+        if (
+            getattr(args, "multi_source", False)
+            and not _switched_from
+            and not args.restore_parameters
+            and not _sw_existing
+        ):
+            # Discovery has not run when it was deferred (--multi-source-lazy)
+            # or when --search --auto-pick supplied the alternatives (those are
+            # keyed on this site's numbers and carry no readable_sites). Run it
+            # now, once — the decision needs it, and no chapter will fail to
+            # trigger it later.
+            if _ms_discovery_result is None and (
+                _ms_lazy_pending or getattr(args, "search", None)
+            ):
+                _ms_lazy_pending = False
+                print(
+                    f"[*] Multi-source: every chapter on {handler.name} is a "
+                    f"placeholder; looking for a readable source now...",
+                    file=sys.stderr,
+                )
+                _discover_multi_source_alternatives()
+            _sw_target, _sw_remaining = _pick_primary_switch(
+                _ms_discovery_result, handler.name
+            )
+        if _sw_target is not None:
+            import tempfile as _tempfile
+            _sw_payload = {
+                "primary": {"site": _sw_target["site"], "url": _sw_target["url"]},
+                "alternatives": _sw_remaining,
+                "title": title,
+                "year": comic_data.get("year"),
+            }
+            _sw_fd, _sw_path = _tempfile.mkstemp(prefix="aio-primary-switch-", suffix=".json")
+            with os.fdopen(_sw_fd, "w", encoding="utf-8") as _sw_f:
+                json.dump(_sw_payload, _sw_f)
+            print(
+                f"[*] {handler.name} lists this series only as {_ph_what}; "
+                f"downloading from {_sw_target['site']} instead: {_sw_target['url']}"
+            )
+            # In-process re-entry rather than a child process: Android runs
+            # main() inside its own interpreter where self-spawn is unavailable
+            # (grep _self_spawn_unavailable), and it already drives main()
+            # through sys.argv the same way (aio_android._run_engine).
+            _sw_saved_argv = sys.argv
+            sys.argv = [sys.argv[0], *_argv_for_primary_switch(
+                sys.argv[1:], args.comic_url, _sw_target["url"], _sw_path, handler.name,
+            )]
+            try:
+                return main()
+            finally:
+                sys.argv = _sw_saved_argv
+                try:
+                    os.remove(_sw_path)
+                except OSError:
+                    pass
+        # "No chapters selected" on purpose: --update-all's child classifier
+        # reads it as "nothing to do" (grep `"No chapters selected" in combined`).
+        if _switched_from:
+            _why = f"already switched here from {_switched_from}; not switching again"
+        elif args.restore_parameters:
+            _why = "a resumed run can't switch sources; start a new download of this series"
+        elif _sw_existing:
+            _why = (
+                f"the library folder '{_sw_existing}' holds this series from "
+                f"{handler.name}; switching sites would fork it. Re-source it "
+                f"from another site by hand"
+            )
+        elif getattr(args, "multi_source", False):
+            _why = "no alternative site had readable chapters for it"
+        else:
+            _why = "enable --multi-source to download it from another site"
+        sys.exit(
+            f"No chapters selected: {handler.name} lists this series only as "
+            f"{_ph_what}, which it can't serve ({_why})."
+        )
 
     # Output goes into a per-title folder under ./manga (title, with hid only on collision)
     # Capture the user-facing ROOT before mutating args.output_dir / args.epub_dir to the
@@ -10995,8 +11294,12 @@ def main():
             # Distinguish an MTL-policy skip from a --no-group-fallback skip so
             # the count below can't over-report. A chapter is only attributed to
             # the MTL policy when every version was confirmed machine-translated.
+            # A number with a placeholder never lands here (the ranker hands
+            # the placeholder on instead of skipping), so the readable filter
+            # is a backstop: a link-out is not a translation.
+            _tally = readable_chapters(versions) or versions
             if all(
-                _version_is_confirmed_mtl(handler, v) for v in versions
+                _version_is_confirmed_mtl(handler, v) for v in _tally
             ):
                 skipped_mtl_labels.append(num)
     if skipped_mtl_labels:
@@ -11101,6 +11404,26 @@ def main():
             f"  collapse-splits: {len(chapters)} entries → {len(grouped_chapters)} groups"
         )
     chapters = grouped_chapters
+
+    # Without --multi-source, drop placeholders (tapas premium episodes,
+    # MangaDex publisher links): there is no rescue path, so each would only
+    # short-circuit → clean-skip, and be re-attempted every run. With
+    # multi-source on they stay so _process_chapter_strict can fill them from
+    # an alternative (grep _PERMANENT_SKIP_REASONS). Runs AFTER grouping so a
+    # collapsed cluster with a placeholder part is dropped whole — see
+    # _drop_placeholder_chapters. A pool of placeholders only never gets here
+    # (grep _primary_all_placeholders).
+    if not getattr(args, "multi_source", False):
+        chapters, _ph_counts = _drop_placeholder_chapters(chapters)
+        if _ph_counts:
+            _ph_total = sum(_ph_counts.values())
+            _ph_split = ", ".join(f"{k}: {v}" for k, v in sorted(_ph_counts.items()))
+            print(
+                f"[i] {_ph_total} chapter(s) skipped ({_ph_split}) — "
+                f"{handler.name} can't serve them. Enable --multi-source "
+                f"to fetch them from an alternative site.",
+                file=sys.stderr,
+            )
     # ──────────────────────────────────────────────────────────────────
 
     if args.no_partials:
@@ -13383,6 +13706,14 @@ def main():
                             f"(premium/locked on {primary_state[0].name}) "
                             f"filled from {alt_handler.name}"
                         )
+                    elif primary_err.reason == "external_link":
+                        # host = the publisher (sites/mangadex.py puts
+                        # _external_host there), not the primary site.
+                        print(
+                            f"    [Multi-source] ✓ Chapter {n_for_log} "
+                            f"(publisher-hosted ({primary_err.host or 'unknown host'}) "
+                            f"on {primary_state[0].name}) filled from {alt_handler.name}"
+                        )
                     elif primary_err.reason == "ghost_chapter":
                         print(
                             f"    [Multi-source] ✓ Chapter {n_for_log} rescued "
@@ -13738,6 +14069,15 @@ def main():
                 _gate_detail = (
                     "deterministic per-chapter gate; no retry/alt source can clear it"
                 )
+            elif cpse.reason == "external_link":
+                _gate_note = (
+                    f"publisher-hosted ({cpse.host or 'unknown host'}) on "
+                    f"{handler.name} — no alternative source could supply it"
+                    f"{'' if getattr(args, 'multi_source', False) else ' (enable --multi-source to look for one)'}"
+                )
+                _gate_detail = (
+                    "publisher link-out; the site hosts no pages for it and no alt source had it"
+                )
             elif cpse.reason == "decode_dropped_pages":
                 # NOT a gate, and not the host's fault. Naming the cause matters
                 # here more than anywhere else in this handler: the remedy is a
@@ -13761,9 +14101,11 @@ def main():
                 _gate_detail = (
                     "deterministic per-chapter gate; no retry/alt source can clear it"
                 )
+            # external_link's host is the publisher and its note already names it.
+            _show_host = cpse.host and cpse.reason != "external_link"
             print(
                 f"\n[!] Chapter {cpse.chap}: {cpse.reason}"
-                f"{f' on {cpse.host}' if cpse.host else ''} — {_gate_note}. "
+                f"{f' on {cpse.host}' if _show_host else ''} — {_gate_note}. "
                 f"Recorded as missed; the run continues."
             )
             _record_missed(
@@ -13926,18 +14268,24 @@ def main():
     # and a second mass-retry would just produce more failure noise without
     # changing the outcome (and would obscure the FATAL message in the log).
     # Missed entries from non-fatal paths (the residual 'exception' /
-    # 'empty_content' branches) still get this final pass.
-    if retry_missed and missed_entries and missed_retries > 0 and not aborted_remaining:
-        print(f"\n[*] Missed {len(missed_entries)} chapter(s). Retrying at the end...")
-        _emit("missed", count=len(missed_entries))
-        missed_entries.sort(key=lambda e: (int(e.get('insert_chapter_index', 0)), int(e.get('insert_list_index', 0))))
-        remaining: List[Dict[str, Any]] = []
+    # 'empty_content' branches) still get this final pass. Permanent skips
+    # (locked / external_link / login gates …) are kept as missed without a
+    # replay — see _replayable_missed.
+    _replay_entries, _permanent_missed = _replayable_missed(missed_entries)
+    if retry_missed and _replay_entries and missed_retries > 0 and not aborted_remaining:
+        print(f"\n[*] Missed {len(_replay_entries)} chapter(s). Retrying at the end...")
+        _emit("missed", count=len(_replay_entries))
+        _replay_entries.sort(key=lambda e: (int(e.get('insert_chapter_index', 0)), int(e.get('insert_list_index', 0))))
+        # Permanent skips stay in the missed log unchanged. Their insert
+        # indices are not touched by the shifts below, which is fine: they are
+        # never inserted.
+        remaining: List[Dict[str, Any]] = list(_permanent_missed)
         content_shift_items = 0
         chapter_shift = 0
         marker_shift = 0
         page_shift = 0
 
-        for entry in missed_entries:
+        for entry in _replay_entries:
             ch_retry = entry.get('ch') or {}
             grp_name_retry = entry.get('group') or handler.get_group_name(ch_retry)
             ok = False
@@ -14012,6 +14360,17 @@ def main():
                 os.remove(missed_log_path)
             except Exception:
                 pass
+    elif retry_missed and _permanent_missed and missed_retries > 0 and not aborted_remaining:
+        # Only permanent skips: nothing to replay, but report them the way the
+        # replay branch reports what it could not recover, so the UI's
+        # still_missed count and the copied log are the same either way.
+        print(f"[!] Still missed {len(_permanent_missed)} chapter(s). A log was saved to: {missed_log_path}")
+        _emit("still_missed", count=len(_permanent_missed), log_path=missed_log_path)
+        try:
+            out_log = os.path.join(out_dir, f"{base_filename} (missed chapters).json")
+            shutil.copy(missed_log_path, out_log)
+        except Exception:
+            pass
 
     # Read the on-disk series metadata ONCE, here, before anything below can
     # rewrite it: the combined-archive overwrite guard needs to know what the

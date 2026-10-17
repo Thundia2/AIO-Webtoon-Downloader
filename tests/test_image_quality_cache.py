@@ -297,6 +297,51 @@ def test_cache_keeps_complete_current_version_entries(tmp_cache):
     assert fresh.get("complete", "https://x/1") == 0.7
 
 
+def _complete_entry(score):
+    return {
+        "score": score,
+        "metadata": {
+            "t1_score": score, "res_norm": 0.5, "blockiness": 0.1,
+            "fft_hf_ratio": 0.55, "tenengrad_norm": 0.9,
+            "content_type": "bw_manga", "tenengrad_clean": 0.9,
+        },
+        "expires_at": time.time() + 86400,
+        "schema_version": ImageQualityCache.SCHEMA_VERSION,
+    }
+
+
+def test_mangadex_ratings_purged_once(tmp_cache):
+    """MangaDex ratings probed before publisher link-outs became placeholders
+    rated the EXTERNAL CHAPTER card. The first load with no marker drops every
+    mangadex: entry (memory + disk) and writes the marker; later loads keep
+    mangadex: entries written by the fixed code. Other sites are untouched."""
+    snapshot_path = tmp_cache._snapshot_path
+    marker = os.path.join(
+        os.path.dirname(snapshot_path), "img_quality.purged-mangadex-linkouts"
+    )
+    # The fixture's own load already ran the purge on an empty cache.
+    assert os.path.exists(marker)
+    os.remove(marker)
+    with open(snapshot_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "mangadex:https://mangadex.org/title/a": _complete_entry(0.0),
+            "mangafire:https://mangafire.to/title/a": _complete_entry(0.8),
+        }, f)
+
+    first = ImageQualityCache()
+    assert first.get("mangadex", "https://mangadex.org/title/a") is None
+    assert first.get("mangafire", "https://mangafire.to/title/a") == 0.8
+    assert os.path.exists(marker)
+    with open(snapshot_path, encoding="utf-8") as f:
+        assert list(json.load(f)) == ["mangafire:https://mangafire.to/title/a"]
+
+    # Post-purge: a fresh MangaDex rating survives reloads.
+    first.set("mangadex", "https://mangadex.org/title/a", 0.7,
+              metadata=_complete_entry(0.7)["metadata"])
+    again = ImageQualityCache()
+    assert again.get("mangadex", "https://mangadex.org/title/a") == 0.7
+
+
 # ---------------------------------------------------------------------------
 # TTL expiry
 # ---------------------------------------------------------------------------

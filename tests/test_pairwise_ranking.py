@@ -275,6 +275,45 @@ def test_run_pairwise_ranking_a_beats_b_on_higher_quality(monkeypatch):
     assert s2.img_quality_metadata["pairwise_winrate"] < 0.5
 
 
+def test_run_pairwise_ranking_never_samples_a_placeholder(monkeypatch):
+    """A MangaDex publisher link-out has no pages to compare. beta lists ch.1
+    only as a link-out, so the only shared chapter is 2 — before the
+    readable_chapters strip, ch.1 was shared too and beta's EXTERNAL CHAPTER
+    card could be compared against alpha's real page."""
+    blob = _make_test_jpeg(quality=85)
+    handler_a = _make_mock_handler("alpha", "http://a/x", [1, 2], blob)
+    handler_b = _make_mock_handler("beta", "http://b/x", [2], blob)
+    handler_b.get_chapters.return_value = [
+        {"chap": "1", "title": "Chapter 1", "url": "http://b/x/ch/1",
+         "_locked": True, "_locked_kind": "external",
+         "_external_host": "mangaplus.shueisha.co.jp"},
+    ] + handler_b.get_chapters.return_value
+
+    import sites
+    monkeypatch.setattr(
+        sites, "get_handler_by_name",
+        lambda name: {"alpha": handler_a, "beta": handler_b}.get(name),
+    )
+    sources = [
+        SourceEntry(
+            site=site, url=url, title="X", title_match=1.0, cover=None,
+            seed_quality=0.5, img_quality_score=0.6,
+            img_quality_metadata={"samples_succeeded": 5, "content_type": "bw_manga"},
+        )
+        for site, url in (("alpha", "http://a/x"), ("beta", "http://b/x"))
+    ]
+    cand = SeriesCandidate(canonical_title="X", canonical_year=None, sources=sources)
+    _run_pairwise_ranking([cand], lambda h: MagicMock(), MagicMock())
+
+    sampled = [
+        call.args[0] for h in (handler_a, handler_b)
+        for call in h.get_chapter_images.call_args_list
+    ]
+    assert sampled, "pairwise sampled nothing"
+    assert {c["chap"] for c in sampled} == {"2"}
+    assert not any(c.get("_locked") for c in sampled)
+
+
 def test_run_pairwise_ranking_identical_sources_get_zero_adjustment(monkeypatch):
     """Two sources serving the same blob → winrate ≈ 0.5 → adj ≈ 0
     (modulo JPEG-ghost which might be small)."""

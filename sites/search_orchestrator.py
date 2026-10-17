@@ -38,7 +38,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 from . import fuzzy_match
-from .base import BaseSiteHandler, SearchHit, SiteBusyError
+from .base import BaseSiteHandler, SearchHit, SiteBusyError, readable_chapters
 
 
 # ─── ML rating gate ────────────────────────────────────────────────────
@@ -460,6 +460,21 @@ class SourceEntry:
     count_outlier: bool = False
 
 
+def _source_sinks(s: "SourceEntry") -> bool:
+    """True when _cmp must push this source to the back of its candidate.
+
+    dmca_likely / count_outlier need peers or a site-claimed count to fire
+    (the cross-site check in search_all). A VERIFIED count of zero needs
+    neither: the site answered that it has no readable chapter, so it can't
+    be the download source whatever its title or image rating says. Live
+    case: MangaDex Goblin Slayer, all 203 rows publisher link-outs, which its
+    search() now counts as 0 (includeExternalUrl=0, sites/mangadex.py).
+    None (count not measured) never sinks. Internal like count_outlier:
+    to_json shows the count, not a flag.
+    """
+    return bool(s.dmca_likely or s.count_outlier or s.actual_chapter_count == 0)
+
+
 def _quality_basis(s: "SourceEntry") -> str:
     """Provenance of the rating the UI displays for this source.
 
@@ -843,7 +858,41 @@ class ImageQualityCache:
                         }
                 self._state = cleaned
         except (OSError, json.JSONDecodeError):
-            return
+            pass
+        self._run_one_shot_purges()
+
+    # One-shot purges: (key prefix, marker file next to the snapshot). Each runs
+    # once per machine — the first load that finds no marker drops the prefix's
+    # entries, rewrites the snapshot, then writes the marker. A marker, not a
+    # date cutoff, because stale entries are "written by code before the fix"
+    # and a fixed date can't know when a given install upgraded.
+    #   - mangadex: (2026-10-17) ratings probed before publisher link-out rows
+    #     became placeholders scored the EXTERNAL CHAPTER card, or 0.0 for a
+    #     list of pages:0 rows the probe could not tell apart from a dead CDN
+    #     (plan sync-temp/plans/mangadex-link-outs.md, decision 4). Delete this
+    #     entry once every install has had a month to upgrade: by then the 30-day
+    #     TTL has expired every pre-fix entry anyway.
+    _ONE_SHOT_PURGES: Tuple[Tuple[str, str], ...] = (
+        ("mangadex:", "img_quality.purged-mangadex-linkouts"),
+    )
+
+    def _run_one_shot_purges(self) -> None:
+        cache_dir = os.path.dirname(self._snapshot_path)
+        for prefix, marker_name in self._ONE_SHOT_PURGES:
+            marker = os.path.join(cache_dir, marker_name)
+            if os.path.exists(marker):
+                continue
+            stale = [k for k in self._state if k.startswith(prefix)]
+            for k in stale:
+                del self._state[k]
+            if stale:
+                self._save_snapshot()
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write(f"purged {len(stale)} entries at {time.time():.0f}\n")
+            except OSError:
+                pass
 
     def _save_snapshot(self) -> None:
         try:
@@ -2665,6 +2714,10 @@ def _run_pairwise_ranking(
                         scraper = scraper_factory(handler)
                         ctx = handler.fetch_comic_context(src.url, scraper, make_request)
                         chapters = handler.get_chapters(ctx, scraper, "en", make_request)
+                    # Placeholders (MangaDex publisher links, tapas premium
+                    # episodes) have no pages to compare; one must never be
+                    # picked as a shared chapter. Grep is_placeholder_chapter.
+                    chapters = readable_chapters(chapters)
                     if chapters:
                         chapter_lists[src.site] = chapters
                 except Exception:
@@ -3059,6 +3112,8 @@ def _run_paired_comparison(
                     scraper = scraper_factory(handler)
                     ctx = handler.fetch_comic_context(src.url, scraper, make_request)
                     chapters = handler.get_chapters(ctx, scraper, "en", make_request)
+                    # Same placeholder strip as the T3 pairwise list above.
+                    chapters = readable_chapters(chapters)
                     if chapters:
                         chapter_lists[src.site] = chapters
                 except Exception:
@@ -6279,14 +6334,14 @@ def search_all(
         return s.img_quality_score if s.img_quality_score is not None else s.seed_quality
 
     def _cmp(a: SourceEntry, b: SourceEntry) -> int:
-        # Sink signal: dmca_likely OR count_outlier. Both push the source
-        # to the back of the candidate's source list — they are the same
-        # signal at the ranking layer, surfaced differently in to_json
-        # (only dmca_likely; count_outlier is intentionally internal).
-        # See the cross-site count check in the build loop for how each
-        # is set.
-        a_sink = a.dmca_likely or a.count_outlier
-        b_sink = b.dmca_likely or b.count_outlier
+        # Sink signal (_source_sinks): dmca_likely OR count_outlier OR a
+        # verified zero count. All push the source to the back of the
+        # candidate's source list — the same signal at the ranking layer,
+        # surfaced differently in to_json (only dmca_likely; the others are
+        # internal). See the cross-site count check in the build loop for
+        # how the first two are set.
+        a_sink = _source_sinks(a)
+        b_sink = _source_sinks(b)
         if a_sink != b_sink:
             return 1 if a_sink else -1
         # Official-publisher tiebreaker — gated behind a title_match
