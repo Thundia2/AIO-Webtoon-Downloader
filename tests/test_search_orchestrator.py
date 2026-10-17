@@ -313,3 +313,96 @@ def test_busy_site_is_a_notice_not_a_failure():
     assert "oksite" in diagnostics["tested_sites"]
     assert cache.is_blocked("busy.example") is False, "contention struck the host"
 
+
+# ────────────────────────────────────────────────────────────────────────
+# Anchored admission (2026-10-17): a hit below the title-match floor joins a
+# candidate when one of its titles has exactly the merge key of a title an
+# ADMITTED hit carries. See the ANCHORED ADMISSION block in search_all.
+# ────────────────────────────────────────────────────────────────────────
+
+def _run_with_hits(query, per_site):
+    """search_all over fake handlers; *per_site* maps site name -> list of
+    (title, alt_titles). Returns the candidates."""
+    from sites.base import BaseSiteHandler, SearchHit
+
+    def _make(name, rows):
+        class _H(BaseSiteHandler):
+            def search(self, *a, **kw):
+                return [
+                    SearchHit(site=name, title=t, url=f"https://{name}.example/{i}",
+                              cover=None, alt_titles=list(alts), year=None,
+                              language=None, chapter_count_hint=5, raw_score=1.0)
+                    for i, (t, alts) in enumerate(rows)
+                ]
+        _H.name = name
+        _H.domains = (f"{name}.example",)
+        return _H()
+
+    handlers = [_make(n, rows) for n, rows in per_site.items()]
+    with patch("sites.iter_search_capable_handlers", lambda: iter(handlers)):
+        with patch("sites.get_handler_by_name", lambda _: None):
+            return search_all(query, MagicMock(return_value=MagicMock()), MagicMock())
+
+
+def _where(cands, site):
+    """(candidate index, source) for *site*, or None."""
+    for i, c in enumerate(cands):
+        for s in c.sources:
+            if s.site == site:
+                return i, s
+    return None
+
+
+def test_all_caps_listing_joins_its_correctly_spelled_twin():
+    # The floor's scorer is case-sensitive: "CHAINSAW MAN" scores 0.25.
+    cands = _run_with_hits("Chainsaw Man", {
+        "alpha": [("Chainsaw Man", [])],
+        "beta": [("CHAINSAW MAN", [])],
+    })
+    a, b = _where(cands, "alpha"), _where(cands, "beta")
+    assert b is not None, "the all-caps listing was dropped"
+    assert a[0] == b[0], "anchored hit landed in a different candidate"
+    assert b[1].title_match == a[1].title_match, "did not inherit the anchor's score"
+
+
+def test_romaji_word_break_variant_is_anchored_by_an_alt_title():
+    # mangahub's only title for Railgun; another site carries "Toaru" as an alt.
+    cands = _run_with_hits("A Certain Scientific Railgun", {
+        "alpha": [("A Certain Scientific Railgun", ["Toaru Kagaku no Railgun"])],
+        "beta": [("To Aru Kagaku no Railgun", [])],
+    })
+    a, b = _where(cands, "alpha"), _where(cands, "beta")
+    assert b is not None and a[0] == b[0]
+
+
+def test_below_floor_hit_without_an_anchor_stays_out():
+    cands = _run_with_hits("Chainsaw Man", {
+        "alpha": [("Chainsaw Man", [])],
+        "beta": [("Completely Different Story", [])],
+    })
+    assert _where(cands, "beta") is None
+
+
+def test_anchored_hit_never_welds_two_candidates():
+    # beta's title matches one admitted candidate and its alt another. It may
+    # join ONE of them (the better-scoring) but must not merge the two.
+    cands = _run_with_hits("Chainsaw Man", {
+        "alpha": [("Chainsaw Man", []), ("Chainsaw Man Devil War", [])],
+        "beta": [("CHAINSAW MAN", ["CHAINSAW MAN DEVIL WAR"])],
+    })
+    titles = sorted(c.canonical_title for c in cands if any(s.site == "alpha" for s in c.sources))
+    assert titles == ["Chainsaw Man", "Chainsaw Man Devil War"], titles
+    b = _where(cands, "beta")
+    assert b is not None and cands[b[0]].canonical_title == "Chainsaw Man"
+
+
+def test_anchored_hits_do_not_chain():
+    # gamma matches only beta's alt; beta is itself only anchored, so gamma
+    # has no admitted voucher.
+    cands = _run_with_hits("Chainsaw Man", {
+        "alpha": [("Chainsaw Man", [])],
+        "beta": [("CHAINSAW MAN", ["Qwyx Blorpt"])],
+        "gamma": [("QWYX BLORPT", [])],
+    })
+    assert _where(cands, "beta") is not None
+    assert _where(cands, "gamma") is None

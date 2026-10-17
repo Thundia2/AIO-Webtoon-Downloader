@@ -5211,6 +5211,23 @@ def _normalize_title(title: str) -> str:
     return s
 
 
+def _title_merge_key(title: str) -> str:
+    """_normalize_title with the spaces removed: the key the cross-site merge
+    and anchored admission compare (grep `_title_merge_key(` in search_all).
+
+    WHY spaces go: sites disagree on word breaks in romanized titles ("To Aru"
+    vs "Toaru", "Chain Saw" vs "Chainsaw", "Onepunch-Man" vs "One Punch-Man"),
+    and those are the same title. Measured 2026-10-17 over 16 live searches:
+    over 647 candidate groups the stripped key joined exactly one more pair,
+    and it was correct — so on its own it is nearly a no-op. It earns its keep
+    in anchored admission, where an exact key is the only evidence a
+    below-floor hit has.
+
+    Only for COMPARING. Never shown to a user — fall back to a real title.
+    """
+    return _normalize_title(title).replace(" ", "")
+
+
 # --- Title matching -----------------------------------------------------
 def _best_title_match(
     query: str, hit: SearchHit, extra_queries: Sequence[str] = (),
@@ -6107,10 +6124,13 @@ def search_all(
 
     # Score every hit against the query.
     scored: List[Tuple[float, SearchHit]] = []
+    below_floor: List[SearchHit] = []
     for hit in all_hits:
         score = _best_title_match(query, hit, seed_title_variants)
         if score >= min_match:
             scored.append((score, hit))
+        else:
+            below_floor.append(hit)
 
     if not scored:
         _emit_site_health()
@@ -6144,25 +6164,73 @@ def search_all(
         if ra != rb:
             parent[ra] = rb
 
+    def _hit_merge_keys(hit: SearchHit) -> List[str]:
+        keys: List[str] = []
+        for t in [hit.title, *(hit.alt_titles or [])]:
+            k = _title_merge_key(t)
+            if k and k not in keys:
+                keys.append(k)
+        return keys
+
     # Pass 1: build keysets per hit; union all keys within a hit; track which
     # hits ended up in which root.
     hit_keys: List[Tuple[float, SearchHit, List[str]]] = []
+    # merge key -> best title-match of an ADMITTED hit carrying it. The
+    # evidence anchored admission (below) and the late-adoption block read.
+    anchor_score: Dict[str, float] = {}
     for score, hit in scored:
-        keys: List[str] = []
-        primary = _normalize_title(hit.title)
-        if primary:
-            keys.append(primary)
-        for alt in hit.alt_titles or []:
-            ak = _normalize_title(alt)
-            if ak and ak not in keys:
-                keys.append(ak)
+        keys = _hit_merge_keys(hit)
         if not keys:
             continue
         for k in keys:
             _find(k)  # ensure node exists
+            if score > anchor_score.get(k, 0.0):
+                anchor_score[k] = score
         for k in keys[1:]:
             _union(keys[0], k)
         hit_keys.append((score, hit, keys))
+
+    # ANCHORED ADMISSION (2026-10-17). A hit below the title-match floor is
+    # admitted when one of its titles has exactly the merge key of a title an
+    # ADMITTED hit carries — the other site already vouched for that title.
+    # WHY: the floor compares the query with each site's own spelling, and
+    # loses the right series whenever a site lists it differently from the
+    # query: mangahub's only title for Railgun is the romaji "To Aru Kagaku no
+    # Railgun" (0.50 vs the English query), and the floor's scorer is
+    # case-sensitive, so linewebtoon's "CHAINSAW MAN" scores 0.25 and
+    # mangafire's "SPY×FAMILY" 0.18. Each has a correctly-spelled twin on
+    # another site. Measured over 16 live searches: 38 hits admitted, about
+    # 32 correct; the wrong ones all come from _normalize_title dropping
+    # parentheticals ("(Novel)", "(Guide Book)"), an over-merge admitted hits
+    # already get.
+    # WHY not fix the scorer instead: making it case-insensitive admits 44-67
+    # hits of mostly NOISE, because WRatio gives 0.855 to any title sharing a
+    # single word with the query (memory search-title-gate-measurements).
+    # Three rules keep this from growing candidates out of noise:
+    #   * Anchors are only hits the FLOOR admitted — an anchored hit never
+    #     anchors another (no chaining).
+    #   * The hit attaches by its ONE best-scoring matching key and adds no
+    #     union, so it can join a group but never weld two groups together.
+    #   * It inherits that anchor's title-match: the key match is the
+    #     evidence, so it ranks as the title it matched (its own score is a
+    #     measure of the spelling, not of the series). Never above the
+    #     group's best, so candidate ORDER cannot change.
+    anchored_sites: List[str] = []
+    for hit in below_floor:
+        best_key, best = None, 0.0
+        for k in _hit_merge_keys(hit):
+            sc = anchor_score.get(k, 0.0)
+            if sc > best:
+                best_key, best = k, sc
+        if best_key is None:
+            continue
+        hit_keys.append((best, hit, [best_key]))
+        anchored_sites.append(hit.site)
+    if anchored_sites and on_status:
+        on_status(
+            f"[*] title anchoring: admitted {len(anchored_sites)} hit(s) below "
+            f"the match floor by exact title ({', '.join(sorted(set(anchored_sites)))})"
+        )
 
     # Pass 2: bucket by root.
     groups: Dict[str, List[Tuple[float, SearchHit]]] = {}
@@ -6797,21 +6865,31 @@ def search_all(
         for _name, hits in late_now.items():
             for hit in hits or []:
                 score = _best_title_match(query, hit, seed_title_variants)
-                if score < min_match:
-                    continue
-                keys: List[str] = []
-                for t in [hit.title] + list(hit.alt_titles or []):
-                    k = _normalize_title(t)
-                    if k and k not in keys:
-                        keys.append(k)
+                keys = _hit_merge_keys(hit)
                 if not keys:
                     continue
+                anchored = score < min_match
+                if anchored:
+                    # Anchored admission, same rules as the build pass: only
+                    # pre-barrier admitted hits anchor, one key, no new group.
+                    best_key, best = None, 0.0
+                    for k in keys:
+                        sc = anchor_score.get(k, 0.0)
+                        if sc > best:
+                            best_key, best = k, sc
+                    if best_key is None:
+                        continue
+                    score, keys = best, [best_key]
                 target: Optional[SeriesCandidate] = None
                 for k in keys:
                     if k in parent:
                         target = candidate_by_root.get(_find(k))
                         if target is not None:
                             break
+                if target is None and anchored:
+                    # Its anchor's candidate was filtered out after the build;
+                    # an anchored hit never founds a candidate of its own.
+                    continue
                 if target is None:
                     for k in keys:
                         target = late_key_map.get(k)
@@ -6850,7 +6928,11 @@ def search_all(
                         entry.img_quality_metadata = cached_late[1] or None
                 if target is None:
                     target = SeriesCandidate(
-                        canonical_title=hit.title or keys[0],
+                        # keys are space-stripped comparison keys — never a
+                        # display title (see _title_merge_key).
+                        canonical_title=hit.title or next(
+                            (a for a in (hit.alt_titles or []) if a), ""
+                        ),
                         canonical_year=hit.year if isinstance(hit.year, int) else None,
                         sources=[],
                     )
