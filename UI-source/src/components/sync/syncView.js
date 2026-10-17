@@ -208,6 +208,22 @@ export function throughput(samples, windowMs = 8000) {
   return ((last.bytes - first.bytes) * 1000) / dt;
 }
 
+/**
+ * Remaining ms at the AVERAGE rate over `samples` ({at, bytes}, one step of
+ * one run), or null until there's enough to go on (3 samples over 15 s).
+ * For progress that moves in coarse steps (a read-back advances per series),
+ * where throughput()'s 8 s window mostly sees no movement.
+ */
+export function averageEta(samples, progress) {
+  if (!progress || !(progress.bytesTotal > 0) || !Array.isArray(samples) || samples.length < 3) return null;
+  const a = samples[0];
+  const b = samples[samples.length - 1];
+  const dt = b.at - a.at;
+  if (dt < 15000 || !(b.bytes > a.bytes)) return null;
+  const left = progress.bytesTotal - (progress.bytesDone || 0);
+  return left > 0 ? (left * dt) / (b.bytes - a.bytes) : 0;
+}
+
 /** Remaining ms at `rate` bytes/s, or null. */
 export function etaMs(progress, rate) {
   if (!progress || !rate || !(progress.bytesTotal > 0)) return null;
@@ -292,7 +308,8 @@ export function lastRunView(run, tn, titleOf) {
   if (run.status === "completed") {
     if (phase === "prune") line = `${count((s.prune && s.prune.removed) || deleted, "folder")} removed`;
     else if (phase === "rename") line = s.reason === "same-name" ? "The folder already had that name" : "Folder renamed";
-    else if (phase === "verify") line = `${count(s.filesDone || 0, "file")} checked`;
+    // executor.js verify counts series folders in filesDone.
+    else if (phase === "verify") line = `${count(s.filesDone || 0, "series", "series")} checked`;
     else line = `${count(s.filesDone || 0, "file")} · ${bytes} copied${deleted ? ` · ${deleted} removed` : ""}`;
     note = `Finished ${clock(run.at)}`;
   } else if (run.status === "cancelled") {

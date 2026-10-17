@@ -1394,6 +1394,44 @@ test("Verify: managed folders only; a failed hash keeps the entries; read-back a
   }
 });
 
+// The read-back of a first sync can run for many minutes on a big tablet
+// (one device-hash per series): its progress must count series and bytes,
+// or the Sync tab and connect card show a spinner with no movement.
+test("verify progress counts series folders and their device bytes, in both device-hash and read-back", async () => {
+  for (const inject of [null, { tools: { sha256sum: false } }]) {
+    const w = await world({ lib: LIB, ...(inject ? { inject } : {}) });
+    try {
+      const sizes = {};
+      for (const [f, n] of [["Alpha", "Ch.001.cbz"], ["Alpha", "Ch.002.cbz"], ["Beta", "Ch.001.cbz"]]) {
+        const b = fs.readFileSync(pcPath(w, f, n));
+        w.devWrite(`${f}/${n}`, b);
+        sizes[f] = (sizes[f] || 0) + b.length;
+      }
+      const evs = [];
+      const p = await w.prepare({ onProgress: (ev) => ev.phase === "verify" && evs.push(ev), opts: inject ? { verifyMode: "read-back" } : {} });
+      assert.ok(p.ok, p.code);
+      const label = inject ? "read-back" : "device-hash";
+      assert.ok(evs.length, `${label}: verify progress sent`);
+      const total = sizes.Alpha + sizes.Beta;
+      for (const ev of evs) {
+        assert.strictEqual(ev.filesTotal, 2, `${label}: filesTotal = series folders`);
+        assert.strictEqual(ev.bytesTotal, total, `${label}: bytesTotal = their device bytes`);
+        assert.ok(ev.bytesDone <= total && ev.filesDone <= 2, `${label}: never past the totals`);
+      }
+      const last = evs[evs.length - 1];
+      assert.deepStrictEqual([last.filesDone, last.bytesDone], [2, total], `${label}: ends at the totals`);
+      const mono = evs.every((e, i) => i === 0 || (e.filesDone >= evs[i - 1].filesDone && e.bytesDone >= evs[i - 1].bytesDone));
+      assert.ok(mono, `${label}: progress never goes back`);
+      // Read-back steps per file: some event lands between the folder ends.
+      if (inject) assert.ok(evs.some((e) => e.current && e.current.name && e.bytesDone > 0 && e.bytesDone < total), "read-back: per-file steps");
+      assert.ok(evs.every((e) => e.current && typeof e.current.folder === "string"), `${label}: current names the folder`);
+      assert.deepStrictEqual([p.verify.filesDone, p.verify.filesTotal], [2, 2], `${label}: the run result counts series`);
+    } finally {
+      await w.close();
+    }
+  }
+});
+
 test("prune: deletes only hash-proven files of ours, keeps foreign and adopted-size, rmdir only when empty", async () => {
   const w = await world({ lib: LIB });
   try {

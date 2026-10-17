@@ -142,6 +142,15 @@ function eq(label, actual, expected) {
   check("refused start carries the refusal", run("failed", { refusal: { code: "blocked", blocking: [] } }).refusal.code === "blocked");
   eq("skipped series named through titleOf", run("completed", { skippedSeries: [{ seriesKey: "pc:A", reason: "folder-reappeared" }] }).skipped, ["1 series skipped: A! (its folder came back on the target meanwhile)"]);
   eq("prune card", run("completed", { prune: { removed: 2 } }, "prune").line, "2 folders removed");
+  // executor.js verify counts series folders in filesDone.
+  eq("verify card counts series", [run("completed", { filesDone: 1 }, "verify").line, run("completed", { filesDone: 24 }, "verify").line], ["1 series checked", "24 series checked"]);
+
+  // ── Average-rate time left (the loading screen's read-back line) ──
+  const smp = (at, bytes) => ({ at, bytes });
+  eq("eta: needs 3 samples over 15 s", [V.averageEta([smp(0, 0), smp(20000, 10)], { bytesTotal: 100, bytesDone: 10 }), V.averageEta([smp(0, 0), smp(5000, 5), smp(10000, 10)], { bytesTotal: 100, bytesDone: 10 })], [null, null]);
+  eq("eta: average rate over the step", V.averageEta([smp(0, 0), smp(10000, 5), smp(20000, 10)], { bytesTotal: 100, bytesDone: 10 }), 180000);
+  eq("eta: no movement or no total → null", [V.averageEta([smp(0, 5), smp(10000, 5), smp(20000, 5)], { bytesTotal: 100, bytesDone: 5 }), V.averageEta([smp(0, 0), smp(10000, 5), smp(20000, 10)], { bytesTotal: 0 })], [null, null]);
+  eq("eta: done → 0", V.averageEta([smp(0, 0), smp(10000, 50), smp(20000, 100)], { bytesTotal: 100, bytesDone: 100 }), 0);
 
   // ── Lanes ──
   let r1 = V.laneFills({ runId: 7, state: "running", phase: "apply", progress: { lane: { seriesKey: "A", landed: 1, total: 4 } } }, null);
@@ -237,6 +246,16 @@ function eq(label, actual, expected) {
   const C = await import(pathToFileURL(out2).href);
   fs.rmSync(out2, { force: true });
   {
+    // The first read-back (executor.js verify): series + byte progress.
+    const vj = (progress) => ({ runId: 3, state: "running", phase: "plan", targetId: "a", progress: { step: "verify", ...progress } });
+    const w = C.workLine(vj({ filesDone: 24, filesTotal: 130, bytesDone: 50, bytesTotal: 200, current: { folder: "Blue Lock" } }), "a");
+    eq("read-back line: series and byte %", [w.text, w.pct, w.current], ["Reading back what's already there (24 of 130 series, 25%)", 25, "Blue Lock"]);
+    const w0 = C.workLine(vj({ filesDone: 1, filesTotal: 4, bytesDone: 0, bytesTotal: 0 }), "a");
+    eq("read-back line: no bytes → series %", [w0.text, w0.pct], ["Reading back what's already there (1 of 4 series, 25%)", 25]);
+    eq("read-back line before any count", C.workLine(vj({}), "a").text, "Reading back what's already there");
+    eq("another target's job → no line", C.workLine(vj({ filesTotal: 2 }), "b"), null);
+  }
+  {
     const T0 = 1_000_000;
     const tgt = (id, extra = {}) => ({ id, name: id === "a" ? "Tab" : "Folder", kind: "folder", root: "/x", ...extra });
     const live = { ...S, gen: 5 };
@@ -262,7 +281,7 @@ function eq(label, actual, expected) {
     eq("card: a non-first needs-mode says Check", r.cards[0].primary.label, "Check (reads ~9.4 GB)");
     const verifying = { state: "running", runId: 3, phase: "plan", auto: true, targetId: "a", progress: { step: "verify", filesDone: 31, filesTotal: 50 } };
     r = C.connectCards({ ...base, prompts: [prompt({ targets: [], attention: [att] })], job: verifying });
-    eq("card: Set up's re-plan shows the read-back progress", [r.cards[0].body, r.cards[0].progress, r.cards[0].primary], ["Reading back what's already there (62%)", 62, null]);
+    eq("card: Set up's re-plan shows the read-back progress", [r.cards[0].body, r.cards[0].progress, r.cards[0].primary], ["Reading back what's already there (31 of 50 series, 62%)", 62, null]);
     r = C.connectCards({ ...base, prompts: [prompt({ targets: [], attention: [att] })], plans: { a: { summary: live } } });
     check("card: after the read-back the live plan makes it ready", r.cards[0].primary && r.cards[0].primary.label === "Review", JSON.stringify(r.cards[0].primary));
 

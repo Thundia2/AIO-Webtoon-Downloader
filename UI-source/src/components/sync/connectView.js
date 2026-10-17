@@ -93,8 +93,14 @@ export function workLine(job, targetId) {
   const n = pct(p.filesDone, p.filesTotal);
   const at = n == null ? "" : ` (${n}%)`;
   switch (p.step) {
-    case "verify":
-      return { text: `Reading back what's already there${at}`, pct: n };
+    case "verify": {
+      // executor.js verify: filesDone/filesTotal count series folders and the
+      // bytes in them; bytes predict the time left, a big series being slow.
+      const b = pct(p.bytesDone, p.bytesTotal);
+      const v = b != null ? b : n;
+      const of = p.filesTotal > 0 ? ` (${p.filesDone || 0} of ${p.filesTotal} series${v != null ? `, ${v}%` : ""})` : "";
+      return { text: `Reading back what's already there${of}`, pct: v, current: p.current && p.current.folder ? p.current.folder : null };
+    }
     case "hashing":
       return { text: `Fingerprinting PC files${at}`, pct: n };
     case "listing":

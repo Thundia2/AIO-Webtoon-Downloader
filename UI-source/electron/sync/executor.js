@@ -947,20 +947,39 @@ class Executor {
    * Verify managed folders (rule 8): results are adopted / adopted-size /
    * foreign; a failed hash keeps the old entries (it never wipes them on a
    * quiet failure). Only managed folders are recorded.
+   *
+   * Progress counts SERIES FOLDERS in filesDone/filesTotal (like prune), and
+   * the bytes in them in bytesDone/bytesTotal: a device-hash is one shell
+   * call per folder that can run for minutes on a large series, so a file
+   * count would sit at 0 and the bytes are what predict the time left.
+   * Consumers: connectView.workLine, SyncDock ProgressDock, service.js
+   * quitInfo, syncView.lastRunView.
    * @param {object} a
-   * @param {Array<{folder:string, shardId:?string, binding:object, pcFiles:object[]}>} a.folders
+   * @param {Array<{folder:string, shardId:?string, binding:object, pcFiles:object[], bytes?:number}>} a.folders
+   *   `bytes` = the folder's size in the device listing the plan was built
+   *   from (planner.verifyBytesOf); absent counts as 0 toward bytesTotal.
    * @param {'device-hash'|'read-back'|'adopt-size'} a.mode
    * @returns {Promise<object>} the run result; result.folders has one row each
    */
   async verify({ folders, mode = "device-hash", runId }) {
-    const result = { runId: runId || null, phase: "verify", status: "completed", reason: null, startedAt: this.now(), endedAt: null, filesTotal: 0, bytesTotal: 0, filesDone: 0, bytesDone: 0, charged: 0, files: [], deletes: [], renames: [], warnings: [], folders: [] };
+    const list = folders || [];
+    const sizeOf = (f) => (Number.isFinite(f.bytes) && f.bytes > 0 ? f.bytes : 0);
+    const bytesTotal = list.reduce((m, f) => m + sizeOf(f), 0);
+    const result = { runId: runId || null, phase: "verify", status: "completed", reason: null, startedAt: this.now(), endedAt: null, filesTotal: list.length, bytesTotal, filesDone: 0, bytesDone: 0, charged: 0, files: [], deletes: [], renames: [], warnings: [], folders: [] };
     this.result = result;
     try {
-      for (const f of folders || []) {
+      for (const f of list) {
         this._checkCancel();
         const row = { folder: f.folder, shardId: f.shardId || null, outcome: null };
         result.folders.push(row);
+        const base = result.bytesDone;
         await this._verifyFolder(f, mode, row);
+        // A failed folder is done too. Snapping to base + its planned size
+        // also absorbs read-back's per-file steps, which count the live
+        // listing's sizes.
+        result.filesDone += 1;
+        result.bytesDone = base + sizeOf(f);
+        this._progress({ folder: f.folder });
       }
     } catch (e) {
       return this._finish(result, e);
@@ -989,6 +1008,8 @@ class Executor {
           const r = await this._dev(() => this.transport.readBack(this._rel(f.folder, x.name), { signal: this.signal }));
           if (r.ok && r.size === x.size) hashes.set(x.name, r.sha256);
           else rc = 1;
+          this.result.bytesDone += x.size || 0;
+          this._progress({ folder: f.folder, name: x.name });
         }
       } else {
         const r = await this._dev(() => this.transport.hashFolder(f.folder, { largest, signal: this.signal }));

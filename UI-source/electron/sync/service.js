@@ -1307,7 +1307,13 @@ function initDeviceSync(deps) {
       if (!sp.shardId || !sp.deviceFolder || (want && !want.has(sp.deviceFolder))) continue;
       if (sp.state === "gone" || sp.state === "held") continue;
       const s = pcByKey.get(sp.seriesKey);
-      list.push({ folder: sp.deviceFolder, shardId: sp.shardId, binding: sp.binding, pcFiles: s ? s.files.filter((f) => f.sha256 && profiles.isMirrored(f.name, prep.target)) : [] });
+      list.push({
+        folder: sp.deviceFolder,
+        shardId: sp.shardId,
+        binding: sp.binding,
+        pcFiles: s ? s.files.filter((f) => f.sha256 && profiles.isMirrored(f.name, prep.target)) : [],
+        bytes: planner.verifyBytesOf(prep.device, [sp.deviceFolder]),
+      });
     }
     const m = transport.kind === "folder" || (prep.probe.caps && prep.probe.caps.sha256sum) ? "device-hash" : mode;
     if (!VERIFY_MODES.includes(m)) return { status: "failed", reason: "needs-mode" };

@@ -7,9 +7,10 @@
 //     (plan id + build time, the settling countdown, or why Review waits),
 //     and Review and start — the only way into the Review dialog.
 //   * progress (a verify/apply/prune/rename job on this target): the current
-//     file, throughput, ETA, files and bytes done, Cancel. A plan job keeps
-//     the selection face and says "Planning…" in its status line: plans are
-//     short and frequent, and the user's place in the totals shouldn't jump.
+//     file (or folder), throughput, ETA, files / series / folders and bytes
+//     done, Cancel. A plan job keeps the selection face and says
+//     "Planning…" in its status line: plans are short and frequent, and the
+//     user's place in the totals shouldn't jump.
 //
 // Throughput is computed by the caller from progress samples
 // (syncView.throughput); this file only draws.
@@ -27,12 +28,19 @@ const PHASE_VERB = {
   rename: (tn) => `Renaming a folder on ${tn}`,
   verify: (tn) => `Reading back ${tn}`,
 };
+// What filesDone/filesTotal count per phase: files for an apply, series
+// folders for a verify (executor.js verify), folders for a prune or rename
+// (same split as service.js quitInfo).
+const UNIT = { apply: ["file", "files"], verify: ["series", "series"], prune: ["folder", "folders"], rename: ["folder", "folders"] };
 const STATUS_ICON = { ok: Check, settle: Timer, busy: Loader2, warn: AlertTriangle, search: Search };
 
 export function ProgressDock({ job, tn, rate, eta, onCancel, cancelling }) {
   const p = job.progress || {};
   const verb = (PHASE_VERB[job.phase] || PHASE_VERB.apply)(tn);
-  const cur = p.current ? `${p.current.folder} / ${p.current.name}` : p.step ? `${p.step}…` : "Starting…";
+  // A verify's current is a folder alone (device-hash names no file).
+  const cur = p.current ? (p.current.name ? `${p.current.folder} / ${p.current.name}` : p.current.folder) : p.step ? `${p.step}…` : "Starting…";
+  const [one, many] = UNIT[job.phase] || UNIT.apply;
+  const unit = (n) => (n === 1 ? one : many);
   const pct = p.bytesTotal > 0 ? (p.bytesDone / p.bytesTotal) * 100 : p.filesTotal > 0 ? (p.filesDone / p.filesTotal) * 100 : 0;
   return (
     <div className="flex shrink-0 flex-col gap-1.5 border-t bg-card px-3.5 py-2.5" role="status" aria-live="polite">
@@ -52,7 +60,7 @@ export function ProgressDock({ job, tn, rate, eta, onCancel, cancelling }) {
       </div>
       <div className="flex font-mono text-[11px] tabular-nums text-muted-foreground">
         <span>
-          {p.filesTotal != null ? `${p.filesDone || 0} of ${p.filesTotal} files` : `${p.filesDone || 0} files`}
+          {p.filesTotal != null ? `${p.filesDone || 0} of ${p.filesTotal} ${unit(p.filesTotal)}` : `${p.filesDone || 0} ${unit(p.filesDone || 0)}`}
           {p.bytesTotal > 0 ? ` · ${formatBytes(p.bytesDone || 0)} of ${formatBytes(p.bytesTotal)}` : ""}
         </span>
       </div>

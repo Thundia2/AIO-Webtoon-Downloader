@@ -333,6 +333,7 @@ async function preparePlan(c) {
           shardId: v.shardId,
           binding: v.binding,
           pcFiles: s ? s.files.filter((f) => f.sha256 && isMirrored(f.name, target)) : [],
+          bytes: planner.verifyBytesOf(device, [v.folder]),
         };
       }),
     });

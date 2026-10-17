@@ -39,6 +39,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { FolderSync, Loader2, Unlink } from "lucide-react";
 import { Button } from "@/components/ui/primitives";
 import { Sheet } from "@/components/ui/overlay";
+import { formatEta } from "@/lib/utils";
 import * as SQ from "@/hooks/selectionQueue";
 import TargetBar from "./TargetBar";
 import TargetEditor from "./TargetEditor";
@@ -49,10 +50,11 @@ import ReviewDialog from "./ReviewDialog";
 import PruneDialog from "./PruneDialog";
 import FindSourcesSheet from "./FindSourcesSheet";
 import { aliasFor } from "./findView";
+import { workLine } from "./connectView";
 import { LastRunCard, RefusalCard, WarningCallouts } from "./SyncCards";
 import { useConfigOps } from "./useConfigOps";
 import {
-  clock, coverIndex, dockTotals, etaMs, jobOn, laneFills, lastRunView, ledgerRows, pcPathIndex, pickTargets, rowToggle, settleInfo, settleLine,
+  averageEta, clock, coverIndex, dockTotals, etaMs, jobOn, laneFills, lastRunView, ledgerRows, pcPathIndex, pickTargets, rowToggle, settleInfo, settleLine,
   throughput, tileCounts,
 } from "./syncView";
 
@@ -199,16 +201,26 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
     return () => clearTimeout(t);
   }, [gen]);
 
-  // Throughput samples per run (progress `at` from service.js _progressOf).
-  const samplesRef = useRef({ runId: null, list: [] });
+  // Throughput samples per run and step (progress `at` from service.js
+  // _progressOf). Per step because a plan job's bytes restart at each one
+  // (PC hashing, then the read-back), which a run-wide list would read as
+  // a negative rate.
+  const samplesRef = useRef({ key: null, list: [] });
   const job = run ? run.job : null;
   if (job && job.progress) {
-    const s = samplesRef.current.runId === job.runId ? samplesRef.current : (samplesRef.current = { runId: job.runId, list: [] });
+    const key = `${job.runId}:${job.progress.step || ""}`;
+    const s = samplesRef.current.key === key ? samplesRef.current : (samplesRef.current = { key, list: [] });
     const at = job.progress.at || Date.now();
     const last = s.list[s.list.length - 1];
     if (!last || last.at !== at) s.list = [...s.list.slice(-39), { at, bytes: job.progress.bytesDone || 0 }];
   }
   const rate = job ? throughput(samplesRef.current.list) : null;
+  // The loading screen's line while a plan builds (the first read-back of a
+  // big tablet runs for many minutes). A read-back advances once per series,
+  // too seldom for throughput's 8 s window, so its time left is the step's
+  // average rate.
+  const work = summary ? null : workLine(sync.job, tid);
+  const workEta = work && work.pct != null && job ? averageEta(samplesRef.current.list, job.progress) : null;
   useEffect(() => {
     if (!job) setCancelling(false);
   }, [job]);
@@ -347,6 +359,22 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
         <>
           <Loader2 className="h-5 w-5 animate-spin motion-reduce:animate-none" aria-hidden="true" />
           <div>Comparing your library with {tn}…</div>
+          {work && (
+            <div className="flex w-full max-w-sm flex-col items-center gap-1.5" role="status" aria-live="polite">
+              <div className="text-foreground">{work.text}</div>
+              {work.pct != null && (
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                  <i className="block h-full rounded-full bg-primary transition-[width] duration-300 motion-reduce:transition-none" style={{ width: `${work.pct}%` }} />
+                </div>
+              )}
+              {(work.current || workEta != null) && (
+                <div className="flex w-full min-w-0 justify-between gap-3 font-mono text-[11px] tabular-nums">
+                  <span className="min-w-0 truncate" title={work.current || ""}>{work.current || ""}</span>
+                  {workEta != null && workEta > 0 && <span className="shrink-0">about {formatEta(workEta)} left</span>}
+                </div>
+              )}
+            </div>
+          )}
         </>
       )}
     </div>
@@ -456,7 +484,9 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
           job={run.job}
           tn={tn}
           rate={rate}
-          eta={etaMs(run.job.progress, rate)}
+          // A verify job advances per series, too seldom for throughput's
+          // window: fall back to the step's average.
+          eta={etaMs(run.job.progress, rate) ?? (run.job.phase === "verify" ? averageEta(samplesRef.current.list, run.job.progress) : null)}
           cancelling={cancelling}
           onCancel={() => {
             setCancelling(true);
