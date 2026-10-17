@@ -367,16 +367,16 @@ export const DEFAULT_SETTINGS = {
     // --no-final-file and writes per-chapter ComicInfo.xml + cover.jpg
     // + details.json at <out>/manga/<Series>/. The format selector
     // above is effectively ignored when this is on (Python prints a
-    // [Komikku] coercion notice in the log). DownloadTab's DEFAULT_FORM
-    // spread picks this up via the useEffect at line ~120-124; App.jsx's
-    // search/library wrappers spread it into queueDownload args.
+    // [Komikku] coercion notice in the log). The New tab shows it via
+    // lib/downloadForm.js:formDefaults; search/library/Sync downloads get
+    // it when they start (lib/queueRecipe.js spreads settings.defaults).
     komikku: false,
     // LINE Webtoon WebP recompression defaults (Phase 1, 2026-05-11).
     // When enabled here, BOTH the New tab AND search/library-initiated
-    // downloads inherit these knobs: the New tab's DEFAULT_FORM spread
-    // (DownloadTab.jsx:~110) and App.jsx's settings.defaults spread for
-    // the search/library onStartDownload wrappers (App.jsx:~155 and
-    // :~192) both pick this up. Master toggle is off by default so
+    // downloads inherit these knobs: the New tab via
+    // lib/downloadForm.js:formDefaults, and every queued download when it
+    // STARTS via lib/queueRecipe.js (so a save reaches waiting items too).
+    // Master toggle is off by default so
     // existing user flows are unchanged; toggling on in Settings makes
     // every new webtoons.com download recompress without per-job UI.
     // Silently no-ops for non-webtoons.com handlers (Python checks

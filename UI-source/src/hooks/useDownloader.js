@@ -17,7 +17,12 @@
 //   activeDownloads: { [downloadId]: { url, args, status, progress, logs, tmpDir? } }
 //   logs: [ { downloadId, line, level, timestamp }, ... ]
 //   queue: [ { id, type:"download"|"resume", url, displayUrl, queuedAt, restored?,
-//             args? (download) | tmpDir?/format?/epubLayout?/title?/cachedChapters? (resume) }, ... ]
+//             recipe? | args? (download) | tmpDir?/format?/epubLayout?/title?/cachedChapters? (resume) }, ... ]
+//     A download item stores a `recipe` (lib/queueRecipe.js); its CLI args are
+//     built when it STARTS, from the settings saved at that moment. Only items
+//     queued before recipes existed (an old download_queue.json) carry frozen
+//     `args`. The `queue` this hook RETURNS adds a display-only `args` to
+//     recipe items (grep displayQueue); the persisted queue never has it.
 //   resumable: [ { hid, tmpDir, params, cachedChapters }, ... ]
 //   settings: { pythonCmd, scriptPath, workingDir, defaults, verboseAlways }
 //
@@ -28,6 +33,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { formatDuration } from "@/lib/utils";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
+import { finalArgsFor, globalArgs } from "@/lib/queueRecipe";
 
 // DEFAULT_DOWNLOAD_DEFAULTS / mergeSettings / normalizeDownloadArgs were
 // removed 2026-05-13: SettingsTab.jsx now owns the defaults dict. The
@@ -41,18 +47,30 @@ import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 const hasAPI = () => typeof window !== "undefined" && !!window.electronAPI;
 
 // ── Queue-item spawn/adopt helpers ──
-// Module-level (NOT useCallback) on purpose: they read only their `item` arg +
+// Module-level (NOT useCallback) on purpose: they read only their arguments +
 // window.electronAPI + Date.now, so the useCallback closures below can reference
 // them WITHOUT dep-array churn. A queue item is either a fresh download
-// ({type:"download", url, displayUrl, args}) or a resume job
+// ({type:"download", url, displayUrl, recipe | args}) or a resume job
 // ({type:"resume", url, tmpDir, format, epubLayout, title}). Both drain through
-// the SAME path (_startNextInQueue / startQueuedNow) via these two helpers, so
+// the SAME path (_startNextInQueue / startQueuedNow) via these helpers, so
 // resume and download queue and replay identically.
 
-// Spawn a queue item via the right IPC. Returns main's { downloadId }. The
-// resume branch mirrors resumeDownload's original payload; the download branch
-// mirrors queueDownload's. grep _spawnQueueItem for the call sites.
-async function _spawnQueueItem(item) {
+// The CLI args a download item starts with under settings `s`: its recipe
+// resolved NOW (lib/queueRecipe.js), or the frozen args of a legacy item.
+// undefined for resume items — they replay run_params.json, and main.js applies
+// the current CPU/network limits to them itself (resumeThrottleFlags).
+// THROWS on a malformed recipe (a restored download_queue.json can hold
+// anything). Every caller resolves BEFORE spawning and drops the item on a
+// throw, so one bad entry can't wedge the queue in a retry loop.
+function _resolveQueueArgs(item, s) {
+  if (item.type === "resume") return undefined;
+  return item.recipe ? finalArgsFor(item.recipe, s) : item.args;
+}
+
+// Spawn a queue item via the right IPC with the args from _resolveQueueArgs.
+// Returns main's { downloadId }. The resume branch mirrors resumeDownload's
+// original payload. grep _spawnQueueItem for the call sites.
+async function _spawnQueueItem(item, args) {
   if (item.type === "resume") {
     return window.electronAPI.resumeDownload({
       url: item.url,
@@ -61,17 +79,19 @@ async function _spawnQueueItem(item) {
       epubLayout: item.epubLayout,  // optional epub layout when format is epub
     });
   }
-  return window.electronAPI.startDownload({ url: item.url, args: item.args });
+  return window.electronAPI.startDownload({ url: item.url, args });
 }
 
-// Build the activeDownloads entry for a just-spawned queue item. `tmpDir` is
-// carried onto the active entry ONLY so resumeDownload's dedupe can spot an
-// in-flight resume for the same folder (grep dupActive in resumeDownload).
-function _activeEntryForQueueItem(item) {
+// Build the activeDownloads entry for a just-spawned queue item. `args` are the
+// RESOLVED args it was spawned with (the running snapshot persists them, and
+// _restoreQueueItems reads their format). `tmpDir` is carried onto the active
+// entry ONLY so resumeDownload's dedupe can spot an in-flight resume for the
+// same folder (grep dupActive in resumeDownload).
+function _activeEntryForQueueItem(item, args) {
   return {
     url: item.url,
     displayUrl: item.displayUrl,
-    args: item.args,          // undefined for resume items — harmless
+    args,                     // undefined for resume items — harmless
     tmpDir: item.tmpDir,      // undefined for download items — harmless
     status: "running",
     progress:
@@ -295,6 +315,12 @@ export function useDownloader() {
   // first process becomes orphaned. Reset in the spawn's finally so a failed
   // start (rare, e.g. main-process IPC error) doesn't lock the queue.
   const startingRef = useRef(false);
+  // Resolves once the saved settings have been read on mount, or the read
+  // failed; it never rejects. Every spawn path awaits it before building a
+  // recipe's args. The restored queue auto-starts ~300ms after mount, and
+  // resolving against the pre-load placeholder (`defaults: {}`) would start it
+  // with none of the user's settings. The mount effect replaces it.
+  const settingsReadyRef = useRef(Promise.resolve());
   // Library scans can be triggered manually from the Library tab and
   // automatically after downloads finish. Keep only one scan active and
   // coalesce any extra requests into one follow-up scan so a batch finishing
@@ -335,9 +361,9 @@ export function useDownloader() {
   // the two in parallel would race the liveness check and either drop a valid
   // resume or revive a job whose tmp folder is gone.
   //
-  // getSettings stays fire-and-forget alongside it — nothing here depends on
-  // it, and blocking the queue restore on a settings read would delay the
-  // auto-start for no reason.
+  // getSettings runs alongside it. The restore itself doesn't need settings,
+  // but SPAWNING does (queue items build their args at start), so the read is
+  // kept in settingsReadyRef and every spawn path awaits it.
   //
   // Deliberately references _startNextInQueue, which is defined further down:
   // effect BODIES run after the whole component body, and it's a
@@ -346,9 +372,16 @@ export function useDownloader() {
   useEffect(() => {
     if (!hasAPI()) return;
 
-    window.electronAPI.getSettings().then((s) => {
-      if (s) setSettings(s);
-    });
+    settingsReadyRef.current = Promise.resolve()
+      .then(() => window.electronAPI.getSettings())
+      .then((s) => {
+        if (!s) return;
+        // Write the ref too: a spawn awaiting this promise reads settingsRef
+        // before React has re-rendered with the new state.
+        settingsRef.current = s;
+        setSettings(s);
+      })
+      .catch((err) => console.error("Failed to load settings:", err));
 
     let cancelled = false;
 
@@ -665,145 +698,89 @@ export function useDownloader() {
 
   // ── Internal: start the next item in the queue ──
   const _startNextInQueue = useCallback(async () => {
-    const q = queueRef.current;
-    if (q.length === 0 || currentIdRef.current || startingRef.current) return;
-
-    const next = q[0];
-
-    // Spawn the Python process. Reserve the slot synchronously before the
-    // await so a concurrent queueDownload (e.g. user clicks Download again
-    // before we resolve) can't also spawn.
+    if (queueRef.current.length === 0 || currentIdRef.current || startingRef.current) return;
     if (!hasAPI()) return;
+
+    // Reserve the slot synchronously before the first await so a concurrent
+    // queueDownload (e.g. user clicks Download again before we resolve) can't
+    // also spawn.
     startingRef.current = true;
+    let retryAfterMs = 0;
     try {
-      // _spawnQueueItem branches resume vs download — the head item becomes the
-      // new serial "anchor" regardless of type.
-      const { downloadId } = await _spawnQueueItem(next);
+      await settingsReadyRef.current;
+      // Read the head AFTER the wait: the user may have removed it meanwhile.
+      const next = queueRef.current[0];
+      if (next) {
+        // Args are built NOW, from the settings in force at start. A recipe
+        // that can't be resolved is dropped, not retried: retrying the same
+        // head would block everything behind it.
+        let args;
+        let resolved = false;
+        try {
+          args = _resolveQueueArgs(next, settingsRef.current);
+          resolved = true;
+        } catch (err) {
+          console.error("Dropping a queued download whose saved recipe can't be read:", err, next);
+          setQueue((prev) => prev.filter((item) => item !== next));
+          retryAfterMs = 300; // once React has committed the removal to queueRef
+        }
 
-      // UIR-1: only dequeue AFTER a successful spawn, so a throw leaves the
-      // item in place to be retried (the startingRef guard above prevents a
-      // concurrent call from double-spawning q[0] during the await). Dequeue by
-      // IDENTITY, not slice(1): if the user removed a DIFFERENT row during the
-      // spawn await, q[0] may no longer be `next`, and slice(1) would drop that
-      // other item instead. Each queued entry is a distinct object, so `!==`
-      // removes exactly the spawned one.
-      setQueue((prev) => prev.filter((item) => item !== next));
+        if (resolved) {
+          try {
+            // _spawnQueueItem branches resume vs download — the head item
+            // becomes the new serial "anchor" regardless of type.
+            const { downloadId } = await _spawnQueueItem(next, args);
 
-      setActiveDownloads((prev) => ({
-        ...prev,
-        [downloadId]: _activeEntryForQueueItem(next),
-      }));
+            // UIR-1: only dequeue AFTER a successful spawn, so a throw leaves
+            // the item in place to be retried (the startingRef guard above
+            // prevents a concurrent call from double-spawning q[0] during the
+            // await). Dequeue by IDENTITY, not slice(1): if the user removed a
+            // DIFFERENT row during the spawn await, q[0] may no longer be
+            // `next`, and slice(1) would drop that other item instead.
+            setQueue((prev) => prev.filter((item) => item !== next));
 
-      setCurrentDownloadId(downloadId);
-    } catch (err) {
-      console.error("Failed to start queued download:", err);
-      // Try the next one if this fails
-      setTimeout(() => _startNextInQueue(), 1000);
+            setActiveDownloads((prev) => ({
+              ...prev,
+              [downloadId]: _activeEntryForQueueItem(next, args),
+            }));
+
+            setCurrentDownloadId(downloadId);
+          } catch (err) {
+            console.error("Failed to start queued download:", err);
+            retryAfterMs = 1000; // the item stays at the head
+          }
+        }
+      }
     } finally {
       startingRef.current = false;
+      // Scheduled after the slot is released, or the retry would find it taken.
+      if (retryAfterMs) setTimeout(() => _startNextInQueue(), retryAfterMs);
     }
   }, []);
 
   // ── Public: add a download (starts immediately or queues) ──
-  // url can be a string (single) or string[] (multi-URL batch with --jobs)
+  // url can be a string (single) or string[] (multi-URL batch with --jobs).
   //
-  // Injects global defaults (verbose, collapseSplits) before passing args to
-  // the spawn so search/library/queue callsites don't have to re-implement
-  // those in every callsite. Caller-provided args win on conflict (the spread
-  // is positioned after the defaults), so DownloadTab's explicit verbose
-  // setting still takes priority over the global default.
+  // The second argument is EITHER:
+  //   { recipe }  — how to build the args (lib/queueRecipe.js). Every UI path
+  //                 passes this. The args are built when the item STARTS, from
+  //                 the settings saved at that moment, so a Settings save
+  //                 reaches items that are still waiting.
+  //   plain args  — frozen now under globalArgs (no current caller; kept so a
+  //                 future direct caller still gets the global settings).
+  // Returns a promise; Sync's FindSourcesSheet awaits it and reports a throw.
   const queueDownload = useCallback(
-    async (url, args) => {
-      const s = settingsRef.current;
-      const finalArgs = {
-        verbose: s?.verboseAlways !== false,
-        // XF-4: opt-in default OFF (absent → OFF). Matches main.js/searcher.js's
-        // `=== true`; the old `!== false` collapsed on download but not on the
-        // update-check, so fragments stuck as "+N new" forever.
-        collapseSplits: s?.collapseSplits === true,
-        // Curated-sites toggle. Persisted under settings.searchOpts.seededOnly
-        // because SettingsTab + SearchTab both write that namespace; we mirror
-        // it here so download paths see the same flag. Only takes effect when
-        // --multi-source is on — aio-dl.py reads seeded_only inside
-        // find_alternatives_for_direct_url to skip the long-tail Madara
-        // extras during the cross-site fan-out (otherwise: 282 handlers
-        // searched instead of ~30 in sites/quality_seed.json).
-        // searcher.js:70 uses the identical opts.seededOnly check; this
-        // closes the asymmetry where Search honored the toggle but
-        // multi-source-direct-URL downloads ignored it.
-        ...(s?.searchOpts?.seededOnly ? { seededOnly: true } : {}),
-        // Global machine-translation policy. Injected HERE rather than at each
-        // callsite so search-initiated and library-update downloads honor it
-        // too, not just the New tab (which passes its own args.mtl and wins on
-        // the spread below). Skipped at "avoid" — that's the Python default,
-        // so omitting it keeps older saved settings producing identical spawns.
-        ...(s?.defaults?.mtl && s.defaults.mtl !== "avoid"
-          ? { mtl: s.defaults.mtl }
-          : {}),
-        ...(s?.defaults?.excludeGroup
-          ? { excludeGroup: s.defaults.excludeGroup }
-          : {}),
-        // -1 sentinel = "match --image-workers"; the Python side resolves it.
-        // Skip injecting if the value is explicitly -1 (the default) so the
-        // CLI default also kicks in without a redundant flag in the spawn.
-        ...(s?.prefetchImageWorkers != null && s.prefetchImageWorkers !== -1
-          ? { prefetchImageWorkers: s.prefetchImageWorkers }
-          : {}),
-        // ── Fast-download knobs (added 2026-05-09; generalized 2026-05-13) ──
-        // Same "skip if at default" pattern as prefetchImageWorkers above:
-        // when the setting matches the Python-side default, leave it out of
-        // the spawn so older saved settings dicts that don't have the field
-        // still produce identical CLI invocations. Python defaults:
-        //   imageConcurrency=8, imagePrefetchDepth=2, imagePrefetchParallel=2.
-        // Migration note: settings dicts persisted
-        // before 2026-05-13 carry `mangafireImageConcurrency` instead of
-        // `imageConcurrency`. The SettingsTab loader migrates them at read
-        // time, so by the time we get here `s.imageConcurrency` is live.
-        ...(s?.imageConcurrency != null && s.imageConcurrency !== 8
-          ? { imageConcurrency: s.imageConcurrency }
-          : {}),
-        ...(s?.imagePrefetchDepth != null && s.imagePrefetchDepth !== 2
-          ? { imagePrefetchDepth: s.imagePrefetchDepth }
-          : {}),
-        ...(s?.imagePrefetchParallel != null && s.imagePrefetchParallel !== 2
-          ? { imagePrefetchParallel: s.imagePrefetchParallel }
-          : {}),
-        ...(s?.noFastDownload === true ? { noFastDownload: true } : {}),
-        // ── External metadata enrichment (--metadata-source family) ──
-        // Top-level global setting from SettingsTab → Metadata Enrichment.
-        // Same "skip when at Python default" pattern as imageConcurrency
-        // above: only emit on spawn when the user explicitly turned it
-        // on AND when the valued sub-options differ from argparse defaults
-        // (50 for tag rank, false for refresh). Keeps the spawn line clean
-        // for the default-off case so the LogPanel's `$ python aio-dl.py
-        // ...` line doesn't carry three metadata flags on every download.
-        // Python side: aio-dl.py near --enable-ml-rating registers the
-        // flags; sites/external_metadata.py runs the GraphQL client.
-        // The valued knobs are gated on metadataSource so they're never
-        // emitted in isolation — pointless without the master toggle.
-        ...(s?.metadataSource && s.metadataSource !== "none"
-          ? { metadataSource: s.metadataSource }
-          : {}),
-        ...(s?.metadataSource && s.metadataSource !== "none"
-            && s?.metadataTagMinRank != null && s.metadataTagMinRank !== 50
-          ? { metadataTagMinRank: s.metadataTagMinRank }
-          : {}),
-        ...(s?.metadataSource && s.metadataSource !== "none"
-            && s?.metadataRefresh === true
-          ? { metadataRefresh: true }
-          : {}),
-        // User-disabled sites → --disable-sites on EVERY spawn (manual / search /
-        // library / queue). downloader.js:buildCliArgs emits the flag when the
-        // array is non-empty; aio-dl.py drops those sites as multi-source
-        // alternatives (and guard-filters the persisted alt cache). Injected
-        // here — the single chokepoint every download path routes through — so
-        // no callsite has to re-implement it. Skipped when empty so default
-        // spawns stay clean. Caller args still win via the trailing ...args.
-        ...(Array.isArray(s?.disabledSites) && s.disabledSites.length
-          ? { disabledSites: s.disabledSites }
-          : {}),
-        ...args,
-      };
+    async (url, argsOrRecipe) => {
+      const recipe =
+        argsOrRecipe && typeof argsOrRecipe.recipe === "object" && argsOrRecipe.recipe
+          ? argsOrRecipe.recipe
+          : null;
+      // Fail at the caller, not silently later at spawn time: a recipe built
+      // in-process that can't resolve is a bug in that caller.
+      if (recipe) finalArgsFor(recipe, settingsRef.current);
+      const frozenArgs = recipe
+        ? null
+        : { ...globalArgs(settingsRef.current), ...(argsOrRecipe || {}) };
 
       // Display label: show first URL + count for batches
       const displayUrl = Array.isArray(url)
@@ -818,14 +795,16 @@ export function useDownloader() {
       if (!currentIdRef.current && !startingRef.current && hasAPI()) {
         startingRef.current = true;
         try {
-          const { downloadId } = await window.electronAPI.startDownload({ url, args: finalArgs });
+          await settingsReadyRef.current;
+          const args = recipe ? finalArgsFor(recipe, settingsRef.current) : frozenArgs;
+          const { downloadId } = await window.electronAPI.startDownload({ url, args });
 
           setActiveDownloads((prev) => ({
             ...prev,
             [downloadId]: {
               url,
               displayUrl,
-              args: finalArgs,
+              args,
               status: "running",
               progress: { phase: "starting" },
               logs: [],
@@ -845,10 +824,18 @@ export function useDownloader() {
 
       // Otherwise add to queue. type:"download" discriminates from resume jobs
       // (which _spawnQueueItem replays via the resume IPC); id is the React key
-      // + the handle removeFromQueue / startQueuedNow operate on.
+      // + the handle removeFromQueue / startQueuedNow operate on. A recipe item
+      // stores NO args — they're built when it starts (_resolveQueueArgs).
       setQueue((prev) => [
         ...prev,
-        { id: `q${++queueIdRef.current}`, type: "download", url, displayUrl, args: finalArgs, queuedAt: Date.now() },
+        {
+          id: `q${++queueIdRef.current}`,
+          type: "download",
+          url,
+          displayUrl,
+          ...(recipe ? { recipe } : { args: frozenArgs }),
+          queuedAt: Date.now(),
+        },
       ]);
     },
     []
@@ -920,10 +907,11 @@ export function useDownloader() {
     if (!currentIdRef.current && !startingRef.current) {
       startingRef.current = true;
       try {
-        const { downloadId } = await _spawnQueueItem(resumeItem);
+        // Resume items carry no args (they replay run_params.json).
+        const { downloadId } = await _spawnQueueItem(resumeItem, undefined);
         setActiveDownloads((prev) => ({
           ...prev,
-          [downloadId]: _activeEntryForQueueItem(resumeItem),
+          [downloadId]: _activeEntryForQueueItem(resumeItem, undefined),
         }));
         setCurrentDownloadId(downloadId);
         return { status: "started" };
@@ -969,10 +957,21 @@ export function useDownloader() {
     // extras are independent and must NOT block each other on one startingRef.
     if (becomesPrimary) startingRef.current = true;
     try {
-      const { downloadId } = await _spawnQueueItem(item);
+      await settingsReadyRef.current;
+      // Built now from the current settings, like the auto-drain. An unreadable
+      // recipe is dropped (it's already off the queue), never restored.
+      let args;
+      try {
+        args = _resolveQueueArgs(item, settingsRef.current);
+      } catch (err) {
+        console.error("Dropping a queued download whose saved recipe can't be read:", err, item);
+        if (becomesPrimary) setTimeout(() => _startNextInQueue(), 300);
+        return;
+      }
+      const { downloadId } = await _spawnQueueItem(item, args);
       setActiveDownloads((prev) => ({
         ...prev,
-        [downloadId]: _activeEntryForQueueItem(item),
+        [downloadId]: _activeEntryForQueueItem(item, args),
       }));
       if (becomesPrimary) setCurrentDownloadId(downloadId);
     } catch (err) {
@@ -1167,13 +1166,35 @@ export function useDownloader() {
     pendingSearchLogsRef.current = [];
   }, []);
 
+  // ── The queue as components see it ──
+  // Recipe items gain a display-only `args`: what they WOULD start with under
+  // the current settings, so QueueTab's format/quality badges follow a
+  // Settings save the same way the spawn does. Recomputed only when the queue
+  // or settings change. Never persisted, and never read back by the spawn path
+  // (that uses queueRef, the raw items). An unreadable recipe shows no badges
+  // here; the drain drops it when it reaches the head.
+  const displayQueue = useMemo(
+    () =>
+      queue.map((item) => {
+        if (!item.recipe) return item;
+        let args;
+        try {
+          args = finalArgsFor(item.recipe, settings);
+        } catch {
+          args = undefined;
+        }
+        return { ...item, args };
+      }),
+    [queue, settings]
+  );
+
   return {
     // State
     activeDownloads,
     logs,
     resumable,
     settings,
-    queue,
+    queue: displayQueue,
     currentDownloadId,
     searchState,
     searchLogs,

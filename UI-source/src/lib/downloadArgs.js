@@ -1,3 +1,10 @@
+// Pure download-args builders shared by the UI and lib/queueRecipe.js.
+//   - buildLibraryDownloadArgs: library / update-check downloads (below).
+//   - searchDialogInitial / searchDialogArgs / confirmSearchArgs: the Search
+//     tab's "Download settings" dialog (end of file).
+// queueRecipe.js re-runs these against the settings in force when a queued
+// item STARTS, so a Settings save reaches items that are still waiting.
+//
 // Shared builder for library/update-check download argument dicts.
 //
 // Both LibraryTab surfaces that queue an update download — the per-series
@@ -6,9 +13,9 @@
 // the SAME args object from the series metadata + the user's saved
 // settings.defaults.
 //
-// The produced arg dict is forwarded to useDownloader.queueDownload (via
-// App.jsx's onStartDownload wrapper, which spreads settings.defaults UNDER it)
-// and ultimately mapped to CLI flags in electron/downloader.js:buildCliArgs.
+// LibraryTab no longer calls this directly: it queues a "library" recipe and
+// lib/queueRecipe.js calls this at spawn, spreading settings.defaults UNDER the
+// result. The args are mapped to CLI flags in electron/downloader.js:buildCliArgs.
 // Flag names / conditional-inclusion here must stay byte-identical to what
 // those call sites emitted before extraction.
 //
@@ -19,7 +26,7 @@
 // the user has --multi-source on in settings (def.multiSource === true) we set
 // multiSourceLazy:true here, which OVERRIDES a global lazy opt-out
 // (settings.defaults.multiSourceLazy === false): this builder's result wins
-// over the settings.defaults spread (App.jsx onStartDownload), and
+// over the settings.defaults spread (queueRecipe.js kind "library"), and
 // downloader.js's chokepoint emits --multi-source-lazy whenever multiSource is
 // on and multiSourceLazy !== false. Normal New-tab / Search downloads never
 // route through here, so they keep honoring the global lazy toggle unchanged.
@@ -94,4 +101,60 @@ export function buildLibraryDownloadArgs(
     args.multiSourceLazy = true;
   }
   return args;
+}
+
+// ── Search tab "Download settings" dialog (SearchTab.jsx:SearchDownloadOptionsDialog) ──
+// Pure so lib/queueRecipe.js (kind "search") can rebuild a waiting search
+// item's args from the settings in force when it STARTS. The dialog keeps only
+// the fields the user changed (lib/downloadForm.js:applyEdits, baseline =
+// searchDialogInitial); every other field follows Settings.
+
+// What the dialog shows before any edit. `multiSource` is the SEARCH's own
+// flag, not a Setting: the prefetched alternatives only exist for that search
+// (see confirmSearchArgs), so it is job data and never follows Settings.
+export function searchDialogInitial(settings, multiSource) {
+  const d = settings?.defaults || {};
+  return {
+    format: d.format || "pdf",
+    epubLayout: d.epubLayout || "vertical",
+    chapters: "all",
+    group: d.group || "",
+    language: d.language || settings?.searchOpts?.searchLanguage || "en",
+    quality: d.quality ?? 100,
+    keepChapters: !!d.keepChapters,
+    keepImages: !!d.keepImages,
+    noFinalFile: !!d.noFinalFile,
+    multiSource: !!multiSource,
+  };
+}
+
+// The dialog's form (initial + edits) → the args it contributes.
+export function searchDialogArgs(form) {
+  const chapters = (form.chapters || "").trim();
+  const group = (form.group || "").trim();
+  const args = {
+    format: form.format,
+    quality: form.quality,
+    language: form.language,
+    keepChapters: form.keepChapters,
+    keepImages: form.keepImages,
+    noFinalFile: form.noFinalFile,
+    multiSource: form.multiSource,
+  };
+  if (form.format === "epub") args.epubLayout = form.epubLayout;
+  if (chapters && chapters.toLowerCase() !== "all") args.chapters = chapters;
+  if (group) args.group = group;
+  return args;
+}
+
+// The search result's own args (site, prefetchedAlts, multiSource, …) under the
+// dialog's. Prefetched alternatives are dropped when multi-source ends up off
+// (the user unticked it in the dialog), since they only feed --multi-source.
+export function confirmSearchArgs(searchArgs, dialogArgs) {
+  const out = { ...(searchArgs || {}), ...(dialogArgs || {}) };
+  if (!out.multiSource) {
+    delete out.prefetchedAlts;
+    delete out.multiSourcePrefetched;
+  }
+  return out;
 }

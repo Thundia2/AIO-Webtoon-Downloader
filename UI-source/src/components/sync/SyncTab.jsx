@@ -104,8 +104,9 @@ function useNow(active) {
  *   initial = {detail?:seriesKey, review?, prune?, edit?, find?, findOpen?:folder[], findCoverage?:folder}: overlays
  *   open at mount (the DEV gallery's seam; App never passes it).
  *   onFindSource({targetId, targetName, folder, query}) = single find (U4-6);
- *   onQueueDownload(url, args) = App's queueDownload with the download
- *   defaults; searchSettings = the saved {seededOnly, collapseSplits} the
+ *   onQueueDownload(url, args) = App's queueDownload; the download defaults
+ *   go under `args` when the download starts ("defaultsPlus" recipe,
+ *   lib/queueRecipe.js); searchSettings = the saved {seededOnly, collapseSplits} the
  *   find-sources sheet names (and links to via onOpenSettings("search")).
  */
 export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibrary, view: viewProp, onView, contained, initial, onFindSource, onQueueDownload, searchSettings }) {

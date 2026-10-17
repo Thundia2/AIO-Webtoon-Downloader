@@ -459,7 +459,7 @@ function searchLine(s) {
  *   search settings, shown only: the search itself runs with them in main
  *   (find-sources.js _searchOptions), with no per-run override
  * @param {() => void} [p.onOpenSearchSettings]  App: Settings → Search
- * @param {(url:string, args:object) => any} p.onQueueDownload  App: dl.queueDownload with the download defaults
+ * @param {(url:string, args:object) => any} p.onQueueDownload  App: dl.queueDownload (download defaults applied at start, lib/queueRecipe.js)
  * @param {string[]} [p.openSites]  folders whose site list starts open (DEV gallery)
  * @param {string} [p.openCoverage]  folder whose coverage sheet starts open (DEV gallery)
  */

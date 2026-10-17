@@ -106,14 +106,29 @@ export default function App() {
   // A download started from Search while the banner is up: link it to the
   // folder FIRST (config-op add-alias), then queue; a refused link queues
   // nothing and says why on the banner. Komikku follows the target (U4-8).
-  const startFoundDownload = async (f, url, args) => {
+  // `opts` is SearchTab's { recipe } (a "search" recipe, lib/queueRecipe.js);
+  // the target's komikku flag rides in its extraArgs, which win over the
+  // dialog and the Settings defaults when the download starts.
+  const startFoundDownload = async (f, url, opts) => {
     const r = await syncOps.run("add-alias", { targetId: f.targetId, alias: { url, deviceFolder: f.folder } });
     if (!r || r.ok === false) {
       setFindFor((x) => (x && x.token === f.token ? { ...x, error: configRefusalCopy(r, f.targetName) } : x));
       return;
     }
     const t = syncTargets.find((x) => x.id === f.targetId);
-    dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args, ...findQueueArgs(t) });
+    const recipe = opts?.recipe;
+    const withTarget = recipe
+      ? {
+          recipe: {
+            ...recipe,
+            input: {
+              ...recipe.input,
+              extraArgs: { ...(recipe.input?.extraArgs || {}), ...findQueueArgs(t) },
+            },
+          },
+        }
+      : opts;
+    dl.queueDownload(url, withTarget);
     setFindFor((x) => (x && x.token === f.token ? null : x));
     setActiveTab("queue");
   };
@@ -263,9 +278,9 @@ export default function App() {
         <div className="flex-1 min-h-0 overflow-hidden">
           {activeTab === "library" && (
             <LibraryTab
-              onStartDownload={(url, args) =>
-                dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args })
-              }
+              // LibraryTab passes a "library" recipe; Settings are applied
+              // when the download starts (lib/queueRecipe.js).
+              onStartDownload={dl.queueDownload}
               onSwitchTab={setActiveTab}
               settings={dl.settings}
               onSaveSettings={dl.saveSettings}
@@ -313,23 +328,19 @@ export default function App() {
               findFor={findFor}
               onFindSearched={(token) => setFindFor((x) => (x && x.token === token ? { ...x, searched: true } : x))}
               onDismissFind={() => setFindFor(null)}
-              onStartDownload={(url, args) => {
+              onStartDownload={(url, opts) => {
                 // Linked only once the find's own search has started
                 // (SearchTab defers it behind a running search, R13);
                 // before that the results on screen belong to another query.
                 if (findFor && findFor.searched) {
-                  startFoundDownload(findFor, url, args);
+                  startFoundDownload(findFor, url, opts);
                   return;
                 }
-                // Fix A (2026-05-07): merge settings.defaults so search- and
-                // library-driven downloads inherit format / quality / scaling /
-                // image-workers / etc. without going through the New tab. The
-                // caller-passed `args` wins on conflicts (search may set
-                // `multiSource: true` even when defaults.multiSource is false,
-                // because the search itself was multi-source). DownloadTab does
-                // its own merge via form initialization, so it doesn't need
-                // this wrapper. Same fix applied to LibraryTab above.
-                dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args });
+                // `opts` is a "search" recipe. settings.defaults go UNDER the
+                // search's own args when the download starts
+                // (lib/queueRecipe.js), so format / quality / image workers /
+                // etc. follow Settings saved while the item waits.
+                dl.queueDownload(url, opts);
                 setActiveTab("queue");
               }}
             />
@@ -368,7 +379,13 @@ export default function App() {
                 setFindFor({ ...f, token: Date.now(), searched: false, error: null });
                 setActiveTab("search");
               }}
-              onQueueDownload={(url, args) => dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args })}
+              // Sync's row args (multi-source, fallback sites, komikku) over
+              // settings.defaults, applied when the download starts
+              // ("defaultsPlus" in lib/queueRecipe.js). Returns the promise:
+              // FindSourcesSheet awaits it.
+              onQueueDownload={(url, args) =>
+                dl.queueDownload(url, { recipe: { kind: "defaultsPlus", input: { jobArgs: args || {} } } })
+              }
               searchSettings={{ seededOnly: dl.settings?.searchOpts?.seededOnly, collapseSplits: dl.settings?.collapseSplits, multiSource: dl.settings?.searchOpts?.multiSource }}
             />
           )}

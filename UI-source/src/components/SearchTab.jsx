@@ -10,8 +10,9 @@
 //   - chapter coverage map (multi-source only)
 //
 // Result cards push downloads into the existing queue via the
-// onStartDownload callback — same path the New tab uses, so the
-// Queue tab handles them transparently.
+// onStartDownload callback as a "search" queue recipe
+// (lib/queueRecipe.js), so a waiting item picks up Settings saved
+// before it starts. The Queue tab handles them like any other item.
 // ============================================================
 
 import React, { useState, useMemo, useEffect, useRef } from "react";
@@ -36,6 +37,8 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { LANGUAGES } from "@/lib/constants";
+import { searchDialogInitial } from "@/lib/downloadArgs";
+import { applyEdits } from "@/lib/downloadForm";
 import SearchSourceCard from "./SearchSourceCard";
 import SearchChapterMap from "./SearchChapterMap";
 import FindBanner from "./sync/FindBanner";
@@ -303,17 +306,20 @@ export default function SearchTab({
 
   const closeDownloadDialog = () => setDownloadDialog(null);
 
-  const confirmSearchDownload = (overrides) => {
+  // Queues a "search" recipe (lib/queueRecipe.js): the result's own args plus
+  // the dialog's edits. The args are built when the download starts, by
+  // lib/downloadArgs.js:confirmSearchArgs over the settings at that moment.
+  const confirmSearchDownload = (dialogEdits) => {
     if (!downloadDialog) return;
-    const finalArgs = {
-      ...(downloadDialog.args || {}),
-      ...overrides,
+    const recipe = {
+      kind: "search",
+      input: {
+        searchArgs: downloadDialog.args || {},
+        dialogEdits: dialogEdits || {},
+        extraArgs: {},
+      },
     };
-    if (!finalArgs.multiSource) {
-      delete finalArgs.prefetchedAlts;
-      delete finalArgs.multiSourcePrefetched;
-    }
-    onStartDownload?.(downloadDialog.url, finalArgs);
+    onStartDownload?.(downloadDialog.url, { recipe });
     setDownloadDialog(null);
   };
 
@@ -1026,24 +1032,17 @@ function SlowSitesCallout({ sites, eligibleCount, onDisable, onDismiss, onManage
   );
 }
 
+// "Download settings" before a search result is queued. Same sparse-edits
+// model as the New tab (lib/downloadForm.js header): the dialog keeps only the
+// fields the user changed, shows them over searchDialogInitial(settings), and
+// hands back just those edits. The queued "search" recipe pins exactly those
+// and follows Settings for every other field until the download starts
+// (lib/queueRecipe.js). A Settings save while the dialog is open updates the
+// unedited fields and leaves the edited ones alone.
 function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) {
-  const initial = useMemo(() => ({
-    format: settings?.defaults?.format || "pdf",
-    epubLayout: settings?.defaults?.epubLayout || "vertical",
-    chapters: "all",
-    group: settings?.defaults?.group || "",
-    language: settings?.defaults?.language || settings?.searchOpts?.searchLanguage || "en",
-    quality: settings?.defaults?.quality ?? 100,
-    keepChapters: !!settings?.defaults?.keepChapters,
-    keepImages: !!settings?.defaults?.keepImages,
-    noFinalFile: !!settings?.defaults?.noFinalFile,
-    multiSource: !!pending?.args?.multiSource,
-  }), [pending?.args?.multiSource, settings?.defaults, settings?.searchOpts?.searchLanguage]);
-  const [form, setForm] = useState(initial);
-
-  useEffect(() => {
-    setForm(initial);
-  }, [initial]);
+  const initial = searchDialogInitial(settings, pending?.args?.multiSource);
+  const [edits, setEdits] = useState({});
+  const form = { ...initial, ...edits };
 
   useEffect(() => {
     const onKeyDown = (event) => {
@@ -1053,32 +1052,26 @@ function SearchDownloadOptionsDialog({ pending, settings, onClose, onConfirm }) 
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
 
+  // A value equal to what the dialog shows unedited drops the edit (it then
+  // follows Settings again); the side-effect writes go through the same rule.
   const set = (key, value) => {
-    setForm((prev) => ({
-      ...prev,
-      [key]: value,
-      ...(key === "format" && value === "none" ? { keepImages: true } : {}),
-      ...(key === "keepChapters" && !value ? { noFinalFile: false } : {}),
-    }));
+    setEdits((prev) =>
+      applyEdits(
+        prev,
+        {
+          [key]: value,
+          ...(key === "format" && value === "none" ? { keepImages: true } : {}),
+          ...(key === "keepChapters" && !value ? { noFinalFile: false } : {}),
+        },
+        initial
+      )
+    );
   };
 
+  // Hands back the EDITS only; confirmSearchDownload wraps them in a recipe.
   const submit = (event) => {
     event?.preventDefault();
-    const chapters = (form.chapters || "").trim();
-    const group = (form.group || "").trim();
-    const args = {
-      format: form.format,
-      quality: form.quality,
-      language: form.language,
-      keepChapters: form.keepChapters,
-      keepImages: form.keepImages,
-      noFinalFile: form.noFinalFile,
-      multiSource: form.multiSource,
-    };
-    if (form.format === "epub") args.epubLayout = form.epubLayout;
-    if (chapters && chapters.toLowerCase() !== "all") args.chapters = chapters;
-    if (group) args.group = group;
-    onConfirm?.(args);
+    onConfirm?.(edits);
   };
 
   const title =

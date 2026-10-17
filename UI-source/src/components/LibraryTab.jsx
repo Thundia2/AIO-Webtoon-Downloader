@@ -29,7 +29,7 @@ import {
   Merge,
 } from "lucide-react";
 import { cn, chaptersToRangeString, getInitials, naturalCompare } from "@/lib/utils";
-import { buildLibraryDownloadArgs } from "@/lib/downloadArgs";
+import { libraryRecipe } from "@/lib/queueRecipe";
 import UpdatesCenter from "./UpdatesCenter";
 import ChapterChips, { ChapterChipsLegend, selectedChapters } from "./ChapterChips";
 import LibraryFilterPanel, {
@@ -871,22 +871,14 @@ function UpdateSection({ entry, onStartDownload, onSwitchTab, settings, onSetCha
     const excluding = [...newChapters.filter((c) => !keep.has(c)), ...ignoredChapters];
     const rangeStr = chaptersToRangeString(selected, { excluding });
 
-    // Start with the user's saved default settings from the Settings tab,
-    // then override format/language/site from the series metadata and set
-    // the chapter range to only the missing ones. Shared with the Updates
-    // Center per-row queue via buildLibraryDownloadArgs (@/lib/downloadArgs),
-    // which forces lazy multi-source for both update-check download paths
-    // (this is a "check for updates" flow — a 1-2 chapter delta shouldn't pay
-    // the eager cross-site discovery). See that builder's header note.
-    const args = buildLibraryDownloadArgs(
-      meta,
-      settings?.defaults,
-      rangeStr,
-      settings?.verboseAlways,
-      entry.folderPath,
-    );
-
-    onStartDownload(meta.url, args);
+    // Queue a "library" recipe: when the download STARTS, the saved Settings
+    // defaults are applied, format/language/site come from the series
+    // metadata, and the chapter range is only the missing ones. Shared with
+    // the Updates Center per-row queue (buildDownloadArgsForRow). The builder
+    // (lib/downloadArgs.js:buildLibraryDownloadArgs) forces lazy multi-source
+    // for both update-check paths: a 1-2 chapter delta shouldn't pay the eager
+    // cross-site discovery. See that builder's header note.
+    onStartDownload(meta.url, { recipe: libraryRecipe(meta, rangeStr, entry.folderPath) });
     onSwitchTab("queue");
   };
 
@@ -1773,21 +1765,19 @@ export default function LibraryTab({
       ...(row.ignoredChapters || []),
     ];
     const rangeStr = chaptersToRangeString(wanted, { excluding });
-    // Shared with the detail-view "Download Missing Chapters" path via
-    // buildLibraryDownloadArgs (@/lib/downloadArgs) — identical args now
-    // that both paths force lazy multi-source (no per-path options).
-    const args = buildLibraryDownloadArgs(
+    // Same "library" recipe as the detail-view "Download Missing Chapters"
+    // path; its args are built when the download starts, from the Settings
+    // saved then (lib/queueRecipe.js).
+    const recipe = libraryRecipe(
       meta,
-      settings?.defaults,
       rangeStr,
-      settings?.verboseAlways,
       // The row's folder, which for a FORKED series is the member holding the
       // bulk of it (main.js picks it; grep seriesIdentityKey). Passing it as
       // --series-dir is what stops the delta landing in the husk instead.
       row.folderPath || entry?.folderPath,
     );
-    return { url: meta.url, args };
-  }, [settings]);
+    return { url: meta.url, args: { recipe } };
+  }, []);
 
   const handleQueueRow = useCallback((row, chapters) => {
     const entry = entries.find((e) => e.folderPath === row.folderPath);
