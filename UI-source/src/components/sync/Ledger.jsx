@@ -256,7 +256,15 @@ export const LedgerRow = memo(
 );
 
 // ── Device-only folders ──
-export function DeviceOnlySection({ items, suggestions, titleOf, tn, locked, active, onOpen, onLink, onIgnore, onPrune }) {
+/**
+ * onFindAll opens the batch Find sources sheet; onFindOne(d) searches one
+ * folder in the Search tab (UI pass U4). Either may be absent (no button).
+ * isLinked(name): the target already holds an alias for that folder (a
+ * download was queued for it), so it shows that instead of Find source; a
+ * second find would add a second alias to the same folder (add-alias
+ * accepts duplicates; the planner then warns alias-conflict).
+ */
+export function DeviceOnlySection({ items, suggestions, titleOf, tn, locked, active, onOpen, onLink, onIgnore, onPrune, onFindAll, onFindOne, isLinked }) {
   if (!items || !items.length) return null;
   const orphaned = items.filter((d) => d.state === "orphaned");
   const byFolder = new Map();
@@ -268,6 +276,12 @@ export function DeviceOnlySection({ items, suggestions, titleOf, tn, locked, act
         Only on {tn}
         <span className="font-mono font-normal text-muted-foreground">{items.length}</span>
         <span className="flex-1" />
+        {onFindAll && (
+          <Button size="sm" variant="ghost" onClick={onFindAll} className={XS}>
+            <Search aria-hidden="true" />
+            Find sources…
+          </Button>
+        )}
         {orphaned.length > 0 && (
           <Button size="sm" variant="outline" disabled={locked} onClick={onPrune} className={cn(XS, "border-destructive/45 text-destructive hover:bg-destructive/[.08] hover:text-destructive")}>
             <Trash2 aria-hidden="true" />
@@ -291,6 +305,26 @@ export function DeviceOnlySection({ items, suggestions, titleOf, tn, locked, act
                 {d.listed === false ? `Couldn't list it on ${tn}` : `${d.files} file${d.files === 1 ? "" : "s"} · ${formatBytes(d.bytes)}`} · {DEVICE_ONLY_COPY[d.state] || d.state}
               </span>
             </div>
+            {!g && isLinked && isLinked(d.name) && (
+              <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground" title="It syncs into this folder once its download lands">
+                <Link className="h-3 w-3 text-primary" aria-hidden="true" />
+                Linked, waiting for its download
+              </span>
+            )}
+            {!g && onFindOne && !(isLinked && isLinked(d.name)) && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className={XS}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onFindOne(d);
+                }}
+              >
+                <Search aria-hidden="true" />
+                Find source
+              </Button>
+            )}
             {g && (
               <span onClick={(e) => e.stopPropagation()} className="flex shrink-0 items-center gap-1.5">
                 <span className="flex items-center gap-1 text-xs" title={SUGGESTION_TIER_COPY[g.tier]}>

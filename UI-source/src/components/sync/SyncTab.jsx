@@ -5,7 +5,13 @@
 // Top to bottom: TargetBar · last-run / refusal / warning cards · tiles ·
 // ledger toolbar · ledger (rows, "Not synced to X", "Only on X") · dock.
 // Overlays: SeriesSheet, ReviewDialog, PruneDialog, the connected-target
-// sheet (TargetEditor).
+// sheet (TargetEditor), FindSourcesSheet (U4).
+//
+// U4 entry points: view.focus {seriesKey} (App's Open in Sync from the
+// Library) opens that series' detail once the plan holds its row, then is
+// cleared; a device-only row's "Find source" calls onFindSource (App opens
+// Search with the banner); "Find sources…" opens the batch sheet, which
+// queues through onQueueDownload.
 //
 // WHO OWNS WHAT
 //   * main owns every plan, selection and job; this renders the hook's
@@ -41,6 +47,8 @@ import { ProgressDock, SelectionDock } from "./SyncDock";
 import SeriesSheet from "./SeriesSheet";
 import ReviewDialog from "./ReviewDialog";
 import PruneDialog from "./PruneDialog";
+import FindSourcesSheet from "./FindSourcesSheet";
+import { aliasFor } from "./findView";
 import { LastRunCard, RefusalCard, WarningCallouts } from "./SyncCards";
 import { useConfigOps } from "./useConfigOps";
 import {
@@ -50,7 +58,7 @@ import {
 
 const WIDE_PX = 1000;
 const ANIM_MS = 1000;
-const EMPTY_VIEW = Object.freeze({ targetId: null, tile: null, query: "", sort: "copy", dismissed: {} });
+const EMPTY_VIEW = Object.freeze({ targetId: null, tile: null, query: "", sort: "copy", dismissed: {}, focus: null });
 
 /**
  * [wide, ref]: a CALLBACK ref, because the tab swaps its root element (the
@@ -91,10 +99,13 @@ function useNow(active) {
  *   onView?(patch), contained?:boolean}} props
  *   contained = overlays stay inside the tab (gallery). libraryEntries feed the
  *   covers (useDownloader's library scan; loaded here once if still empty).
- *   initial = {detail?:seriesKey, review?, prune?, edit?}: overlays open at
- *   mount (the DEV gallery's seam; App never passes it).
+ *   initial = {detail?:seriesKey, review?, prune?, edit?, find?}: overlays
+ *   open at mount (the DEV gallery's seam; App never passes it).
+ *   onFindSource({targetId, targetName, folder, query}) = single find (U4-6);
+ *   onQueueDownload(url, args) = App's queueDownload with the download
+ *   defaults; findSeeded = the Search tab's "curated sites only".
  */
-export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibrary, view: viewProp, onView, contained, initial }) {
+export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibrary, view: viewProp, onView, contained, initial, onFindSource, onQueueDownload, findSeeded }) {
   const [wide, rootRef] = useWide();
   const [localView, setLocalView] = useState(EMPTY_VIEW);
   const view = viewProp || localView;
@@ -124,6 +135,7 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
   const [reviewOpen, setReviewOpen] = useState(!!init.review);
   const [pruneOpen, setPruneOpen] = useState(!!init.prune);
   const [editOpen, setEditOpen] = useState(!!init.edit);
+  const [findOpen, setFindOpen] = useState(!!init.find);
   const [actionRefusal, setActionRefusal] = useState(null);
   const [cancelling, setCancelling] = useState(false);
   // A real switch only: the first target to appear (the hook hydrates after
@@ -136,8 +148,27 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
     setDetailKey(null);
     setReviewOpen(false);
     setPruneOpen(false);
+    setFindOpen(false);
     setActionRefusal(null);
   }, [tid]);
+
+  // Open in Sync (U4-5): wait for a summary, open the row if the plan has
+  // it, and clear the focus either way so a later visit doesn't reopen it.
+  // A disconnected target with no summary will not get one by waiting, so
+  // the focus clears too; otherwise the sheet would pop up whenever that
+  // target next connects.
+  const focusKey = view.focus && view.focus.seriesKey;
+  const focusSummary = (tid && sync.plans[tid] && sync.plans[tid].summary) || null;
+  const focusDead = !focusSummary && !status.connected;
+  useEffect(() => {
+    if (!focusKey) return;
+    if (!focusSummary) {
+      if (focusDead) setView({ focus: null });
+      return;
+    }
+    if (focusSummary.series.some((r) => r.seriesKey === focusKey)) setDetailKey(focusKey);
+    setView({ focus: null });
+  }, [focusKey, focusSummary, focusDead, setView]);
 
   // Plan on open / switch / connect; the service decides (U2-1).
   useEffect(() => {
@@ -363,6 +394,9 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
             onLink={(g) => sync.actions.link({ targetId: tid, suggestionIds: [g.id] }).then(reply)}
             onIgnore={(g) => ops.run("ignore-suggestion", { targetId: tid, suggestionId: g.id }).then(reply)}
             onPrune={() => setPruneOpen(true)}
+            onFindAll={onQueueDownload ? () => setFindOpen(true) : undefined}
+            onFindOne={onFindSource ? (d) => onFindSource({ targetId: tid, targetName: tn, folder: d.name, query: d.query || d.name }) : undefined}
+            isLinked={(name) => !!aliasFor(target, name)}
           />
         )}
         {showLedger && !active.length && !held.length && (
@@ -449,6 +483,19 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
         pendingOps={sel.ops}
         onSelect={select}
         onAction={onAction}
+      />
+      <FindSourcesSheet
+        open={findOpen}
+        onClose={() => setFindOpen(false)}
+        target={target}
+        tn={tn}
+        items={deviceOnly}
+        wide={wide}
+        contained={contained}
+        sync={sync}
+        ops={ops}
+        defaultSeeded={findSeeded}
+        onQueueDownload={onQueueDownload || (() => Promise.reject(new Error("downloads aren't available here")))}
       />
       <PruneDialog open={pruneOpen} onClose={() => setPruneOpen(false)} targetId={tid} tn={tn} items={deviceOnly} contained={contained} sync={sync} onAction={onAction} />
       <Sheet

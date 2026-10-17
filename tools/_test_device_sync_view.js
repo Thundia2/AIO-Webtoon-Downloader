@@ -18,6 +18,8 @@
 //   - lane fills across series, the Review gate's every reason, the apply
 //     payload (loss op ids, mass acks only when required)
 //   - detail grouping + group changes, cover/path indexes, chapter labels
+//   - U4: the Library chip / Sync line / Open in Sync target (libraryView.js)
+//     and the find-sources rows, Linked, queue args and status (findView.js)
 
 const fs = require("fs");
 const os = require("os");
@@ -305,6 +307,79 @@ function eq(label, actual, expected) {
   };
   walk(path.join(UI, "src"));
   eq("no built sync-seg-${…} class names in src", built, []);
+
+  // ── Library chip + find sources (libraryView.js / findView.js, UI pass U4) ──
+  const bundle = async (name) => {
+    const o = path.join(os.tmpdir(), `aio-${name}-${process.pid}.mjs`);
+    await esbuild.build({ entryPoints: [path.join(UI, "src", "components", "sync", `${name}.js`)], bundle: true, format: "esm", platform: "neutral", outfile: o, alias: { "@": path.join(UI, "src") }, logLevel: "error" });
+    const m = await import(pathToFileURL(o).href);
+    fs.rmSync(o, { force: true });
+    return m;
+  };
+  {
+    const L = await bundle("libraryView");
+    const targets = [
+      { id: "a", name: "Galaxy Tab S9", kind: "adb" },
+      { id: "b", name: "Komikku folder", kind: "folder" },
+    ];
+    eq("seriesKey from a Windows path", L.librarySeriesKey("D:\\AIO\\manga\\Eleceed"), "pc:Eleceed");
+    eq("seriesKey from a posix path", L.librarySeriesKey("/x/manga/Solo Leveling/"), "pc:Solo Leveling");
+    eq("no rows → no chip (not mirrored)", L.seriesSyncChip(undefined, targets), null);
+    eq("rows only for removed targets → no chip", L.seriesSyncChip([{ targetId: "zz", state: "pending", pending: 4 }], targets), null);
+    const mixed = [
+      { targetId: "b", state: "synced", pending: 0 },
+      { targetId: "a", state: "pending", pending: 15 },
+    ];
+    const chip = L.seriesSyncChip(mixed, targets);
+    eq("count = most missing among targets holding it", [chip.kind, chip.n], ["count", 15]);
+    check("tooltip names each target", /Galaxy Tab S9: 15 to copy/.test(chip.tip) && /Komikku folder: in sync/.test(chip.tip), chip.tip);
+    eq("removed counts as present", L.seriesSyncChip([{ targetId: "a", state: "removed", pending: 3 }], targets).n, 3);
+    eq("synced + absent → check", L.seriesSyncChip([{ targetId: "a", state: "synced", pending: 0 }, { targetId: "b", state: "absent", pending: 9 }], targets).kind, "ok");
+    eq("absent everywhere → dim", L.seriesSyncChip([{ targetId: "a", state: "absent", pending: 9 }], targets).kind, "dim");
+    eq(
+      "lines in config order with tones",
+      L.seriesSyncLines(mixed, targets).map((l) => [l.name, l.kind, l.text, l.tone]),
+      [["Galaxy Tab S9", "tablet", "15 to copy", "push"], ["Komikku folder", "folder", "in sync", "ok"]],
+    );
+    eq("Open in Sync → first target with chapters to copy", L.openInSyncTarget([{ targetId: "a", state: "synced" }, { targetId: "b", state: "pending", pending: 1 }], targets), "b");
+    eq("Open in Sync → else the first", L.openInSyncTarget([{ targetId: "b", state: "absent" }, { targetId: "a", state: "synced" }], targets), "a");
+    eq("Open in Sync with no rows", L.openInSyncTarget(null, targets), null);
+  }
+  {
+    const F = await bundle("findView");
+    const items = [
+      { key: "dev:Dungeon Meshi", name: "Dungeon Meshi", query: "Dungeon Meshi" },
+      { key: "dev:Hunter_x_Hunter", name: "Hunter_x_Hunter", query: "Hunter x Hunter" },
+      { key: "dev:SHELTER", name: "SHELTER", query: "SHELTER" },
+      { key: "dev:Linked", name: "Linked", query: "Linked" },
+      { key: "dev:New", name: "New", query: "New" },
+    ];
+    const cand = (site, url, composite, basis) => ({ title: site, best: { site, url, title: site, composite, chapters: 97, qualityBasis: basis } });
+    const rows = {
+      "Dungeon Meshi": { folder: "Dungeon Meshi", query: "Dungeon Meshi", state: "done", candidates: [cand("mangadex", "https://a/1", 0.92, "chapter_probe"), cand("weeb", "https://b/2", 0.5, "seed")], pick: 1, pinnedUrl: null, skip: false },
+      Hunter_x_Hunter: { folder: "Hunter_x_Hunter", query: "HxH", state: "done", candidates: [], pick: null, pinnedUrl: "https://pin/x", skip: false },
+      SHELTER: { folder: "SHELTER", query: "SHELTER", state: "done", candidates: [cand("mf", "https://c/3", 0.8, "chapter_probe")], pick: 0, pinnedUrl: null, skip: true },
+      Linked: { folder: "Linked", query: "Linked", state: "done", candidates: [cand("mf", "https://d/4", 0.8, "chapter_probe")], pick: 0, pinnedUrl: null, skip: false },
+      Gone: { folder: "Gone", state: "done", candidates: [] },
+    };
+    const target = { id: "a", profile: "komikku", aliases: [{ url: "https://d/4", deviceFolder: "Linked" }] };
+    const v = F.findRows(items, rows, target);
+    eq("one view row per current device-only folder", v.map((r) => r.folder), ["Dungeon Meshi", "Hunter_x_Hunter", "SHELTER", "Linked", "New"]);
+    eq("url = the picked candidate", v[0].url, "https://b/2");
+    eq("a pinned URL wins", v[1].url, "https://pin/x");
+    eq("queueable: not skipped, not linked, has a url", v.map((r) => r.queueable), [true, true, false, false, false]);
+    eq("Linked is read from the target's aliases", [v[3].linked, v[0].linked], ["https://d/4", null]);
+    eq("a folder without a row: unsearched, the entry's query", [v[4].state, v[4].query], ["unsearched", "New"]);
+    eq("searchable: not done, not skipped, not linked", F.searchable(v).map((r) => r.folder), ["New"]);
+    eq("candidate score", F.candidateScore(rows["Dungeon Meshi"].candidates[0]), "0.92 · ch.97");
+    eq("unmeasured rating flagged", [F.unmeasured(rows["Dungeon Meshi"].candidates[0]), F.unmeasured(rows["Dungeon Meshi"].candidates[1])], [false, true]);
+    eq("komikku reader → komikku download", F.findQueueArgs(target), { komikku: true });
+    eq("other readers → the defaults", [F.findQueueArgs({ profile: "everything" }), F.findQueueArgs(null)], [{}, {}]);
+    eq("status while this target runs", F.findStatusLine({ targetId: "a", done: 1, total: 3, waiting: null }, "a", v), "Searching 2 of 3…");
+    eq("status while waiting", F.findStatusLine({ targetId: "a", done: 0, total: 3, waiting: "check-all" }, "a", v), "Waiting for Library Check All to finish");
+    eq("status after a run", F.findStatusLine(null, "a", v), "3 of 5 found a source.");
+    eq("no status before any search", F.findStatusLine(null, "a", F.findRows(items, {}, target)), null);
+  }
 
   if (failures) {
     console.error(`\n${failures} view check(s) failed`);

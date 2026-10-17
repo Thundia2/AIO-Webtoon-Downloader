@@ -923,6 +923,27 @@ test("find-sources: top 5 per row, waits while Check All runs, edited query re-q
     assert.ok(file.rows.every((x) => x.state === "done"));
     got = await a.call("find-sources:get", { targetId: id });
     assert.strictEqual(got.running, false);
+
+    // U4: rows follow the device-only folders. A folder that appears gets a
+    // queued row from get() alone (editable before any search), and a start
+    // narrowed to it keeps the other rows.
+    for (const n of ["Mu", "Nu"]) {
+      fs.mkdirSync(path.join(a.dir, "device", n), { recursive: true });
+      fs.writeFileSync(path.join(a.dir, "device", n, "Ch.001.cbz"), "x");
+    }
+    await a.call("plan", { targetId: id });
+    await a.idle();
+    got = await a.call("find-sources:get", { targetId: id });
+    assert.deepStrictEqual(got.rows.map((x) => [x.folder, x.state]).sort(), [["Kappa_(hid=abc)", "done"], ["Lambda", "done"], ["Mu", "queued"], ["Nu", "queued"]]);
+    const skip = await a.call("find-sources:update-row", { targetId: id, folder: "Nu", patch: { skip: true } });
+    assert.strictEqual(skip.ok, true, "an unsearched row takes edits");
+    const from3 = a.since();
+    await a.call("find-sources:start", { targetId: id, folders: ["Mu"] });
+    await a.waitEvent((e) => e.kind === "find" && e.state === "done", 8000, from3, "done 3");
+    assert.deepStrictEqual(a.search.calls.slice(3), ["Mu"]);
+    got = await a.call("find-sources:get", { targetId: id });
+    assert.strictEqual(got.rows.length, 4, "a narrowed start keeps every row");
+    assert.strictEqual(got.rows.find((x) => x.folder === "Nu").skip, true);
   } finally {
     await a.close();
   }

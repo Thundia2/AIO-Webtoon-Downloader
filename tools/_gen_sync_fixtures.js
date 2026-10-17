@@ -77,17 +77,19 @@ function series(lib, folder, files) {
   for (const [name, size] of Object.entries(files)) write(path.join(dir, name), bytes(name, size));
 }
 
-// Rewrite the temp prefix (both slash flavours) in every string.
+// Rewrite the temp prefix (both slash flavours) in every string, object
+// KEYS included: library-status is keyed by folder path.
 function scrub(v, tmp) {
   const variants = [tmp, tmp.replace(/\\/g, "/")];
+  const str = (x) => {
+    let s = x;
+    for (const t of variants) s = s.split(t).join(FAKE_ROOT);
+    return s;
+  };
   const walk = (x) => {
-    if (typeof x === "string") {
-      let s = x;
-      for (const t of variants) s = s.split(t).join(FAKE_ROOT);
-      return s;
-    }
+    if (typeof x === "string") return str(x);
     if (Array.isArray(x)) return x.map(walk);
-    if (x && typeof x === "object") return Object.fromEntries(Object.entries(x).map(([k, y]) => [k, walk(y)]));
+    if (x && typeof x === "object") return Object.fromEntries(Object.entries(x).map(([k, y]) => [str(k), walk(y)]));
     return x;
   };
   return walk(v);
@@ -111,7 +113,12 @@ function scrub(v, tmp) {
 //     the progress isn't coalesced away) and the lastRun it leaves;
 //   * refusals: plan-changed, busy, record-mismatch, device-listing-suspect,
 //     library-missing, disconnected; needs-mode comes from a fake-adb
-//     device without sha256sum.
+//     device without sha256sum;
+//   * U4: library-status for that plan, and a find-sources run over its
+//     device-only folders (rows, one mid-run `find` event) plus the config
+//     after one folder is linked. The SEARCH RESULTS ARE SYNTHETIC (a real
+//     search hits the network): FAKE_SEARCH answers by query in the
+//     --search-json shape, and the real find-sources.js compacts them.
 // Snapshots are whole get-state answers, so the gallery feeds them as is.
 
 function writeYoung(p, data, ageS) {
@@ -119,6 +126,35 @@ function writeYoung(p, data, ageS) {
   fs.writeFileSync(p, data);
   const t = new Date(Date.now() - ageS * 1000);
   fs.utimesSync(p, t, t);
+}
+
+// --search-json payloads for the find-sources recording, by query. Berserk
+// fails (an error row), Kagurabachi finds nothing.
+const FAKE_SEARCH = {
+  "Chainsaw Man": {
+    candidates: [
+      { canonical_title: "Chainsaw Man", canonical_year: 2018, sources: [
+        { site: "mangadex", url: "https://mangadex.org/title/a77742b1/chainsaw-man", title: "Chainsaw Man", composite_score: 0.91, actual_chapter_count: 181, quality_basis: "chapter_probe" },
+        { site: "weebcentral", url: "https://weebcentral.com/series/01J76XY/chainsaw-man", title: "Chainsaw Man", composite_score: 0.84, actual_chapter_count: 181, quality_basis: "chapter_probe" },
+      ] },
+      { canonical_title: "Chainsaw Man (Colored)", canonical_year: 2021, sources: [
+        { site: "mangafire", url: "https://mangafire.to/title/x9c2-chainsaw-man-colored", title: "Chainsaw Man (Colored)", composite_score: 0.62, chapter_count_hint: 97, quality_basis: "seed" },
+      ] },
+    ],
+  },
+  Kagurabachi: { candidates: [] },
+};
+function fakeSearcher() {
+  return {
+    runSearch: async ({ query }) => {
+      await sleep(40);
+      if (!(query in FAKE_SEARCH)) throw new Error("search exited with code 1");
+      return JSON.parse(JSON.stringify(FAKE_SEARCH[query]));
+    },
+    cancel() {},
+    cancelAndWait: async () => {},
+    cancelNow: () => false,
+  };
 }
 
 async function recordTab(tmp) {
@@ -170,6 +206,7 @@ async function recordTab(tmp) {
       bootEpoch: 1,
       connectWaitMs: 2000,
       executorDeps: { hooks: (pt) => (pt === "after-pushed" && slow ? sleep(slow) : undefined) },
+      makeSearcher: fakeSearcher,
     },
   };
   const svc = service.initDeviceSync(deps);
@@ -242,6 +279,15 @@ async function recordTab(tmp) {
     for (const row of sum.series) out.details[row.seriesKey] = await call("series-detail", { targetId: id, seriesKey: row.seriesKey });
     for (const d of sum.deviceOnly) out.details[d.key] = await call("series-detail", { targetId: id, seriesKey: d.key });
     out.review = await call("review", { targetId: id });
+
+    // U4: the Library chip's input, and find-sources over the device-only
+    // folders (no config change, so the plan below is untouched).
+    out.libraryStatus = await call("library-status");
+    const findFrom = events.length;
+    await call("find-sources:start", { targetId: id });
+    await waitFor(() => events.slice(findFrom).find((e) => e.ev.kind === "find" && e.ev.state === "done"), 15000, "find-sources done");
+    out.find = await call("find-sources:get", { targetId: id });
+    out.findRunning = (events.slice(findFrom).find((e) => e.ev.kind === "find" && e.ev.row && e.ev.row.state === "searching") || {}).ev || null;
 
     // Selection: each request with its reply and the `plans` push after it.
     const recordSel = async (label, req) => {
@@ -318,6 +364,12 @@ async function recordTab(tmp) {
     out.refusals.disconnected = await raw("plan", { targetId: id });
     out.snapshots.disconnected = await state();
     fs.renameSync(parked, root);
+
+    // U4: a folder linked by a queued find (what Queue N downloads writes).
+    const csm = out.find.rows.find((r) => r.folder === "Chainsaw Man");
+    st = await state();
+    await call("config-op", { op: "add-alias", targetId: id, expectVersion: st.config.version, alias: { url: csm.candidates[0].best.url, deviceFolder: "Chainsaw Man" } });
+    out.findConfig = (await state()).config;
   } finally {
     await svc.shutdown({ timeoutMs: 2000 });
   }
@@ -587,7 +639,13 @@ async function main() {
     const body = { [SYNC_FIXTURE_MARKER]: name, generatedBy: "tools/_gen_sync_fixtures.js", data: scrub(data, tmp) };
     fs.writeFileSync(path.join(OUT, name), JSON.stringify(body, null, 2) + "\n");
   }
-  const leaked = Object.keys(files).filter((n) => fs.readFileSync(path.join(OUT, n), "utf8").includes(os.userInfo().username));
+  // The account name and the profile folder can differ (this PC: account
+  // "Thundia", profile C:\Users\legoc), so check both, and the temp root.
+  const needles = [os.userInfo().username, path.basename(os.homedir()), "aio-sync-fixtures-"].filter((x) => x && x.length > 2).map((x) => x.toLowerCase());
+  const leaked = Object.keys(files).filter((n) => {
+    const body = fs.readFileSync(path.join(OUT, n), "utf8").toLowerCase();
+    return needles.some((x) => body.includes(x));
+  });
   fs.rmSync(tmp, { recursive: true, force: true });
   if (leaked.length) throw new Error(`fixture carries the local user name: ${leaked.join(", ")}`);
   console.log(`wrote ${Object.keys(files).length} fixtures to ${path.relative(ROOT, OUT)}`);

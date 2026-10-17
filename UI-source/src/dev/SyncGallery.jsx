@@ -7,7 +7,8 @@
 // frame at a fixed width. Phase U1 of sync-temp/plans/device-sync-ui-pass.md
 // added the Settings cases; U2 adds the Sync tab ("tab-*", the fake source's
 // TAB MODE) and the card sheet ("cards"); U3 the connect cards ("connect-*")
-// and the rail badge ("rail").
+// and the rail badge ("rail"); U4 the Library chip / Sync line / Search
+// banner ("library") and the Find sources sheet ("tab-find*").
 //
 // URL: ?gallery=sync                      index of cases
 //      ?gallery=sync&case=<id>            one case, light above dark
@@ -31,6 +32,9 @@ import { LastRunCard, RefusalCard } from "@/components/sync/SyncCards";
 import { lastRunView } from "@/components/sync/syncView";
 import ConnectPrompt, { ConnectCard, RailBadge } from "@/components/sync/ConnectPrompt";
 import { connectCards } from "@/components/sync/connectView";
+import { SyncChip, SyncLine } from "@/components/sync/LibrarySync";
+import FindBanner from "@/components/sync/FindBanner";
+import { seriesSyncChip, seriesSyncLines } from "@/components/sync/libraryView";
 import { FolderSync } from "lucide-react";
 import { FIXTURES, makeSyncSource } from "./syncFixtureSource";
 
@@ -105,11 +109,55 @@ const TAB_CASES = [
   { id: "tab-disconnected", title: "Tab: disconnected", spec: { tab: "disconnected" } },
   { id: "tab-needs-mode", title: "Tab: needs a verify mode (adb)", spec: { tab: "needsMode" } },
   { id: "tab-none", title: "Tab: no targets", spec: { tab: "planned", mutate: (s) => { s.config.targets = []; } } },
+  { id: "tab-find", title: "Tab: find sources", note: "Recorded rows (synthetic search results): an error, a found source, nothing found. Search replays them; Queue links then queues (a no-op here).", spec: { tab: "planned" }, initial: { find: true } },
+  {
+    id: "tab-find-linked",
+    title: "Tab: find sources, one folder linked",
+    note: "The recorded config after Queue linked Chainsaw Man.",
+    spec: { tab: "planned", mutate: (s) => { s.config = JSON.parse(JSON.stringify(FIXTURES.tab.findConfig)); } },
+    initial: { find: true },
+  },
 ];
 
 function TabCase({ c }) {
   const sync = useDeviceSync({ source: makeSyncSource(c.spec) });
-  return <SyncTab sync={sync} contained initial={c.initial} libraryEntries={TAB_LIBRARY} onOpenSettings={() => {}} />;
+  return <SyncTab sync={sync} contained initial={c.initial} libraryEntries={TAB_LIBRARY} onOpenSettings={() => {}} onQueueDownload={() => Promise.resolve()} onFindSource={() => {}} findSeeded />;
+}
+
+// Library surfaces (U4): the recorded library-status over the recorded
+// target, plus a second, synthetic folder target so the multi-target chip and
+// line show. Covers are plain gradients (the Library's own art isn't here).
+function LibraryCase() {
+  const T = FIXTURES.tab;
+  const by = T.libraryStatus.bySeries;
+  const targets = T.snapshots.planned.config.targets;
+  const second = { id: "tsecond", name: "Komikku folder", kind: "folder" };
+  const keys = Object.keys(by);
+  const extra = { [keys[0]]: [...by[keys[0]], { targetId: "tsecond", state: "pending", pending: 7 }], [keys[1]]: [...by[keys[1]], { targetId: "tsecond", state: "synced", pending: 0 }] };
+  const all = [...targets, second];
+  const cards = [...keys.map((k) => [k, extra[k] || by[k]]), ["D:\\Sync-fixture\\tab-manga\\Not mirrored", undefined]];
+  return (
+    <div className="flex h-full flex-col gap-4 overflow-auto p-4">
+      <div className="grid gap-3" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))" }}>
+        {cards.map(([k, rows], i) => {
+          const name = k.split(/[\\/]/).pop();
+          return (
+            <div key={k} className="overflow-hidden rounded-lg border border-border/50 bg-card/60">
+              <div className="relative aspect-[3/4]" style={{ background: `linear-gradient(160deg, hsl(${i * 67} 35% 55%), hsl(${i * 67} 40% 28%))` }}>
+                <SyncChip chip={seriesSyncChip(rows, all)} />
+              </div>
+              <div className="p-2 text-xs font-semibold">{name}</div>
+            </div>
+          );
+        })}
+      </div>
+      {cards.slice(0, 5).map(([k, rows]) => (
+        <SyncLine key={k} lines={seriesSyncLines(rows, all)} onOpen={() => {}} />
+      ))}
+      <FindBanner findFor={{ folder: "Chainsaw Man", targetName: "Galaxy Tab" }} onDismiss={() => {}} />
+      <FindBanner findFor={{ folder: "Chainsaw Man", targetName: "Galaxy Tab", error: "The sync settings changed. Try again." }} onDismiss={() => {}} />
+    </div>
+  );
 }
 
 // Every refusal code and last-run outcome as a card. Synthetic objects in the
@@ -328,6 +376,7 @@ const ALL = [
   { id: "connect-cards", title: "Connect prompt: every card variant", note: "Recorded ready / needs-mode cards plus the synthetic states (see the gallery source).", height: 1100, render: () => <ConnectCardsCase /> },
   { id: "connect-ready", title: "Connect prompt: live corner card (ready)", note: "Review / Not now answer through the fake source.", render: () => <ConnectLiveCase spec={{ prompt: "ready" }} /> },
   { id: "connect-needs-mode", title: "Connect prompt: live corner card (first sync)", note: "Set up stores read-back (the fake source only bumps the config).", render: () => <ConnectLiveCase spec={{ prompt: "needsMode" }} /> },
+  { id: "library", title: "Library: cover chip, Sync line, Search banner", note: "Recorded library-status (pending / synced / absent / removed), a synthetic second target, a series no target mirrors (no chip).", height: 900, render: () => <LibraryCase /> },
   { id: "rail", title: "Rail badge", note: "Count · pulse while a job runs · red on a problem · 99+ · none.", height: 160, render: () => <RailCase /> },
 ];
 

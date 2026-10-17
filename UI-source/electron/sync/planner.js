@@ -675,6 +675,9 @@ function buildPlan(input) {
       chapterFiles,
       ours,
       suggestions: plan.suggestions.filter((g) => g.deviceFolder === u.name).map((g) => g.id),
+      // The single "Find source" search (UI-pass U4-1): the same query the
+      // batch runner seeds its rows with (find-sources.js _newRow).
+      query: naming.deriveSearchQuery(u.name),
     });
   }
 

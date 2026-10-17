@@ -37,6 +37,7 @@ import { cn } from "@/lib/utils";
 import { LANGUAGES } from "@/lib/constants";
 import SearchSourceCard from "./SearchSourceCard";
 import SearchChapterMap from "./SearchChapterMap";
+import FindBanner from "./sync/FindBanner";
 
 // Detect HTTP/S URLs in the search query — when matched, we cross-reference
 // against the resumable list (tmp_* folders) so the user can pick up a
@@ -163,8 +164,16 @@ export default function SearchTab({
   onResumeDownload,
   searchSiteHealth = {},
   onManageSources,
+  // Device Sync single find (UI pass U4-6): App's request {token, query,
+  // folder, targetName, searched, error} or null. The tab runs the search
+  // itself (with its own options) once per token, then reports it with
+  // onFindSearched(token) so a remount doesn't search again; the banner's
+  // ✕ calls onDismissFind. App links any download started meanwhile.
+  findFor = null,
+  onFindSearched,
+  onDismissFind,
 }) {
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(() => (findFor ? findFor.query : ""));
   const [downloadDialog, setDownloadDialog] = useState(null);
   // Session-only "don't recommend these again" set for the SlowSitesCallout.
   // Persists nothing — a chronically-bad site re-surfaces next session, which
@@ -236,6 +245,17 @@ export default function SearchTab({
   }, []);
   const isRunning = searchState?.status === "running";
   const hasResults = searchState?.status === "done" && searchState.results;
+
+  // Single find: prefill and search once per request. A search already
+  // running is left alone (the query is filled in for the next press).
+  const findToken = findFor && !findFor.searched ? findFor.token : null;
+  useEffect(() => {
+    if (findToken == null) return;
+    setQuery(findFor.query);
+    if (!isRunning) runSearch(findFor.query, opts);
+    onFindSearched?.(findToken);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [findToken]);
 
   // Auto-focus on mount so users can type immediately when they switch tabs.
   useEffect(() => {
@@ -386,6 +406,7 @@ export default function SearchTab({
     <div className="flex flex-col h-full">
       {/* Scrollable content area */}
       <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-4">
+        <FindBanner findFor={findFor} onDismiss={onDismissFind} />
         {/* ── Search bar ── */}
         <form onSubmit={handleSubmit}>
           <Label htmlFor="search-query" className="text-sm font-semibold">

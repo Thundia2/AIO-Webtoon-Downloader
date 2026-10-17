@@ -443,3 +443,71 @@ the connect plan's own job progress, not the pre-warm (`_runJob` pauses the pre-
   both top-right and overlapped them).
 - The card's ✕ is labelled "Dismiss" (same effect as Not now for a prompt card; for a device card
   it hides that serial + state locally) so the two controls don't announce the same name.
+
+## Phase U4 design (2026-10-17)
+
+No separate design / adversarial agents this phase (user, 2026-10-17: "no need for independent
+planning this time"). Built on the backend P4 already shipped: `sync:library-status`
+(planner `libraryStatus`, rule 13: record-based, never a device listing), `sync:find-sources:*`
+(find-sources.js, its own Searcher, rows persisted per target) and config-op `add-alias`.
+
+**Backend:**
+- **U4-1 device-only entries carry `query`** (naming `deriveSearchQuery`, the same query the batch
+  runner seeds its rows with), so the single "Find source" needs no renderer copy of the rule.
+
+**Library (D9):**
+- **U4-2 the hook loads library status when sync turns on** and drops it when sync turns off; the
+  service's `library-status` events keep it current (after every plan job and a library change).
+- **U4-3 the cover chip** aggregates `bySeries[folderPath]` over targets: a count = the largest
+  `pending` among targets that hold the series (`pending` / `removed`); else a success check when
+  any target is `synced`; else dim (`absent` everywhere: "on no target yet"). No entry = not
+  mirrored = no chip. Never orange. Tooltip names each target.
+- **U4-4 DetailView "Sync" line** under the stats: per target "N to copy" / "in sync" / "not on
+  it yet" / "removed there", plus Open in Sync.
+- **U4-5 Open in Sync** = App `syncView.focus {seriesKey}` (seriesKey = `pc:` + the folder name,
+  planner `pcSeriesKey`) + targetId (first target with pending, else the first listed). The Sync
+  tab opens that series' detail sheet once the summary holds the row, then clears the focus.
+
+**Single find source:**
+- **U4-6** a device-only row's "Find source" (shown when it has no Link suggestion) sends
+  `{targetId, targetName, folder, query}` to App, which opens Search with a `findFor` banner.
+  SearchTab runs the search itself from the prefill (its own options), once per request token.
+  Deviation from the plan line "App runs dl.runSearch": the options live in SearchTab.
+- **U4-7** while the banner is up, a download started from Search first adds the alias
+  `{url, deviceFolder}` (config-op, `expectVersion`), then queues; a refused alias shows on the
+  banner and queues nothing. The banner clears after one queued download or on ✕.
+- **U4-8 Komikku mode follows the target**: a `komikku` reader queues with `komikku: true`;
+  other readers keep the download defaults.
+
+**Batch find sources (spec §4 sheet, 600 / 680 px):**
+- **U4-9** opened from "Find sources…" in the Only-on header; rows = `find-sources:get` rows,
+  which the service now RECONCILES with the plan's device-only folders on every get (see U4-13), so
+  every folder shown has a row to edit before its first search.
+  Search N folders → `find-sources:start {seededOnly}` (toggle seeded from the Search setting);
+  rows stream through `find` events; Cancel; the waiting reason shows.
+- **U4-10** per row: device cover (`device-cover`, lazy, one at a time), editable query (blur →
+  update-row, which re-queues), candidate select (`pick`), Pin URL (`pinnedUrl`), and one
+  checkbox ↔ `skip` (the runner and Queue both honour it; `include` is left true).
+- **U4-11 a row is "Linked" when the target already has an alias for its folder** (asked from the
+  config, not remembered): it shows the URL and can't be queued twice.
+- **U4-12 Queue N downloads**, per row in order: add-alias, then queue; per-row result line.
+
+**Deviations found while building U4:**
+- **U4-13 find-sources rows follow the device-only folders (backend fix).** As shipped in P4,
+  rows existed only after a start, and `start({folders})` with a SUBSET deleted every other row
+  (it reconciled against the subset). Now `find-sources.js _reconcile` runs on `get(targetId,
+  folders)` and `start({folders, only})`: `folders` is always the full device-only list (service
+  passes it), `only` narrows what runs. Test: `_test_device_sync_service.js` find-sources section.
+- **U4-14 fixture leak check widened.** `tools/_gen_sync_fixtures.js` checked only the GitHub
+  handle while the Windows profile folder differs; library-status keys carried the temp path. The
+  scrubber now also rewrites object keys and the check covers the username, the homedir basename
+  and the temp-dir prefix, case-insensitively.
+- **U4-15 Open in Sync on a disconnected, never-planned target** clears its focus instead of
+  waiting (it would otherwise pop the sheet open whenever that target next connects).
+- **U4-16 a linked device-only row hides "Find source"** and says "Linked, waiting for its
+  download": add-alias accepts duplicates, so a second find for the same folder would leave two
+  aliases on it (planner `alias-conflict` once both download).
+
+**U4 stop-point E2E:** `tools/_e2e_device_sync_find.js` (fake python backend for search +
+download; batch skip / search / pin / queue-2, single find via the Search banner, Library chip +
+Open in Sync).

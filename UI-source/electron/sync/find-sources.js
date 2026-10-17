@@ -7,6 +7,12 @@
 // TOP_CANDIDATES candidates per row. Rows persist per target in
 // userData/sync/targets/<id>/find-sources.json, written after every row, so
 // a run is resumable: start() runs every included row that isn't `done`.
+// ROWS FOLLOW THE TARGET'S DEVICE-ONLY FOLDERS (UI pass U4): get() and
+// start() take the full current list and reconcile against it (a new folder
+// gets a `queued` row, a folder no longer device-only loses its row), so
+// every folder the Find sources sheet shows has a row it can edit (query,
+// pin, skip) before its first search. start()'s `only` narrows what RUNS,
+// never what is kept.
 // Editing a row's query (update-row) sends it back to `queued`, which is the
 // "retry with an edited query" path for rows that errored or found nothing.
 //
@@ -147,9 +153,38 @@ class FindSources {
     return !!this.run;
   }
 
-  /** {running, targetId, waiting, done, total, rows} for one target (rows in folder order). */
-  async get(targetId) {
+  /**
+   * Make the target's rows match `folders` (its current device-only folder
+   * names): new folders get a queued row, rows of folders that left are
+   * dropped. Saves only when something changed.
+   */
+  async _reconcile(targetId, folders) {
     const m = await this._load(targetId);
+    const want = new Set(folders || []);
+    let changed = false;
+    for (const f of want) {
+      if (!m.has(f)) {
+        m.set(f, this._newRow(f));
+        changed = true;
+      }
+    }
+    for (const f of [...m.keys()]) {
+      if (!want.has(f)) {
+        m.delete(f);
+        changed = true;
+      }
+    }
+    if (changed) await this._save(targetId).catch(() => {});
+    return m;
+  }
+
+  /**
+   * {running, targetId, waiting, done, total, rows} for one target (rows in
+   * folder order). With `folders` (the target's device-only folders) the
+   * rows are reconciled first; without (no plan yet) they are as stored.
+   */
+  async get(targetId, folders) {
+    const m = Array.isArray(folders) ? await this._reconcile(targetId, folders) : await this._load(targetId);
     const r = this.run && this.run.targetId === targetId ? this.run : null;
     return {
       ok: true,
@@ -169,21 +204,18 @@ class FindSources {
   }
 
   /**
-   * Make the target's rows match its device-only folders (new folders get a
-   * row; rows of folders no longer device-only are dropped) and run every
-   * included row that isn't done. Resolves when the run ends; the service
-   * doesn't await it (find events carry the progress).
-   * @param {{targetId:string, folders:string[], seededOnly?:boolean}} a
+   * Reconcile the rows with `folders` (all of the target's device-only
+   * folders), then run every included, unskipped row that isn't done,
+   * limited to `only` when given. Resolves once the run has started; the
+   * service doesn't await the run (find events carry the progress).
+   * @param {{targetId:string, folders:string[], only?:string[], seededOnly?:boolean}} a
    * @returns {Promise<{ok:true, started:boolean}|{ok:false, code:string, message:string}>}
    */
-  async start({ targetId, folders, seededOnly }) {
+  async start({ targetId, folders, only, seededOnly }) {
     if (this.run) return { ok: false, code: "busy", message: "a find-sources run is already going" };
-    const m = await this._load(targetId);
-    const want = new Set(folders || []);
-    for (const f of want) if (!m.has(f)) m.set(f, this._newRow(f));
-    for (const f of [...m.keys()]) if (!want.has(f)) m.delete(f);
-    await this._save(targetId).catch(() => {});
-    const todo = [...m.values()].filter((r) => r.include && !r.skip && r.state !== "done");
+    const m = await this._reconcile(targetId, folders);
+    const pick = Array.isArray(only) ? new Set(only) : null;
+    const todo = [...m.values()].filter((r) => (!pick || pick.has(r.folder)) && r.include && !r.skip && r.state !== "done");
     if (!todo.length) {
       this.emit({ targetId, state: "done", done: 0, total: 0 });
       return { ok: true, started: false };

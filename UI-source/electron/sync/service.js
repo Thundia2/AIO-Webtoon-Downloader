@@ -2146,16 +2146,20 @@ function initDeviceSync(deps) {
     if (!t) return refuse("invalid", "unknown target");
     const rt = rts.get(t.id);
     if (!rt || !rt.plan) return refuse("invalid", "plan this target first");
-    const only = Array.isArray(p.folders) ? new Set(p.folders.map(String)) : null;
-    const folders = rt.plan.deviceOnly.filter((d) => !only || only.has(d.name)).map((d) => d.name);
-    const r = await findSources.start({ targetId: t.id, folders, seededOnly: p.seededOnly });
+    // Rows follow ALL device-only folders; `folders` only narrows the run.
+    const folders = rt.plan.deviceOnly.map((d) => d.name);
+    const only = Array.isArray(p.folders) ? p.folders.map(String) : undefined;
+    const r = await findSources.start({ targetId: t.id, folders, only, seededOnly: p.seededOnly });
     if (!r.ok) return refuse(r.code === "busy" ? "busy" : "invalid", r.message);
     return { ok: true, started: r.started };
   };
 
   H["find-sources:get"] = async (p) => {
     if (!_target(p.targetId)) return refuse("invalid", "unknown target");
-    return findSources.get(p.targetId);
+    // With a plan, rows are reconciled with its device-only folders first, so
+    // the sheet can edit a folder's row before its first search (U4).
+    const rt = rts.get(p.targetId);
+    return findSources.get(p.targetId, rt && rt.plan ? rt.plan.deviceOnly.map((d) => d.name) : undefined);
   };
 
   H["find-sources:update-row"] = async (p) => {

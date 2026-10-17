@@ -13,6 +13,10 @@ import SyncTab from "@/components/sync/SyncTab";
 import ConnectPrompt, { RailBadge } from "@/components/sync/ConnectPrompt";
 import { railBadge } from "@/components/sync/connectView";
 import { pickTargets } from "@/components/sync/syncView";
+import { librarySeriesKey, openInSyncTarget } from "@/components/sync/libraryView";
+import { findQueueArgs } from "@/components/sync/findView";
+import { useConfigOps } from "@/components/sync/useConfigOps";
+import { configRefusalCopy } from "@/components/sync/copy";
 import appIcon from "../build-resources/icon.png";
 import {
   Download,
@@ -59,7 +63,9 @@ export default function App() {
   // The Sync tab's per-visit view (picked target, tile filter, query, sort,
   // dismissed last-run cards) lives here, not in the tab: App unmounts tabs
   // on every switch (UI-pass U2-14; components/sync/SyncTab.jsx `view`).
-  const [syncView, setSyncView] = useState({ targetId: null, tile: null, query: "", sort: "copy", dismissed: {} });
+  // `focus` {seriesKey} is the Library's Open in Sync (U4-5): the tab opens
+  // that series' detail once its plan holds the row, then clears it.
+  const [syncView, setSyncView] = useState({ targetId: null, tile: null, query: "", sort: "copy", dismissed: {}, focus: null });
   const patchSyncView = React.useCallback((patch) => setSyncView((v) => ({ ...v, ...patch })), []);
   // The Sync rail badge (UI-pass U3-14, components/sync/connectView.js
   // railBadge): series count on connected targets + red / pulsing dot.
@@ -76,6 +82,42 @@ export default function App() {
     const picked = list.find((x) => x.target.id === syncView.targetId) || list[0] || null;
     return picked ? picked.target.id : null;
   }, [activeTab, sync.enabled, sync.config, sync.devices, sync.folderPresence, syncView.targetId]);
+  const syncTargets = useMemo(() => (sync.config && sync.config.targets) || [], [sync.config]);
+  // The Library's chip + Sync line (U4-3/4): null while sync is off or the
+  // status hasn't loaded (no chips rather than wrong ones).
+  const syncLibrary = useMemo(
+    () => (sync.enabled && sync.libraryStatus ? { bySeries: sync.libraryStatus.bySeries || {}, targets: syncTargets } : null),
+    [sync.enabled, sync.libraryStatus, syncTargets]
+  );
+  const openInSync = React.useCallback(
+    (folderPath) => {
+      const rows = sync.libraryStatus && sync.libraryStatus.bySeries ? sync.libraryStatus.bySeries[folderPath] : null;
+      patchSyncView({ targetId: openInSyncTarget(rows, syncTargets), tile: null, query: "", focus: { seriesKey: librarySeriesKey(folderPath) } });
+      setActiveTab("sync");
+    },
+    [sync.libraryStatus, syncTargets, patchSyncView]
+  );
+
+  // Single find source (U4-6/7): {token, targetId, targetName, folder, query,
+  // searched, error}. Set by the Sync tab's "Find source", searched once by
+  // SearchTab, cleared by the banner's ✕ or once a download is queued.
+  const [findFor, setFindFor] = useState(null);
+  const syncOps = useConfigOps(sync);
+  // A download started from Search while the banner is up: link it to the
+  // folder FIRST (config-op add-alias), then queue; a refused link queues
+  // nothing and says why on the banner. Komikku follows the target (U4-8).
+  const startFoundDownload = async (f, url, args) => {
+    const r = await syncOps.run("add-alias", { targetId: f.targetId, alias: { url, deviceFolder: f.folder } });
+    if (!r || r.ok === false) {
+      setFindFor((x) => (x && x.token === f.token ? { ...x, error: configRefusalCopy(r, f.targetName) } : x));
+      return;
+    }
+    const t = syncTargets.find((x) => x.id === f.targetId);
+    dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args, ...findQueueArgs(t) });
+    setFindFor((x) => (x && x.token === f.token ? null : x));
+    setActiveTab("queue");
+  };
+
   const tabs = useMemo(() => {
     if (!sync.enabled) return BASE_TABS;
     const at = BASE_TABS.findIndex((t) => t.id === "settings");
@@ -231,6 +273,8 @@ export default function App() {
               libraryLoading={dl.libraryLoading}
               loadLibrary={dl.loadLibrary}
               updateCheck={dl.updateCheck}
+              syncLibrary={syncLibrary}
+              onOpenInSync={openInSync}
             />
           )}
           {activeTab === "new" && (
@@ -266,7 +310,14 @@ export default function App() {
                 setSettingsCategory("search");
                 setActiveTab("settings");
               }}
+              findFor={findFor}
+              onFindSearched={(token) => setFindFor((x) => (x && x.token === token ? { ...x, searched: true } : x))}
+              onDismissFind={() => setFindFor(null)}
               onStartDownload={(url, args) => {
+                if (findFor) {
+                  startFoundDownload(findFor, url, args);
+                  return;
+                }
                 // Fix A (2026-05-07): merge settings.defaults so search- and
                 // library-driven downloads inherit format / quality / scaling /
                 // image-workers / etc. without going through the New tab. The
@@ -310,6 +361,12 @@ export default function App() {
                 setSettingsCategory(category === "general" ? "general" : "sync");
                 setActiveTab("settings");
               }}
+              onFindSource={(f) => {
+                setFindFor({ ...f, token: Date.now(), searched: false, error: null });
+                setActiveTab("search");
+              }}
+              onQueueDownload={(url, args) => dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args })}
+              findSeeded={!!dl.settings?.searchOpts?.seededOnly}
             />
           )}
           {activeTab === "settings" && (

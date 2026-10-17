@@ -21,7 +21,8 @@
 // recorded — so a tick on an unrecorded op shows its pending state and then
 // snaps back. That snap-back is the fake's limit, not the service's.
 // apply replays the recorded job events on their own clock, then pushes the
-// recorded after-apply view. Nothing here re-plans.
+// recorded after-apply view. Nothing here re-plans. U4 adds library-status
+// (recorded) and the find-sources channels (makeFindChannels below).
 //
 // Loaded only through src/dev/SyncGallery.jsx, which main.jsx imports
 // dynamically under import.meta.env.DEV, so none of this reaches dist
@@ -224,5 +225,51 @@ function makeTabChannels(snap, emit, hold) {
     syncLink: () => later(200, { ok: true }),
     syncExportReport: () => later(200, { ok: true, path: "D:/Sync-fixture/report.txt" }),
     syncDeviceCover: () => Promise.resolve({ ok: false, code: "invalid", message: "no covers in the gallery" }),
+    syncLibraryStatus: () => Promise.resolve(clone(T.libraryStatus)),
+    ...makeFindChannels(snap, emit),
+  };
+}
+
+/**
+ * find-sources (U4) over the recorded rows (tab.json `find`, whose search
+ * results are synthetic: see the generator). get answers the recording;
+ * update-row patches a copy the naive way (a new query re-queues the row);
+ * start replays the recorded run: each searched row turns `searching`, then
+ * its recorded result. Nothing here searches.
+ */
+function makeFindChannels(snap, emit) {
+  const T = FIXTURES.tab;
+  const rows = new Map(T.find.rows.map((r) => [r.folder, clone(r)]));
+  const tid = () => Object.keys(snap.plans || {})[0] || T.targetId;
+  const rowEv = (row, extra) => emit({ kind: "find", targetId: tid(), state: "idle", row: clone(row), ...(extra || {}) });
+  return {
+    syncFindSourcesGet: () => later(80, { ok: true, running: false, targetId: tid(), waiting: null, done: 0, total: 0, rows: [...rows.values()].map(clone) }),
+    syncFindSourcesUpdateRow: ({ folder, patch }) => {
+      const row = rows.get(folder);
+      if (!row) return Promise.resolve({ ok: false, code: "invalid", message: "unknown row" });
+      if (patch.query != null && patch.query !== row.query) Object.assign(row, { query: patch.query, state: "queued", candidates: [], pick: null, error: null });
+      for (const k of ["pick", "pinnedUrl", "skip", "include"]) if (k in patch) row[k] = patch[k];
+      rowEv(row);
+      return later(60, { ok: true, row: clone(row) });
+    },
+    syncFindSourcesStart: ({ folders }) => {
+      const want = Array.isArray(folders) ? new Set(folders) : null;
+      const todo = [...rows.values()].filter((r) => (!want || want.has(r.folder)) && !r.skip && r.state !== "done");
+      const recorded = new Map(T.find.rows.map((r) => [r.folder, r]));
+      todo.forEach((r, i) => {
+        setTimeout(() => {
+          r.state = "searching";
+          emit({ kind: "find", targetId: tid(), state: "running", done: i, total: todo.length, row: clone(r) });
+        }, 400 * i + 50);
+        setTimeout(() => {
+          const rec = recorded.get(r.folder) || {};
+          Object.assign(r, { state: rec.state === "error" ? "error" : "done", candidates: clone(rec.candidates || []), pick: rec.pick != null ? rec.pick : null, error: rec.error || null });
+          emit({ kind: "find", targetId: tid(), state: "running", done: i + 1, total: todo.length, row: clone(r) });
+        }, 400 * i + 400);
+      });
+      setTimeout(() => emit({ kind: "find", targetId: tid(), state: "done", done: todo.length, total: todo.length }), 400 * todo.length + 450);
+      return later(30, { ok: true, started: todo.length > 0 });
+    },
+    syncFindSourcesCancel: () => Promise.resolve({ ok: true, wasRunning: false }),
   };
 }

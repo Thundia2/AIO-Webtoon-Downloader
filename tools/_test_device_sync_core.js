@@ -988,6 +988,8 @@ test("device-only folders: preserved vs orphaned; loose root files", () => {
   const byName = Object.fromEntries(p.deviceOnly.map((d) => [d.name, d]));
   assert.deepStrictEqual([byName["Old Series"].state, byName["Old Series"].ours], ["orphaned", 1]);
   assert.strictEqual(byName.Shelter.state, "preserved");
+  // U4-1: the single Find source's query rides the entry.
+  assert.deepStrictEqual([byName["Old Series"].query, byName.Shelter.query], ["Old Series", "Shelter"]);
   assert.ok(p.anomalies.some((x) => x.kind === "loose-root-files"));
 });
 

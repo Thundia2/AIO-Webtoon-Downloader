@@ -76,7 +76,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t3fbe785d12",
+              "id": "ta086fd923e",
               "deletePolicy": "guarded",
               "excludes": [],
               "aliases": [],
@@ -100,18 +100,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t3fbe785d12": true
+          "ta086fd923e": true
         },
         "job": {
           "job": {
             "runId": 1,
             "phase": "plan",
-            "targetId": "t3fbe785d12",
+            "targetId": "ta086fd923e",
             "serial": null,
             "auto": true,
             "state": "done",
-            "startedAt": 1792224799350,
-            "finishedAt": 1792224799400,
+            "startedAt": 1792226408788,
+            "finishedAt": 1792226408855,
             "progress": {
               "bytesDone": 127108,
               "bytesTotal": 127108,
@@ -132,13 +132,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792224799394
+              "at": 1792226408847
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "t3fbe785d12",
-                "asOf": 1792224799394,
+                "targetId": "ta086fd923e",
+                "asOf": 1792226408847,
                 "firstSync": true,
                 "totals": {
                   "push": {
@@ -430,15 +430,15 @@
                 "gen": 1,
                 "warnings": [],
                 "capacity": {
-                  "free": 229169524736,
+                  "free": 229113716736,
                   "total": 1999343972352,
                   "needed": 127108,
                   "reserve": 1073741824,
                   "freeable": 0,
                   "freeableEarly": 0,
-                  "after": 229169397628,
+                  "after": 229113589628,
                   "fits": true,
-                  "asOf": 1792224799362
+                  "asOf": 1792226408805
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -451,10 +451,10 @@
           "queue": []
         },
         "plans": {
-          "t3fbe785d12": {
+          "ta086fd923e": {
             "summary": {
-              "targetId": "t3fbe785d12",
-              "asOf": 1792224799394,
+              "targetId": "ta086fd923e",
+              "asOf": 1792226408847,
               "firstSync": true,
               "totals": {
                 "push": {
@@ -746,15 +746,15 @@
               "gen": 1,
               "warnings": [],
               "capacity": {
-                "free": 229169524736,
+                "free": 229113716736,
                 "total": 1999343972352,
                 "needed": 127108,
                 "reserve": 1073741824,
                 "freeable": 0,
                 "freeableEarly": 0,
-                "after": 229169397628,
+                "after": 229113589628,
                 "fits": true,
-                "asOf": 1792224799362
+                "asOf": 1792226408805
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -772,7 +772,7 @@
               "status": "completed",
               "auto": true,
               "reason": null,
-              "at": 1792224799400
+              "at": 1792226408855
             }
           }
         },
@@ -863,7 +863,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t3fbe785d12",
+              "id": "ta086fd923e",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -898,18 +898,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t3fbe785d12": true
+          "ta086fd923e": true
         },
         "job": {
           "job": {
             "runId": 6,
             "phase": "plan",
-            "targetId": "t3fbe785d12",
+            "targetId": "ta086fd923e",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792224800512,
-            "finishedAt": 1792224800541,
+            "startedAt": 1792226410008,
+            "finishedAt": 1792226410044,
             "progress": {
               "bytesDone": 91442,
               "bytesTotal": 91442,
@@ -930,13 +930,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792224800540
+              "at": 1792226410043
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "t3fbe785d12",
-                "asOf": 1792224800540,
+                "targetId": "ta086fd923e",
+                "asOf": 1792226410043,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -974,7 +974,7 @@
                   "count": 1
                 },
                 "needsVerify": 0,
-                "settleAt": 1792224825355,
+                "settleAt": 1792226434822,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -1325,13 +1325,14 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "6efd3eec220c61a6",
+                    "shardId": "cf8f24225093fd8c",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
                     "chapterFiles": 5,
                     "ours": 5,
-                    "suggestions": []
+                    "suggestions": [],
+                    "query": "Berserk"
                   },
                   {
                     "key": "dev:Chainsaw Man",
@@ -1343,7 +1344,8 @@
                     "bytes": 5100,
                     "chapterFiles": 2,
                     "ours": 0,
-                    "suggestions": []
+                    "suggestions": [],
+                    "query": "Chainsaw Man"
                   },
                   {
                     "key": "dev:Kagurabachi_",
@@ -1357,7 +1359,8 @@
                     "ours": 0,
                     "suggestions": [
                       "link:pc:Kagurabachi=>Kagurabachi_"
-                    ]
+                    ],
+                    "query": "Kagurabachi"
                   }
                 ],
                 "anomalies": 4,
@@ -1374,15 +1377,15 @@
                 "gen": 5,
                 "warnings": [],
                 "capacity": {
-                  "free": 229169287168,
+                  "free": 229113475072,
                   "total": 1999343972352,
                   "needed": 60912,
                   "reserve": 1073741824,
                   "freeable": 36078,
                   "freeableEarly": 36078,
-                  "after": 229169262334,
+                  "after": 229113450238,
                   "fits": true,
-                  "asOf": 1792224800530
+                  "asOf": 1792226410030
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -1395,10 +1398,10 @@
           "queue": []
         },
         "plans": {
-          "t3fbe785d12": {
+          "ta086fd923e": {
             "summary": {
-              "targetId": "t3fbe785d12",
-              "asOf": 1792224800540,
+              "targetId": "ta086fd923e",
+              "asOf": 1792226410043,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -1436,7 +1439,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792224825355,
+              "settleAt": 1792226434822,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -1787,13 +1790,14 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "6efd3eec220c61a6",
+                  "shardId": "cf8f24225093fd8c",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
                   "chapterFiles": 5,
                   "ours": 5,
-                  "suggestions": []
+                  "suggestions": [],
+                  "query": "Berserk"
                 },
                 {
                   "key": "dev:Chainsaw Man",
@@ -1805,7 +1809,8 @@
                   "bytes": 5100,
                   "chapterFiles": 2,
                   "ours": 0,
-                  "suggestions": []
+                  "suggestions": [],
+                  "query": "Chainsaw Man"
                 },
                 {
                   "key": "dev:Kagurabachi_",
@@ -1819,7 +1824,8 @@
                   "ours": 0,
                   "suggestions": [
                     "link:pc:Kagurabachi=>Kagurabachi_"
-                  ]
+                  ],
+                  "query": "Kagurabachi"
                 }
               ],
               "anomalies": 4,
@@ -1836,15 +1842,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 229169287168,
+                "free": 229113475072,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 36078,
                 "freeableEarly": 36078,
-                "after": 229169262334,
+                "after": 229113450238,
                 "fits": true,
-                "asOf": 1792224800530
+                "asOf": 1792226410030
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -1859,7 +1865,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792224800223,
+              "at": 1792226409684,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -1888,7 +1894,7 @@
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792224800541
+              "at": 1792226410044
             }
           }
         },
@@ -1979,7 +1985,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t3fbe785d12",
+              "id": "ta086fd923e",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -2014,18 +2020,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t3fbe785d12": true
+          "ta086fd923e": true
         },
         "job": {
           "job": {
             "runId": 6,
             "phase": "plan",
-            "targetId": "t3fbe785d12",
+            "targetId": "ta086fd923e",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792224800512,
-            "finishedAt": 1792224800541,
+            "startedAt": 1792226410008,
+            "finishedAt": 1792226410044,
             "progress": {
               "bytesDone": 91442,
               "bytesTotal": 91442,
@@ -2046,13 +2052,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792224800540
+              "at": 1792226410043
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "t3fbe785d12",
-                "asOf": 1792224800540,
+                "targetId": "ta086fd923e",
+                "asOf": 1792226410043,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -2090,7 +2096,7 @@
                   "count": 1
                 },
                 "needsVerify": 0,
-                "settleAt": 1792224825355,
+                "settleAt": 1792226434822,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -2441,13 +2447,14 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "6efd3eec220c61a6",
+                    "shardId": "cf8f24225093fd8c",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
                     "chapterFiles": 5,
                     "ours": 5,
-                    "suggestions": []
+                    "suggestions": [],
+                    "query": "Berserk"
                   },
                   {
                     "key": "dev:Chainsaw Man",
@@ -2459,7 +2466,8 @@
                     "bytes": 5100,
                     "chapterFiles": 2,
                     "ours": 0,
-                    "suggestions": []
+                    "suggestions": [],
+                    "query": "Chainsaw Man"
                   },
                   {
                     "key": "dev:Kagurabachi_",
@@ -2473,7 +2481,8 @@
                     "ours": 0,
                     "suggestions": [
                       "link:pc:Kagurabachi=>Kagurabachi_"
-                    ]
+                    ],
+                    "query": "Kagurabachi"
                   }
                 ],
                 "anomalies": 4,
@@ -2490,15 +2499,15 @@
                 "gen": 5,
                 "warnings": [],
                 "capacity": {
-                  "free": 229169287168,
+                  "free": 229113475072,
                   "total": 1999343972352,
                   "needed": 60912,
                   "reserve": 1073741824,
                   "freeable": 36078,
                   "freeableEarly": 36078,
-                  "after": 229169262334,
+                  "after": 229113450238,
                   "fits": true,
-                  "asOf": 1792224800530
+                  "asOf": 1792226410030
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -2511,10 +2520,10 @@
           "queue": []
         },
         "plans": {
-          "t3fbe785d12": {
+          "ta086fd923e": {
             "summary": {
-              "targetId": "t3fbe785d12",
-              "asOf": 1792224800540,
+              "targetId": "ta086fd923e",
+              "asOf": 1792226410043,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -2552,7 +2561,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792224825355,
+              "settleAt": 1792226434822,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -2904,13 +2913,14 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "6efd3eec220c61a6",
+                  "shardId": "cf8f24225093fd8c",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
                   "chapterFiles": 5,
                   "ours": 5,
-                  "suggestions": []
+                  "suggestions": [],
+                  "query": "Berserk"
                 },
                 {
                   "key": "dev:Chainsaw Man",
@@ -2922,7 +2932,8 @@
                   "bytes": 5100,
                   "chapterFiles": 2,
                   "ours": 0,
-                  "suggestions": []
+                  "suggestions": [],
+                  "query": "Chainsaw Man"
                 },
                 {
                   "key": "dev:Kagurabachi_",
@@ -2936,7 +2947,8 @@
                   "ours": 0,
                   "suggestions": [
                     "link:pc:Kagurabachi=>Kagurabachi_"
-                  ]
+                  ],
+                  "query": "Kagurabachi"
                 }
               ],
               "anomalies": 4,
@@ -2953,15 +2965,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 229169287168,
+                "free": 229113475072,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 39081,
                 "freeableEarly": 39081,
-                "after": 229169265337,
+                "after": 229113453241,
                 "fits": true,
-                "asOf": 1792224800530
+                "asOf": 1792226410030
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -2976,7 +2988,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792224800223,
+              "at": 1792226409684,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -3005,7 +3017,7 @@
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792224800541
+              "at": 1792226410044
             }
           }
         },
@@ -3096,7 +3108,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t3fbe785d12",
+              "id": "ta086fd923e",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -3131,17 +3143,17 @@
         },
         "devices": [],
         "folderPresence": {
-          "t3fbe785d12": true
+          "ta086fd923e": true
         },
         "job": {
           "job": {
             "runId": 7,
             "phase": "apply",
-            "targetId": "t3fbe785d12",
+            "targetId": "ta086fd923e",
             "serial": null,
             "auto": false,
             "state": "running",
-            "startedAt": 1792224800748,
+            "startedAt": 1792226410413,
             "finishedAt": null,
             "progress": {
               "bytesDone": 3402,
@@ -3166,7 +3178,7 @@
                 "refusal": null
               },
               "step": "apply",
-              "at": 1792224800814,
+              "at": 1792226410487,
               "lane": {
                 "seriesKey": "pc:Eleceed",
                 "landed": 1,
@@ -3179,10 +3191,10 @@
           "queue": []
         },
         "plans": {
-          "t3fbe785d12": {
+          "ta086fd923e": {
             "summary": {
-              "targetId": "t3fbe785d12",
-              "asOf": 1792224800540,
+              "targetId": "ta086fd923e",
+              "asOf": 1792226410043,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -3220,7 +3232,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792224825355,
+              "settleAt": 1792226434822,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -3572,13 +3584,14 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "6efd3eec220c61a6",
+                  "shardId": "cf8f24225093fd8c",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
                   "chapterFiles": 5,
                   "ours": 5,
-                  "suggestions": []
+                  "suggestions": [],
+                  "query": "Berserk"
                 },
                 {
                   "key": "dev:Chainsaw Man",
@@ -3590,7 +3603,8 @@
                   "bytes": 5100,
                   "chapterFiles": 2,
                   "ours": 0,
-                  "suggestions": []
+                  "suggestions": [],
+                  "query": "Chainsaw Man"
                 },
                 {
                   "key": "dev:Kagurabachi_",
@@ -3604,7 +3618,8 @@
                   "ours": 0,
                   "suggestions": [
                     "link:pc:Kagurabachi=>Kagurabachi_"
-                  ]
+                  ],
+                  "query": "Kagurabachi"
                 }
               ],
               "anomalies": 4,
@@ -3621,15 +3636,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 229169287168,
+                "free": 229113475072,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 39081,
                 "freeableEarly": 39081,
-                "after": 229169265337,
+                "after": 229113453241,
                 "fits": true,
-                "asOf": 1792224800530
+                "asOf": 1792226410030
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -3644,7 +3659,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792224800223,
+              "at": 1792226409684,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -3673,7 +3688,7 @@
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792224800541
+              "at": 1792226410044
             }
           }
         },
@@ -3764,7 +3779,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t3fbe785d12",
+              "id": "ta086fd923e",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -3798,18 +3813,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t3fbe785d12": true
+          "ta086fd923e": true
         },
         "job": {
           "job": {
             "runId": 8,
             "phase": "plan",
-            "targetId": "t3fbe785d12",
+            "targetId": "ta086fd923e",
             "serial": null,
             "auto": true,
             "state": "done",
-            "startedAt": 1792224803681,
-            "finishedAt": 1792224803714,
+            "startedAt": 1792226413505,
+            "finishedAt": 1792226413546,
             "progress": {
               "bytesDone": 91442,
               "bytesTotal": 91442,
@@ -3830,13 +3845,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792224803714
+              "at": 1792226413545
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "t3fbe785d12",
-                "asOf": 1792224803714,
+                "targetId": "ta086fd923e",
+                "asOf": 1792226413545,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -3874,7 +3889,7 @@
                   "count": 0
                 },
                 "needsVerify": 0,
-                "settleAt": 1792224825355,
+                "settleAt": 1792226434822,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -4171,13 +4186,14 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "6efd3eec220c61a6",
+                    "shardId": "cf8f24225093fd8c",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
                     "chapterFiles": 5,
                     "ours": 5,
-                    "suggestions": []
+                    "suggestions": [],
+                    "query": "Berserk"
                   },
                   {
                     "key": "dev:Chainsaw Man",
@@ -4189,7 +4205,8 @@
                     "bytes": 5100,
                     "chapterFiles": 2,
                     "ours": 0,
-                    "suggestions": []
+                    "suggestions": [],
+                    "query": "Chainsaw Man"
                   },
                   {
                     "key": "dev:Kagurabachi_",
@@ -4201,7 +4218,8 @@
                     "bytes": 2100,
                     "chapterFiles": 1,
                     "ours": 0,
-                    "suggestions": []
+                    "suggestions": [],
+                    "query": "Kagurabachi"
                   }
                 ],
                 "anomalies": 4,
@@ -4210,15 +4228,15 @@
                 "gen": 6,
                 "warnings": [],
                 "capacity": {
-                  "free": 229169172480,
+                  "free": 229120700416,
                   "total": 1999343972352,
                   "needed": 0,
                   "reserve": 1073741824,
                   "freeable": 0,
                   "freeableEarly": 0,
-                  "after": 229169172480,
+                  "after": 229120700416,
                   "fits": true,
-                  "asOf": 1792224803701
+                  "asOf": 1792226413530
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -4231,10 +4249,10 @@
           "queue": []
         },
         "plans": {
-          "t3fbe785d12": {
+          "ta086fd923e": {
             "summary": {
-              "targetId": "t3fbe785d12",
-              "asOf": 1792224803714,
+              "targetId": "ta086fd923e",
+              "asOf": 1792226413545,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -4272,7 +4290,7 @@
                 "count": 0
               },
               "needsVerify": 0,
-              "settleAt": 1792224825355,
+              "settleAt": 1792226434822,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -4569,13 +4587,14 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "6efd3eec220c61a6",
+                  "shardId": "cf8f24225093fd8c",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
                   "chapterFiles": 5,
                   "ours": 5,
-                  "suggestions": []
+                  "suggestions": [],
+                  "query": "Berserk"
                 },
                 {
                   "key": "dev:Chainsaw Man",
@@ -4587,7 +4606,8 @@
                   "bytes": 5100,
                   "chapterFiles": 2,
                   "ours": 0,
-                  "suggestions": []
+                  "suggestions": [],
+                  "query": "Chainsaw Man"
                 },
                 {
                   "key": "dev:Kagurabachi_",
@@ -4599,7 +4619,8 @@
                   "bytes": 2100,
                   "chapterFiles": 1,
                   "ours": 0,
-                  "suggestions": []
+                  "suggestions": [],
+                  "query": "Kagurabachi"
                 }
               ],
               "anomalies": 4,
@@ -4608,15 +4629,15 @@
               "gen": 6,
               "warnings": [],
               "capacity": {
-                "free": 229169172480,
+                "free": 229120700416,
                 "total": 1999343972352,
                 "needed": 0,
                 "reserve": 1073741824,
                 "freeable": 0,
                 "freeableEarly": 0,
-                "after": 229169172480,
+                "after": 229120700416,
                 "fits": true,
-                "asOf": 1792224803701
+                "asOf": 1792226413530
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -4631,7 +4652,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792224803681,
+              "at": 1792226413505,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -4669,7 +4690,7 @@
               "status": "completed",
               "auto": true,
               "reason": null,
-              "at": 1792224803714
+              "at": 1792226413546
             }
           }
         },
@@ -4760,7 +4781,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t3fbe785d12",
+              "id": "ta086fd923e",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -4794,18 +4815,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t3fbe785d12": true
+          "ta086fd923e": true
         },
         "job": {
           "job": {
             "runId": 9,
             "phase": "plan",
-            "targetId": "t3fbe785d12",
+            "targetId": "ta086fd923e",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792224803863,
-            "finishedAt": 1792224803883,
+            "startedAt": 1792226413697,
+            "finishedAt": 1792226413721,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -4833,7 +4854,7 @@
                 }
               },
               "step": "device-ready",
-              "at": 1792224803863
+              "at": 1792226413697
             },
             "status": "failed",
             "summary": {
@@ -4851,7 +4872,7 @@
           "queue": []
         },
         "plans": {
-          "t3fbe785d12": {
+          "ta086fd923e": {
             "summary": null,
             "refusal": {
               "fields": [
@@ -4868,7 +4889,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792224803681,
+              "at": 1792226413505,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -4906,7 +4927,7 @@
               "status": "failed",
               "auto": false,
               "reason": "record-mismatch",
-              "at": 1792224803883
+              "at": 1792226413721
             }
           }
         },
@@ -4997,7 +5018,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t3fbe785d12",
+              "id": "ta086fd923e",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -5031,18 +5052,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t3fbe785d12": true
+          "ta086fd923e": true
         },
         "job": {
           "job": {
             "runId": 10,
             "phase": "plan",
-            "targetId": "t3fbe785d12",
+            "targetId": "ta086fd923e",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792224804020,
-            "finishedAt": 1792224804040,
+            "startedAt": 1792226413885,
+            "finishedAt": 1792226413909,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -5068,7 +5089,7 @@
                 }
               },
               "step": "device-ready",
-              "at": 1792224804039
+              "at": 1792226413909
             },
             "status": "failed",
             "summary": {
@@ -5084,7 +5105,7 @@
           "queue": []
         },
         "plans": {
-          "t3fbe785d12": {
+          "ta086fd923e": {
             "summary": null,
             "refusal": {
               "detail": "empty-root",
@@ -5099,7 +5120,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792224803681,
+              "at": 1792226413505,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -5137,7 +5158,7 @@
               "status": "failed",
               "auto": false,
               "reason": "device-listing-suspect",
-              "at": 1792224804040
+              "at": 1792226413909
             }
           }
         },
@@ -5228,7 +5249,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t3fbe785d12",
+              "id": "ta086fd923e",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -5262,18 +5283,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t3fbe785d12": false
+          "ta086fd923e": false
         },
         "job": {
           "job": {
             "runId": 10,
             "phase": "plan",
-            "targetId": "t3fbe785d12",
+            "targetId": "ta086fd923e",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792224804020,
-            "finishedAt": 1792224804040,
+            "startedAt": 1792226413885,
+            "finishedAt": 1792226413909,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -5299,7 +5320,7 @@
                 }
               },
               "step": "device-ready",
-              "at": 1792224804039
+              "at": 1792226413909
             },
             "status": "failed",
             "summary": {
@@ -5315,7 +5336,7 @@
           "queue": []
         },
         "plans": {
-          "t3fbe785d12": {
+          "ta086fd923e": {
             "summary": null,
             "refusal": {
               "detail": "empty-root",
@@ -5330,7 +5351,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792224803681,
+              "at": 1792226413505,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -5368,7 +5389,7 @@
               "status": "failed",
               "auto": false,
               "reason": "device-listing-suspect",
-              "at": 1792224804040
+              "at": 1792226413909
             }
           }
         },
@@ -5459,7 +5480,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t6be69df213",
+              "id": "t5721599c0a",
               "deletePolicy": "guarded",
               "excludes": [],
               "aliases": [],
@@ -5498,12 +5519,12 @@
           "job": {
             "runId": 1,
             "phase": "plan",
-            "targetId": "t6be69df213",
+            "targetId": "t5721599c0a",
             "serial": "R5CW71ABCDE",
             "auto": true,
             "state": "done",
-            "startedAt": 1792224809398,
-            "finishedAt": 1792224809510,
+            "startedAt": 1792226423866,
+            "finishedAt": 1792226423989,
             "progress": {
               "bytesDone": 136526,
               "bytesTotal": 136526,
@@ -5530,7 +5551,7 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792224809509
+              "at": 1792226423988
             },
             "status": "failed",
             "summary": {
@@ -5554,7 +5575,7 @@
           "queue": []
         },
         "plans": {
-          "t6be69df213": {
+          "t5721599c0a": {
             "summary": null,
             "refusal": {
               "folders": [
@@ -5580,7 +5601,7 @@
               "status": "failed",
               "auto": true,
               "reason": "needs-mode",
-              "at": 1792224809510
+              "at": 1792226423989
             }
           }
         },
@@ -6437,7 +6458,7 @@
         ],
         "suggestions": [],
         "rebind": {
-          "shardId": "dce88bfc80a27ee8",
+          "shardId": "da53a4a456571d54",
           "choices": [
             {
               "source": "previous",
@@ -6707,13 +6728,14 @@
           "key": "dev:Berserk",
           "name": "Berserk",
           "state": "orphaned",
-          "shardId": "6efd3eec220c61a6",
+          "shardId": "cf8f24225093fd8c",
           "listed": true,
           "files": 5,
           "bytes": 15015,
           "chapterFiles": 5,
           "ours": 5,
-          "suggestions": []
+          "suggestions": [],
+          "query": "Berserk"
         },
         "rows": [
           {
@@ -6773,7 +6795,8 @@
           "bytes": 5100,
           "chapterFiles": 2,
           "ours": 0,
-          "suggestions": []
+          "suggestions": [],
+          "query": "Chainsaw Man"
         },
         "rows": [
           {
@@ -6811,7 +6834,8 @@
           "ours": 0,
           "suggestions": [
             "link:pc:Kagurabachi=>Kagurabachi_"
-          ]
+          ],
+          "query": "Kagurabachi"
         },
         "rows": [
           {
@@ -6899,10 +6923,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "t3fbe785d12",
+          "targetId": "ta086fd923e",
           "summary": {
-            "targetId": "t3fbe785d12",
-            "asOf": 1792224800540,
+            "targetId": "ta086fd923e",
+            "asOf": 1792226410043,
             "firstSync": false,
             "totals": {
               "push": {
@@ -6940,7 +6964,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792224825355,
+            "settleAt": 1792226434822,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -7297,13 +7321,14 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "6efd3eec220c61a6",
+                "shardId": "cf8f24225093fd8c",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
                 "chapterFiles": 5,
                 "ours": 5,
-                "suggestions": []
+                "suggestions": [],
+                "query": "Berserk"
               },
               {
                 "key": "dev:Chainsaw Man",
@@ -7315,7 +7340,8 @@
                 "bytes": 5100,
                 "chapterFiles": 2,
                 "ours": 0,
-                "suggestions": []
+                "suggestions": [],
+                "query": "Chainsaw Man"
               },
               {
                 "key": "dev:Kagurabachi_",
@@ -7329,7 +7355,8 @@
                 "ours": 0,
                 "suggestions": [
                   "link:pc:Kagurabachi=>Kagurabachi_"
-                ]
+                ],
+                "query": "Kagurabachi"
               }
             ],
             "anomalies": 4,
@@ -7346,15 +7373,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229169287168,
+              "free": 229113475072,
               "total": 1999343972352,
               "needed": 57905,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 229169265341,
+              "after": 229113453245,
               "fits": true,
-              "asOf": 1792224800530
+              "asOf": 1792226410030
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -7369,7 +7396,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792224800223,
+            "at": 1792226409684,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -7398,7 +7425,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792224800541
+            "at": 1792226410044
           }
         }
       },
@@ -7460,10 +7487,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "t3fbe785d12",
+          "targetId": "ta086fd923e",
           "summary": {
-            "targetId": "t3fbe785d12",
-            "asOf": 1792224800540,
+            "targetId": "ta086fd923e",
+            "asOf": 1792226410043,
             "firstSync": false,
             "totals": {
               "push": {
@@ -7501,7 +7528,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792224825355,
+            "settleAt": 1792226434822,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -7852,13 +7879,14 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "6efd3eec220c61a6",
+                "shardId": "cf8f24225093fd8c",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
                 "chapterFiles": 5,
                 "ours": 5,
-                "suggestions": []
+                "suggestions": [],
+                "query": "Berserk"
               },
               {
                 "key": "dev:Chainsaw Man",
@@ -7870,7 +7898,8 @@
                 "bytes": 5100,
                 "chapterFiles": 2,
                 "ours": 0,
-                "suggestions": []
+                "suggestions": [],
+                "query": "Chainsaw Man"
               },
               {
                 "key": "dev:Kagurabachi_",
@@ -7884,7 +7913,8 @@
                 "ours": 0,
                 "suggestions": [
                   "link:pc:Kagurabachi=>Kagurabachi_"
-                ]
+                ],
+                "query": "Kagurabachi"
               }
             ],
             "anomalies": 4,
@@ -7901,15 +7931,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229169287168,
+              "free": 229113475072,
               "total": 1999343972352,
               "needed": 48086,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 229169275160,
+              "after": 229113463064,
               "fits": true,
-              "asOf": 1792224800530
+              "asOf": 1792226410030
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -7924,7 +7954,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792224800223,
+            "at": 1792226409684,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -7953,7 +7983,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792224800541
+            "at": 1792226410044
           }
         }
       },
@@ -8015,10 +8045,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "t3fbe785d12",
+          "targetId": "ta086fd923e",
           "summary": {
-            "targetId": "t3fbe785d12",
-            "asOf": 1792224800540,
+            "targetId": "ta086fd923e",
+            "asOf": 1792226410043,
             "firstSync": false,
             "totals": {
               "push": {
@@ -8056,7 +8086,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792224825355,
+            "settleAt": 1792226434822,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -8407,13 +8437,14 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "6efd3eec220c61a6",
+                "shardId": "cf8f24225093fd8c",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
                 "chapterFiles": 5,
                 "ours": 5,
-                "suggestions": []
+                "suggestions": [],
+                "query": "Berserk"
               },
               {
                 "key": "dev:Chainsaw Man",
@@ -8425,7 +8456,8 @@
                 "bytes": 5100,
                 "chapterFiles": 2,
                 "ours": 0,
-                "suggestions": []
+                "suggestions": [],
+                "query": "Chainsaw Man"
               },
               {
                 "key": "dev:Kagurabachi_",
@@ -8439,7 +8471,8 @@
                 "ours": 0,
                 "suggestions": [
                   "link:pc:Kagurabachi=>Kagurabachi_"
-                ]
+                ],
+                "query": "Kagurabachi"
               }
             ],
             "anomalies": 4,
@@ -8456,15 +8489,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229169287168,
+              "free": 229113475072,
               "total": 1999343972352,
               "needed": 60912,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 229169262334,
+              "after": 229113450238,
               "fits": true,
-              "asOf": 1792224800530
+              "asOf": 1792226410030
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -8479,7 +8512,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792224800223,
+            "at": 1792226409684,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -8508,7 +8541,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792224800541
+            "at": 1792226410044
           }
         }
       },
@@ -8594,10 +8627,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "t3fbe785d12",
+          "targetId": "ta086fd923e",
           "summary": {
-            "targetId": "t3fbe785d12",
-            "asOf": 1792224800540,
+            "targetId": "ta086fd923e",
+            "asOf": 1792226410043,
             "firstSync": false,
             "totals": {
               "push": {
@@ -8635,7 +8668,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792224825355,
+            "settleAt": 1792226434822,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -8987,13 +9020,14 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "6efd3eec220c61a6",
+                "shardId": "cf8f24225093fd8c",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
                 "chapterFiles": 5,
                 "ours": 5,
-                "suggestions": []
+                "suggestions": [],
+                "query": "Berserk"
               },
               {
                 "key": "dev:Chainsaw Man",
@@ -9005,7 +9039,8 @@
                 "bytes": 5100,
                 "chapterFiles": 2,
                 "ours": 0,
-                "suggestions": []
+                "suggestions": [],
+                "query": "Chainsaw Man"
               },
               {
                 "key": "dev:Kagurabachi_",
@@ -9019,7 +9054,8 @@
                 "ours": 0,
                 "suggestions": [
                   "link:pc:Kagurabachi=>Kagurabachi_"
-                ]
+                ],
+                "query": "Kagurabachi"
               }
             ],
             "anomalies": 4,
@@ -9036,15 +9072,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229169287168,
+              "free": 229113475072,
               "total": 1999343972352,
               "needed": 60912,
               "reserve": 1073741824,
               "freeable": 39081,
               "freeableEarly": 39081,
-              "after": 229169265337,
+              "after": 229113453241,
               "fits": true,
-              "asOf": 1792224800530
+              "asOf": 1792226410030
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -9059,7 +9095,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792224800223,
+            "at": 1792226409684,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -9088,7 +9124,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792224800541
+            "at": 1792226410044
           }
         }
       }
@@ -9110,11 +9146,11 @@
         "job": {
           "runId": 7,
           "phase": "apply",
-          "targetId": "t3fbe785d12",
+          "targetId": "ta086fd923e",
           "serial": null,
           "auto": false,
           "state": "running",
-          "startedAt": 1792224800748,
+          "startedAt": 1792226410413,
           "finishedAt": null,
           "progress": {
             "bytesDone": 3402,
@@ -9139,7 +9175,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224800814,
+            "at": 1792226410487,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 1,
@@ -9164,11 +9200,11 @@
         "message": "the folder isn't available"
       }
     },
-    "targetId": "t3fbe785d12",
+    "targetId": "ta086fd923e",
     "review": {
       "ok": true,
-      "targetId": "t3fbe785d12",
-      "asOf": 1792224800540,
+      "targetId": "ta086fd923e",
+      "asOf": 1792226410043,
       "firstSync": false,
       "deletePolicy": "guarded",
       "totals": {
@@ -9895,7 +9931,7 @@
           "seriesKey": "pc:Solo Leveling",
           "series": "Solo Leveling",
           "rebind": {
-            "shardId": "dce88bfc80a27ee8",
+            "shardId": "da53a4a456571d54",
             "choices": [
               {
                 "source": "previous",
@@ -9917,15 +9953,15 @@
       "gen": 5,
       "stale": false,
       "capacity": {
-        "free": 229169287168,
+        "free": 229113475072,
         "total": 1999343972352,
         "needed": 60912,
         "reserve": 1073741824,
         "freeable": 36078,
         "freeableEarly": 36078,
-        "after": 229169262334,
+        "after": 229113450238,
         "fits": true,
-        "asOf": 1792224800530
+        "asOf": 1792226410030
       },
       "policy": {
         "deletePolicy": "guarded",
@@ -9935,10 +9971,175 @@
       "warnings": [],
       "busy": false
     },
+    "libraryStatus": {
+      "ok": true,
+      "asOf": 1792226410064,
+      "bySeries": {
+        "D:\\Sync-fixture\\tab-manga\\Dungeon Meshi": [
+          {
+            "targetId": "ta086fd923e",
+            "state": "synced",
+            "pending": 0
+          }
+        ],
+        "D:\\Sync-fixture\\tab-manga\\Eleceed": [
+          {
+            "targetId": "ta086fd923e",
+            "state": "pending",
+            "pending": 4
+          }
+        ],
+        "D:\\Sync-fixture\\tab-manga\\Frieren": [
+          {
+            "targetId": "ta086fd923e",
+            "state": "pending",
+            "pending": 2
+          }
+        ],
+        "D:\\Sync-fixture\\tab-manga\\Kagurabachi": [
+          {
+            "targetId": "ta086fd923e",
+            "state": "absent",
+            "pending": 3
+          }
+        ],
+        "D:\\Sync-fixture\\tab-manga\\Solo Leveling": [
+          {
+            "targetId": "ta086fd923e",
+            "state": "removed",
+            "pending": 12,
+            "asOf": 1792226410043
+          }
+        ]
+      }
+    },
+    "find": {
+      "ok": true,
+      "running": false,
+      "targetId": "ta086fd923e",
+      "waiting": null,
+      "done": 0,
+      "total": 0,
+      "rows": [
+        {
+          "folder": "Berserk",
+          "query": "Berserk",
+          "include": true,
+          "state": "error",
+          "candidates": [],
+          "pick": null,
+          "pinnedUrl": null,
+          "skip": false,
+          "error": "search exited with code 1",
+          "searchedAt": 1792226410179
+        },
+        {
+          "folder": "Chainsaw Man",
+          "query": "Chainsaw Man",
+          "include": true,
+          "state": "done",
+          "candidates": [
+            {
+              "title": "Chainsaw Man",
+              "year": 2018,
+              "best": {
+                "site": "mangadex",
+                "url": "https://mangadex.org/title/a77742b1/chainsaw-man",
+                "title": "Chainsaw Man",
+                "cover": null,
+                "composite": 0.91,
+                "chapters": 181,
+                "qualityBasis": "chapter_probe"
+              },
+              "sources": [
+                {
+                  "site": "mangadex",
+                  "url": "https://mangadex.org/title/a77742b1/chainsaw-man",
+                  "title": "Chainsaw Man",
+                  "cover": null,
+                  "composite": 0.91,
+                  "chapters": 181,
+                  "qualityBasis": "chapter_probe"
+                },
+                {
+                  "site": "weebcentral",
+                  "url": "https://weebcentral.com/series/01J76XY/chainsaw-man",
+                  "title": "Chainsaw Man",
+                  "cover": null,
+                  "composite": 0.84,
+                  "chapters": 181,
+                  "qualityBasis": "chapter_probe"
+                }
+              ]
+            },
+            {
+              "title": "Chainsaw Man (Colored)",
+              "year": 2021,
+              "best": {
+                "site": "mangafire",
+                "url": "https://mangafire.to/title/x9c2-chainsaw-man-colored",
+                "title": "Chainsaw Man (Colored)",
+                "cover": null,
+                "composite": 0.62,
+                "chapters": 97,
+                "qualityBasis": "seed"
+              },
+              "sources": [
+                {
+                  "site": "mangafire",
+                  "url": "https://mangafire.to/title/x9c2-chainsaw-man-colored",
+                  "title": "Chainsaw Man (Colored)",
+                  "cover": null,
+                  "composite": 0.62,
+                  "chapters": 97,
+                  "qualityBasis": "seed"
+                }
+              ]
+            }
+          ],
+          "pick": 0,
+          "pinnedUrl": null,
+          "skip": false,
+          "error": null,
+          "searchedAt": 1792226410227
+        },
+        {
+          "folder": "Kagurabachi_",
+          "query": "Kagurabachi",
+          "include": true,
+          "state": "done",
+          "candidates": [],
+          "pick": null,
+          "pinnedUrl": null,
+          "skip": false,
+          "error": null,
+          "searchedAt": 1792226410273
+        }
+      ]
+    },
+    "findRunning": {
+      "kind": "find",
+      "targetId": "ta086fd923e",
+      "state": "running",
+      "done": 0,
+      "total": 3,
+      "row": {
+        "folder": "Berserk",
+        "query": "Berserk",
+        "include": true,
+        "state": "searching",
+        "candidates": [],
+        "pick": null,
+        "pinnedUrl": null,
+        "skip": false,
+        "error": null,
+        "searchedAt": null
+      }
+    },
     "reviewWithLoss": {
       "ok": true,
-      "targetId": "t3fbe785d12",
-      "asOf": 1792224800540,
+      "targetId": "ta086fd923e",
+      "asOf": 1792226410043,
       "firstSync": false,
       "deletePolicy": "guarded",
       "totals": {
@@ -10676,7 +10877,7 @@
           "seriesKey": "pc:Solo Leveling",
           "series": "Solo Leveling",
           "rebind": {
-            "shardId": "dce88bfc80a27ee8",
+            "shardId": "da53a4a456571d54",
             "choices": [
               {
                 "source": "previous",
@@ -10698,15 +10899,15 @@
       "gen": 5,
       "stale": false,
       "capacity": {
-        "free": 229169287168,
+        "free": 229113475072,
         "total": 1999343972352,
         "needed": 60912,
         "reserve": 1073741824,
         "freeable": 39081,
         "freeableEarly": 39081,
-        "after": 229169265337,
+        "after": 229113453241,
         "fits": true,
-        "asOf": 1792224800530
+        "asOf": 1792226410030
       },
       "policy": {
         "deletePolicy": "guarded",
@@ -10726,11 +10927,11 @@
           "job": {
             "runId": 7,
             "phase": "apply",
-            "targetId": "t3fbe785d12",
+            "targetId": "ta086fd923e",
             "serial": null,
             "auto": false,
             "state": "running",
-            "startedAt": 1792224800748,
+            "startedAt": 1792226410413,
             "finishedAt": null,
             "progress": {
               "bytesDone": 0,
@@ -10759,12 +10960,12 @@
             "current": null,
             "preflight": null,
             "step": "probe",
-            "at": 1792224800748
+            "at": 1792226410413
           }
         }
       },
       {
-        "t": 19,
+        "t": 23,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -10789,12 +10990,12 @@
               "refusal": null
             },
             "step": "device-ready",
-            "at": 1792224800766
+            "at": 1792226410435
           }
         }
       },
       {
-        "t": 122,
+        "t": 123,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -10822,7 +11023,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224800814,
+            "at": 1792226410487,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 1,
@@ -10832,7 +11033,7 @@
         }
       },
       {
-        "t": 230,
+        "t": 232,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -10860,7 +11061,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224800956,
+            "at": 1792226410625,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 2,
@@ -10870,7 +11071,7 @@
         }
       },
       {
-        "t": 344,
+        "t": 347,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -10898,7 +11099,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224801092,
+            "at": 1792226410760,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 2,
@@ -10908,7 +11109,7 @@
         }
       },
       {
-        "t": 448,
+        "t": 450,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -10936,7 +11137,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224801097,
+            "at": 1792226410764,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 3,
@@ -10946,7 +11147,7 @@
         }
       },
       {
-        "t": 557,
+        "t": 559,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -10974,7 +11175,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224801236,
+            "at": 1792226410906,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 4,
@@ -10984,7 +11185,7 @@
         }
       },
       {
-        "t": 667,
+        "t": 670,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11012,7 +11213,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224801380,
+            "at": 1792226411053,
             "lane": {
               "seriesKey": "pc:Frieren",
               "landed": 1,
@@ -11022,7 +11223,7 @@
         }
       },
       {
-        "t": 767,
+        "t": 784,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11050,7 +11251,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224801514,
+            "at": 1792226411197,
             "lane": {
               "seriesKey": "pc:Frieren",
               "landed": 1,
@@ -11060,7 +11261,7 @@
         }
       },
       {
-        "t": 869,
+        "t": 888,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11088,7 +11289,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224801518,
+            "at": 1792226411203,
             "lane": {
               "seriesKey": "pc:Frieren",
               "landed": 2,
@@ -11098,7 +11299,7 @@
         }
       },
       {
-        "t": 978,
+        "t": 996,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11126,7 +11327,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224801670,
+            "at": 1792226411358,
             "lane": {
               "seriesKey": "pc:Kagurabachi",
               "landed": 1,
@@ -11136,7 +11337,45 @@
         }
       },
       {
-        "t": 1087,
+        "t": 1104,
+        "ev": {
+          "kind": "job",
+          "runId": 7,
+          "state": "running",
+          "progress": {
+            "bytesDone": 24434,
+            "bytesTotal": 60512,
+            "filesDone": 7,
+            "filesTotal": 20,
+            "current": {
+              "folder": "Kagurabachi",
+              "name": "Ch.002 - Kagurabachi.cbz"
+            },
+            "preflight": {
+              "kind": "folder",
+              "caps": {
+                "sha256sum": true,
+                "local": true
+              },
+              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
+              "caseInsensitive": true,
+              "caseMeasured": true,
+              "canHash": true,
+              "mayNeedMode": false,
+              "refusal": null
+            },
+            "step": "apply",
+            "at": 1792226411496,
+            "lane": {
+              "seriesKey": "pc:Kagurabachi",
+              "landed": 1,
+              "total": 2
+            }
+          }
+        }
+      },
+      {
+        "t": 1226,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11164,17 +11403,17 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224801813,
+            "at": 1792226411639,
             "lane": {
               "seriesKey": "pc:Kagurabachi",
-              "landed": 2,
+              "landed": 1,
               "total": 2
             }
           }
         }
       },
       {
-        "t": 1214,
+        "t": 1337,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11185,8 +11424,8 @@
             "filesDone": 8,
             "filesTotal": 20,
             "current": {
-              "folder": "Solo Leveling",
-              "name": "Ch.001 - Solo Leveling.cbz"
+              "folder": "Kagurabachi",
+              "name": "Ch.002 - Kagurabachi.cbz"
             },
             "preflight": {
               "kind": "folder",
@@ -11202,17 +11441,17 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224801962,
+            "at": 1792226411639,
             "lane": {
-              "seriesKey": "pc:Solo Leveling",
-              "landed": 0,
-              "total": 12
+              "seriesKey": "pc:Kagurabachi",
+              "landed": 2,
+              "total": 2
             }
           }
         }
       },
       {
-        "t": 1322,
+        "t": 1448,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11240,7 +11479,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224801967,
+            "at": 1792226411792,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 1,
@@ -11250,7 +11489,7 @@
         }
       },
       {
-        "t": 1432,
+        "t": 1556,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11278,7 +11517,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224802111,
+            "at": 1792226411934,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 2,
@@ -11288,7 +11527,45 @@
         }
       },
       {
-        "t": 1543,
+        "t": 1656,
+        "ev": {
+          "kind": "job",
+          "runId": 7,
+          "state": "running",
+          "progress": {
+            "bytesDone": 30437,
+            "bytesTotal": 60512,
+            "filesDone": 10,
+            "filesTotal": 20,
+            "current": {
+              "folder": "Solo Leveling",
+              "name": "Ch.003 - Solo Leveling.cbz"
+            },
+            "preflight": {
+              "kind": "folder",
+              "caps": {
+                "sha256sum": true,
+                "local": true
+              },
+              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
+              "caseInsensitive": true,
+              "caseMeasured": true,
+              "canHash": true,
+              "mayNeedMode": false,
+              "refusal": null
+            },
+            "step": "apply",
+            "at": 1792226412068,
+            "lane": {
+              "seriesKey": "pc:Solo Leveling",
+              "landed": 2,
+              "total": 12
+            }
+          }
+        }
+      },
+      {
+        "t": 1758,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11316,7 +11593,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224802253,
+            "at": 1792226412073,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 3,
@@ -11326,45 +11603,7 @@
         }
       },
       {
-        "t": 1643,
-        "ev": {
-          "kind": "job",
-          "runId": 7,
-          "state": "running",
-          "progress": {
-            "bytesDone": 33440,
-            "bytesTotal": 60512,
-            "filesDone": 11,
-            "filesTotal": 20,
-            "current": {
-              "folder": "Solo Leveling",
-              "name": "Ch.004 - Solo Leveling.cbz"
-            },
-            "preflight": {
-              "kind": "folder",
-              "caps": {
-                "sha256sum": true,
-                "local": true
-              },
-              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
-              "caseInsensitive": true,
-              "caseMeasured": true,
-              "canHash": true,
-              "mayNeedMode": false,
-              "refusal": null
-            },
-            "step": "apply",
-            "at": 1792224802390,
-            "lane": {
-              "seriesKey": "pc:Solo Leveling",
-              "landed": 3,
-              "total": 12
-            }
-          }
-        }
-      },
-      {
-        "t": 1744,
+        "t": 1867,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11392,7 +11631,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224802395,
+            "at": 1792226412213,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 4,
@@ -11402,7 +11641,7 @@
         }
       },
       {
-        "t": 1853,
+        "t": 1975,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11430,7 +11669,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224802533,
+            "at": 1792226412352,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 5,
@@ -11440,7 +11679,45 @@
         }
       },
       {
-        "t": 1963,
+        "t": 2074,
+        "ev": {
+          "kind": "job",
+          "runId": 7,
+          "state": "running",
+          "progress": {
+            "bytesDone": 39449,
+            "bytesTotal": 60512,
+            "filesDone": 13,
+            "filesTotal": 20,
+            "current": {
+              "folder": "Solo Leveling",
+              "name": "Ch.006 - Solo Leveling.cbz"
+            },
+            "preflight": {
+              "kind": "folder",
+              "caps": {
+                "sha256sum": true,
+                "local": true
+              },
+              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
+              "caseInsensitive": true,
+              "caseMeasured": true,
+              "canHash": true,
+              "mayNeedMode": false,
+              "refusal": null
+            },
+            "step": "apply",
+            "at": 1792226412486,
+            "lane": {
+              "seriesKey": "pc:Solo Leveling",
+              "landed": 5,
+              "total": 12
+            }
+          }
+        }
+      },
+      {
+        "t": 2179,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11468,7 +11745,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224802673,
+            "at": 1792226412490,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 6,
@@ -11478,45 +11755,7 @@
         }
       },
       {
-        "t": 2064,
-        "ev": {
-          "kind": "job",
-          "runId": 7,
-          "state": "running",
-          "progress": {
-            "bytesDone": 45462,
-            "bytesTotal": 60512,
-            "filesDone": 14,
-            "filesTotal": 20,
-            "current": {
-              "folder": "Solo Leveling",
-              "name": "Ch.007 - Solo Leveling.cbz"
-            },
-            "preflight": {
-              "kind": "folder",
-              "caps": {
-                "sha256sum": true,
-                "local": true
-              },
-              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
-              "caseInsensitive": true,
-              "caseMeasured": true,
-              "canHash": true,
-              "mayNeedMode": false,
-              "refusal": null
-            },
-            "step": "apply",
-            "at": 1792224802810,
-            "lane": {
-              "seriesKey": "pc:Solo Leveling",
-              "landed": 6,
-              "total": 12
-            }
-          }
-        }
-      },
-      {
-        "t": 2166,
+        "t": 2290,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11544,7 +11783,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224802813,
+            "at": 1792226412634,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 7,
@@ -11554,7 +11793,7 @@
         }
       },
       {
-        "t": 2275,
+        "t": 2400,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11582,7 +11821,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224802955,
+            "at": 1792226412776,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 8,
@@ -11592,7 +11831,45 @@
         }
       },
       {
-        "t": 2383,
+        "t": 2500,
+        "ev": {
+          "kind": "job",
+          "runId": 7,
+          "state": "running",
+          "progress": {
+            "bytesDone": 48470,
+            "bytesTotal": 60512,
+            "filesDone": 16,
+            "filesTotal": 20,
+            "current": {
+              "folder": "Solo Leveling",
+              "name": "Ch.009 - Solo Leveling.cbz"
+            },
+            "preflight": {
+              "kind": "folder",
+              "caps": {
+                "sha256sum": true,
+                "local": true
+              },
+              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
+              "caseInsensitive": true,
+              "caseMeasured": true,
+              "canHash": true,
+              "mayNeedMode": false,
+              "refusal": null
+            },
+            "step": "apply",
+            "at": 1792226412912,
+            "lane": {
+              "seriesKey": "pc:Solo Leveling",
+              "landed": 8,
+              "total": 12
+            }
+          }
+        }
+      },
+      {
+        "t": 2602,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11620,7 +11897,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224803094,
+            "at": 1792226412918,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 9,
@@ -11630,45 +11907,7 @@
         }
       },
       {
-        "t": 2483,
-        "ev": {
-          "kind": "job",
-          "runId": 7,
-          "state": "running",
-          "progress": {
-            "bytesDone": 51479,
-            "bytesTotal": 60512,
-            "filesDone": 17,
-            "filesTotal": 20,
-            "current": {
-              "folder": "Solo Leveling",
-              "name": "Ch.010 - Solo Leveling.cbz"
-            },
-            "preflight": {
-              "kind": "folder",
-              "caps": {
-                "sha256sum": true,
-                "local": true
-              },
-              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
-              "caseInsensitive": true,
-              "caseMeasured": true,
-              "canHash": true,
-              "mayNeedMode": false,
-              "refusal": null
-            },
-            "step": "apply",
-            "at": 1792224803230,
-            "lane": {
-              "seriesKey": "pc:Solo Leveling",
-              "landed": 9,
-              "total": 12
-            }
-          }
-        }
-      },
-      {
-        "t": 2584,
+        "t": 2710,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11696,7 +11935,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224803235,
+            "at": 1792226413056,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 10,
@@ -11706,7 +11945,7 @@
         }
       },
       {
-        "t": 2695,
+        "t": 2819,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11734,7 +11973,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224803373,
+            "at": 1792226413196,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 11,
@@ -11744,7 +11983,45 @@
         }
       },
       {
-        "t": 2803,
+        "t": 2919,
+        "ev": {
+          "kind": "job",
+          "runId": 7,
+          "state": "running",
+          "progress": {
+            "bytesDone": 60512,
+            "bytesTotal": 60512,
+            "filesDone": 19,
+            "filesTotal": 20,
+            "current": {
+              "folder": "Solo Leveling",
+              "name": "Ch.012 - Solo Leveling.cbz"
+            },
+            "preflight": {
+              "kind": "folder",
+              "caps": {
+                "sha256sum": true,
+                "local": true
+              },
+              "canonicalRoot": "D:\\Sync-fixture\\Tablet\\Komikku",
+              "caseInsensitive": true,
+              "caseMeasured": true,
+              "canHash": true,
+              "mayNeedMode": false,
+              "refusal": null
+            },
+            "step": "apply",
+            "at": 1792226413332,
+            "lane": {
+              "seriesKey": "pc:Solo Leveling",
+              "landed": 11,
+              "total": 12
+            }
+          }
+        }
+      },
+      {
+        "t": 3020,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11772,7 +12049,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792224803515,
+            "at": 1792226413335,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 12,
@@ -11782,7 +12059,7 @@
         }
       },
       {
-        "t": 2933,
+        "t": 3092,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11820,12 +12097,12 @@
           "job": {
             "runId": 7,
             "phase": "apply",
-            "targetId": "t3fbe785d12",
+            "targetId": "ta086fd923e",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792224800748,
-            "finishedAt": 1792224803681,
+            "startedAt": 1792226410413,
+            "finishedAt": 1792226413505,
             "progress": {
               "bytesDone": 60512,
               "bytesTotal": 60512,
@@ -11849,7 +12126,7 @@
                 "refusal": null
               },
               "step": "apply",
-              "at": 1792224803515,
+              "at": 1792226413335,
               "lane": {
                 "seriesKey": "pc:Solo Leveling",
                 "landed": 12,
@@ -11889,6 +12166,39 @@
           }
         }
       }
-    ]
+    ],
+    "findConfig": {
+      "version": 5,
+      "adbPath": null,
+      "targets": [
+        {
+          "id": "ta086fd923e",
+          "deletePolicy": "guarded",
+          "excludes": [
+            {
+              "pcFolder": "Blue Lock"
+            },
+            {
+              "identityKey": "url:https://mangafire.to/title/tower-of-god",
+              "url": "https://mangafire.to/title/tower-of-god",
+              "pcFolder": "Tower of God"
+            }
+          ],
+          "aliases": [
+            {
+              "url": "https://mangadex.org/title/a77742b1/chainsaw-man",
+              "deviceFolder": "Chainsaw Man"
+            }
+          ],
+          "ignoredSuggestions": [],
+          "acknowledged": [],
+          "name": "Galaxy Tab",
+          "kind": "folder",
+          "root": "D:\\Sync-fixture\\Tablet\\Komikku",
+          "profile": "komikku",
+          "only": []
+        }
+      ]
+    }
   }
 }

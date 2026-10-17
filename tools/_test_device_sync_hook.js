@@ -16,6 +16,8 @@
 //     and only a settings event that flips `enabled` re-reads the snapshot
 //   - find events: batch status vs a row-only edit; findSourcesGet keeps rows
 //   - prompt / device / prewarm / library-status / config by kind; unknown kinds ignored
+//   - library status (U4-2) is asked once when sync is on, an earlier event
+//     wins over the answer, and turning sync off drops it
 //   - without electronAPI the hook is inert and actions answer `disabled`
 //   - a refused or rejected first get-state still loads and drains the buffer
 //   - the selection client (U2-10): batching, one in flight, seq above the
@@ -235,7 +237,7 @@ function makeHarness({ snap = snapshot(), delayed = false, noApi = false } = {})
       return n ? n.promise : Promise.resolve(snap);
     },
   };
-  for (const fn of ["syncConfigOp", "syncPlan", "syncApply", "syncLink", "syncFindSourcesGet", "syncCancel"]) {
+  for (const fn of ["syncConfigOp", "syncPlan", "syncApply", "syncLink", "syncFindSourcesGet", "syncCancel", "syncLibraryStatus"]) {
     electronAPI[fn] = (p) => { calls.invokes.push([fn, p]); return Promise.resolve(harness.answers[fn] || { ok: true }); };
   }
   // set-selection answers through harness.setSelection when a test sets one.
@@ -364,6 +366,35 @@ function deferred(value) {
     eq("waiting", h.mounted.state.find.waiting, "download");
     h.mounted.act(() => h.emit({ kind: "find", targetId: "t1", state: "done", done: 2, total: 2 }));
     eq("batch end clears status", h.mounted.state.find, null);
+  }
+
+  console.log("\n[5b] library status load (U4-2)");
+  {
+    const h = makeHarness();
+    h.answers.syncLibraryStatus = { ok: true, asOf: 7, bySeries: { "/lib/A": [{ targetId: "t1", state: "pending", pending: 2 }] } };
+    await h.mounted.actAsync(() => {});
+    await h.mounted.actAsync(() => {});
+    eq("asked once when on", h.calls.invokes.filter(([fn]) => fn === "syncLibraryStatus").length, 1);
+    eq("answer adopted", h.mounted.state.libraryStatus, { asOf: 7, bySeries: { "/lib/A": [{ targetId: "t1", state: "pending", pending: 2 }] } });
+    const off = deferred({ ok: true, enabled: false, settings: { syncEnabled: false }, config: null, adb: null, devices: [], folderPresence: {}, job: { job: null, queue: [] }, plans: {}, prompt: null, prompts: [], find: null, prewarm: null });
+    h.nextStates.push(off);
+    h.mounted.act(() => h.emit({ kind: "settings", enabled: false, settings: { syncEnabled: false } }));
+    off.resolve();
+    await h.mounted.actAsync(() => {});
+    eq("turning sync off drops it", h.mounted.state.libraryStatus, null);
+
+    const h2 = makeHarness();
+    let answer;
+    h2.answers.syncLibraryStatus = new Promise((r) => { answer = r; });
+    await h2.mounted.actAsync(() => {});
+    h2.mounted.act(() => h2.emit({ kind: "library-status", status: { asOf: 9, bySeries: {} } }));
+    answer({ ok: true, asOf: 8, bySeries: { x: [] } });
+    await h2.mounted.actAsync(() => {});
+    eq("an event before the answer wins", h2.mounted.state.libraryStatus, { asOf: 9, bySeries: {} });
+
+    const h3 = makeHarness({ snap: snapshot({ enabled: false }) });
+    await h3.mounted.actAsync(() => {});
+    eq("never asked while off", h3.calls.invokes.filter(([fn]) => fn === "syncLibraryStatus").length, 0);
   }
 
   console.log("\n[6] other kinds; unknown ignored; actions pass through");

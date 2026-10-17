@@ -29,6 +29,11 @@
 // re-read left: a `settings` event that flips `enabled` adopts a fresh
 // snapshot, since turning sync on or off replaces every field at once.
 //
+// LIBRARY STATUS (UI-pass U4-2, the Library cover chip and DetailView line):
+// asked once when sync is on, then replaced by `library-status` events;
+// dropped when sync turns off. Shape {asOf, bySeries: {folderPath:
+// [{targetId, state, pending}]}} (service.js _computeLibraryStatus).
+//
 // SELECTION CLIENT (UI-pass U2-10): actions.select(targetId, req) queues an
 // edit through selectionQueue.js (pure; batching, FIFO, one request in
 // flight, pending until a `plans` push's selSeq reaches it). It lives here,
@@ -244,7 +249,9 @@ export function useDeviceSync(opts) {
       .then((snap) => {
         if (seq === refreshSeqRef.current && snap && snap.ok !== false) {
           enabledRef.current = !!snap.enabled;
-          setState((s) => ({ ...fromSnapshot(snap), findRows: s.findRows, libraryStatus: s.libraryStatus }));
+          // Library status survives a re-read while sync stays on (only its
+          // own events and the load below replace it); off drops it.
+          setState((s) => ({ ...fromSnapshot(snap), findRows: s.findRows, libraryStatus: snap.enabled ? s.libraryStatus : null }));
         }
         return snap;
       })
@@ -294,6 +301,26 @@ export function useDeviceSync(opts) {
       if (typeof unsubscribe === "function") unsubscribe();
     };
   }, [onEvent, getApi]);
+
+  // Library status (UI-pass U4-2): main computes it lazily and pushes it
+  // only after a plan job or a library change, so a session that turns sync
+  // on asks once. An event that lands before the answer is newer and wins.
+  useEffect(() => {
+    if (!state.enabled) return undefined;
+    const a = getApi();
+    if (!a || typeof a.syncLibraryStatus !== "function") return undefined;
+    let alive = true;
+    Promise.resolve(a.syncLibraryStatus({}))
+      .then((r) => {
+        if (!alive || !r || r.ok === false) return;
+        const status = { asOf: r.asOf || null, bySeries: r.bySeries || {}, ...(r.error ? { error: r.error } : {}) };
+        setState((s) => (s.libraryStatus ? s : { ...s, libraryStatus: status }));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [state.enabled, getApi]);
 
   const actions = useMemo(() => {
     const out = { refresh };

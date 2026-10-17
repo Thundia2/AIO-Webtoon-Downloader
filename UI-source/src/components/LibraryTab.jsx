@@ -36,6 +36,10 @@ import LibraryFilterPanel, {
   FACET_GROUPS,
   FACET_GROUP_BY_KEY,
 } from "./LibraryFilterPanel";
+// Device Sync's Library surfaces (UI pass U4, design D9). Only drawn while
+// sync is on: App passes syncLibrary = null otherwise.
+import { SyncChip, SyncLine } from "./sync/LibrarySync";
+import { seriesSyncChip, seriesSyncLines } from "./sync/libraryView";
 
 // NOTE on the funnel glyph: this repo pins lucide-react 0.263.1, where the
 // funnel icon is still named `Filter` (upstream renamed it to `Funnel` much
@@ -392,7 +396,7 @@ function DuplicateBadge({ duplicate, onClick }) {
   );
 }
 
-function MangaCard({ entry, newCount, onClick, onShowDuplicate }) {
+function MangaCard({ entry, newCount, onClick, onShowDuplicate, syncChip }) {
   const formats = getEntryFormats(entry);
   const status = entry.seriesMeta?.status;
 
@@ -434,6 +438,10 @@ function MangaCard({ entry, newCount, onClick, onShowDuplicate }) {
             onClick={() => onShowDuplicate(entry)}
           />
         )}
+
+        {/* Device Sync (bottom-right): chapters not yet on a target, or a
+            check when in sync everywhere it is (sync/libraryView.js). */}
+        <SyncChip chip={syncChip} />
       </div>
 
       {/* Info area */}
@@ -1220,6 +1228,9 @@ function DetailView({
   // setRowIgnored). Routed through the hook so a cross-out made here also
   // lands on the Updates Center row and the library entry.
   onSetChaptersIgnored,
+  // Device Sync (U4): this series' libraryStatus rows + the configured
+  // targets, or null while sync is off; onOpenInSync(folderPath).
+  syncLibrary, onOpenInSync,
 }) {
   const [deleting, setDeleting] = useState(false);
   // Two-step delete confirmation (avoids window.confirm which breaks
@@ -1290,8 +1301,9 @@ function DetailView({
       <div className="flex-1 overflow-y-auto px-5 py-4">
         <div className="flex gap-5">
           {/* Cover */}
-          <div className="w-44 shrink-0 aspect-[3/4] rounded-lg overflow-hidden border border-border/50 bg-muted/30">
+          <div className="w-44 shrink-0 aspect-[3/4] rounded-lg overflow-hidden border border-border/50 bg-muted/30 relative">
             <PdfCover entry={entry} />
+            {syncLibrary && <SyncChip chip={seriesSyncChip(syncLibrary.bySeries[entry.folderPath], syncLibrary.targets)} />}
           </div>
 
           {/* Info */}
@@ -1342,6 +1354,14 @@ function DetailView({
               )}
               {entry.lastModified && <div>Modified {formatDate(entry.lastModified)}</div>}
             </div>
+
+            {/* Device Sync facts for this series (design D9), with Open in Sync. */}
+            {syncLibrary && (
+              <SyncLine
+                lines={seriesSyncLines(syncLibrary.bySeries[entry.folderPath], syncLibrary.targets)}
+                onOpen={onOpenInSync ? () => onOpenInSync(entry.folderPath) : undefined}
+              />
+            )}
 
             {/* Format badges */}
             <div className="flex gap-1.5">
@@ -1551,6 +1571,10 @@ export default function LibraryTab({
   // that used to be useState in here now arrives through this prop; the only
   // scan state LibraryTab still owns is whether the panel is open.
   updateCheck,
+  // Device Sync (UI pass U4): {bySeries, targets} from useDeviceSync's
+  // libraryStatus + config, or null while sync is off (no chip, no line).
+  // onOpenInSync(folderPath) is App's deep link into the Sync tab.
+  syncLibrary = null, onOpenInSync,
 }) {
   const entries = libraryEntries || [];
   const loading = libraryLoading || libraryEntries === null;
@@ -2031,6 +2055,8 @@ export default function LibraryTab({
           setSelectedEntry(null);
         }}
         onSetChaptersIgnored={setRowIgnored}
+        syncLibrary={syncLibrary}
+        onOpenInSync={onOpenInSync}
       />
     );
   }
@@ -2273,6 +2299,7 @@ export default function LibraryTab({
                 newCount={newChapterCounts[entry.folderPath] || 0}
                 onClick={() => setSelectedEntry(entry)}
                 onShowDuplicate={setDuplicateEntry}
+                syncChip={syncLibrary ? seriesSyncChip(syncLibrary.bySeries[entry.folderPath], syncLibrary.targets) : null}
               />
             ))}
 
