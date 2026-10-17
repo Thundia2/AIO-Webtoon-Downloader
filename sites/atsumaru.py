@@ -11,6 +11,14 @@ class AtsumaruSiteHandler(BaseSiteHandler):
     domains = ("atsu.moe", "www.atsu.moe")
 
     _BASE_URL = "https://atsu.moe"
+    # Every `/static/...` asset (chapter pages, posters) is served from this
+    # host, NOT _BASE_URL. Since 2026-10 atsu.moe itself answers `410 Gone` for
+    # /static/pages/*, for old and new chapters alike. The API still returns
+    # host-less `/static/...` paths, and the site's own client hardcodes this
+    # host (the `staticImages-<hash>.js` chunk), so a constant here mirrors the
+    # site exactly. If pages start failing again, open a chapter in a browser and
+    # compare `document.images[*].src` with this value.
+    _STATIC_URL = "https://cdn.atsu.moe"
     _SEARCH_URL = "/collections/manga/documents/search"
 
     # Probe atsumaru's 8 breadth-sample chapters in ONE wave, not 2. Each sample
@@ -59,7 +67,7 @@ class AtsumaruSiteHandler(BaseSiteHandler):
             poster = poster.lstrip("/")
             if poster.startswith("static/"):
                 poster = poster[len("static/") :]
-            return f"{self._BASE_URL}/static/{poster}"
+            return f"{self._STATIC_URL}/static/{poster}"
         return None
 
     def _parse_people(self, entries: Optional[List[Dict]]) -> List[str]:
@@ -376,7 +384,9 @@ class AtsumaruSiteHandler(BaseSiteHandler):
             image = page.get("image")
             if not image:
                 continue
-            images.append(urljoin(self._BASE_URL, image))
+            # urljoin keeps an absolute URL as-is, so a future API that returns
+            # full CDN URLs still works.
+            images.append(urljoin(self._STATIC_URL, image))
         if not images:
             raise RuntimeError("No images returned for Atsumaru chapter.")
         return images

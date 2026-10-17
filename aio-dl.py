@@ -2565,6 +2565,20 @@ def dl_image(url: str, folder: str, name: str, scraper, cleanup: bool = True) ->
     if _poison_threshold > 0 and _host_fail_count(_host) >= _poison_threshold:
         return None
 
+    # 410 Gone is the server saying the resource was removed on purpose, and
+    # every variant below is the same host + path with a different extension or
+    # a `-m` suffix. The cascade exists for 404s caused by a wrong extension in
+    # the site's data. Against a 410 it only multiplies requests to a retired
+    # host (atsu.moe 2026-10: 10 requests per page, all 410). Fail the page
+    # now; the chapter-level gate then sees a uniform failure and hands off to
+    # multi-source as usual (grep "uniform error on primary").
+    if first_error is not None and _extract_error_info(first_error)[0] == 410:
+        print(
+            f"  Error: Skipping image {os.path.basename(name)}: 410 Gone "
+            f"(host retired this URL; not trying extension variants)."
+        )
+        return None
+
     # 2. First URL failed – now generate fallback variants (lazy, only when needed)
     extensions_to_try = [".webp", ".png", ".jpg", ".jpeg", ".avif"]
     urls_to_try = [url]
