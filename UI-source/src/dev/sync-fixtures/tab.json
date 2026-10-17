@@ -76,7 +76,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "tcc4f7ece4a",
+              "id": "t9b79998600",
               "deletePolicy": "guarded",
               "excludes": [],
               "aliases": [],
@@ -100,18 +100,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "tcc4f7ece4a": true
+          "t9b79998600": true
         },
         "job": {
           "job": {
             "runId": 1,
             "phase": "plan",
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "serial": null,
             "auto": true,
             "state": "done",
-            "startedAt": 1792242099756,
-            "finishedAt": 1792242099799,
+            "startedAt": 1792242826153,
+            "finishedAt": 1792242826209,
             "progress": {
               "bytesDone": 127108,
               "bytesTotal": 127108,
@@ -132,13 +132,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792242099792
+              "at": 1792242826200
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "tcc4f7ece4a",
-                "asOf": 1792242099792,
+                "targetId": "t9b79998600",
+                "asOf": 1792242826200,
                 "firstSync": true,
                 "totals": {
                   "push": {
@@ -430,15 +430,15 @@
                 "gen": 1,
                 "warnings": [],
                 "capacity": {
-                  "free": 229076590592,
+                  "free": 229054029824,
                   "total": 1999343972352,
                   "needed": 127108,
                   "reserve": 1073741824,
                   "freeable": 0,
                   "freeableEarly": 0,
-                  "after": 229076463484,
+                  "after": 229053902716,
                   "fits": true,
-                  "asOf": 1792242099765
+                  "asOf": 1792242826166
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -451,10 +451,10 @@
           "queue": []
         },
         "plans": {
-          "tcc4f7ece4a": {
+          "t9b79998600": {
             "summary": {
-              "targetId": "tcc4f7ece4a",
-              "asOf": 1792242099792,
+              "targetId": "t9b79998600",
+              "asOf": 1792242826200,
               "firstSync": true,
               "totals": {
                 "push": {
@@ -746,15 +746,15 @@
               "gen": 1,
               "warnings": [],
               "capacity": {
-                "free": 229076590592,
+                "free": 229054029824,
                 "total": 1999343972352,
                 "needed": 127108,
                 "reserve": 1073741824,
                 "freeable": 0,
                 "freeableEarly": 0,
-                "after": 229076463484,
+                "after": 229053902716,
                 "fits": true,
-                "asOf": 1792242099765
+                "asOf": 1792242826166
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -772,7 +772,7 @@
               "status": "completed",
               "auto": true,
               "reason": null,
-              "at": 1792242099799
+              "at": 1792242826209
             }
           }
         },
@@ -863,7 +863,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "tcc4f7ece4a",
+              "id": "t9b79998600",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -898,18 +898,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "tcc4f7ece4a": true
+          "t9b79998600": true
         },
         "job": {
           "job": {
             "runId": 6,
             "phase": "plan",
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792242100708,
-            "finishedAt": 1792242100731,
+            "startedAt": 1792242827142,
+            "finishedAt": 1792242827163,
             "progress": {
               "bytesDone": 91442,
               "bytesTotal": 91442,
@@ -930,13 +930,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792242100729
+              "at": 1792242827161
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "tcc4f7ece4a",
-                "asOf": 1792242100729,
+                "targetId": "t9b79998600",
+                "asOf": 1792242827161,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -974,7 +974,7 @@
                   "count": 1
                 },
                 "needsVerify": 0,
-                "settleAt": 1792242125518,
+                "settleAt": 1792242851982,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -1325,7 +1325,7 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "77e18ea89145aedd",
+                    "shardId": "52b15d35437505a8",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
@@ -1361,6 +1361,19 @@
                       "link:pc:Kagurabachi=>Kagurabachi_"
                     ],
                     "query": "Kagurabachi"
+                  },
+                  {
+                    "key": "dev:Tis Time for Torture Princess",
+                    "name": "Tis Time for Torture Princess",
+                    "state": "preserved",
+                    "shardId": null,
+                    "listed": true,
+                    "files": 1,
+                    "bytes": 2700,
+                    "chapterFiles": 1,
+                    "ours": 0,
+                    "suggestions": [],
+                    "query": "Tis Time for Torture Princess"
                   }
                 ],
                 "anomalies": 4,
@@ -1377,15 +1390,15 @@
                 "gen": 5,
                 "warnings": [],
                 "capacity": {
-                  "free": 229075820544,
+                  "free": 229053779968,
                   "total": 1999343972352,
                   "needed": 60912,
                   "reserve": 1073741824,
                   "freeable": 36078,
                   "freeableEarly": 36078,
-                  "after": 229075795710,
+                  "after": 229053755134,
                   "fits": true,
-                  "asOf": 1792242100722
+                  "asOf": 1792242827154
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -1398,10 +1411,10 @@
           "queue": []
         },
         "plans": {
-          "tcc4f7ece4a": {
+          "t9b79998600": {
             "summary": {
-              "targetId": "tcc4f7ece4a",
-              "asOf": 1792242100729,
+              "targetId": "t9b79998600",
+              "asOf": 1792242827161,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -1439,7 +1452,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792242125518,
+              "settleAt": 1792242851982,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -1790,7 +1803,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "77e18ea89145aedd",
+                  "shardId": "52b15d35437505a8",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -1826,6 +1839,19 @@
                     "link:pc:Kagurabachi=>Kagurabachi_"
                   ],
                   "query": "Kagurabachi"
+                },
+                {
+                  "key": "dev:Tis Time for Torture Princess",
+                  "name": "Tis Time for Torture Princess",
+                  "state": "preserved",
+                  "shardId": null,
+                  "listed": true,
+                  "files": 1,
+                  "bytes": 2700,
+                  "chapterFiles": 1,
+                  "ours": 0,
+                  "suggestions": [],
+                  "query": "Tis Time for Torture Princess"
                 }
               ],
               "anomalies": 4,
@@ -1842,15 +1868,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 229075820544,
+                "free": 229053779968,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 36078,
                 "freeableEarly": 36078,
-                "after": 229075795710,
+                "after": 229053755134,
                 "fits": true,
-                "asOf": 1792242100722
+                "asOf": 1792242827154
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -1865,7 +1891,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792242100405,
+              "at": 1792242826863,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -1894,7 +1920,7 @@
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792242100731
+              "at": 1792242827163
             }
           }
         },
@@ -1985,7 +2011,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "tcc4f7ece4a",
+              "id": "t9b79998600",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -2020,18 +2046,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "tcc4f7ece4a": true
+          "t9b79998600": true
         },
         "job": {
           "job": {
             "runId": 6,
             "phase": "plan",
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792242100708,
-            "finishedAt": 1792242100731,
+            "startedAt": 1792242827142,
+            "finishedAt": 1792242827163,
             "progress": {
               "bytesDone": 91442,
               "bytesTotal": 91442,
@@ -2052,13 +2078,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792242100729
+              "at": 1792242827161
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "tcc4f7ece4a",
-                "asOf": 1792242100729,
+                "targetId": "t9b79998600",
+                "asOf": 1792242827161,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -2096,7 +2122,7 @@
                   "count": 1
                 },
                 "needsVerify": 0,
-                "settleAt": 1792242125518,
+                "settleAt": 1792242851982,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -2447,7 +2473,7 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "77e18ea89145aedd",
+                    "shardId": "52b15d35437505a8",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
@@ -2483,6 +2509,19 @@
                       "link:pc:Kagurabachi=>Kagurabachi_"
                     ],
                     "query": "Kagurabachi"
+                  },
+                  {
+                    "key": "dev:Tis Time for Torture Princess",
+                    "name": "Tis Time for Torture Princess",
+                    "state": "preserved",
+                    "shardId": null,
+                    "listed": true,
+                    "files": 1,
+                    "bytes": 2700,
+                    "chapterFiles": 1,
+                    "ours": 0,
+                    "suggestions": [],
+                    "query": "Tis Time for Torture Princess"
                   }
                 ],
                 "anomalies": 4,
@@ -2499,15 +2538,15 @@
                 "gen": 5,
                 "warnings": [],
                 "capacity": {
-                  "free": 229075820544,
+                  "free": 229053779968,
                   "total": 1999343972352,
                   "needed": 60912,
                   "reserve": 1073741824,
                   "freeable": 36078,
                   "freeableEarly": 36078,
-                  "after": 229075795710,
+                  "after": 229053755134,
                   "fits": true,
-                  "asOf": 1792242100722
+                  "asOf": 1792242827154
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -2520,10 +2559,10 @@
           "queue": []
         },
         "plans": {
-          "tcc4f7ece4a": {
+          "t9b79998600": {
             "summary": {
-              "targetId": "tcc4f7ece4a",
-              "asOf": 1792242100729,
+              "targetId": "t9b79998600",
+              "asOf": 1792242827161,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -2561,7 +2600,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792242125518,
+              "settleAt": 1792242851982,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -2913,7 +2952,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "77e18ea89145aedd",
+                  "shardId": "52b15d35437505a8",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -2949,6 +2988,19 @@
                     "link:pc:Kagurabachi=>Kagurabachi_"
                   ],
                   "query": "Kagurabachi"
+                },
+                {
+                  "key": "dev:Tis Time for Torture Princess",
+                  "name": "Tis Time for Torture Princess",
+                  "state": "preserved",
+                  "shardId": null,
+                  "listed": true,
+                  "files": 1,
+                  "bytes": 2700,
+                  "chapterFiles": 1,
+                  "ours": 0,
+                  "suggestions": [],
+                  "query": "Tis Time for Torture Princess"
                 }
               ],
               "anomalies": 4,
@@ -2965,15 +3017,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 229075820544,
+                "free": 229053779968,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 39081,
                 "freeableEarly": 39081,
-                "after": 229075798713,
+                "after": 229053758137,
                 "fits": true,
-                "asOf": 1792242100722
+                "asOf": 1792242827154
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -2988,7 +3040,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792242100405,
+              "at": 1792242826863,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -3017,7 +3069,7 @@
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792242100731
+              "at": 1792242827163
             }
           }
         },
@@ -3108,7 +3160,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "tcc4f7ece4a",
+              "id": "t9b79998600",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -3143,17 +3195,17 @@
         },
         "devices": [],
         "folderPresence": {
-          "tcc4f7ece4a": true
+          "t9b79998600": true
         },
         "job": {
           "job": {
             "runId": 7,
             "phase": "apply",
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "serial": null,
             "auto": false,
             "state": "running",
-            "startedAt": 1792242101099,
+            "startedAt": 1792242827593,
             "finishedAt": null,
             "progress": {
               "bytesDone": 3402,
@@ -3178,7 +3230,7 @@
                 "refusal": null
               },
               "step": "apply",
-              "at": 1792242101145,
+              "at": 1792242827640,
               "lane": {
                 "seriesKey": "pc:Eleceed",
                 "landed": 1,
@@ -3191,10 +3243,10 @@
           "queue": []
         },
         "plans": {
-          "tcc4f7ece4a": {
+          "t9b79998600": {
             "summary": {
-              "targetId": "tcc4f7ece4a",
-              "asOf": 1792242100729,
+              "targetId": "t9b79998600",
+              "asOf": 1792242827161,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -3232,7 +3284,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792242125518,
+              "settleAt": 1792242851982,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -3584,7 +3636,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "77e18ea89145aedd",
+                  "shardId": "52b15d35437505a8",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -3620,6 +3672,19 @@
                     "link:pc:Kagurabachi=>Kagurabachi_"
                   ],
                   "query": "Kagurabachi"
+                },
+                {
+                  "key": "dev:Tis Time for Torture Princess",
+                  "name": "Tis Time for Torture Princess",
+                  "state": "preserved",
+                  "shardId": null,
+                  "listed": true,
+                  "files": 1,
+                  "bytes": 2700,
+                  "chapterFiles": 1,
+                  "ours": 0,
+                  "suggestions": [],
+                  "query": "Tis Time for Torture Princess"
                 }
               ],
               "anomalies": 4,
@@ -3636,15 +3701,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 229075820544,
+                "free": 229053779968,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 39081,
                 "freeableEarly": 39081,
-                "after": 229075798713,
+                "after": 229053758137,
                 "fits": true,
-                "asOf": 1792242100722
+                "asOf": 1792242827154
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -3659,7 +3724,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792242100405,
+              "at": 1792242826863,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -3688,7 +3753,7 @@
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792242100731
+              "at": 1792242827163
             }
           }
         },
@@ -3779,7 +3844,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "tcc4f7ece4a",
+              "id": "t9b79998600",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -3813,18 +3878,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "tcc4f7ece4a": true
+          "t9b79998600": true
         },
         "job": {
           "job": {
             "runId": 8,
             "phase": "plan",
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "serial": null,
             "auto": true,
             "state": "done",
-            "startedAt": 1792242104001,
-            "finishedAt": 1792242104026,
+            "startedAt": 1792242830491,
+            "finishedAt": 1792242830517,
             "progress": {
               "bytesDone": 91442,
               "bytesTotal": 91442,
@@ -3845,13 +3910,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792242104025
+              "at": 1792242830515
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "tcc4f7ece4a",
-                "asOf": 1792242104025,
+                "targetId": "t9b79998600",
+                "asOf": 1792242830515,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -3889,7 +3954,7 @@
                   "count": 0
                 },
                 "needsVerify": 0,
-                "settleAt": 1792242125518,
+                "settleAt": 1792242851982,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -4186,7 +4251,7 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "77e18ea89145aedd",
+                    "shardId": "52b15d35437505a8",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
@@ -4220,6 +4285,19 @@
                     "ours": 0,
                     "suggestions": [],
                     "query": "Kagurabachi"
+                  },
+                  {
+                    "key": "dev:Tis Time for Torture Princess",
+                    "name": "Tis Time for Torture Princess",
+                    "state": "preserved",
+                    "shardId": null,
+                    "listed": true,
+                    "files": 1,
+                    "bytes": 2700,
+                    "chapterFiles": 1,
+                    "ours": 0,
+                    "suggestions": [],
+                    "query": "Tis Time for Torture Princess"
                   }
                 ],
                 "anomalies": 4,
@@ -4228,15 +4306,15 @@
                 "gen": 6,
                 "warnings": [],
                 "capacity": {
-                  "free": 229075775488,
+                  "free": 229053775872,
                   "total": 1999343972352,
                   "needed": 0,
                   "reserve": 1073741824,
                   "freeable": 0,
                   "freeableEarly": 0,
-                  "after": 229075775488,
+                  "after": 229053775872,
                   "fits": true,
-                  "asOf": 1792242104016
+                  "asOf": 1792242830505
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -4249,10 +4327,10 @@
           "queue": []
         },
         "plans": {
-          "tcc4f7ece4a": {
+          "t9b79998600": {
             "summary": {
-              "targetId": "tcc4f7ece4a",
-              "asOf": 1792242104025,
+              "targetId": "t9b79998600",
+              "asOf": 1792242830515,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -4290,7 +4368,7 @@
                 "count": 0
               },
               "needsVerify": 0,
-              "settleAt": 1792242125518,
+              "settleAt": 1792242851982,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -4587,7 +4665,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "77e18ea89145aedd",
+                  "shardId": "52b15d35437505a8",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -4621,6 +4699,19 @@
                   "ours": 0,
                   "suggestions": [],
                   "query": "Kagurabachi"
+                },
+                {
+                  "key": "dev:Tis Time for Torture Princess",
+                  "name": "Tis Time for Torture Princess",
+                  "state": "preserved",
+                  "shardId": null,
+                  "listed": true,
+                  "files": 1,
+                  "bytes": 2700,
+                  "chapterFiles": 1,
+                  "ours": 0,
+                  "suggestions": [],
+                  "query": "Tis Time for Torture Princess"
                 }
               ],
               "anomalies": 4,
@@ -4629,15 +4720,15 @@
               "gen": 6,
               "warnings": [],
               "capacity": {
-                "free": 229075775488,
+                "free": 229053775872,
                 "total": 1999343972352,
                 "needed": 0,
                 "reserve": 1073741824,
                 "freeable": 0,
                 "freeableEarly": 0,
-                "after": 229075775488,
+                "after": 229053775872,
                 "fits": true,
-                "asOf": 1792242104016
+                "asOf": 1792242830505
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -4652,7 +4743,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792242104001,
+              "at": 1792242830491,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -4690,7 +4781,7 @@
               "status": "completed",
               "auto": true,
               "reason": null,
-              "at": 1792242104027
+              "at": 1792242830517
             }
           }
         },
@@ -4781,7 +4872,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "tcc4f7ece4a",
+              "id": "t9b79998600",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -4815,18 +4906,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "tcc4f7ece4a": true
+          "t9b79998600": true
         },
         "job": {
           "job": {
             "runId": 9,
             "phase": "plan",
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792242104176,
-            "finishedAt": 1792242104190,
+            "startedAt": 1792242830665,
+            "finishedAt": 1792242830678,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -4854,7 +4945,7 @@
                 }
               },
               "step": "device-ready",
-              "at": 1792242104176
+              "at": 1792242830665
             },
             "status": "failed",
             "summary": {
@@ -4872,7 +4963,7 @@
           "queue": []
         },
         "plans": {
-          "tcc4f7ece4a": {
+          "t9b79998600": {
             "summary": null,
             "refusal": {
               "fields": [
@@ -4889,7 +4980,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792242104001,
+              "at": 1792242830491,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -4927,7 +5018,7 @@
               "status": "failed",
               "auto": false,
               "reason": "record-mismatch",
-              "at": 1792242104190
+              "at": 1792242830678
             }
           }
         },
@@ -5018,7 +5109,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "tcc4f7ece4a",
+              "id": "t9b79998600",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -5052,18 +5143,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "tcc4f7ece4a": true
+          "t9b79998600": true
         },
         "job": {
           "job": {
             "runId": 10,
             "phase": "plan",
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792242104332,
-            "finishedAt": 1792242104348,
+            "startedAt": 1792242830819,
+            "finishedAt": 1792242830835,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -5090,7 +5181,7 @@
                 }
               },
               "step": "device-ready",
-              "at": 1792242104347
+              "at": 1792242830834
             },
             "status": "failed",
             "summary": {
@@ -5107,7 +5198,7 @@
           "queue": []
         },
         "plans": {
-          "tcc4f7ece4a": {
+          "t9b79998600": {
             "summary": null,
             "refusal": {
               "detail": "empty-root",
@@ -5123,7 +5214,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792242104001,
+              "at": 1792242830491,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -5161,7 +5252,7 @@
               "status": "failed",
               "auto": false,
               "reason": "device-listing-suspect",
-              "at": 1792242104348
+              "at": 1792242830835
             }
           }
         },
@@ -5252,7 +5343,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "tcc4f7ece4a",
+              "id": "t9b79998600",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -5286,18 +5377,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "tcc4f7ece4a": false
+          "t9b79998600": false
         },
         "job": {
           "job": {
             "runId": 10,
             "phase": "plan",
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792242104332,
-            "finishedAt": 1792242104348,
+            "startedAt": 1792242830819,
+            "finishedAt": 1792242830835,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -5324,7 +5415,7 @@
                 }
               },
               "step": "device-ready",
-              "at": 1792242104347
+              "at": 1792242830834
             },
             "status": "failed",
             "summary": {
@@ -5341,7 +5432,7 @@
           "queue": []
         },
         "plans": {
-          "tcc4f7ece4a": {
+          "t9b79998600": {
             "summary": null,
             "refusal": {
               "detail": "empty-root",
@@ -5357,7 +5448,7 @@
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792242104001,
+              "at": 1792242830491,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -5395,7 +5486,7 @@
               "status": "failed",
               "auto": false,
               "reason": "device-listing-suspect",
-              "at": 1792242104348
+              "at": 1792242830835
             }
           }
         },
@@ -5486,7 +5577,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "tf199b65f98",
+              "id": "tb8bbefad3b",
               "deletePolicy": "guarded",
               "excludes": [],
               "aliases": [],
@@ -5525,12 +5616,12 @@
           "job": {
             "runId": 1,
             "phase": "plan",
-            "targetId": "tf199b65f98",
+            "targetId": "tb8bbefad3b",
             "serial": "R5CW71ABCDE",
             "auto": true,
             "state": "done",
-            "startedAt": 1792242109821,
-            "finishedAt": 1792242109930,
+            "startedAt": 1792242836215,
+            "finishedAt": 1792242836323,
             "progress": {
               "bytesDone": 136526,
               "bytesTotal": 136526,
@@ -5557,7 +5648,7 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792242109928
+              "at": 1792242836321
             },
             "status": "failed",
             "summary": {
@@ -5581,7 +5672,7 @@
           "queue": []
         },
         "plans": {
-          "tf199b65f98": {
+          "tb8bbefad3b": {
             "summary": null,
             "refusal": {
               "folders": [
@@ -5607,7 +5698,7 @@
               "status": "failed",
               "auto": true,
               "reason": "needs-mode",
-              "at": 1792242109930
+              "at": 1792242836323
             }
           }
         },
@@ -6464,7 +6555,7 @@
         ],
         "suggestions": [],
         "rebind": {
-          "shardId": "6937f057d27e4149",
+          "shardId": "f422b187d031c917",
           "choices": [
             {
               "source": "previous",
@@ -6734,7 +6825,7 @@
           "key": "dev:Berserk",
           "name": "Berserk",
           "state": "orphaned",
-          "shardId": "77e18ea89145aedd",
+          "shardId": "52b15d35437505a8",
           "listed": true,
           "files": 5,
           "bytes": 15015,
@@ -6865,6 +6956,35 @@
           }
         ],
         "anomalies": []
+      },
+      "dev:Tis Time for Torture Princess": {
+        "ok": true,
+        "seriesKey": "dev:Tis Time for Torture Princess",
+        "deviceOnly": {
+          "key": "dev:Tis Time for Torture Princess",
+          "name": "Tis Time for Torture Princess",
+          "state": "preserved",
+          "shardId": null,
+          "listed": true,
+          "files": 1,
+          "bytes": 2700,
+          "chapterFiles": 1,
+          "ours": 0,
+          "suggestions": [],
+          "query": "Tis Time for Torture Princess"
+        },
+        "rows": [
+          {
+            "kind": "device-only",
+            "name": "Ch.001.cbz",
+            "size": 2700,
+            "unit": "chapter",
+            "label": "1",
+            "origin": null
+          }
+        ],
+        "suggestions": [],
+        "anomalies": []
       }
     },
     "selection": [
@@ -6929,10 +7049,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "tcc4f7ece4a",
+          "targetId": "t9b79998600",
           "summary": {
-            "targetId": "tcc4f7ece4a",
-            "asOf": 1792242100729,
+            "targetId": "t9b79998600",
+            "asOf": 1792242827161,
             "firstSync": false,
             "totals": {
               "push": {
@@ -6970,7 +7090,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792242125518,
+            "settleAt": 1792242851982,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -7327,7 +7447,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "77e18ea89145aedd",
+                "shardId": "52b15d35437505a8",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -7363,6 +7483,19 @@
                   "link:pc:Kagurabachi=>Kagurabachi_"
                 ],
                 "query": "Kagurabachi"
+              },
+              {
+                "key": "dev:Tis Time for Torture Princess",
+                "name": "Tis Time for Torture Princess",
+                "state": "preserved",
+                "shardId": null,
+                "listed": true,
+                "files": 1,
+                "bytes": 2700,
+                "chapterFiles": 1,
+                "ours": 0,
+                "suggestions": [],
+                "query": "Tis Time for Torture Princess"
               }
             ],
             "anomalies": 4,
@@ -7379,15 +7512,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229075820544,
+              "free": 229053779968,
               "total": 1999343972352,
               "needed": 57905,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 229075798717,
+              "after": 229053758141,
               "fits": true,
-              "asOf": 1792242100722
+              "asOf": 1792242827154
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -7402,7 +7535,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792242100405,
+            "at": 1792242826863,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -7431,7 +7564,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792242100731
+            "at": 1792242827163
           }
         }
       },
@@ -7493,10 +7626,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "tcc4f7ece4a",
+          "targetId": "t9b79998600",
           "summary": {
-            "targetId": "tcc4f7ece4a",
-            "asOf": 1792242100729,
+            "targetId": "t9b79998600",
+            "asOf": 1792242827161,
             "firstSync": false,
             "totals": {
               "push": {
@@ -7534,7 +7667,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792242125518,
+            "settleAt": 1792242851982,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -7885,7 +8018,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "77e18ea89145aedd",
+                "shardId": "52b15d35437505a8",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -7921,6 +8054,19 @@
                   "link:pc:Kagurabachi=>Kagurabachi_"
                 ],
                 "query": "Kagurabachi"
+              },
+              {
+                "key": "dev:Tis Time for Torture Princess",
+                "name": "Tis Time for Torture Princess",
+                "state": "preserved",
+                "shardId": null,
+                "listed": true,
+                "files": 1,
+                "bytes": 2700,
+                "chapterFiles": 1,
+                "ours": 0,
+                "suggestions": [],
+                "query": "Tis Time for Torture Princess"
               }
             ],
             "anomalies": 4,
@@ -7937,15 +8083,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229075820544,
+              "free": 229053779968,
               "total": 1999343972352,
               "needed": 48086,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 229075808536,
+              "after": 229053767960,
               "fits": true,
-              "asOf": 1792242100722
+              "asOf": 1792242827154
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -7960,7 +8106,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792242100405,
+            "at": 1792242826863,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -7989,7 +8135,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792242100731
+            "at": 1792242827163
           }
         }
       },
@@ -8051,10 +8197,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "tcc4f7ece4a",
+          "targetId": "t9b79998600",
           "summary": {
-            "targetId": "tcc4f7ece4a",
-            "asOf": 1792242100729,
+            "targetId": "t9b79998600",
+            "asOf": 1792242827161,
             "firstSync": false,
             "totals": {
               "push": {
@@ -8092,7 +8238,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792242125518,
+            "settleAt": 1792242851982,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -8443,7 +8589,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "77e18ea89145aedd",
+                "shardId": "52b15d35437505a8",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -8479,6 +8625,19 @@
                   "link:pc:Kagurabachi=>Kagurabachi_"
                 ],
                 "query": "Kagurabachi"
+              },
+              {
+                "key": "dev:Tis Time for Torture Princess",
+                "name": "Tis Time for Torture Princess",
+                "state": "preserved",
+                "shardId": null,
+                "listed": true,
+                "files": 1,
+                "bytes": 2700,
+                "chapterFiles": 1,
+                "ours": 0,
+                "suggestions": [],
+                "query": "Tis Time for Torture Princess"
               }
             ],
             "anomalies": 4,
@@ -8495,15 +8654,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229075820544,
+              "free": 229053779968,
               "total": 1999343972352,
               "needed": 60912,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 229075795710,
+              "after": 229053755134,
               "fits": true,
-              "asOf": 1792242100722
+              "asOf": 1792242827154
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -8518,7 +8677,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792242100405,
+            "at": 1792242826863,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -8547,7 +8706,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792242100731
+            "at": 1792242827163
           }
         }
       },
@@ -8633,10 +8792,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "tcc4f7ece4a",
+          "targetId": "t9b79998600",
           "summary": {
-            "targetId": "tcc4f7ece4a",
-            "asOf": 1792242100729,
+            "targetId": "t9b79998600",
+            "asOf": 1792242827161,
             "firstSync": false,
             "totals": {
               "push": {
@@ -8674,7 +8833,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792242125518,
+            "settleAt": 1792242851982,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -9026,7 +9185,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "77e18ea89145aedd",
+                "shardId": "52b15d35437505a8",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -9062,6 +9221,19 @@
                   "link:pc:Kagurabachi=>Kagurabachi_"
                 ],
                 "query": "Kagurabachi"
+              },
+              {
+                "key": "dev:Tis Time for Torture Princess",
+                "name": "Tis Time for Torture Princess",
+                "state": "preserved",
+                "shardId": null,
+                "listed": true,
+                "files": 1,
+                "bytes": 2700,
+                "chapterFiles": 1,
+                "ours": 0,
+                "suggestions": [],
+                "query": "Tis Time for Torture Princess"
               }
             ],
             "anomalies": 4,
@@ -9078,15 +9250,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 229075820544,
+              "free": 229053779968,
               "total": 1999343972352,
               "needed": 60912,
               "reserve": 1073741824,
               "freeable": 39081,
               "freeableEarly": 39081,
-              "after": 229075798713,
+              "after": 229053758137,
               "fits": true,
-              "asOf": 1792242100722
+              "asOf": 1792242827154
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -9101,7 +9273,7 @@
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792242100405,
+            "at": 1792242826863,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -9130,7 +9302,7 @@
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792242100731
+            "at": 1792242827163
           }
         }
       }
@@ -9152,11 +9324,11 @@
         "job": {
           "runId": 7,
           "phase": "apply",
-          "targetId": "tcc4f7ece4a",
+          "targetId": "t9b79998600",
           "serial": null,
           "auto": false,
           "state": "running",
-          "startedAt": 1792242101099,
+          "startedAt": 1792242827593,
           "finishedAt": null,
           "progress": {
             "bytesDone": 3402,
@@ -9181,7 +9353,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242101145,
+            "at": 1792242827640,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 1,
@@ -9206,11 +9378,11 @@
         "message": "the folder isn't available"
       }
     },
-    "targetId": "tcc4f7ece4a",
+    "targetId": "t9b79998600",
     "review": {
       "ok": true,
-      "targetId": "tcc4f7ece4a",
-      "asOf": 1792242100729,
+      "targetId": "t9b79998600",
+      "asOf": 1792242827161,
       "firstSync": false,
       "deletePolicy": "guarded",
       "totals": {
@@ -9937,7 +10109,7 @@
           "seriesKey": "pc:Solo Leveling",
           "series": "Solo Leveling",
           "rebind": {
-            "shardId": "6937f057d27e4149",
+            "shardId": "f422b187d031c917",
             "choices": [
               {
                 "source": "previous",
@@ -9960,15 +10132,15 @@
       "selSeq": null,
       "stale": false,
       "capacity": {
-        "free": 229075820544,
+        "free": 229053779968,
         "total": 1999343972352,
         "needed": 60912,
         "reserve": 1073741824,
         "freeable": 36078,
         "freeableEarly": 36078,
-        "after": 229075795710,
+        "after": 229053755134,
         "fits": true,
-        "asOf": 1792242100722
+        "asOf": 1792242827154
       },
       "policy": {
         "deletePolicy": "guarded",
@@ -9980,42 +10152,42 @@
     },
     "libraryStatus": {
       "ok": true,
-      "asOf": 1792242100742,
+      "asOf": 1792242827174,
       "bySeries": {
         "D:\\Sync-fixture\\tab-manga\\Dungeon Meshi": [
           {
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "state": "synced",
             "pending": 0
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Eleceed": [
           {
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "state": "pending",
             "pending": 4
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Frieren": [
           {
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "state": "pending",
             "pending": 2
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Kagurabachi": [
           {
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "state": "absent",
             "pending": 3
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Solo Leveling": [
           {
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "state": "removed",
             "pending": 12,
-            "asOf": 1792242100729
+            "asOf": 1792242827161
           }
         ]
       }
@@ -10023,7 +10195,7 @@
     "find": {
       "ok": true,
       "running": false,
-      "targetId": "tcc4f7ece4a",
+      "targetId": "t9b79998600",
       "waiting": null,
       "done": 0,
       "total": 0,
@@ -10039,7 +10211,7 @@
           "pinnedUrl": null,
           "skip": false,
           "error": "search exited with code 1",
-          "searchedAt": 1792242100863
+          "searchedAt": 1792242827296
         },
         {
           "folder": "Chainsaw Man",
@@ -10059,7 +10231,7 @@
                 "composite": 0.91,
                 "chapters": 181,
                 "qualityBasis": "chapter_probe",
-                "titleMatch": null
+                "titleMatch": 1
               },
               "sources": [
                 {
@@ -10070,7 +10242,7 @@
                   "composite": 0.91,
                   "chapters": 181,
                   "qualityBasis": "chapter_probe",
-                  "titleMatch": null
+                  "titleMatch": 1
                 },
                 {
                   "site": "weebcentral",
@@ -10080,7 +10252,7 @@
                   "composite": 0.84,
                   "chapters": 181,
                   "qualityBasis": "chapter_probe",
-                  "titleMatch": null
+                  "titleMatch": 1
                 },
                 {
                   "site": "mangafire",
@@ -10090,7 +10262,7 @@
                   "composite": 0.82,
                   "chapters": 180,
                   "qualityBasis": "chapter_probe",
-                  "titleMatch": null
+                  "titleMatch": 1
                 },
                 {
                   "site": "mangakatana",
@@ -10100,7 +10272,7 @@
                   "composite": 0.78,
                   "chapters": 179,
                   "qualityBasis": "cover",
-                  "titleMatch": null
+                  "titleMatch": 1
                 },
                 {
                   "site": "mangapill",
@@ -10110,7 +10282,7 @@
                   "composite": 0.74,
                   "chapters": 181,
                   "qualityBasis": "chapter_probe",
-                  "titleMatch": null
+                  "titleMatch": 1
                 },
                 {
                   "site": "mangahub",
@@ -10120,7 +10292,7 @@
                   "composite": 0.7,
                   "chapters": 181,
                   "qualityBasis": "seed",
-                  "titleMatch": null
+                  "titleMatch": 1
                 }
               ]
             },
@@ -10136,7 +10308,7 @@
                 "composite": 0.62,
                 "chapters": 97,
                 "qualityBasis": "seed",
-                "titleMatch": null
+                "titleMatch": 0.82
               },
               "sources": [
                 {
@@ -10147,7 +10319,7 @@
                   "composite": 0.62,
                   "chapters": 97,
                   "qualityBasis": "seed",
-                  "titleMatch": null
+                  "titleMatch": 0.82
                 }
               ]
             }
@@ -10157,7 +10329,7 @@
           "pinnedUrl": null,
           "skip": false,
           "error": null,
-          "searchedAt": 1792242100910
+          "searchedAt": 1792242827343
         },
         {
           "folder": "Kagurabachi_",
@@ -10170,16 +10342,104 @@
           "pinnedUrl": null,
           "skip": false,
           "error": null,
-          "searchedAt": 1792242100956
+          "searchedAt": 1792242827390
+        },
+        {
+          "folder": "Tis Time for Torture Princess",
+          "query": "Tis Time for Torture Princess",
+          "include": true,
+          "state": "done",
+          "candidates": [
+            {
+              "title": "'Tis Time for \"Torture,\" Princess",
+              "canonicalTitle": "'Tis Time for \"Torture,\" Princess",
+              "year": 2019,
+              "best": {
+                "site": "mangadex",
+                "url": "https://mangadex.org/title/5e1b/tis-time-for-torture-princess",
+                "title": "'Tis Time for \"Torture,\" Princess",
+                "cover": null,
+                "composite": 0.88,
+                "chapters": 212,
+                "qualityBasis": "chapter_probe",
+                "titleMatch": 0.87
+              },
+              "sources": [
+                {
+                  "site": "mangadex",
+                  "url": "https://mangadex.org/title/5e1b/tis-time-for-torture-princess",
+                  "title": "'Tis Time for \"Torture,\" Princess",
+                  "cover": null,
+                  "composite": 0.88,
+                  "chapters": 212,
+                  "qualityBasis": "chapter_probe",
+                  "titleMatch": 0.87
+                },
+                {
+                  "site": "mangafire",
+                  "url": "https://mangafire.to/title/p7q1-tis-time-for-torture-princess",
+                  "title": "'Tis Time for Torture, Princess",
+                  "cover": null,
+                  "composite": 0.83,
+                  "chapters": 210,
+                  "qualityBasis": "chapter_probe",
+                  "titleMatch": 0.87
+                },
+                {
+                  "site": "atsumaru",
+                  "url": "https://atsu.moe/manga/tis-time-for-torture-princess",
+                  "title": "Tis Time for Torture Princess",
+                  "cover": null,
+                  "composite": 0.8,
+                  "chapters": 212,
+                  "qualityBasis": "seed",
+                  "titleMatch": 0.86
+                }
+              ]
+            },
+            {
+              "title": "Princess Princess",
+              "canonicalTitle": "Princess Princess",
+              "year": 2002,
+              "best": {
+                "site": "mangahub",
+                "url": "https://mangahub.io/manga/princess-princess",
+                "title": "Princess Princess",
+                "cover": null,
+                "composite": 0.66,
+                "chapters": 34,
+                "qualityBasis": "seed",
+                "titleMatch": 0.8
+              },
+              "sources": [
+                {
+                  "site": "mangahub",
+                  "url": "https://mangahub.io/manga/princess-princess",
+                  "title": "Princess Princess",
+                  "cover": null,
+                  "composite": 0.66,
+                  "chapters": 34,
+                  "qualityBasis": "seed",
+                  "titleMatch": 0.8
+                }
+              ]
+            }
+          ],
+          "pickUrl": null,
+          "multiSource": true,
+          "pinnedUrl": null,
+          "skip": false,
+          "error": null,
+          "searchedAt": 1792242827436
         }
       ]
     },
     "findRunning": {
       "kind": "find",
-      "targetId": "tcc4f7ece4a",
+      "targetId": "t9b79998600",
       "state": "running",
       "done": 0,
-      "total": 3,
+      "total": 4,
       "row": {
         "folder": "Berserk",
         "query": "Berserk",
@@ -10196,8 +10456,8 @@
     },
     "reviewWithLoss": {
       "ok": true,
-      "targetId": "tcc4f7ece4a",
-      "asOf": 1792242100729,
+      "targetId": "t9b79998600",
+      "asOf": 1792242827161,
       "firstSync": false,
       "deletePolicy": "guarded",
       "totals": {
@@ -10935,7 +11195,7 @@
           "seriesKey": "pc:Solo Leveling",
           "series": "Solo Leveling",
           "rebind": {
-            "shardId": "6937f057d27e4149",
+            "shardId": "f422b187d031c917",
             "choices": [
               {
                 "source": "previous",
@@ -10958,15 +11218,15 @@
       "selSeq": 5,
       "stale": false,
       "capacity": {
-        "free": 229075820544,
+        "free": 229053779968,
         "total": 1999343972352,
         "needed": 60912,
         "reserve": 1073741824,
         "freeable": 39081,
         "freeableEarly": 39081,
-        "after": 229075798713,
+        "after": 229053758137,
         "fits": true,
-        "asOf": 1792242100722
+        "asOf": 1792242827154
       },
       "policy": {
         "deletePolicy": "guarded",
@@ -10986,11 +11246,11 @@
           "job": {
             "runId": 7,
             "phase": "apply",
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "serial": null,
             "auto": false,
             "state": "running",
-            "startedAt": 1792242101099,
+            "startedAt": 1792242827593,
             "finishedAt": null,
             "progress": {
               "bytesDone": 0,
@@ -11006,7 +11266,7 @@
         }
       },
       {
-        "t": 0,
+        "t": 1,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11019,12 +11279,12 @@
             "current": null,
             "preflight": null,
             "step": "probe",
-            "at": 1792242101099
+            "at": 1792242827594
           }
         }
       },
       {
-        "t": 12,
+        "t": 13,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11049,12 +11309,12 @@
               "refusal": null
             },
             "step": "device-ready",
-            "at": 1792242101111
+            "at": 1792242827605
           }
         }
       },
       {
-        "t": 122,
+        "t": 124,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11082,7 +11342,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242101145,
+            "at": 1792242827640,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 1,
@@ -11120,7 +11380,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242101276,
+            "at": 1792242827771,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 2,
@@ -11158,7 +11418,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242101417,
+            "at": 1792242827912,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 3,
@@ -11168,7 +11428,7 @@
         }
       },
       {
-        "t": 456,
+        "t": 455,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11196,7 +11456,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242101555,
+            "at": 1792242828048,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 3,
@@ -11234,7 +11494,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242101558,
+            "at": 1792242828052,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 4,
@@ -11244,7 +11504,7 @@
         }
       },
       {
-        "t": 671,
+        "t": 670,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11272,7 +11532,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242101702,
+            "at": 1792242828197,
             "lane": {
               "seriesKey": "pc:Frieren",
               "landed": 1,
@@ -11282,7 +11542,7 @@
         }
       },
       {
-        "t": 782,
+        "t": 779,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11310,7 +11570,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242101843,
+            "at": 1792242828333,
             "lane": {
               "seriesKey": "pc:Frieren",
               "landed": 2,
@@ -11320,7 +11580,7 @@
         }
       },
       {
-        "t": 894,
+        "t": 886,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11348,7 +11608,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242101993,
+            "at": 1792242828479,
             "lane": {
               "seriesKey": "pc:Kagurabachi",
               "landed": 0,
@@ -11358,7 +11618,7 @@
         }
       },
       {
-        "t": 1001,
+        "t": 996,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11386,7 +11646,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242101996,
+            "at": 1792242828482,
             "lane": {
               "seriesKey": "pc:Kagurabachi",
               "landed": 1,
@@ -11396,7 +11656,7 @@
         }
       },
       {
-        "t": 1110,
+        "t": 1104,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11424,7 +11684,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242102139,
+            "at": 1792242828627,
             "lane": {
               "seriesKey": "pc:Kagurabachi",
               "landed": 2,
@@ -11434,7 +11694,7 @@
         }
       },
       {
-        "t": 1220,
+        "t": 1215,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11462,7 +11722,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242102290,
+            "at": 1792242828780,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 1,
@@ -11472,7 +11732,7 @@
         }
       },
       {
-        "t": 1334,
+        "t": 1326,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11500,7 +11760,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242102433,
+            "at": 1792242828919,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 1,
@@ -11510,7 +11770,7 @@
         }
       },
       {
-        "t": 1440,
+        "t": 1431,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11538,7 +11798,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242102436,
+            "at": 1792242828923,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 2,
@@ -11548,7 +11808,7 @@
         }
       },
       {
-        "t": 1547,
+        "t": 1541,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11576,7 +11836,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242102576,
+            "at": 1792242829064,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 3,
@@ -11586,7 +11846,7 @@
         }
       },
       {
-        "t": 1655,
+        "t": 1650,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11614,7 +11874,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242102716,
+            "at": 1792242829204,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 4,
@@ -11624,7 +11884,7 @@
         }
       },
       {
-        "t": 1756,
+        "t": 1750,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11652,7 +11912,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242102853,
+            "at": 1792242829341,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 4,
@@ -11662,7 +11922,7 @@
         }
       },
       {
-        "t": 1857,
+        "t": 1853,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11690,7 +11950,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242102856,
+            "at": 1792242829344,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 5,
@@ -11700,7 +11960,7 @@
         }
       },
       {
-        "t": 1967,
+        "t": 1961,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11728,7 +11988,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242102997,
+            "at": 1792242829485,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 6,
@@ -11738,7 +11998,7 @@
         }
       },
       {
-        "t": 2076,
+        "t": 2071,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11766,7 +12026,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242103136,
+            "at": 1792242829625,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 7,
@@ -11776,7 +12036,7 @@
         }
       },
       {
-        "t": 2177,
+        "t": 2172,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11804,7 +12064,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242103274,
+            "at": 1792242829763,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 7,
@@ -11814,7 +12074,7 @@
         }
       },
       {
-        "t": 2278,
+        "t": 2275,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11842,7 +12102,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242103276,
+            "at": 1792242829766,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 8,
@@ -11852,7 +12112,7 @@
         }
       },
       {
-        "t": 2387,
+        "t": 2385,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11880,7 +12140,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242103417,
+            "at": 1792242829908,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 9,
@@ -11890,7 +12150,7 @@
         }
       },
       {
-        "t": 2497,
+        "t": 2495,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11918,7 +12178,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242103556,
+            "at": 1792242830049,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 10,
@@ -11928,7 +12188,7 @@
         }
       },
       {
-        "t": 2597,
+        "t": 2595,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -11956,7 +12216,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242103696,
+            "at": 1792242830188,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 10,
@@ -11994,7 +12254,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242103700,
+            "at": 1792242830192,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 11,
@@ -12004,7 +12264,7 @@
         }
       },
       {
-        "t": 2811,
+        "t": 2807,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -12032,7 +12292,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792242103840,
+            "at": 1792242830331,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 12,
@@ -12042,7 +12302,7 @@
         }
       },
       {
-        "t": 2902,
+        "t": 2898,
         "ev": {
           "kind": "job",
           "runId": 7,
@@ -12080,12 +12340,12 @@
           "job": {
             "runId": 7,
             "phase": "apply",
-            "targetId": "tcc4f7ece4a",
+            "targetId": "t9b79998600",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792242101099,
-            "finishedAt": 1792242104001,
+            "startedAt": 1792242827593,
+            "finishedAt": 1792242830491,
             "progress": {
               "bytesDone": 60512,
               "bytesTotal": 60512,
@@ -12109,7 +12369,7 @@
                 "refusal": null
               },
               "step": "apply",
-              "at": 1792242103840,
+              "at": 1792242830331,
               "lane": {
                 "seriesKey": "pc:Solo Leveling",
                 "landed": 12,
@@ -12155,7 +12415,7 @@
       "adbPath": null,
       "targets": [
         {
-          "id": "tcc4f7ece4a",
+          "id": "t9b79998600",
           "deletePolicy": "guarded",
           "excludes": [
             {

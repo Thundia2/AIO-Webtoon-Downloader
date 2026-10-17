@@ -96,6 +96,21 @@ defaults only.
 - Build the chosen design in `FindSourcesSheet.jsx` (+ view helpers in findView.js); regenerate
   gallery fixtures with multi-site candidates (`tools/_gen_sync_fixtures.js`).
 
+**F2 outcome (2026-10-17).** The user chose the mockup layout as shown AND the Ready/Check-match
+badges. As built:
+- Ready = match 0's best-site title score ≥ 0.85 and ≥ 0.10 ahead of match 1's (thresholds re-read
+  at `sites/search_orchestrator.py:236` / `:178`; matches are ranked by that same best-site score).
+  A row without recorded title scores is never Ready.
+- Queue takes a row only when it is Ready or confirmed. Confirmed = the user set `pickUrl` (any
+  site radio, "Yes, use it", or another match's "Use this") or pinned a URL — no new row field,
+  so a re-search keeps the confirmation exactly while it keeps the pick, and a query change
+  clears both. Footer counts "N to check, not queued".
+- Badges: Picked (confirmed) / Ready / Check match. Site radios label the pick "downloads" and the
+  rest "fallback N" (only when the row's search ran with fallback sites on).
+- Build calls not in the mockup: the "older version" note now actually renders (F1's copy sat in a
+  branch that was unreachable once a row had results); a re-searching row keeps "Searching…"
+  under its old results; site radios tick after main saves the pick (same round-trip as Skip).
+
 ### F3 — live check
 
 Re-search the 2 rows saved under the old 5-site cap; confirm every site shows; queue one with the

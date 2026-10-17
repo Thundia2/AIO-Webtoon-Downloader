@@ -131,24 +131,38 @@ function writeYoung(p, data, ageS) {
 // --search-json payloads for the find-sources recording, by query. Berserk
 // fails (an error row), Kagurabachi finds nothing. Chainsaw Man's first match
 // has SIX sites (the runner used to cut sites past the 5th; the sheet shows
-// and falls back over all of them) and a weak one-site second match.
+// and falls back over all of them) and a weak one-site second match, far
+// enough behind to read Ready. The princess folder's two matches are close
+// on title, so it reads "Check match" (findView.matchReady).
 const FAKE_SEARCH = {
   "Chainsaw Man": {
     candidates: [
       { canonical_title: "Chainsaw Man", canonical_year: 2018, sources: [
-        { site: "mangadex", url: "https://mangadex.org/title/a77742b1/chainsaw-man", title: "Chainsaw Man", composite_score: 0.91, actual_chapter_count: 181, quality_basis: "chapter_probe" },
-        { site: "weebcentral", url: "https://weebcentral.com/series/01J76XY/chainsaw-man", title: "Chainsaw Man", composite_score: 0.84, actual_chapter_count: 181, quality_basis: "chapter_probe" },
-        { site: "mangafire", url: "https://mangafire.to/title/k2d9-chainsaw-man", title: "Chainsaw Man", composite_score: 0.82, actual_chapter_count: 180, quality_basis: "chapter_probe" },
-        { site: "mangakatana", url: "https://mangakatana.com/manga/chainsaw-man.21", title: "Chainsaw Man", composite_score: 0.78, chapter_count_hint: 179, quality_basis: "cover" },
-        { site: "mangapill", url: "https://mangapill.com/manga/2/chainsaw-man", title: "Chainsaw Man", composite_score: 0.74, actual_chapter_count: 181, quality_basis: "chapter_probe" },
-        { site: "mangahub", url: "https://mangahub.io/manga/chainsaw-man", title: "Chainsaw Man", composite_score: 0.7, chapter_count_hint: 181, quality_basis: "seed" },
+        { site: "mangadex", url: "https://mangadex.org/title/a77742b1/chainsaw-man", title: "Chainsaw Man", composite_score: 0.91, actual_chapter_count: 181, quality_basis: "chapter_probe", title_match: 1 },
+        { site: "weebcentral", url: "https://weebcentral.com/series/01J76XY/chainsaw-man", title: "Chainsaw Man", composite_score: 0.84, actual_chapter_count: 181, quality_basis: "chapter_probe", title_match: 1 },
+        { site: "mangafire", url: "https://mangafire.to/title/k2d9-chainsaw-man", title: "Chainsaw Man", composite_score: 0.82, actual_chapter_count: 180, quality_basis: "chapter_probe", title_match: 1 },
+        { site: "mangakatana", url: "https://mangakatana.com/manga/chainsaw-man.21", title: "Chainsaw Man", composite_score: 0.78, chapter_count_hint: 179, quality_basis: "cover", title_match: 1 },
+        { site: "mangapill", url: "https://mangapill.com/manga/2/chainsaw-man", title: "Chainsaw Man", composite_score: 0.74, actual_chapter_count: 181, quality_basis: "chapter_probe", title_match: 1 },
+        { site: "mangahub", url: "https://mangahub.io/manga/chainsaw-man", title: "Chainsaw Man", composite_score: 0.7, chapter_count_hint: 181, quality_basis: "seed", title_match: 1 },
       ] },
       { canonical_title: "Chainsaw Man (Colored)", canonical_year: 2021, sources: [
-        { site: "mangafire", url: "https://mangafire.to/title/x9c2-chainsaw-man-colored", title: "Chainsaw Man (Colored)", composite_score: 0.62, chapter_count_hint: 97, quality_basis: "seed" },
+        { site: "mangafire", url: "https://mangafire.to/title/x9c2-chainsaw-man-colored", title: "Chainsaw Man (Colored)", composite_score: 0.62, chapter_count_hint: 97, quality_basis: "seed", title_match: 0.82 },
       ] },
     ],
   },
   Kagurabachi: { candidates: [] },
+  "Tis Time for Torture Princess": {
+    candidates: [
+      { canonical_title: "'Tis Time for \"Torture,\" Princess", canonical_year: 2019, sources: [
+        { site: "mangadex", url: "https://mangadex.org/title/5e1b/tis-time-for-torture-princess", title: "'Tis Time for \"Torture,\" Princess", composite_score: 0.88, actual_chapter_count: 212, quality_basis: "chapter_probe", title_match: 0.87 },
+        { site: "mangafire", url: "https://mangafire.to/title/p7q1-tis-time-for-torture-princess", title: "'Tis Time for Torture, Princess", composite_score: 0.83, actual_chapter_count: 210, quality_basis: "chapter_probe", title_match: 0.87 },
+        { site: "atsumaru", url: "https://atsu.moe/manga/tis-time-for-torture-princess", title: "Tis Time for Torture Princess", composite_score: 0.8, chapter_count_hint: 212, quality_basis: "seed", title_match: 0.86 },
+      ] },
+      { canonical_title: "Princess Princess", canonical_year: 2002, sources: [
+        { site: "mangahub", url: "https://mangahub.io/manga/princess-princess", title: "Princess Princess", composite_score: 0.66, chapter_count_hint: 34, quality_basis: "seed", title_match: 0.8 },
+      ] },
+    ],
+  },
 };
 function fakeSearcher() {
   return {
@@ -274,6 +288,8 @@ async function recordTab(tmp) {
     // punctuation is dropped (planner compactKey): a weak ("name" tier) link
     // suggestion. Not a case-only variant: on NTFS that IS the same folder.
     touchOld(dev("Kagurabachi_/Ch.001.cbz"), bytes("kb other", 2100));
+    // F2: a device-only folder whose search is too close to call (Check match).
+    touchOld(dev("Tis Time for Torture Princess/Ch.001.cbz"), bytes("ttp 1", 2700));
     let st = await state();
     const keyOf = (title) => st.plans[id].summary.series.find((x) => x.title === title || x.folder === title).seriesKey;
     await call("config-op", { op: "add-exclude", targetId: id, expectVersion: st.config.version, entry: { pcFolder: "Blue Lock" } });

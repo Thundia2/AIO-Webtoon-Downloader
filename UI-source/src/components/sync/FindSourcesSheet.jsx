@@ -27,18 +27,27 @@
 //
 // One checkbox per row = the runner's `skip` (skipped rows are neither
 // searched nor queued); `include` stays true.
+//
+// THE PICKER (F2, the user picked this layout from a mockup 2026-10-17): a
+// row shows its matched series and ONE chip for the site it downloads from
+// (+N fallbacks). The chip opens every site of that series as radios (pick
+// = pickUrl); the search's other, unrelated matches fold behind "Not this
+// series?" so lookalikes (e.g. a one-site "Princess Princess") never sit
+// beside the real series as if they were more sites of it. The badge is
+// findView's Ready / Check match rule; "Check match" rows are not queued
+// until the user picks a site, uses another match, or pins a URL.
 // Consumer: SyncTab.jsx. Depends on: findView.js, useConfigOps (ops),
 // copy.js configRefusalCopy.
 // ============================================================
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Download, Link2, Loader2, Pin, Search, Settings2, X } from "lucide-react";
-import { Button, Checkbox, Input } from "@/components/ui/primitives";
+import { AlertTriangle, Check, ChevronDown, Download, Link2, Loader2, Pin, Search, Settings2, X } from "lucide-react";
+import { Badge, Button, Checkbox, Input } from "@/components/ui/primitives";
 import { Sheet } from "@/components/ui/overlay";
 import { cn } from "@/lib/utils";
 import { Cover } from "./Ledger";
 import { configRefusalCopy } from "./copy";
-import { aliasFor, candidateScore, findQueueArgs, findRows, findStatusLine, rowCandidate, rowQueueArgs, rowSource, searchable, unmeasured } from "./findView";
+import { aliasFor, candidateScore, findQueueArgs, findRows, findStatusLine, otherMatches, rowCandidate, rowQueueArgs, rowSites, rowSource, searchable, unmeasured } from "./findView";
 
 const XS = "h-7 px-2 text-xs gap-1 [&_svg]:h-3.5 [&_svg]:w-3.5";
 
@@ -60,11 +69,140 @@ function RowState({ row }) {
     );
   if (row.state === "error") return <span className="truncate text-[11.5px] text-destructive" title={row.error || ""}>Search failed{row.error ? `: ${row.error}` : ""}</span>;
   if (row.state === "done" && !row.candidates.length && !row.pinnedUrl) return <span className="text-[11.5px] text-muted-foreground">No source found. Edit the query, or pin a URL.</span>;
-  // Queued WITH results = a row searched before file version 2 (only 5 sites
-  // per match were kept then; find-sources.js _migrateRow re-queues it).
-  if (row.state === "queued" && row.candidates.length) return <span className="text-[11.5px] text-muted-foreground">Searched by an older version. Search again to see every site.</span>;
   if (row.state === "unsearched" || row.state === "queued" || row.state === "cancelled") return <span className="text-[11.5px] text-muted-foreground">Not searched yet</span>;
   return null;
+}
+
+/** "0.91 · ch.181" plus the red triangle when the rating isn't measured from chapter pages. */
+function SiteScore({ source }) {
+  const warn = unmeasured(source);
+  return (
+    <span className="flex shrink-0 items-center gap-1 font-mono text-[11px] text-muted-foreground" title={warn ? "Rating not measured from chapter pages" : undefined}>
+      {candidateScore(source)}
+      {warn && <AlertTriangle className="h-3 w-3 text-destructive" aria-label="Rating not measured from chapter pages" />}
+    </span>
+  );
+}
+
+function MatchBadge({ row }) {
+  if (row.confirmed)
+    return (
+      <Badge variant="token-success" title="You picked this series">
+        <Check aria-hidden="true" />
+        Picked
+      </Badge>
+    );
+  if (row.ready)
+    return (
+      <Badge variant="token-success" title="The search matched this title clearly ahead of any other">
+        <Check aria-hidden="true" />
+        Ready
+      </Badge>
+    );
+  return (
+    <Badge variant="token-warning" title="The title match is weak or close to another match. Open the sources and confirm it, or pick another.">
+      Check match
+    </Badge>
+  );
+}
+
+/**
+ * The found-series picker of one row: matched series + badge, the chip for
+ * the site it downloads from, and (opened) every site of that series plus
+ * the search's other matches. Every change is a pickUrl patch.
+ */
+function Picker({ row, busy, onPatch }) {
+  const [open, setOpen] = useState(false);
+  const [othersOpen, setOthersOpen] = useState(false);
+  const cand = rowCandidate(row);
+  const src = rowSource(row);
+  const sites = rowSites(row);
+  const others = otherMatches(row);
+  if (!cand || !src) return null;
+  const nMore = sites.length - 1;
+  const more = !nMore ? "" : row.multiSource === true ? `+${nMore} fallback${nMore === 1 ? "" : "s"}` : `+${nMore} site${nMore === 1 ? "" : "s"}`;
+  const panelId = `find-sites-${row.key}`;
+  const title = cand.title || src.title || "Untitled";
+  return (
+    <div className="flex min-w-0 flex-col gap-1">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="truncate text-[12.5px] font-medium" title={title}>
+          {title}
+          {cand.year ? <span className="font-normal text-muted-foreground"> ({cand.year})</span> : null}
+        </span>
+        <MatchBadge row={row} />
+      </div>
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={panelId}
+        aria-label={`Sources for ${row.folder}: ${src.site}${more ? `, ${more}` : ""}`}
+        onClick={() => setOpen((o) => !o)}
+        className="flex h-7 min-w-0 max-w-full items-center gap-1.5 self-start rounded-md border border-input bg-background px-2 text-xs hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <span className="truncate font-mono">{src.site}</span>
+        <SiteScore source={src} />
+        {more && <span className="shrink-0 text-[11px] text-muted-foreground">{more}</span>}
+        <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform motion-reduce:transition-none", open && "rotate-180")} aria-hidden="true" />
+      </button>
+      {open && (
+        <div id={panelId} className="flex flex-col gap-1 rounded-md border border-border/70 bg-muted/30 p-1">
+          <div role="radiogroup" aria-label={`Download site for ${row.folder}`}>
+            {sites.map(({ source, picked, fallback }) => (
+              <label key={source.url} className={cn("flex min-w-0 cursor-pointer items-center gap-2 rounded px-2 py-1 text-xs hover:bg-accent", picked && "bg-primary/[.06]")} title={source.url}>
+                <input type="radio" name={panelId} className="accent-primary" checked={picked} disabled={busy} onChange={() => onPatch({ pickUrl: source.url })} />
+                <span className="w-28 shrink-0 truncate font-mono">{source.site}</span>
+                <SiteScore source={source} />
+                <span className={cn("ml-auto shrink-0 text-[11px]", picked ? "font-medium text-primary" : "text-muted-foreground")}>{picked ? "downloads" : fallback ? `fallback ${fallback}` : ""}</span>
+              </label>
+            ))}
+          </div>
+          {row.multiSource === false && nMore > 0 && <span className="px-2 text-[11px] text-muted-foreground">Fallback sites were off for this search, so only the picked site downloads.</span>}
+          {row.needsCheck && (
+            <div className="flex items-center gap-2 px-2 py-0.5">
+              <span className="min-w-0 flex-1 text-[11px] text-muted-foreground">Is this the series in the folder?</span>
+              <Button size="sm" variant="outline" className={XS} disabled={busy} onClick={() => onPatch({ pickUrl: src.url })}>
+                <Check aria-hidden="true" />
+                Yes, use it
+              </Button>
+            </div>
+          )}
+          {others.length > 0 && (
+            <div className="flex flex-col border-t border-border/70 pt-1">
+              <button type="button" aria-expanded={othersOpen} onClick={() => setOthersOpen((o) => !o)} className="self-start px-2 py-0.5 text-[11.5px] text-muted-foreground underline-offset-2 hover:underline">
+                Not this series? {others.length} other match{others.length === 1 ? "" : "es"}
+              </button>
+              {othersOpen &&
+                others.map((c, i) => {
+                  const b = c.best || (c.sources || [])[0];
+                  if (!b) return null;
+                  const n = (c.sources || []).length;
+                  return (
+                    <div key={`${b.url}-${i}`} className="flex min-w-0 items-center gap-2 px-2 py-1 text-xs">
+                      <span className="min-w-0 flex-1 truncate" title={c.title || b.title || ""}>
+                        {c.title || b.title || "Untitled"}
+                        {c.year ? <span className="text-muted-foreground"> ({c.year})</span> : null}
+                      </span>
+                      <span className="shrink-0 font-mono text-[11px]">{b.site}</span>
+                      {n > 1 && <span className="shrink-0 text-[11px] text-muted-foreground">+{n - 1}</span>}
+                      <SiteScore source={b} />
+                      <Button size="sm" variant="ghost" className={XS} disabled={busy} onClick={() => onPatch({ pickUrl: b.url })} aria-label={`Use ${c.title || b.title || b.site}`}>
+                        Use this
+                      </Button>
+                    </div>
+                  );
+                })}
+            </div>
+          )}
+        </div>
+      )}
+      {/* Queued WITH results = a row searched before file version 2 (only 5
+          sites per match were kept then; find-sources.js _migrateRow re-queues it). */}
+      {row.state === "queued" && <span className="text-[11.5px] text-muted-foreground">Searched by an older version. Search again to see every site.</span>}
+      {/* A re-search keeps the old results on screen until the new ones land. */}
+      {row.state === "searching" && <RowState row={row} />}
+    </div>
+  );
 }
 
 function FindRow({ row, cover, busy, result, onPatch, onUnlink }) {
@@ -79,11 +217,6 @@ function FindRow({ row, cover, busy, result, onPatch, onUnlink }) {
     if (q && q !== row.query) onPatch({ query: q });
     else setQuery(row.query);
   };
-  // Interim picker until F2's redesign: one option per series match; picking
-  // one picks its top site. The score shows the site actually queued.
-  const pickedCand = rowCandidate(row);
-  const pickedIdx = pickedCand ? row.candidates.indexOf(pickedCand) : -1;
-  const src = rowSource(row);
   return (
     <div data-testid="find-row" data-folder={row.folder} className={cn("flex items-start gap-2.5 border-b border-border/70 px-3 py-2.5", (row.skip || linked) && "opacity-70")}>
       <Checkbox
@@ -126,30 +259,7 @@ function FindRow({ row, cover, busy, result, onPatch, onUnlink }) {
             </button>
           </span>
         ) : !linked && row.candidates.length > 0 ? (
-          <div className="flex min-w-0 items-center gap-2">
-            <select
-              value={pickedIdx < 0 ? "" : String(pickedIdx)}
-              disabled={busy}
-              aria-label={`Source for ${row.folder}`}
-              onChange={(e) => {
-                const cand = row.candidates[Number(e.target.value)];
-                onPatch({ pickUrl: (cand && cand.best && cand.best.url) || null });
-              }}
-              className="h-7 min-w-0 flex-1 truncate rounded-md border border-input bg-background px-2 text-xs"
-            >
-              {row.candidates.map((cand, i) => (
-                <option key={i} value={i}>
-                  {(cand.title || (cand.best && cand.best.title) || "Untitled") + (cand.best ? ` · ${cand.best.site}` : "")}
-                </option>
-              ))}
-            </select>
-            {src && (
-              <span className="flex shrink-0 items-center gap-1 font-mono text-[11px] text-muted-foreground" title={unmeasured(src) ? "Rating not measured from chapter pages" : undefined}>
-                {candidateScore(src)}
-                {unmeasured(src) && <AlertTriangle className="h-3 w-3 text-destructive" aria-hidden="true" />}
-              </span>
-            )}
-          </div>
+          <Picker row={row} busy={busy} onPatch={onPatch} />
         ) : (
           <RowState row={row} />
         )}
@@ -278,6 +388,7 @@ export default function FindSourcesSheet({ open, onClose, target, tn, items, wid
   const runningHere = running && find.targetId === tid;
   const toSearch = searchable(rows);
   const queueable = rows.filter((r) => r.queueable);
+  const nCheck = rows.filter((r) => r.needsCheck).length;
   const status = findStatusLine(find, tid, rows);
   const komikku = target && target.profile === "komikku";
 
@@ -334,6 +445,7 @@ export default function FindSourcesSheet({ open, onClose, target, tn, items, wid
       footer={
         <>
           <span className="min-w-0 flex-1 text-xs text-muted-foreground">
+            {nCheck > 0 && <span className="text-warn-fg">{nCheck} to check, not queued · </span>}
             Komikku mode follows {tn} ({komikku ? "on" : "off"}) · each queued series is linked to its folder first
           </span>
           <Button size="sm" disabled={!nQueue || busy || runningHere} onClick={queue} className="gap-1.5 [&_svg]:h-3.5 [&_svg]:w-3.5">

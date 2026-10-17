@@ -19,11 +19,14 @@
 //      URL on the row that found nothing → Queue 2: both aliases recorded
 //      (two back-to-back config ops), both downloads spawned with --komikku
 //      (the target's reader is Komikku), both device folders bind after.
-//      The saved search settings have multi-source ON, so the picked row
-//      downloads like a Search-tab download: --multi-source plus its series'
-//      other sites as --multi-source-prefetched (the fake backend logs that
-//      file's JSON, which downloader.js deletes when the process exits); the
-//      pinned row adds neither.
+//      The found row reads Ready (one match, title score 1); its source chip
+//      opens every site and the test picks the SECOND one (mangafire), so
+//      the download proves the picker's choice reaches it. The saved search
+//      settings have multi-source ON, so the picked row downloads like a
+//      Search-tab download: --multi-source plus its series' other sites as
+//      --multi-source-prefetched (the fake backend logs that file's JSON,
+//      which downloader.js deletes when the process exits); the pinned row
+//      adds neither.
 //   2. single: a row's Find source → Search tab with the banner, the search
 //      already run → Download → Queue: alias recorded, banner gone, Queue tab
 //   3. Library: the chip on a series with chapters to copy, the detail's
@@ -73,8 +76,10 @@ function series(lib, folder, chapters) {
 
 const CSM_URL = "https://mangadex.org/title/e2e-csm/chainsaw-man";
 const DAN_URL = "https://mangafire.to/title/e2e-dan-dandadan";
-// Chainsaw Man's other sites: the fallbacks its queued download carries.
+// Chainsaw Man's other sites. The test picks CSM_PICK in the sheet, so it
+// downloads from there with mangadex + mangakatana as fallbacks.
 const CSM_ALTS = ["https://mangafire.to/title/e2e-csm-chainsaw-man", "https://mangakatana.com/manga/e2e-csm.1"];
+const CSM_PICK = CSM_ALTS[0];
 // Pinned by hand on the row whose search found nothing.
 const KAG_URL = "https://weebcentral.com/series/e2e-kag/kagurabachi";
 // --search-json answers by query. Device folder names are their own queries
@@ -86,9 +91,9 @@ const FAKE_SEARCH = {
         canonical_title: "Chainsaw Man",
         canonical_year: 2018,
         sources: [
-          { site: "mangadex", url: CSM_URL, title: "Chainsaw Man", composite_score: 0.91, actual_chapter_count: 2, quality_basis: "chapter_probe" },
-          { site: "mangafire", url: CSM_ALTS[0], title: "Chainsaw Man", cover: "https://mangafire.to/e2e.jpg", composite_score: 0.85, actual_chapter_count: 2, quality_basis: "chapter_probe" },
-          { site: "mangakatana", url: CSM_ALTS[1], title: "Chainsaw Man", composite_score: 0.8, chapter_count_hint: 2, quality_basis: "seed" },
+          { site: "mangadex", url: CSM_URL, title: "Chainsaw Man", composite_score: 0.91, actual_chapter_count: 2, quality_basis: "chapter_probe", title_match: 1 },
+          { site: "mangafire", url: CSM_ALTS[0], title: "Chainsaw Man", cover: "https://mangafire.to/e2e.jpg", composite_score: 0.85, actual_chapter_count: 2, quality_basis: "chapter_probe", title_match: 1 },
+          { site: "mangakatana", url: CSM_ALTS[1], title: "Chainsaw Man", composite_score: 0.8, chapter_count_hint: 2, quality_basis: "seed", title_match: 0.95 },
         ],
       },
     ],
@@ -103,7 +108,7 @@ const FAKE_SEARCH = {
 // What a download of each url leaves in the library. The folder names differ
 // from the device folders on purpose (see FAKE BACKEND above).
 const FAKE_DOWNLOADS = {
-  [CSM_URL]: { folder: "Chainsaw Man (PC)", title: "Chainsaw Man", chapters: ["Ch.001.cbz", "Ch.002.cbz"] },
+  [CSM_PICK]: { folder: "Chainsaw Man (PC)", title: "Chainsaw Man", chapters: ["Ch.001.cbz", "Ch.002.cbz"] },
   [DAN_URL]: { folder: "Dandadan (PC)", title: "Dandadan", chapters: ["Ch.001.cbz"] },
   [KAG_URL]: { folder: "Kagurabachi (PC)", title: "Kagurabachi", chapters: ["Ch.001.cbz"] },
 };
@@ -263,6 +268,20 @@ sys.exit(0)
       await win.getByRole("button", { name: "Search 2 folders" }).click();
       await win.getByRole("button", { name: "Queue 1 download" }).waitFor({ timeout: 30_000 });
     });
+    await step("the found row reads Ready; its chip lists every site; picking the second makes it the download", async () => {
+      const row = win.locator('[data-testid="find-row"][data-folder="Chainsaw Man"]');
+      await row.getByText("Ready", { exact: true }).waitFor({ timeout: 5_000 });
+      await row.getByRole("button", { name: /^Sources for Chainsaw Man: mangadex, \+2 fallbacks$/ }).click();
+      const radios = row.getByRole("radio");
+      if ((await radios.count()) !== 3) throw new Error(`${await radios.count()} sites listed`);
+      // click, not check(): the radio is controlled by the SAVED row, so it
+      // ticks only once main stores the pick and the row streams back.
+      await row.getByRole("radio", { name: /mangafire/ }).click();
+      await row.getByText("Picked", { exact: true }).waitFor({ timeout: 5_000 });
+      await row.getByRole("button", { name: /^Sources for Chainsaw Man: mangafire/ }).waitFor({ timeout: 5_000 });
+      const labels = await row.locator("label").allTextContents();
+      if (!/mangadex.*fallback 1/.test(labels[0]) || !/mangafire.*downloads/.test(labels[1]) || !/mangakatana.*fallback 2/.test(labels[2])) throw new Error(`labels ${JSON.stringify(labels)}`);
+    });
     check("the skipped folder wasn't searched", !calls().some((a) => a.includes("--search") && a.includes("Dandadan")));
     check("the search ran with --search-json", calls().some((a) => a.includes("--search") && a.includes("Chainsaw Man") && a.includes("--search-json")));
     await step("pin a URL on the row that found nothing", async () => {
@@ -280,28 +299,28 @@ sys.exit(0)
       await ok.first().waitFor();
     });
     const t1 = targetOf(await state());
-    for (const [url, folder] of [[CSM_URL, "Chainsaw Man"], [KAG_URL, "Kagurabachi"]]) {
+    for (const [url, folder] of [[CSM_PICK, "Chainsaw Man"], [KAG_URL, "Kagurabachi"]]) {
       check(`alias recorded for ${folder}`, !!t1 && (t1.aliases || []).some((a) => a.url === url && a.deviceFolder === folder), JSON.stringify(t1 && t1.aliases));
     }
     await step("both downloads ran with --komikku", async () => {
       const t0 = Date.now();
-      while ((!downloadsOf(CSM_URL).length || !downloadsOf(KAG_URL).length) && Date.now() - t0 < 30_000) await win.waitForTimeout(250);
-      for (const url of [CSM_URL, KAG_URL]) {
+      while ((!downloadsOf(CSM_PICK).length || !downloadsOf(KAG_URL).length) && Date.now() - t0 < 30_000) await win.waitForTimeout(250);
+      for (const url of [CSM_PICK, KAG_URL]) {
         const d = downloadsOf(url);
         if (!d.length) throw new Error(`no download call for ${url}`);
         if (!d[0].includes("--komikku")) throw new Error(`args ${d[0].join(" ")}`);
       }
     });
     await step("the picked row downloads with its series' other sites as fallbacks; the pinned row with none", async () => {
-      const csm = downloadsOf(CSM_URL)[0];
+      const csm = downloadsOf(CSM_PICK)[0];
       const kag = downloadsOf(KAG_URL)[0];
       if (!csm.includes("--multi-source") || !csm.includes("--multi-source-prefetched")) throw new Error(`csm args ${csm.join(" ")}`);
       if (kag.includes("--multi-source-prefetched")) throw new Error(`kag args ${kag.join(" ")}`);
       const p = prefetched();
       if (p.length !== 1) throw new Error(`${p.length} prefetched payloads`);
       const want = {
-        primary: { site: "mangadex", url: CSM_URL },
-        alternatives: [{ site: "mangafire", url: CSM_ALTS[0], title: "Chainsaw Man", cover: "https://mangafire.to/e2e.jpg" }, { site: "mangakatana", url: CSM_ALTS[1], title: "Chainsaw Man" }],
+        primary: { site: "mangafire", url: CSM_PICK },
+        alternatives: [{ site: "mangadex", url: CSM_URL, title: "Chainsaw Man" }, { site: "mangakatana", url: CSM_ALTS[1], title: "Chainsaw Man" }],
         title: "Chainsaw Man",
         year: 2018,
       };

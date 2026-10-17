@@ -452,6 +452,38 @@ function eq(label, actual, expected) {
     eq("nothing found / no row: nothing added", [F.rowQueueArgs({ candidates: [], multiSource: true }), F.rowQueueArgs(null)], [{}, {}]);
     const vr = F.findRows([{ key: "k", name: "F" }], { F: { ...row(), state: "done", skip: false } }, { aliases: [] })[0];
     eq("findRows carries what rowQueueArgs reads", [vr.pickUrl, vr.multiSource, F.rowQueueArgs(vr).prefetchedAlts.primary.site], [null, true, "mangadex"]);
+
+    // ── the picker (F2): Ready / Check match, sites in order, other matches ──
+    const tm = (title, ...scores) => ({ title, best: { url: `https://${title}/0` }, sources: scores.map((t, i) => ({ site: `s${i}`, url: `https://${title}/${i}`, titleMatch: t })) });
+    const R = (cands, o) => ({ candidates: cands, pickUrl: null, pinnedUrl: null, ...o });
+    eq("title score = the match's best site", [F.matchTitleScore(tm("a", 0.7, 0.9)), F.matchTitleScore(tm("a")), F.matchTitleScore({ sources: [{ titleMatch: null }] })], [0.9, null, null]);
+    eq(
+      "ready: >= 0.85 and a 0.10 lead (or no rival)",
+      [R([tm("a", 0.85)]), R([tm("a", 0.95), tm("b", 0.85)]), R([tm("a", 0.95), tm("b", 0.86)]), R([tm("a", 0.84)]), R([tm("a")]), R([])].map(F.matchReady),
+      [true, true, false, false, false, false],
+    );
+    const fv = F.findRows(
+      [{ key: "1", name: "sure" }, { key: "2", name: "close" }, { key: "3", name: "picked" }, { key: "4", name: "pinned" }, { key: "5", name: "skipped" }],
+      {
+        sure: { ...R([tm("a", 1), tm("b", 0.8)]), state: "done" },
+        close: { ...R([tm("a", 0.87), tm("b", 0.8)]), state: "done" },
+        picked: { ...R([tm("a", 0.87), tm("b", 0.8)], { pickUrl: "https://b/0" }), state: "done" },
+        pinned: { ...R([], { pinnedUrl: "https://pin/z" }), state: "done" },
+        skipped: { ...R([tm("a", 0.87), tm("b", 0.8)], { skip: true }), state: "done" },
+      },
+      { aliases: [] },
+    );
+    eq(
+      "[ready, confirmed, needsCheck, queueable]: a close call waits for the user",
+      fv.map((r) => [r.ready, r.confirmed, r.needsCheck, r.queueable]),
+      [[true, false, false, true], [false, false, true, false], [false, true, false, true], [false, true, false, true], [false, false, false, false]],
+    );
+    const sitesOf = (r) => F.rowSites(r).map((x) => [x.source.site, x.picked, x.fallback]);
+    eq("sites: picked + fallback ranks in search order", sitesOf(row({ pickUrl: "https://mangapill.test/x" })), [["mangadex", false, 1], ["mangafire", false, 2], ["mangakatana", false, 3], ["mangapill", true, null], ["mangahub", false, 4], ["atsumaru", false, 5]]);
+    eq("sites with fallback sites off: no ranks", sitesOf(row({ multiSource: false })).map((x) => x[2]), [null, null, null, null, null, null]);
+    eq("sites: the fallback ranks are rowQueueArgs' alternatives order", F.rowSites(row()).filter((x) => x.fallback).map((x) => x.source.site), altSites(F.rowQueueArgs(row())));
+    eq("sites: none when pinned or nothing found", [F.rowSites(row({ pinnedUrl: "https://p/1" })), F.rowSites({ candidates: [] })], [[], []]);
+    eq("other matches: every match but the picked one", [F.otherMatches(row()).map((c) => c.title), F.otherMatches(row({ pickUrl: "https://dynasty.test/x" })).map((c) => c.title)], [["Other", "Solo"], ["Chainsaw Man", "Solo"]]);
   }
 
   // ── one fallback payload for both tabs (src/lib/prefetchedAlts.js) ──

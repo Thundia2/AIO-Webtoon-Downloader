@@ -23,6 +23,11 @@
 // (summary.deviceOnly), each joined with its row when one exists; a folder
 // the runner hasn't seen yet reads "not searched".
 //
+// READY vs CHECK MATCH (F2, user choice 2026-10-17): Queue takes a row only
+// when the user has said which series it is (a pickUrl or a pin) or the
+// search was sure on its own (matchReady). A guessed series downloads a
+// whole wrong manga into the folder, so a doubtful row costs one click.
+//
 // LINKED is asked from the config, not remembered (U4-11): a folder the
 // target already holds an alias for (sync/service.js OPS["add-alias"]) was
 // queued before, so it shows the alias URL and can't be queued twice. The
@@ -87,6 +92,58 @@ export function rowQueueArgs(row) {
   return args;
 }
 
+// The search orchestrator's own cut-offs for "this title match is strong"
+// (sites/search_orchestrator.py EXPENSIVE_PROBE_QUICK_THRESHOLD) and "these
+// two are too close to call on title alone" (TIEBREAKER_WINDOW). Copied, not
+// read: the runner gets only the search JSON. Keep in sync by grep.
+const READY_TITLE_MATCH = 0.85;
+const READY_LEAD = 0.1;
+
+/** A match's title score: its best site's (the search ranks matches by it). null when unknown. */
+export function matchTitleScore(c) {
+  let best = null;
+  for (const s of (c && c.sources) || []) if (s && typeof s.titleMatch === "number" && (best == null || s.titleMatch > best)) best = s.titleMatch;
+  return best;
+}
+
+/**
+ * The search was sure on its own: match 0 scores >= READY_TITLE_MATCH and
+ * leads match 1 by >= READY_LEAD (or has no rival). A row searched before
+ * titleMatch was recorded is never ready (unknown is not sure).
+ */
+export function matchReady(row) {
+  const list = (row && row.candidates) || [];
+  const top = matchTitleScore(list[0]);
+  if (top == null || top < READY_TITLE_MATCH) return false;
+  const next = list.length > 1 ? matchTitleScore(list[1]) : null;
+  // 1e-9: 0.95 - 0.85 is 0.0999… in floating point.
+  return next == null || top - next >= READY_LEAD - 1e-9;
+}
+
+/**
+ * The picked match's sites in search order for the picker, each with
+ * `picked` and its fallback rank (1-based, the order the download tries
+ * them) when the row's search ran with fallback sites on, else null.
+ * [] when pinned or nothing was found.
+ */
+export function rowSites(row) {
+  const c = rowCandidate(row);
+  const picked = rowSource(row);
+  if (!c || !picked) return [];
+  let n = 0;
+  return (c.sources || []).filter(Boolean).map((s) => {
+    const isPicked = s.url === picked.url;
+    if (!isPicked) n += 1;
+    return { source: s, picked: isPicked, fallback: !isPicked && row.multiSource === true ? n : null };
+  });
+}
+
+/** The row's other series matches (not the picked one), in search order. */
+export function otherMatches(row) {
+  const c = rowCandidate(row);
+  return ((row && row.candidates) || []).filter((x) => x && x !== c);
+}
+
 /** The target's alias for a device folder, or null. */
 export function aliasFor(target, folder) {
   const list = (target && Array.isArray(target.aliases) && target.aliases) || [];
@@ -105,6 +162,11 @@ export function findRows(items, rowsByFolder, target) {
     const alias = aliasFor(target, d.name);
     const url = rowUrl(r);
     const skip = !!(r && r.skip);
+    // confirmed: the user named the series (a pick or a pin). ready: the
+    // search was sure. needsCheck: found, but neither, so Queue skips it.
+    const confirmed = !!(r && (r.pinnedUrl || r.pickUrl));
+    const ready = !!(r && !r.pinnedUrl && matchReady(r));
+    const needsCheck = !!url && !confirmed && !ready && !skip && !alias;
     return {
       key: d.key,
       folder: d.name,
@@ -118,7 +180,10 @@ export function findRows(items, rowsByFolder, target) {
       skip,
       url,
       linked: alias ? alias.url || alias.identityKey || alias.pcFolder || "" : null,
-      queueable: !skip && !alias && !!url,
+      confirmed,
+      ready,
+      needsCheck,
+      queueable: !skip && !alias && !!url && (confirmed || ready),
     };
   });
 }

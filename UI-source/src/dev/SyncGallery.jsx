@@ -109,7 +109,7 @@ const TAB_CASES = [
   { id: "tab-disconnected", title: "Tab: disconnected", spec: { tab: "disconnected" } },
   { id: "tab-needs-mode", title: "Tab: needs a verify mode (adb)", spec: { tab: "needsMode" } },
   { id: "tab-none", title: "Tab: no targets", spec: { tab: "planned", mutate: (s) => { s.config.targets = []; } } },
-  { id: "tab-find", title: "Tab: find sources", note: "Recorded rows (synthetic search results): an error, a found source, nothing found. Search replays them; Queue links then queues (a no-op here).", spec: { tab: "planned" }, initial: { find: true } },
+  { id: "tab-find", title: "Tab: find sources", note: "Recorded rows (synthetic search results): an error, a Ready match on six sites, nothing found, and a close call that reads Check match. A source chip opens every site of the series; Search replays them; Queue links then queues (a no-op here).", spec: { tab: "planned" }, initial: { find: true } },
   {
     id: "tab-find-linked",
     title: "Tab: find sources, one folder linked",
