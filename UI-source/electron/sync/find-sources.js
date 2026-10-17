@@ -51,8 +51,18 @@ const BLOCKED_POLL_MS = 2000;
 const FILE = "find-sources.json";
 const ROW_PATCH_KEYS = Object.freeze(["query", "pick", "pinnedUrl", "skip", "include"]);
 
-function _searchOptions(settings, seededOnly) {
+/**
+ * The Search tab's options for one batch row, from the SAVED settings only:
+ * the sheet has no per-run override (it links to Settings → Search). Every
+ * searchOpts default equals aio-dl.py's argparse default, so an absent key
+ * may stay absent, except seededOnly: the renderer defaults it ON
+ * (SettingsTab DEFAULT_SEARCH_OPTS, SearchTab DEFAULT_OPTS) while the CLI's
+ * default is off, so a user who never saved search settings would otherwise
+ * search every site here and only curated ones on the Search tab.
+ */
+function _searchOptions(settings) {
   const s = settings || {};
+  const so = s.searchOpts || {};
   let parallelism;
   try {
     const { searchParallelismForLevel } = require("../resource-limits");
@@ -61,10 +71,10 @@ function _searchOptions(settings, seededOnly) {
     parallelism = s.searchOpts ? s.searchOpts.searchParallelism : undefined;
   }
   return {
-    ...(s.searchOpts || {}),
+    ...so,
+    seededOnly: so.seededOnly !== false,
     collapseSplits: s.collapseSplits === true,
     ...(Array.isArray(s.disabledSites) && s.disabledSites.length ? { disabledSites: s.disabledSites } : {}),
-    ...(seededOnly != null ? { seededOnly: !!seededOnly } : {}),
     searchParallelism: parallelism,
   };
 }
@@ -208,10 +218,10 @@ class FindSources {
    * folders), then run every included, unskipped row that isn't done,
    * limited to `only` when given. Resolves once the run has started; the
    * service doesn't await the run (find events carry the progress).
-   * @param {{targetId:string, folders:string[], only?:string[], seededOnly?:boolean}} a
+   * @param {{targetId:string, folders:string[], only?:string[]}} a
    * @returns {Promise<{ok:true, started:boolean}|{ok:false, code:string, message:string}>}
    */
-  async start({ targetId, folders, only, seededOnly }) {
+  async start({ targetId, folders, only }) {
     if (this.run) return { ok: false, code: "busy", message: "a find-sources run is already going" };
     const m = await this._reconcile(targetId, folders);
     const pick = Array.isArray(only) ? new Set(only) : null;
@@ -224,11 +234,11 @@ class FindSources {
     this.run = run;
     this.searcher = this.makeSearcher();
     this.emit({ targetId, state: "running", done: 0, total: run.total });
-    this._loop(run, todo, seededOnly).catch(() => {});
+    this._loop(run, todo).catch(() => {});
     return { ok: true, started: true };
   }
 
-  async _loop(run, todo, seededOnly) {
+  async _loop(run, todo) {
     try {
       for (const row of todo) {
         if (run.cancelled) break;
@@ -239,7 +249,7 @@ class FindSources {
         this.emit({ targetId: run.targetId, state: "running", done: run.done, total: run.total, row: { ...row } });
         try {
           const settings = this.getSettings() || {};
-          const json = await this.searcher.runSearch({ ...this.spawnPaths(settings), query: row.query, opts: _searchOptions(settings, seededOnly) });
+          const json = await this.searcher.runSearch({ ...this.spawnPaths(settings), query: row.query, opts: _searchOptions(settings) });
           row.candidates = compactCandidates(json);
           row.state = "done";
           if (row.pick == null || row.pick >= row.candidates.length) row.pick = row.candidates.length ? 0 : null;

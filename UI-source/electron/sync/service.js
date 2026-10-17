@@ -2357,7 +2357,7 @@ function initDeviceSync(deps) {
     // Rows follow ALL device-only folders; `folders` only narrows the run.
     const folders = rt.plan.deviceOnly.map((d) => d.name);
     const only = Array.isArray(p.folders) ? p.folders.map(String) : undefined;
-    const r = await findSources.start({ targetId: t.id, folders, only, seededOnly: p.seededOnly });
+    const r = await findSources.start({ targetId: t.id, folders, only });
     if (!r.ok) return refuse(r.code === "busy" ? "busy" : "invalid", r.message);
     return { ok: true, started: r.started };
   };

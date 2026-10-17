@@ -2497,7 +2497,11 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
 
   // ── Search › Search Options ──
   // Same settings.searchOpts namespace SearchTab reads/writes; the two surfaces
-  // stay in sync on every change.
+  // stay in sync on every change. "Collapse split chapters" is the top-level
+  // settings.collapseSplits (it shapes downloads too, so it isn't in
+  // searchOpts); SearchTab's inline toggle writes the same key. Device Sync's
+  // find-sources searches with exactly these saved values (electron/sync/
+  // find-sources.js _searchOptions) and links here instead of overriding them.
   const renderSearch = () => (
     <div className="grid grid-cols-2 gap-x-6 gap-y-3">
       <div>
@@ -2534,6 +2538,20 @@ export default function SettingsTab({ settings, onSave, searchSiteHealth = {}, i
         <Switch
           checked={!!local.searchOpts?.multiSource}
           onCheckedChange={(v) => setSearchOpt("multiSource", v)}
+        />
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex-1">
+          <Label className="text-xs cursor-pointer">Collapse split chapters</Label>
+          <p className="text-[10px] text-muted-foreground mt-0.5">
+            Merge X.1/X.2/X.3 splits and drop fragment uploads, in search
+            counts and downloads
+          </p>
+        </div>
+        <Switch
+          // `=== true`: absent means off, like every spawn site reads it.
+          checked={local.collapseSplits === true}
+          onCheckedChange={(v) => set("collapseSplits", v)}
         />
       </div>
       {local.searchOpts?.multiSource && (

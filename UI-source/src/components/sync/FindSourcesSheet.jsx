@@ -29,8 +29,8 @@
 // ============================================================
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Download, Link2, Loader2, Pin, Search, X } from "lucide-react";
-import { Button, Checkbox, Input, Switch } from "@/components/ui/primitives";
+import { AlertTriangle, Download, Link2, Loader2, Pin, Search, Settings2, X } from "lucide-react";
+import { Button, Checkbox, Input } from "@/components/ui/primitives";
 import { Sheet } from "@/components/ui/overlay";
 import { cn } from "@/lib/utils";
 import { Cover } from "./Ledger";
@@ -185,17 +185,27 @@ function FindRow({ row, cover, busy, result, onPatch, onUnlink }) {
   );
 }
 
+/** What the batch searches with, from the saved settings (absent = the defaults). */
+function searchLine(s) {
+  const o = s || {};
+  const sites = o.seededOnly === false ? "all sites" : "curated sites only";
+  const collapse = o.collapseSplits === true ? "split chapters collapsed" : "split chapters kept";
+  return `Your search settings: ${sites} · ${collapse}`;
+}
+
 /**
  * @param {object} p
  * @param {boolean} p.open
  * @param {object} p.target      the config target (name, profile, aliases)
  * @param {Array} p.items        summary.deviceOnly (with `query`, U4-1)
- * @param {boolean} [p.defaultSeeded]  the Search tab's "curated sites only"
+ * @param {{seededOnly?:boolean, collapseSplits?:boolean}} [p.searchSettings]  the SAVED
+ *   search settings, shown only: the search itself runs with them in main
+ *   (find-sources.js _searchOptions), with no per-run override
+ * @param {() => void} [p.onOpenSearchSettings]  App: Settings → Search
  * @param {(url:string, args:object) => any} p.onQueueDownload  App: dl.queueDownload with the download defaults
  */
-export default function FindSourcesSheet({ open, onClose, target, tn, items, wide, contained, sync, ops, defaultSeeded, onQueueDownload }) {
+export default function FindSourcesSheet({ open, onClose, target, tn, items, wide, contained, sync, ops, searchSettings, onOpenSearchSettings, onQueueDownload }) {
   const tid = target ? target.id : null;
-  const [seeded, setSeeded] = useState(!!defaultSeeded);
   const [covers, setCovers] = useState({});
   const [results, setResults] = useState({});
   const [busyRows, setBusyRows] = useState(false);
@@ -206,7 +216,6 @@ export default function FindSourcesSheet({ open, onClose, target, tn, items, wid
     if (!open || !tid) return;
     setResults({});
     setRefusal(null);
-    setSeeded(!!defaultSeeded);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, tid]);
   // Covers are per target (folder names repeat across targets).
@@ -264,7 +273,7 @@ export default function FindSourcesSheet({ open, onClose, target, tn, items, wid
   };
   const startSearch = async () => {
     setRefusal(null);
-    const r = await sync.actions.findSourcesStart({ targetId: tid, folders: toSearch.map((x) => x.folder), seededOnly: seeded });
+    const r = await sync.actions.findSourcesStart({ targetId: tid, folders: toSearch.map((x) => x.folder) });
     if (r && r.ok === false) setRefusal(r);
   };
 
@@ -317,11 +326,15 @@ export default function FindSourcesSheet({ open, onClose, target, tn, items, wid
       }
     >
       <div className="flex items-center gap-3 border-b px-4 py-2.5">
-        <label className="flex items-center gap-2 text-xs">
-          <Switch checked={seeded} onCheckedChange={setSeeded} disabled={runningHere} />
-          Only sites with measured quality
-        </label>
-        <span className="flex-1" />
+        <span className="min-w-0 flex-1 text-[11.5px] leading-snug text-muted-foreground">
+          {searchLine(searchSettings)}
+        </span>
+        {onOpenSearchSettings && (
+          <Button size="sm" variant="ghost" className={XS} onClick={onOpenSearchSettings}>
+            <Settings2 aria-hidden="true" />
+            Search settings
+          </Button>
+        )}
         {runningHere ? (
           <Button size="sm" variant="outline" className={XS} onClick={() => sync.actions.findSourcesCancel({})}>
             <X aria-hidden="true" />

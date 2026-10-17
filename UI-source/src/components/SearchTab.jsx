@@ -577,9 +577,9 @@ export default function SearchTab({
 
           {/* Collapse split chapters — global setting (settings.collapseSplits),
               moved out of opts in 2026-05-08 because it now affects download
-              behavior too. SettingsTab → "Default Chapter Behavior" mirrors
-              this same toggle; the global state stays in sync regardless of
-              which surface the user changes it from. Always visible (not
+              behavior too. Settings → Search mirrors this same toggle
+              (SettingsTab renderSearch); the global state stays in sync
+              regardless of which surface the user changes it from. Always visible (not
               gated on multi-source) since downloads are affected too.
               2026-05-27: flipped to OPT-IN — checked = strictly true.
               `=== true` (not `!== false`) so undefined/null defaults to OFF;

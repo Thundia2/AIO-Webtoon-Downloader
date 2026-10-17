@@ -361,7 +361,7 @@ export default function App() {
               libraryEntries={dl.libraryEntries}
               loadLibrary={dl.loadLibrary}
               onOpenSettings={(category) => {
-                setSettingsCategory(category === "general" ? "general" : "sync");
+                setSettingsCategory(category === "general" || category === "search" ? category : "sync");
                 setActiveTab("settings");
               }}
               onFindSource={(f) => {
@@ -369,7 +369,7 @@ export default function App() {
                 setActiveTab("search");
               }}
               onQueueDownload={(url, args) => dl.queueDownload(url, { ...(dl.settings?.defaults || {}), ...args })}
-              findSeeded={!!dl.settings?.searchOpts?.seededOnly}
+              searchSettings={{ seededOnly: dl.settings?.searchOpts?.seededOnly, collapseSplits: dl.settings?.collapseSplits }}
             />
           )}
           {activeTab === "settings" && (

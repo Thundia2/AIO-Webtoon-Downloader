@@ -85,8 +85,9 @@ class FakeSearcher {
     this.ctl = ctl;
     this.pending = null;
   }
-  runSearch({ query }) {
+  runSearch({ query, opts }) {
     this.ctl.calls.push(query);
+    this.ctl.opts.push(opts || null);
     return new Promise((resolve, reject) => {
       this.pending = { resolve, reject };
       if (this.ctl.mode === "auto") {
@@ -142,7 +143,7 @@ async function app(o = {}) {
     searching: false,
     downloads: [],
     settings: { syncEnabled: o.enabled !== false, cpuLimit: "unlimited", ...(o.settings || {}) },
-    search: { mode: "auto", calls: [], nowCalls: 0, result: searchResult, fail: null },
+    search: { mode: "auto", calls: [], opts: [], nowCalls: 0, result: searchResult, fail: null },
     saved: [],
   };
   fs.mkdirSync(a.lib, { recursive: true });
@@ -2083,6 +2084,36 @@ test("R12 list edits name the entry: entry removes, a missing entry is a no-op, 
     assert.ok((await a.call("config-op", { op: "edit-list", targetId: id, field: "only", add: { pcFolder: "B" } })).ok);
     assert.ok((await a.call("config-op", { op: "edit-list", targetId: id, field: "only", remove: { pcFolder: "A" } })).ok);
     assert.deepStrictEqual((await a.state()).config.targets[0].only, [{ pcFolder: "B" }]);
+  } finally {
+    await a.close();
+  }
+});
+
+// The find-sources sheet has no per-run switch: it searches with the SAVED
+// search settings (find-sources.js _searchOptions) and links to Settings →
+// Search. seededOnly absent = ON, the renderer's default.
+test("find-sources searches with the saved search settings: seededOnly absent = curated, collapse and disabled sites ride along, a renderer override is ignored", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Mu", { "Ch.001.cbz": 1000 });
+    fs.mkdirSync(path.join(a.dir, "device", "Nu"), { recursive: true });
+    fs.writeFileSync(path.join(a.dir, "device", "Nu", "Ch.001.cbz"), "x");
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const run = async (settings, extra = {}) => {
+      a.settings = { ...a.settings, searchOpts: undefined, collapseSplits: undefined, disabledSites: undefined, ...settings };
+      await a.call("find-sources:update-row", { targetId: id, folder: "Nu", patch: { query: `Nu ${a.search.opts.length}` } });
+      const from = a.since();
+      const n = a.search.opts.length;
+      assert.ok((await a.call("find-sources:start", { targetId: id, ...extra })).ok);
+      await a.waitEvent((e) => e.kind === "find" && e.state === "done", 8000, from, "done");
+      assert.strictEqual(a.search.opts.length, n + 1, "one search");
+      return a.search.opts[n];
+    };
+    let o = await run({});
+    assert.deepStrictEqual([o.seededOnly, o.collapseSplits, "disabledSites" in o], [true, false, false], JSON.stringify(o));
+    o = await run({ searchOpts: { seededOnly: false, searchTimeout: 30 }, collapseSplits: true, disabledSites: ["asura"] }, { seededOnly: true });
+    assert.deepStrictEqual([o.seededOnly, o.collapseSplits, o.searchTimeout, o.disabledSites], [false, true, 30, ["asura"]], "saved values win; the request's seededOnly is ignored");
   } finally {
     await a.close();
   }

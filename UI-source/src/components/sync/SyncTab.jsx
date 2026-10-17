@@ -105,9 +105,10 @@ function useNow(active) {
  *   open at mount (the DEV gallery's seam; App never passes it).
  *   onFindSource({targetId, targetName, folder, query}) = single find (U4-6);
  *   onQueueDownload(url, args) = App's queueDownload with the download
- *   defaults; findSeeded = the Search tab's "curated sites only".
+ *   defaults; searchSettings = the saved {seededOnly, collapseSplits} the
+ *   find-sources sheet names (and links to via onOpenSettings("search")).
  */
-export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibrary, view: viewProp, onView, contained, initial, onFindSource, onQueueDownload, findSeeded }) {
+export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibrary, view: viewProp, onView, contained, initial, onFindSource, onQueueDownload, searchSettings }) {
   const [wide, rootRef] = useWide();
   const [localView, setLocalView] = useState(EMPTY_VIEW);
   const view = viewProp || localView;
@@ -543,7 +544,8 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
         contained={contained}
         sync={sync}
         ops={ops}
-        defaultSeeded={findSeeded}
+        searchSettings={searchSettings}
+        onOpenSearchSettings={onOpenSettings ? () => onOpenSettings("search") : undefined}
         onQueueDownload={onQueueDownload || (() => Promise.reject(new Error("downloads aren't available here")))}
       />
       <PruneDialog open={pruneOpen} onClose={() => setPruneOpen(false)} targetId={tid} tn={tn} items={deviceOnly} contained={contained} sync={sync} onAction={onAction} />
