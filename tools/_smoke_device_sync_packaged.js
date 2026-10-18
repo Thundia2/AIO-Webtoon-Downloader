@@ -36,6 +36,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
+const { launchApp } = require("./_e2e_launch");
 
 const argv = process.argv.slice(2);
 const opt = (k) => {
@@ -48,7 +49,6 @@ if (!EXE || !fs.existsSync(EXE)) {
   process.exit(1);
 }
 const PY = opt("--python") || "python";
-const { _electron } = require(process.env.PLAYWRIGHT_PATH || "playwright");
 
 let failures = 0;
 function check(label, ok, detail) {
@@ -104,8 +104,6 @@ async function launch(label, quit) {
   const DEV = path.join(TMP, "device");
   const PIDS = path.join(TMP, "pids");
   for (const d of [UD, LIB, DEV, PIDS]) fs.mkdirSync(d, { recursive: true });
-  fs.mkdirSync(path.join(UD, "python-env"), { recursive: true });
-  fs.writeFileSync(path.join(UD, "python-env", ".setup-complete"), "smoke");
   const fakeSearch = path.join(TMP, "fake_search.py");
   fs.writeFileSync(fakeSearch, FAKE_SEARCH);
   fs.writeFileSync(path.join(UD, "settings.json"), JSON.stringify({ syncEnabled: true, pythonCmd: PY, scriptPath: fakeSearch, workingDir: TMP }));
@@ -115,13 +113,10 @@ async function launch(label, quit) {
   series(LIB, "Beta", 2, 4 << 20);
   writeOld(path.join(DEV, "Old One", "a.cbz"), "a");
 
-  const env = { ...process.env, AIO_OUTPUT_DIR: LIB, AIO_SMOKE_PIDS: PIDS };
-  delete env.ELECTRON_RUN_AS_NODE;
-  delete env.NODE_ENV;
-  const app = await _electron.launch({ executablePath: EXE, args: [`--user-data-dir=${UD}`], env, timeout: 60_000 });
+  // launchApp pre-marks the profile set up (python-env/.setup-complete) and
+  // checks the window shows the asar's dist.
+  const { app, win } = await launchApp({ exe: EXE, userDataDir: UD, env: { AIO_OUTPUT_DIR: LIB, AIO_SMOKE_PIDS: PIDS } });
   const exited = new Promise((r) => app.process().on("exit", (c, s) => r({ c, s })));
-  const win = await app.firstWindow();
-  await win.waitForFunction(() => !!window.electronAPI && document.querySelector("#root") && document.querySelector("#root").children.length > 0, null, { timeout: 30_000 });
   const userData = await app.evaluate(({ app: a }) => a.getPath("userData"));
   check("userData is the temp profile", path.resolve(userData) === path.resolve(UD), userData);
   check("packaged", await app.evaluate(({ app: a }) => a.isPackaged));

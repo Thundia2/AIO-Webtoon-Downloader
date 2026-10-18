@@ -1,11 +1,13 @@
 // Dev-app smoke for the Device Sync integration, with sync OFF (plan P4).
-// Run: node tools/_smoke_device_sync_dev.js [--app <UI-source dir>] [--baseline] [--python <exe>]
-//   Linux without a display: prefix with `xvfb-run -a`. Needs UI-source/dist (npm run build).
+// Run: node tools/_smoke_device_sync_dev.js [--app <UI-source dir>] [--baseline] [--python <exe>] [--renderer dist|dev] [--no-build]
+//   Linux without a display: prefix with `xvfb-run -a`. Renderer flags:
+//   tools/_e2e_launch.js (dist is built first by default).
 //   PLAYWRIGHT_PATH overrides where `playwright` is required from (on the
 //   Windows PC it lives only in the npx cache: %LOCALAPPDATA%\npm-cache\_npx\<hash>\node_modules\playwright).
 //
-// Launches the real dev app (electron + UI-source, renderer from dist/) with
-// an isolated userData and library (AIO_OUTPUT_DIR), then:
+// Launches the real dev app (electron + UI-source, renderer checked by
+// tools/_e2e_launch.js) with an isolated userData and library
+// (AIO_OUTPUT_DIR), then:
 //   1. after one UI Save on the fresh profile, settings load with 0 changed
 //      ("Up to date") and Save round-trips;
 //   2. a series merge works, dry run then real;
@@ -36,6 +38,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawn } = require("child_process");
+const { cliOptions, launchApp, waitReady } = require("./_e2e_launch");
 
 const argv = process.argv.slice(2);
 const opt = (k) => {
@@ -43,11 +46,8 @@ const opt = (k) => {
   return i >= 0 ? argv[i + 1] : null;
 };
 const BASELINE = argv.includes("--baseline");
-const REPO = path.resolve(__dirname, "..");
-const APP = path.resolve(opt("--app") || path.join(REPO, "UI-source"));
+const LAUNCH = cliOptions(argv);
 const WIN = process.platform === "win32";
-const ELECTRON = path.join(APP, "node_modules", "electron", "dist", process.platform === "darwin" ? "Electron.app/Contents/MacOS/Electron" : WIN ? "electron.exe" : "electron");
-const { _electron } = require(process.env.PLAYWRIGHT_PATH || "playwright");
 
 let failures = 0;
 function check(label, ok, detail) {
@@ -81,19 +81,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     fs.writeFileSync(path.join(dir, `Ch.00${ch}.cbz`), ch);
   }
 
-  const env = { ...process.env, XDG_CONFIG_HOME: CFG, AIO_OUTPUT_DIR: LIB };
-  delete env.ELECTRON_RUN_AS_NODE;
-  delete env.NODE_ENV;
-  const args = ["--no-sandbox", `--user-data-dir=${CFG}`, APP];
-  console.log(`app: ${APP}${BASELINE ? " (baseline)" : ""}`);
-
-  const app = await _electron.launch({ executablePath: ELECTRON, args, env, timeout: 60_000 });
-  let stderr = "";
-  app.process().stderr.on("data", (d) => (stderr += d));
-  app.process().stdout.on("data", (d) => (stderr += d));
-  const win = await app.firstWindow();
-  await win.waitForLoadState("domcontentloaded");
-  await win.waitForFunction(() => !!window.electronAPI && document.querySelector("#root") && document.querySelector("#root").children.length > 0, null, { timeout: 30_000 });
+  if (BASELINE) console.log("baseline run");
+  // executablePath/args/env: step 3 starts a second instance with them.
+  const { app, win, output, executablePath, args, env } = await launchApp({ ...LAUNCH, userDataDir: CFG, env: { XDG_CONFIG_HOME: CFG, AIO_OUTPUT_DIR: LIB } });
   const userData = await app.evaluate(({ app: a }) => a.getPath("userData"));
   check("isolated userData", userData.startsWith(CFG), userData);
 
@@ -113,7 +103,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await win.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => /Up to date/.test(b.textContent)), null, { timeout: 15_000 });
   }
   await win.reload();
-  await win.waitForFunction(() => !!window.electronAPI && document.querySelector("#root") && document.querySelector("#root").children.length > 0, null, { timeout: 30_000 });
+  await waitReady(win);
   await openSettings();
   const label = (await saveLabel().textContent()).trim();
   check("settings load with 0 changed", /Up to date/.test(label), label);
@@ -123,7 +113,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check("save answers ok", saved && saved.ok === true, JSON.stringify(saved));
   check("Save round-trips", JSON.stringify(after) === JSON.stringify(before));
   await win.reload();
-  await win.waitForFunction(() => !!window.electronAPI && document.querySelector("#root") && document.querySelector("#root").children.length > 0, null, { timeout: 30_000 });
+  await waitReady(win);
   await openSettings();
   const label2 = (await saveLabel().textContent()).trim();
   check("still 0 changed after the round-trip", /Up to date/.test(label2), label2);
@@ -146,7 +136,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await sleep(500);
     const minimized = await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].isMinimized());
     const t0 = Date.now();
-    const second = spawn(ELECTRON, args, { env, stdio: "ignore" });
+    const second = spawn(executablePath, args, { env, stdio: "ignore" });
     const code = await new Promise((r) => {
       const t = setTimeout(() => {
         second.kill("SIGKILL");
@@ -173,7 +163,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // 5. inert while off (before step 6 turns sync on)
   check("no userData/sync/", !fs.existsSync(path.join(userData, "sync")));
-  check("no [deviceSync] line in main's output", !/\[deviceSync\]/.test(stderr), stderr.split("\n").filter((l) => /deviceSync/.test(l)).join(" | "));
+  check("no [deviceSync] line in main's output", !/\[deviceSync\]/.test(output()), output().split("\n").filter((l) => /deviceSync/.test(l)).join(" | "));
 
   // 6. sync on, then off, through the UI. The rail is App.jsx's w-16 <nav>;
   // SettingsTab's category list is the other <nav>.

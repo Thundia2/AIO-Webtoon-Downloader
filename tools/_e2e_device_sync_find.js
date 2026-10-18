@@ -1,9 +1,10 @@
 // E2E for find-sources and the Library sync chip (UI pass U4) on the real dev
 // app with a FOLDER target that holds folders the PC library doesn't have.
-// Run: node tools/_e2e_device_sync_find.js [--app <UI-source dir>] [--exe <packaged exe>]
-//   Same prerequisites as tools/_e2e_device_sync_tab.js (UI-source/dist from
-//   `npm run build`, Playwright via PLAYWRIGHT_PATH). Needs a `python` on
-//   PATH (or PYTHON=<exe>) to run the fake backend below.
+// Run: node tools/_e2e_device_sync_find.js [--app <UI-source dir>] [--exe <packaged exe>] [--renderer dist|dev] [--no-build]
+//   Same prerequisites as tools/_e2e_device_sync_tab.js (Playwright via
+//   PLAYWRIGHT_PATH; the renderer flags are tools/_e2e_launch.js's, which
+//   builds dist first by default). Needs a `python` on PATH (or
+//   PYTHON=<exe>) to run the fake backend below.
 //
 // FAKE BACKEND. Search and download both spawn `<pythonCmd> -u <scriptPath>
 // …` (searcher.js / downloader.js), so the run points scriptPath at a tiny
@@ -28,26 +29,20 @@
 //      which downloader.js deletes when the process exits); the pinned row
 //      adds neither.
 //   2. single: a row's Find source → Search tab with the banner, the search
-//      already run → Download → Queue: alias recorded, banner gone, Queue tab
+//      already run exactly once (a second, StrictMode-doubled search once hid
+//      the results) → Download → Queue: alias recorded, banner gone, Queue tab
 //   3. Library: the chip on a series with chapters to copy, the detail's
 //      sync line, Open in Sync opens that series on the Sync tab
 "use strict";
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { cliOptions, launchApp } = require("./_e2e_launch");
 
 const argv = process.argv.slice(2);
-const opt = (k) => {
-  const i = argv.indexOf(k);
-  return i >= 0 ? argv[i + 1] : null;
-};
 const REPO = path.resolve(__dirname, "..");
-const APP = path.resolve(opt("--app") || path.join(REPO, "UI-source"));
-const EXE = opt("--exe") ? path.resolve(opt("--exe")) : null;
-const WIN = process.platform === "win32";
-const ELECTRON = path.join(APP, "node_modules", "electron", "dist", process.platform === "darwin" ? "Electron.app/Contents/MacOS/Electron" : WIN ? "electron.exe" : "electron");
+const LAUNCH = cliOptions(argv);
 const PYTHON = process.env.PYTHON || "python";
-const { _electron } = require(process.env.PLAYWRIGHT_PATH || "playwright");
 
 let failures = 0;
 function check(label, ok, detail) {
@@ -187,24 +182,7 @@ sys.exit(0)
     AIO_E2E_FAKE_SEARCH: JSON.stringify(FAKE_SEARCH),
     AIO_E2E_FAKE_DOWNLOADS: JSON.stringify(FAKE_DOWNLOADS),
   };
-  delete env.ELECTRON_RUN_AS_NODE;
-  delete env.NODE_ENV;
-  if (EXE) {
-    fs.mkdirSync(path.join(CFG, "python-env"), { recursive: true });
-    fs.writeFileSync(path.join(CFG, "python-env", ".setup-complete"), "e2e");
-  }
-  console.log(`app: ${EXE || APP}`);
-  const app = await _electron.launch(
-    EXE
-      ? { executablePath: EXE, args: [`--user-data-dir=${CFG}`], env, timeout: 60_000 }
-      : { executablePath: ELECTRON, args: ["--no-sandbox", `--user-data-dir=${CFG}`, APP], env, timeout: 60_000 }
-  );
-  let out = "";
-  app.process().stderr.on("data", (d) => (out += d));
-  app.process().stdout.on("data", (d) => (out += d));
-  const win = await app.firstWindow();
-  await win.waitForLoadState("domcontentloaded");
-  await win.waitForFunction(() => !!window.electronAPI && document.querySelector("#root") && document.querySelector("#root").children.length > 0, null, { timeout: 30_000 });
+  const { app, win, output } = await launchApp({ ...LAUNCH, userDataDir: CFG, env });
   const userData = await app.evaluate(({ app: a }) => a.getPath("userData"));
   check("isolated userData", userData.startsWith(CFG), userData);
 
@@ -389,7 +367,12 @@ sys.exit(0)
       await win.locator('[data-testid="find-banner"]').getByText("Dandadan").first().waitFor();
       await win.getByRole("heading", { name: "Dandadan" }).waitFor({ timeout: 30_000 });
     });
-    check("the single search used the folder's query", calls().some((a) => a.includes("--search") && a.includes("Dandadan")));
+    // A late answer from a replaced search used to hide the results about a
+    // second after they showed, so count the searches and look again.
+    await win.waitForTimeout(1000);
+    const danSearches = calls().filter((a) => a.includes("--search") && a.includes("Dandadan")).length;
+    check("the single search ran exactly once, with the folder's query", danSearches === 1, `${danSearches} searches`);
+    check("its results are still shown a second later", (await win.getByRole("heading", { name: "Dandadan" }).count()) > 0);
     await step("Download → Queue links, queues, clears the banner", async () => {
       await win.getByRole("button", { name: "Download" }).first().click();
       // The rail's Queue tab button shares the name; the dialog's isn't in nav.
@@ -435,7 +418,7 @@ sys.exit(0)
   } catch (e) {
     if (!failures) check("e2e", false, e && e.stack);
   } finally {
-    const errs = out.split("\n").filter((l) => /\[deviceSync\].*(error|internal)/i.test(l));
+    const errs = output().split("\n").filter((l) => /\[deviceSync\].*(error|internal)/i.test(l));
     check("no internal sync errors in main's log", !errs.length, errs.slice(0, 3).join(" | "));
     await app.close().catch(() => {});
     fs.rmSync(TMP, { recursive: true, force: true });

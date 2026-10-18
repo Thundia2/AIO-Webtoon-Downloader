@@ -139,6 +139,18 @@ test("runSearch's own cancel-previous path: the old process's late close stays c
   assert.strictEqual(r2.status, "fulfilled");
 });
 
+// The renderer passes its own request id (hooks/useSearch.js) and drops log
+// lines carrying any other id, so the id must reach every line.
+test("a passed searchId is the id on every log line; without one the Searcher mints its own", async () => {
+  const ids = [];
+  const s = new Searcher({ onLog: (id) => ids.push(id) });
+  await s.runSearch({ pythonCmd: PY, scriptPath: SCRIPT, workingDir: TMP, query: "ok", opts: {}, searchId: "srch_r7_123" });
+  assert.ok(ids.length > 0 && ids.every((id) => id === "srch_r7_123"), JSON.stringify(ids));
+  ids.length = 0;
+  await run(s, "ok");
+  assert.ok(ids.length > 0 && ids.every((id) => /^srch_\d+_\d+$/.test(id)), JSON.stringify(ids));
+});
+
 test("cancel after the child exited (close still pending) returns false and the result stands", async () => {
   const s = mkSearcher();
   const p = run(s, "held");

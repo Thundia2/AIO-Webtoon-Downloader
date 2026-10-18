@@ -1,10 +1,11 @@
 // E2E for the Sync tab (UI pass U2) on the real dev app with a FOLDER target.
-// Run: node tools/_e2e_device_sync_tab.js [--app <UI-source dir>] [--exe <packaged exe>]
+// Run: node tools/_e2e_device_sync_tab.js [--app <UI-source dir>] [--exe <packaged exe>] [--renderer dist|dev] [--no-build]
 //   --exe runs the same flows on a packaged build (electron-builder --dir;
 //   see tools/_smoke_device_sync_packaged.js for the command). Its temp
 //   profile is pre-marked set up (python-env/.setup-complete), as that smoke
 //   does, so the first-run wizard doesn't download Python.
-//   Needs UI-source/dist (npm run build) and Playwright (PLAYWRIGHT_PATH, as
+//   Renderer flags: tools/_e2e_launch.js (dist is built first by default).
+//   Needs Playwright (PLAYWRIGHT_PATH, as
 //   tools/_smoke_device_sync_dev.js documents; on this PC it lives in the npx
 //   cache). Linux without a display: prefix with `xvfb-run -a`.
 //
@@ -34,18 +35,11 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { cliOptions, launchApp, waitReady } = require("./_e2e_launch");
 
 const argv = process.argv.slice(2);
-const opt = (k) => {
-  const i = argv.indexOf(k);
-  return i >= 0 ? argv[i + 1] : null;
-};
 const REPO = path.resolve(__dirname, "..");
-const APP = path.resolve(opt("--app") || path.join(REPO, "UI-source"));
-const EXE = opt("--exe") ? path.resolve(opt("--exe")) : null;
-const WIN = process.platform === "win32";
-const ELECTRON = path.join(APP, "node_modules", "electron", "dist", process.platform === "darwin" ? "Electron.app/Contents/MacOS/Electron" : WIN ? "electron.exe" : "electron");
-const { _electron } = require(process.env.PLAYWRIGHT_PATH || "playwright");
+const LAUNCH = cliOptions(argv);
 
 let failures = 0;
 function check(label, ok, detail) {
@@ -94,25 +88,8 @@ function findFile(root, name) {
   series(LIB, "Beta", ["Ch.001.cbz", "Ch.002.cbz"]);
 
   const env = { ...process.env, XDG_CONFIG_HOME: CFG, AIO_OUTPUT_DIR: LIB };
-  delete env.ELECTRON_RUN_AS_NODE;
-  delete env.NODE_ENV;
-  if (EXE) {
-    fs.mkdirSync(path.join(CFG, "python-env"), { recursive: true });
-    fs.writeFileSync(path.join(CFG, "python-env", ".setup-complete"), "e2e");
-  }
-  console.log(`app: ${EXE || APP}`);
-  const app = await _electron.launch(
-    EXE
-      ? { executablePath: EXE, args: [`--user-data-dir=${CFG}`], env, timeout: 60_000 }
-      : { executablePath: ELECTRON, args: ["--no-sandbox", `--user-data-dir=${CFG}`, APP], env, timeout: 60_000 }
-  );
-  let out = "";
-  app.process().stderr.on("data", (d) => (out += d));
-  app.process().stdout.on("data", (d) => (out += d));
-  const win = await app.firstWindow();
-  const ready = () => win.waitForFunction(() => !!window.electronAPI && document.querySelector("#root") && document.querySelector("#root").children.length > 0, null, { timeout: 30_000 });
-  await win.waitForLoadState("domcontentloaded");
-  await ready();
+  const { app, win, output } = await launchApp({ ...LAUNCH, userDataDir: CFG, env });
+  const ready = () => waitReady(win);
   const userData = await app.evaluate(({ app: a }) => a.getPath("userData"));
   check("isolated userData", userData.startsWith(CFG), userData);
 
@@ -314,7 +291,7 @@ function findFile(root, name) {
   } catch (e) {
     if (!failures) check("e2e", false, e && e.stack);
   } finally {
-    const errs = out.split("\n").filter((l) => /\[deviceSync\].*(error|internal)/i.test(l));
+    const errs = output().split("\n").filter((l) => /\[deviceSync\].*(error|internal)/i.test(l));
     check("no internal sync errors in main's log", !errs.length, errs.slice(0, 3).join(" | "));
     await app.close().catch(() => {});
     try {

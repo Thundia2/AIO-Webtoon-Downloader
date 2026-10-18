@@ -2,8 +2,8 @@
 // on the real dev app, expanded, for a saved --search-json payload. Used for
 // before/after shots when the panel's code moves (coverage plan C2,
 // sync-temp/plans/find-sources-coverage.md).
-// Run: node tools/_shot_search_coverage.js --out <png> [--payload <json>] [--theme dark|light]
-//   Needs UI-source/dist (`npm run build`), Playwright via PLAYWRIGHT_PATH and
+// Run: node tools/_shot_search_coverage.js --out <png> [--payload <json>] [--theme dark|light] [--renderer dist|dev] [--no-build]
+//   Renderer flags: tools/_e2e_launch.js (dist built first). Needs Playwright via PLAYWRIGHT_PATH and
 //   a `python` on PATH (PYTHON=<exe> overrides) for the fake backend: a script
 //   that prints the payload for any `--search`. Isolated userData (temp dir);
 //   nothing touches the network or the real settings.
@@ -14,6 +14,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { cliOptions, launchApp } = require("./_e2e_launch");
 
 const argv = process.argv.slice(2);
 const opt = (k, d) => {
@@ -21,14 +22,11 @@ const opt = (k, d) => {
   return i >= 0 ? argv[i + 1] : d;
 };
 const REPO = path.resolve(__dirname, "..");
-const APP = path.join(REPO, "UI-source");
+const LAUNCH = cliOptions(argv);
 const OUT = path.resolve(opt("--out", path.join(REPO, "tools", "_shot_search_coverage.png")));
 const PAYLOAD = path.resolve(opt("--payload", path.join(REPO, "tools", "fixtures", "search-torture-princess-multisource.json")));
 const THEME = opt("--theme", "dark");
-const WIN = process.platform === "win32";
-const ELECTRON = path.join(APP, "node_modules", "electron", "dist", process.platform === "darwin" ? "Electron.app/Contents/MacOS/Electron" : WIN ? "electron.exe" : "electron");
 const PYTHON = process.env.PYTHON || "python";
-const { _electron } = require(process.env.PLAYWRIGHT_PATH || "playwright");
 
 const FAKE_PY = `import os, sys
 if "--search" in sys.argv:
@@ -44,15 +42,10 @@ sys.exit(0)
   fs.mkdirSync(CFG, { recursive: true });
   fs.writeFileSync(FAKE, FAKE_PY);
   const query = JSON.parse(fs.readFileSync(PAYLOAD, "utf8")).query || "x";
-  const env = { ...process.env, XDG_CONFIG_HOME: CFG, AIO_SHOT_PAYLOAD: PAYLOAD };
-  delete env.ELECTRON_RUN_AS_NODE;
-  delete env.NODE_ENV;
-  const app = await _electron.launch({ executablePath: ELECTRON, args: ["--no-sandbox", `--user-data-dir=${CFG}`, APP], env, timeout: 60_000 });
+  const { app, win } = await launchApp({ ...LAUNCH, userDataDir: CFG, env: { XDG_CONFIG_HOME: CFG, AIO_SHOT_PAYLOAD: PAYLOAD } });
   let code = 0;
   try {
-    const win = await app.firstWindow();
     await win.setViewportSize({ width: 1280, height: 900 });
-    await win.waitForFunction(() => !!window.electronAPI && document.querySelector("#root") && document.querySelector("#root").children.length > 0, null, { timeout: 30_000 });
     const s = await win.evaluate(() => window.electronAPI.getSettings());
     await win.evaluate((x) => window.electronAPI.saveSettings({ ...x.s, pythonCmd: x.py, scriptPath: x.fake, workingDir: x.wd, searchOpts: { ...(x.s.searchOpts || {}), multiSource: true } }), { s, py: PYTHON, fake: FAKE, wd: TMP });
     await win.evaluate((t) => document.documentElement.classList.toggle("dark", t === "dark"), THEME);

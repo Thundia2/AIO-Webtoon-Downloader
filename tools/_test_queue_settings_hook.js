@@ -2,9 +2,8 @@
 // Run: node tools/_test_queue_settings_hook.js   (from the repo root)
 //
 // Drives the REAL UI-source/src/hooks/useDownloader.js (esbuild-bundled with
-// `@` aliased to src and "react" swapped for the minimal hook runtime below,
-// same runtime as tools/_test_update_check_hook.js) against a stubbed
-// window.electronAPI that records every startDownload.
+// `@` aliased to src and "react" swapped for tools/_hook_runtime.js) against a
+// stubbed window.electronAPI that records every startDownload.
 //
 // What it pins (user rule 2026-10-17 + the adversarial review of the plan):
 //   - items waiting behind a running download start with Settings saved
@@ -15,14 +14,7 @@
 //   - an unreadable recipe at the head is dropped and the next item starts
 //   - a legacy item (frozen args, from before recipes) spawns those args as-is
 
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-const { pathToFileURL } = require("url");
-
-const ROOT = path.resolve(__dirname, "..");
-const UI = path.join(ROOT, "UI-source");
-const esbuild = require(path.join(UI, "node_modules", "esbuild"));
+const { makeRuntime, bundleHook } = require("./_hook_runtime");
 
 let failures = 0;
 function check(label, ok, detail) {
@@ -36,101 +28,6 @@ function eq(label, actual, expected) {
   const a = JSON.stringify(actual);
   const e = JSON.stringify(expected);
   check(label, a === e, a === e ? "" : `got ${a}, want ${e}`);
-}
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// ── Minimal hook runtime (see tools/_test_update_check_hook.js) ──────────
-// Exposed to the bundle through globalThis.__hookRuntime; the "react" import
-// resolves to a shim that forwards to whichever component is rendering.
-function makeRuntime() {
-  let current = null;
-  const sameDeps = (a, b) =>
-    Array.isArray(a) && Array.isArray(b) && a.length === b.length &&
-    a.every((v, i) => Object.is(v, b[i]));
-  const api = {
-    useState(init) {
-      const c = current; const i = c.cursor++;
-      if (!(i in c.slots)) c.slots[i] = { v: typeof init === "function" ? init() : init };
-      const slot = c.slots[i];
-      const set = (next) => {
-        const value = typeof next === "function" ? next(slot.v) : next;
-        if (Object.is(value, slot.v)) return;
-        slot.v = value;
-        c.dirty = true;
-      };
-      return [slot.v, set];
-    },
-    useRef(init) {
-      const c = current; const i = c.cursor++;
-      if (!(i in c.slots)) c.slots[i] = { current: init };
-      return c.slots[i];
-    },
-    useCallback(fn, deps) {
-      const c = current; const i = c.cursor++;
-      const prev = c.slots[i];
-      if (prev && sameDeps(prev.deps, deps)) return prev.value;
-      c.slots[i] = { value: fn, deps };
-      return fn;
-    },
-    useMemo(fn, deps) {
-      const c = current; const i = c.cursor++;
-      const prev = c.slots[i];
-      if (prev && sameDeps(prev.deps, deps)) return prev.value;
-      const value = fn();
-      c.slots[i] = { value, deps };
-      return value;
-    },
-    useEffect(fn, deps) {
-      const c = current; const i = c.cursor++;
-      const prev = c.slots[i];
-      if (prev && sameDeps(prev.deps, deps)) return;
-      const slot = { deps, cleanup: prev ? prev.cleanup : undefined };
-      c.slots[i] = slot;
-      c.effects.push(() => {
-        if (typeof slot.cleanup === "function") slot.cleanup();
-        slot.cleanup = fn();
-      });
-    },
-  };
-  function mount(hook) {
-    const c = { slots: [], cursor: 0, dirty: false, effects: [], result: null };
-    function renderOnce() {
-      current = c;
-      c.cursor = 0;
-      c.dirty = false;
-      c.result = hook();
-      current = null;
-      const effects = c.effects;
-      c.effects = [];
-      for (const run of effects) run();
-    }
-    function settle() {
-      renderOnce();
-      let guard = 0;
-      while (c.dirty) {
-        if (++guard > 50) throw new Error("render loop did not settle");
-        renderOnce();
-      }
-      return c.result;
-    }
-    settle();
-    return {
-      get state() { return c.result; },
-      settle,
-      // Let timers / promise chains the hook started run, re-rendering the
-      // way React would whenever state changed.
-      async wait(ms) {
-        const end = Date.now() + ms;
-        do {
-          await sleep(10);
-          if (c.dirty) settle();
-        } while (Date.now() < end);
-        settle();
-        return c.result;
-      },
-    };
-  }
-  return { api, mount };
 }
 
 // ── Fixtures ─────────────────────────────────────────────────────────────
@@ -169,31 +66,7 @@ function makeApi({ settings = S1, settingsGate = null, snapshot = null } = {}) {
 }
 
 (async () => {
-  // Bundle the real hook. "react" → a shim over globalThis.__hookRuntime.
-  const shim = path.join(os.tmpdir(), `aio-react-shim-${process.pid}.js`);
-  fs.writeFileSync(shim, [
-    "const R = () => globalThis.__hookRuntime;",
-    "export const useState = (...a) => R().useState(...a);",
-    "export const useEffect = (...a) => R().useEffect(...a);",
-    "export const useCallback = (...a) => R().useCallback(...a);",
-    "export const useMemo = (...a) => R().useMemo(...a);",
-    "export const useRef = (...a) => R().useRef(...a);",
-    "export default {};",
-  ].join("\n"));
-  const out = path.join(os.tmpdir(), `aio-usedownloader-${process.pid}.mjs`);
-  await esbuild.build({
-    entryPoints: [path.join(UI, "src", "hooks", "useDownloader.js")],
-    bundle: true,
-    format: "esm",
-    platform: "node",
-    outfile: out,
-    alias: { "@": path.join(UI, "src"), react: shim },
-    nodePaths: [path.join(UI, "node_modules")],
-    logLevel: "error",
-  });
-  const { useDownloader } = await import(pathToFileURL(out).href);
-  fs.rmSync(out, { force: true });
-  fs.rmSync(shim, { force: true });
+  const { useDownloader } = await bundleHook("hooks/useDownloader.js");
 
   const rt = makeRuntime();
   globalThis.__hookRuntime = rt.api;

@@ -1,9 +1,8 @@
 // E2E for the connect prompt and the rail badge (UI pass U3) on the real dev
 // app with a FOLDER target.
-// Run: node tools/_e2e_device_sync_prompt.js [--app <UI-source dir>] [--exe <packaged exe>]
-//   Same prerequisites as tools/_e2e_device_sync_tab.js (UI-source/dist from
-//   `npm run build`, Playwright via PLAYWRIGHT_PATH; --exe for an unpacked
-//   build, whose profile is pre-marked set up).
+// Run: node tools/_e2e_device_sync_prompt.js [--app <UI-source dir>] [--exe <packaged exe>] [--renderer dist|dev] [--no-build]
+//   Same prerequisites as tools/_e2e_device_sync_tab.js (Playwright via
+//   PLAYWRIGHT_PATH; renderer flags and --exe are tools/_e2e_launch.js's).
 //
 // The whole engine runs for real; only the target is a temp folder, created
 // AFTER the target is configured, so the app sees it "plugged in" through
@@ -30,18 +29,11 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { cliOptions, launchApp } = require("./_e2e_launch");
 
 const argv = process.argv.slice(2);
-const opt = (k) => {
-  const i = argv.indexOf(k);
-  return i >= 0 ? argv[i + 1] : null;
-};
 const REPO = path.resolve(__dirname, "..");
-const APP = path.resolve(opt("--app") || path.join(REPO, "UI-source"));
-const EXE = opt("--exe") ? path.resolve(opt("--exe")) : null;
-const WIN = process.platform === "win32";
-const ELECTRON = path.join(APP, "node_modules", "electron", "dist", process.platform === "darwin" ? "Electron.app/Contents/MacOS/Electron" : WIN ? "electron.exe" : "electron");
-const { _electron } = require(process.env.PLAYWRIGHT_PATH || "playwright");
+const LAUNCH = cliOptions(argv);
 
 let failures = 0;
 function check(label, ok, detail) {
@@ -78,24 +70,7 @@ function series(lib, folder, chapters) {
   series(LIB, "Beta", ["Ch.001.cbz", "Ch.002.cbz"]);
 
   const env = { ...process.env, XDG_CONFIG_HOME: CFG, AIO_OUTPUT_DIR: LIB };
-  delete env.ELECTRON_RUN_AS_NODE;
-  delete env.NODE_ENV;
-  if (EXE) {
-    fs.mkdirSync(path.join(CFG, "python-env"), { recursive: true });
-    fs.writeFileSync(path.join(CFG, "python-env", ".setup-complete"), "e2e");
-  }
-  console.log(`app: ${EXE || APP}`);
-  const app = await _electron.launch(
-    EXE
-      ? { executablePath: EXE, args: [`--user-data-dir=${CFG}`], env, timeout: 60_000 }
-      : { executablePath: ELECTRON, args: ["--no-sandbox", `--user-data-dir=${CFG}`, APP], env, timeout: 60_000 }
-  );
-  let out = "";
-  app.process().stderr.on("data", (d) => (out += d));
-  app.process().stdout.on("data", (d) => (out += d));
-  const win = await app.firstWindow();
-  await win.waitForLoadState("domcontentloaded");
-  await win.waitForFunction(() => !!window.electronAPI && document.querySelector("#root") && document.querySelector("#root").children.length > 0, null, { timeout: 30_000 });
+  const { app, win, output } = await launchApp({ ...LAUNCH, userDataDir: CFG, env });
   const userData = await app.evaluate(({ app: a }) => a.getPath("userData"));
   check("isolated userData", userData.startsWith(CFG), userData);
   await app.evaluate(({ BrowserWindow, app: a }) => {
@@ -235,7 +210,7 @@ function series(lib, folder, chapters) {
   } catch (e) {
     if (!failures) check("e2e", false, e && e.stack);
   } finally {
-    const errs = out.split("\n").filter((l) => /\[deviceSync\].*(error|internal)/i.test(l));
+    const errs = output().split("\n").filter((l) => /\[deviceSync\].*(error|internal)/i.test(l));
     check("no internal sync errors in main's log", !errs.length, errs.slice(0, 3).join(" | "));
     await app.close().catch(() => {});
     fs.rmSync(TMP, { recursive: true, force: true });
