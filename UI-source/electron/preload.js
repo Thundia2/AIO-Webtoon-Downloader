@@ -132,7 +132,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // runSearch resolves with the parsed JSON result (candidate list +
   // optional winner_chapter_map). UI shows live progress via the log
   // feed (onSearchLog) while the search runs (~40-100s typical).
-  runSearch: (query, opts) => ipcRenderer.invoke("search:run", { query, opts }),
+  // requestId (optional) becomes the searchId on this search's log lines, so
+  // the renderer can drop lines from a search it has since replaced
+  // (hooks/useSearch.js, grep currentRequestIdRef).
+  runSearch: (query, opts, requestId) =>
+    ipcRenderer.invoke("search:run", { query, opts, requestId }),
   cancelSearch: () => ipcRenderer.invoke("search:cancel"),
   onSearchLog: (callback) => {
     const handler = (_event, data) => callback(data);

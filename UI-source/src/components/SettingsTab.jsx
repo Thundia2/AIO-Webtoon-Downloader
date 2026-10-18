@@ -208,8 +208,8 @@ export const DEFAULT_SETTINGS = {
   //     merge into one combined chapter file; redundant duplicate uploads
   //     of the same chapter are pruned. See sites/chapter_merger.py
   //     :group_chapters_for_download for the full 6-rule cluster table.
-  // Persisted as settings.collapseSplits; useDownloader.queueDownload and
-  // .runSearch inject this into args/opts before IPC.
+  // Persisted as settings.collapseSplits; lib/queueRecipe.js globalArgs and
+  // hooks/useSearch.js runSearch inject this into args/opts before IPC.
   // Default OFF (opt-in, documented 2026-05-27) to MATCH the spawn sites,
   // which all read `settings.collapseSplits === true` (absent → OFF): with a
   // `true` default here the toggle showed ON while downloads ran OFF until the
@@ -293,8 +293,8 @@ export const DEFAULT_SETTINGS = {
   // Handler names the user opted out of (Settings → Search → "Search Sources"
   // or the SearchTab slow-sites callout). Excluded from the search fan-out/probe
   // AND multi-source download alternatives. Persisted top-level (mirrors
-  // collapseSplits). useDownloader injects it into runSearch (→ --disable-sites)
-  // and queueDownload (→ --disable-sites). IMMEDIATE-PERSIST from the Settings
+  // collapseSplits). hooks/useSearch.js runSearch and lib/queueRecipe.js
+  // globalArgs inject it (→ --disable-sites). IMMEDIATE-PERSIST from the Settings
   // section (writes via onSave, not the Save button) — so it's in SKIP_TOP of
   // countDirtySettings (never a dirty-badge count) and the hydration effect is
   // diff-aware so an immediate write can't clobber unsaved draft edits.

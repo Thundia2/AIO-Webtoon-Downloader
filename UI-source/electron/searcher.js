@@ -101,9 +101,11 @@ class Searcher {
     // Downloader._extraEnv — see main.js:initDownloader.
     this._extraEnv = extraEnv || {};
 
-    // The currently-running child process. Only one search at a time
-    // (the UI prevents concurrent invocations via searchState.status).
-    // Hold a reference so cancel() can SIGTERM it.
+    // The currently-running child process: one search at a time per
+    // Searcher. The UI does NOT prevent a second runSearch while one runs
+    // (a new query, a re-search, React StrictMode's double effect), so
+    // runSearch cancels the previous process; the renderer ignores the
+    // replaced call's answer (hooks/useSearch.js). Held so cancel() can kill it.
     this._proc = null;
 
     // Counter for log-correlation IDs (same shape as downloader's
@@ -125,16 +127,19 @@ class Searcher {
    * parsed JSON on clean exit (code=0 + valid JSON), or rejects with an
    * Error on spawn failure / non-zero exit / JSON parse failure.
    *
-   * @param {object} cfg - { pythonCmd, scriptPath, workingDir, query, opts }
+   * @param {object} cfg - { pythonCmd, scriptPath, workingDir, query, opts, searchId? }
+   *   searchId: the id put on this search's log lines; minted here when absent.
    */
-  runSearch({ pythonCmd, scriptPath, workingDir, query, opts }) {
+  runSearch({ pythonCmd, scriptPath, workingDir, query, opts, searchId: givenId }) {
     if (this._proc) {
-      // Defense-in-depth: UI shouldn't allow a second search while one is
-      // running, but if it happens we cancel the prior before starting.
+      // A second search while one runs is normal (new query, re-search,
+      // StrictMode): the newest wins, the prior process is cancelled and its
+      // promise rejects with err.cancelled.
       this.cancel();
     }
 
-    const searchId = `srch_${this._nextId++}_${Date.now()}`;
+    const mintedId = `srch_${this._nextId++}_${Date.now()}`;
+    const searchId = typeof givenId === "string" && givenId ? givenId : mintedId;
     const cliArgs = ["-u", scriptPath, ...buildSearchArgs(query, opts)];
     const cmdString = `${pythonCmd} ${cliArgs.join(" ")}`;
 

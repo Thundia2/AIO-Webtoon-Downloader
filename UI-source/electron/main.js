@@ -554,6 +554,55 @@ function runSetupFlow() {
 // MAIN WINDOW
 // ============================================================
 
+// ── Which renderer the main window loads ──
+// The Vite dev server ONLY when the app is unpackaged AND AIO_DEV_SERVER_URL
+// names it; everything else loads dist/index.html. `npm run electron:dev`
+// (scripts/electron-dev.js) starts Vite and sets the variable to the port Vite
+// actually bound. A bare `electron .` next to a hand-started `npm run dev`
+// therefore loads dist: set AIO_DEV_SERVER_URL or use electron:dev.
+// Why not the old "unpackaged → try localhost:5173, fall back to dist": any
+// Vite on 5173, e.g. another checkout's, was loaded silently instead of this
+// build, so the E2E harnesses (tools/_e2e_*.js) tested the wrong code, and
+// electron:preview (NODE_ENV=production) never previewed dist. NODE_ENV no
+// longer picks the renderer.
+// Localhost only: the preload exposes powerful IPC and there is no
+// will-navigate guard, so the URL must never name another machine.
+// Returns the URL to load, or null for dist.
+function devServerUrl() {
+  const raw = process.env.AIO_DEV_SERVER_URL;
+  if (!raw) {
+    if (process.env.NODE_ENV === "development" && !IS_PACKAGED) {
+      console.warn("[main] NODE_ENV=development without AIO_DEV_SERVER_URL: loading dist. `npm run electron:dev` runs the dev server.");
+    }
+    return null;
+  }
+  if (IS_PACKAGED) {
+    console.warn("[main] AIO_DEV_SERVER_URL is ignored in a packaged app");
+    return null;
+  }
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    console.error(`[main] AIO_DEV_SERVER_URL is not a URL (${raw}); loading dist`);
+    return null;
+  }
+  // WHATWG URL keeps the brackets on an IPv6 hostname.
+  const localHost = ["localhost", "127.0.0.1", "[::1]"].includes(u.hostname);
+  if (!/^https?:$/.test(u.protocol) || !localHost) {
+    console.error(`[main] AIO_DEV_SERVER_URL must be http(s) on localhost (${raw}); loading dist`);
+    return null;
+  }
+  return u.href;
+}
+
+// Shown instead of a blank window when an unpackaged run has no build.
+const MISSING_DIST_HTML =
+  "<!doctype html><meta charset=utf-8><title>No build</title>" +
+  "<body style='font:14px sans-serif;padding:2em'><h2>No renderer build</h2>" +
+  "<p><code>UI-source/dist/index.html</code> is missing. Run <code>npm run build</code>, " +
+  "or <code>npm run electron:dev</code> for the dev server.</p>";
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1100,
@@ -570,14 +619,23 @@ function createWindow() {
     },
   });
 
-  // Dev mode: load from Vite dev server (hot reload)
-  // Prod mode: load built files from disk
-  if (process.env.NODE_ENV === "development" || !IS_PACKAGED) {
-    mainWindow.loadURL("http://localhost:5173").catch(() => {
-      mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+  // Dev server or dist: see devServerUrl. No silent fallback from one to the
+  // other — a failed dev load stays visible and logged. The URL is logged on
+  // every load; tools/_e2e_launch.js asserts the same thing from the outside.
+  mainWindow.webContents.on("did-finish-load", () => {
+    console.log(`[main] renderer: ${mainWindow.webContents.getURL()}`);
+  });
+  const devUrl = devServerUrl();
+  const distIndex = path.join(__dirname, "..", "dist", "index.html");
+  if (devUrl) {
+    mainWindow.loadURL(devUrl).catch((err) => {
+      console.error(`[main] dev server ${devUrl} failed to load: ${err.message}`);
     });
+  } else if (fs.existsSync(distIndex)) {
+    mainWindow.loadFile(distIndex);
   } else {
-    mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+    console.error(`[main] ${distIndex} is missing; run npm run build`);
+    mainWindow.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(MISSING_DIST_HTML));
   }
 
   // ── Confirm on close while a download is running ──
@@ -818,7 +876,10 @@ function setupIPC() {
   // Single blocking call: spawn aio-dl.py --search, accumulate stdout,
   // return parsed JSON when child exits. stderr lines stream live to the
   // UI via 'search-log' events. UI shows results when this resolves.
-  ipcMain.handle("search:run", async (_event, { query, opts }) => {
+  // requestId (renderer-minted, see hooks/useSearch.js) is passed on as the
+  // log lines' searchId; anything that isn't a short string is ignored and
+  // the Searcher mints its own.
+  ipcMain.handle("search:run", async (_event, { query, opts, requestId }) => {
     const settings = history.getSettings();
     const { pythonCmd, scriptPath, workingDir } = resolveSpawnPaths(settings);
     try { fs.mkdirSync(workingDir, { recursive: true }); } catch {}
@@ -841,6 +902,7 @@ function setupIPC() {
         workingDir,
         query,
         opts: throttledOpts,
+        searchId: typeof requestId === "string" && requestId.length <= 64 ? requestId : undefined,
       });
       return { ok: true, result };
     } catch (err) {

@@ -33,6 +33,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { formatDuration } from "@/lib/utils";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
+import { useSearch } from "@/hooks/useSearch";
 import { finalArgsFor, globalArgs } from "@/lib/queueRecipe";
 
 // DEFAULT_DOWNLOAD_DEFAULTS / mergeSettings / normalizeDownloadArgs were
@@ -216,45 +217,13 @@ export function useDownloader() {
     // Durable list of handler names the user disabled (Settings → Search →
     // "Search Sources", or the SlowSitesCallout). Excluded from the search
     // fan-out/probe AND from multi-source download alternatives. Injected into
-    // runSearch (→ --disable-sites) and queueDownload (→ --disable-sites) below.
+    // useSearch's runSearch and every queued download (→ --disable-sites).
     // Placeholder here for the pre-load window; SettingsTab.DEFAULT_SETTINGS
     // owns the canonical default and get-settings hydrates the saved value.
     disabledSites: [],
   });
   const [queue, setQueue] = useState([]);
   const [currentDownloadId, setCurrentDownloadId] = useState(null);
-
-  // ── Cross-site search state ──
-  // status: 'idle' | 'running' | 'done' | 'error' | 'cancelled'
-  // results: parsed JSON from `aio-dl.py --search --search-json` or null.
-  // searchLogs: stderr lines from the in-flight search (and the most recent
-  //   completed search) — separate buffer from download logs so the search
-  //   feed only shows search-relevant progress instead of the global firehose.
-  const [searchState, setSearchState] = useState({
-    status: "idle",
-    query: "",
-    opts: {},
-    results: null,
-    error: null,
-  });
-  const [searchLogs, setSearchLogs] = useState([]);
-  const pendingSearchLogsRef = useRef([]);
-
-  // ── Rolling per-site search health (IN-MEMORY — deliberately NOT persisted) ──
-  // Keyed by handler name → { strikes, lastStatus, lastReason, lastFanoutS,
-  // lastProbeS, displayName, host, lastSeen }. Folded from each search's
-  // result.site_health (strikes) + result.tested_sites (decay) in runSearch.
-  // A merely-SLOW site needs 2+ searches to cross the recommend threshold (+1
-  // per slow run); a DOWN/unreachable site crosses in one (+2). Sites that come
-  // back healthy decay (−1) and drop off at 0; untested sites are left alone.
-  //
-  // WHY in-memory and not a persisted setting: writing it to `settings` every
-  // search would fire SettingsTab's hydration effect mid-edit and clobber the
-  // user's unsaved Settings draft (searches run 30–240 s — "start search, edit
-  // Settings, search finishes" is reachable). Resetting strikes on app restart
-  // is acceptable; only the disabledSites LIST is durable. The SearchTab callout
-  // and the Settings "Search Sources" section both read this snapshot.
-  const [searchSiteHealth, setSearchSiteHealth] = useState({});
 
   // ── Library state ──
   // Lifted from LibraryTab.jsx so the entries survive tab switches without
@@ -300,7 +269,7 @@ export function useDownloader() {
   // batching window and aren't a clean place for log-buffer mutation).
   const activeDownloadsRef = useRef(activeDownloads);
   activeDownloadsRef.current = activeDownloads;
-  // settingsRef keeps queueDownload / runSearch closures pointed at the latest
+  // settingsRef keeps queueDownload / useSearch's runSearch pointed at the latest
   // settings without forcing those callbacks to be recreated (and forcing
   // every consumer's effect deps to invalidate) on every settings save.
   const settingsRef = useRef(settings);
@@ -448,6 +417,11 @@ export function useDownloader() {
   // Can be changed in Settings → "Log Update Interval"
   const flushInterval = settings?.logUpdateInterval ?? 100;
 
+  // Cross-site search state + actions (hooks/useSearch.js), re-exported
+  // below under the same names. Called here, after settingsRef and
+  // flushInterval exist; it runs its own log subscription and flush timer.
+  const search = useSearch({ settingsRef, flushInterval });
+
   // Refs that accumulate events between flushes (no re-renders until flush)
   const pendingLogsRef = useRef([]);
   const pendingProgressRef = useRef({});   // { downloadId: latestProgress }
@@ -526,14 +500,6 @@ export function useDownloader() {
       refreshLibraryFromDisk({ showLoading: false });
     });
 
-    // Search stderr stream — buffered same way as download logs so the
-    // 100ms flush timer batches them. Each entry has a searchId for
-    // correlation; the UI only shows the latest search's lines.
-    const unsubSearchLog = window.electronAPI.onSearchLog?.(({ searchId, line, level }) => {
-      const timestamp = new Date().toLocaleTimeString("en-GB");
-      pendingSearchLogsRef.current.push({ searchId, line, level, timestamp });
-    });
-
     // Library thumbnail-ready stream. Lifted from LibraryTab so the
     // subscription doesn't churn on every tab switch — and so a
     // tab-unmounted thumb completion still updates the central entries
@@ -552,7 +518,6 @@ export function useDownloader() {
       unsubLog();
       unsubProgress();
       unsubComplete();
-      if (unsubSearchLog) unsubSearchLog();
       if (unsubThumb) unsubThumb();
     };
   }, [refreshLibraryFromDisk]); // Subscribe once; refresh helper has stable deps.
@@ -568,7 +533,8 @@ export function useDownloader() {
   // currentDownloadId/queue have flipped to "idle" (Python process is
   // shutting down stdout/stderr). If we deactivated the interval at that
   // boundary, those final lines would sit in the buffer forever. The
-  // cost when idle is three boolean checks per fire — genuinely cheap.
+  // cost when idle is two length checks per fire — genuinely cheap. (The
+  // search feed has its own timer in hooks/useSearch.js.)
   useEffect(() => {
     const timer = setInterval(() => {
       // --- Flush pending log lines ---
@@ -601,18 +567,6 @@ export function useDownloader() {
             };
           }
           return changed ? next : prev;
-        });
-      }
-
-      // --- Flush pending search log lines ---
-      const newSearchLogs = pendingSearchLogsRef.current;
-      if (newSearchLogs.length > 0) {
-        pendingSearchLogsRef.current = [];
-        setSearchLogs((prev) => {
-          const combined = prev.concat(newSearchLogs);
-          // Cap at 500 — each search produces ~50-100 stderr lines, so
-          // this comfortably holds 5+ recent searches.
-          return combined.length > 500 ? combined.slice(-500) : combined;
         });
       }
 
@@ -1031,141 +985,6 @@ export function useDownloader() {
     await refreshLibraryFromDisk({ showLoading: true });
   }, [refreshLibraryFromDisk]);
 
-  // ── Public: run a cross-site search ──
-  // opts: { multiSource, seededOnly, searchLanguage, multiSourceQualityMin,
-  //         searchTimeout, searchMinMatch, searchParallelism }
-  // Returns the parsed JSON (or null on failure) — the UI also reads
-  // searchState directly for status and recent error.
-  const runSearch = useCallback(async (query, opts = {}) => {
-    if (!hasAPI() || !query?.trim()) return null;
-
-    // Reset log feed for the new search so the user only sees current-run
-    // stderr (rather than appending forever — search runs are discrete).
-    setSearchLogs([]);
-    pendingSearchLogsRef.current = [];
-
-    // Merge the global collapseSplits setting into opts so SearchTab's inline
-    // toggle (which writes settings.collapseSplits via onSaveSettings) is
-    // honored even when the caller passes opts that omit the field.
-    // Post 2026-05-27 opt-in flip: `=== true` is required (undefined/null
-    // default to OFF). searcher.js buildSearchArgs only emits the positive
-    // --collapse-splits flag when this is explicitly true. Caller-passed
-    // opts win on conflict (...opts at end).
-    const s = settingsRef.current;
-    const finalOpts = {
-      collapseSplits: s?.collapseSplits === true,
-      // Durable disabled-sites list → --disable-sites (searcher.js). Injected
-      // from settings so every ordinary search honors the block. The callout's
-      // "Disable & re-search" overrides this via an explicit opts.disabledSites
-      // (opts spreads last, so it wins) to dodge the settingsRef update race —
-      // saveSettings updates React state async, but the re-search fires
-      // synchronously right after, so the ref may still hold the pre-disable list.
-      ...(Array.isArray(s?.disabledSites) && s.disabledSites.length
-        ? { disabledSites: s.disabledSites }
-        : {}),
-      ...opts,
-    };
-
-    setSearchState({
-      status: "running",
-      query,
-      opts: finalOpts,
-      results: null,
-      error: null,
-    });
-
-    try {
-      const { ok, result, error, cancelled } = await window.electronAPI.runSearch(query, finalOpts);
-      if (!ok) {
-        setSearchState((prev) => ({
-          ...prev,
-          status: cancelled ? "cancelled" : "error",
-          error: error || "Search failed",
-        }));
-        return null;
-      }
-      setSearchState((prev) => ({
-        ...prev,
-        status: "done",
-        results: result,
-        error: null,
-      }));
-
-      // Fold this run's per-site health into the rolling in-memory map (see the
-      // searchSiteHealth declaration for the model + why it's not persisted).
-      //   site_health  → STRIKES (down +2, slow +1, capped 4)
-      //   tested_sites → the DECAY roster (tested-and-healthy this run → −1)
-      // A site in neither list wasn't measured this run, so it's left untouched.
-      // status "busy" is the exception inside site_health: THIS machine kept the
-      // site from answering (mangafire's browser held by another AIO process —
-      // grep SiteBusyError in sites/base.py). It is a notice SearchTab shows
-      // from the result itself (grep BusySitesNotice), never a strike, and
-      // Python leaves busy sites out of tested_sites so they don't decay either.
-      const health = Array.isArray(result?.site_health) ? result.site_health : [];
-      const tested = Array.isArray(result?.tested_sites) ? result.tested_sites : [];
-      if (health.length || tested.length) {
-        setSearchSiteHealth((prev) => {
-          const next = { ...prev };
-          const seenNow = Date.now();
-          const flagged = new Set();
-          // 1) Strike the sites flagged slow/down this run.
-          for (const h of health) {
-            const key = h?.site;
-            if (!key || h.status === "busy") continue;
-            flagged.add(key);
-            const prevStrikes = next[key]?.strikes || 0;
-            const delta = h.status === "down" ? 2 : 1; // down clears the 2-strike bar alone
-            next[key] = {
-              strikes: Math.min(prevStrikes + delta, 4),
-              lastStatus: h.status || "slow",
-              lastReason: h.reason || null,
-              lastFanoutS: h.fanout_s ?? null,
-              lastProbeS: h.probe_s ?? null,
-              displayName: h.display_name || key,
-              host: h.host || null,
-              lastSeen: seenNow,
-            };
-          }
-          // 2) Decay sites that were tested this run but came back healthy
-          //    (present in tested_sites, absent from site_health). Fully-decayed
-          //    entries are deleted so the map stays bounded to live problems.
-          for (const site of tested) {
-            if (flagged.has(site)) continue;
-            const cur = next[site];
-            if (!cur) continue; // never flagged → nothing to decay
-            const strikes = Math.max((cur.strikes || 0) - 1, 0);
-            if (strikes === 0) {
-              delete next[site];
-            } else {
-              next[site] = { ...cur, strikes, lastStatus: "ok", lastReason: null, lastSeen: seenNow };
-            }
-          }
-          return next;
-        });
-      }
-      return result;
-    } catch (err) {
-      setSearchState((prev) => ({
-        ...prev,
-        status: "error",
-        error: err?.message || String(err),
-      }));
-      return null;
-    }
-  }, []);
-
-  // ── Public: cancel an in-flight search ──
-  const cancelSearch = useCallback(async () => {
-    if (!hasAPI()) return;
-    await window.electronAPI.cancelSearch();
-  }, []);
-
-  // ── Public: clear search log feed ──
-  const clearSearchLogs = useCallback(() => {
-    setSearchLogs([]);
-    pendingSearchLogsRef.current = [];
-  }, []);
-
   // ── The queue as components see it ──
   // Recipe items gain a display-only `args`: what they WOULD start with under
   // the current settings, so QueueTab's format/quality badges follow a
@@ -1196,9 +1015,9 @@ export function useDownloader() {
     settings,
     queue: displayQueue,
     currentDownloadId,
-    searchState,
-    searchLogs,
-    searchSiteHealth,
+    searchState: search.searchState,
+    searchLogs: search.searchLogs,
+    searchSiteHealth: search.searchSiteHealth,
     libraryEntries,
     libraryLoading,
     // { rows, scanState, scanStats, newChapterCounts, foundCount,
@@ -1217,9 +1036,9 @@ export function useDownloader() {
     clearLogs,
     saveSettings,
     refreshResumable,
-    runSearch,
-    cancelSearch,
-    clearSearchLogs,
+    runSearch: search.runSearch,
+    cancelSearch: search.cancelSearch,
+    clearSearchLogs: search.clearSearchLogs,
     loadLibrary,
   };
 }

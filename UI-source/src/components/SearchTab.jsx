@@ -72,7 +72,7 @@ function normalizeUrl(u) {
 // settings.collapseSplits in 2026-05-08 because the same toggle now affects
 // download behavior, not just search-display diagnostics. SearchTab's inline
 // toggle below reads/writes settings.collapseSplits directly via
-// onSaveSettings, and useDownloader.runSearch injects it into opts before IPC.
+// onSaveSettings, and useSearch's runSearch injects it into opts before IPC.
 const DEFAULT_OPTS = {
   searchLanguage: "en",
   seededOnly: true,         // user-facing default ON: faster, cleaner results
@@ -255,15 +255,22 @@ export default function SearchTab({
   // finish (it may be the user's), and the request stays un-searched until
   // its own search starts: App links a download to the device folder only
   // after that (review R13), so results of the OTHER search can't be linked.
+  // Two refs on purpose: `prefilled` fires as soon as the request arrives,
+  // `ranFor` only when its search starts (possibly a later run, after the
+  // running search ends). `ranFor` is what stops React StrictMode's second
+  // effect run, whose closure still sees the request un-searched, from
+  // starting the same search twice.
   const findToken = findFor && !findFor.searched ? findFor.token : null;
   const prefilled = useRef(null);
+  const ranFor = useRef(null);
   useEffect(() => {
     if (findToken == null) return;
     if (prefilled.current !== findToken) {
       prefilled.current = findToken;
       setQuery(findFor.query);
     }
-    if (isRunning) return;
+    if (isRunning || ranFor.current === findToken) return;
+    ranFor.current = findToken;
     runSearch(findFor.query, opts);
     onFindSearched?.(findToken);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -397,7 +404,7 @@ export default function SearchTab({
   // Add the chosen sites to the durable disabled list, then re-run the SAME
   // search — now faster, since the fan-out skips them. The merged list is
   // passed explicitly in opts (not just saved) so the re-search doesn't race
-  // the async settings write (see useDownloader.runSearch's disabledSites note).
+  // the async settings write (see hooks/useSearch.js runSearch's disabledSites note).
   const handleDisableAndReSearch = (siteNames) => {
     if (!siteNames?.length) return;
     const cur = Array.isArray(settings?.disabledSites) ? settings.disabledSites : [];
