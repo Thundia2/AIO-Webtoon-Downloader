@@ -97,11 +97,35 @@ function series(lib, folder, chapters) {
       throw e;
     }
   };
+  // Review and start → wait for Start to enable → Start. A re-plan that
+  // lands while the dialog is open and changes what it shows raises "The
+  // plan changed. Review it again." (ReviewDialog.jsx grep changedNotice),
+  // which holds Start until dismissed: that is the app working, and a user
+  // would click "I've reviewed it". In flow 5 the reconnect's follow-up
+  // re-plan can land after Review opens, so the helper dismisses the notice
+  // the way a user would and logs that it did. On timeout the footer's
+  // reason line ("Ready", "Saving…", "The plan is being rebuilt"…) goes into
+  // the error so the cause is in the log, not only in the screenshot.
   const startSync = async () => {
     await win.getByRole("button", { name: "Review and start" }).click();
-    const start = win.getByRole("dialog").getByRole("button", { name: /^Start sync/ });
+    const dialog = win.getByRole("dialog");
+    const start = dialog.getByRole("button", { name: /^Start sync/ });
+    const reviewed = dialog.getByRole("button", { name: "I've reviewed it" });
     await start.waitFor();
-    await win.waitForFunction(() => [...document.querySelectorAll("[role=dialog] button")].some((b) => /^Start sync/.test(b.textContent) && !b.disabled), null, { timeout: 15_000 });
+    const end = Date.now() + 15_000;
+    while (!(await start.isEnabled())) {
+      // Deadline first, so a notice that keeps coming back can't loop forever.
+      if (Date.now() > end) {
+        const why = await dialog.locator("span.flex-1.text-xs").first().textContent({ timeout: 2_000 }).catch(() => "?");
+        throw new Error(`Start sync stayed disabled for 15 s: "${why}"`);
+      }
+      if (await reviewed.isVisible()) {
+        console.log("  ..  the plan changed while Review was open; dismissed the notice");
+        await reviewed.click();
+        continue;
+      }
+      await win.waitForTimeout(200);
+    }
     await start.click();
     await text(`Synced to ${TN}`, 60_000);
   };

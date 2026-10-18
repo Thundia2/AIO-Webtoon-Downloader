@@ -4,8 +4,12 @@ export default {
   // The Electron main process will add/remove this class based on Windows theme
   darkMode: "class",
 
-  // Tell Tailwind which files contain class names to scan
-  content: ["./index.html", "./src/**/*.{js,jsx,ts,tsx}"],
+  // Tell Tailwind which files contain class names to scan. relative: the
+  // globs resolve against THIS file's folder, not the process cwd. Without it
+  // a Vite started from another folder (tools/_e2e_launch.js's dev server
+  // runs in the harness process, cwd = repo root) matched nothing and served
+  // CSS with no utilities at all: an unstyled UI with 0x0 checkboxes.
+  content: { relative: true, files: ["./index.html", "./src/**/*.{js,jsx,ts,tsx}"] },
 
   theme: {
     extend: {

@@ -25,6 +25,11 @@
 //   --exe           a packaged build: expects resources/app.asar/dist and
 //                   pre-marks the profile set up so the first-run Python
 //                   wizard (setup.html) doesn't open.
+// Window (CLI: --show, or env AIO_E2E_SHOW=1): unpackaged runs open their
+// windows off-screen, unfocused and off the taskbar (tools/_e2e_offscreen.js,
+// loaded into main with `electron -r`), so a run doesn't flash on the
+// desktop or take focus. --show keeps the normal window, for watching a run.
+// --exe always shows its window (see _e2e_offscreen.js for why).
 // tools/ is gitignored; force-added on wip/device-sync-handoff.
 "use strict";
 const fs = require("fs");
@@ -34,6 +39,7 @@ const { fileURLToPath, pathToFileURL } = require("url");
 
 const WIN = process.platform === "win32";
 const REPO = path.resolve(__dirname, "..");
+const OFFSCREEN = path.join(__dirname, "_e2e_offscreen.js");
 
 // Parse the shared flags. Harness-specific flags are left for the caller.
 function cliOptions(argv, { app } = {}) {
@@ -48,6 +54,7 @@ function cliOptions(argv, { app } = {}) {
     exe: opt("--exe") ? path.resolve(opt("--exe")) : null,
     renderer,
     build: !argv.includes("--no-build"),
+    show: argv.includes("--show") || process.env.AIO_E2E_SHOW === "1",
   };
 }
 
@@ -124,6 +131,25 @@ async function assertRenderer(win, expected) {
   }
   if (!ok) throw new Error(`renderer is ${url}, expected ${expected.kind === "url" ? expected.url : expected.file}`);
   console.log(`  ..  renderer: ${url}`);
+  // The page's CSS must carry Tailwind's utilities. A renderer whose Tailwind
+  // scanned no sources still loads and mounts, but unstyled: every check that
+  // clicks a sized control then times out somewhere unrelated (the sync tab
+  // E2E's 0x0 chapter checkbox, 2026-10-18: a Vite started outside UI-source
+  // found no Tailwind config and no sources; fixed in UI-source/postcss.config.js
+  // and tailwind.config.js, grep relative). `hidden` and `flex` are used across
+  // src, so both exist in any correct build.
+  const css = await win.evaluate(() => {
+    const probe = (cls) => {
+      const d = document.createElement("div");
+      d.className = cls;
+      document.body.appendChild(d);
+      const v = getComputedStyle(d).display;
+      d.remove();
+      return v;
+    };
+    return { hidden: probe("hidden"), flex: probe("flex") };
+  });
+  if (css.hidden !== "none" || css.flex !== "flex") throw new Error(`renderer CSS has no Tailwind utilities (.hidden → ${css.hidden}, .flex → ${css.flex})`);
 }
 
 /**
@@ -133,6 +159,7 @@ async function assertRenderer(win, expected) {
  * @param {string|null} o.exe     packaged executable, or null
  * @param {"dist"|"dev"} o.renderer
  * @param {boolean} o.build       dist mode: run vite build first
+ * @param {boolean} o.show        unpackaged: a normal window instead of off-screen
  * @param {string} o.userDataDir  passed as --user-data-dir (the isolated profile)
  * @param {object} o.env          extra env (merged over process.env)
  * @param {string[]} o.extraArgs  extra Chromium switches
@@ -140,7 +167,7 @@ async function assertRenderer(win, expected) {
  *   output: main's stdout+stderr so far. executablePath/args/env: what was
  *   launched, for harnesses that start a second instance themselves.
  */
-async function launchApp({ app, exe = null, renderer = "dist", build = true, userDataDir, env: extra = {}, extraArgs = [], timeout = 60_000 }) {
+async function launchApp({ app, exe = null, renderer = "dist", build = true, show = process.env.AIO_E2E_SHOW === "1", userDataDir, env: extra = {}, extraArgs = [], timeout = 60_000 }) {
   const { _electron } = require(process.env.PLAYWRIGHT_PATH || "playwright");
   const env = { ...process.env, ...extra };
   delete env.ELECTRON_RUN_AS_NODE;
@@ -169,9 +196,9 @@ async function launchApp({ app, exe = null, renderer = "dist", build = true, use
       expected = { kind: "file", file: path.join(app, "dist", "index.html") };
     }
     executablePath = electronBinary(app);
-    args = ["--no-sandbox", ...extraArgs, `--user-data-dir=${userDataDir}`, app];
+    args = ["--no-sandbox", ...(show ? [] : ["-r", OFFSCREEN]), ...extraArgs, `--user-data-dir=${userDataDir}`, app];
   }
-  console.log(`app: ${exe || app} (renderer ${exe ? "packaged" : renderer})`);
+  console.log(`app: ${exe || app} (renderer ${exe ? "packaged" : renderer}, window ${exe || show ? "shown" : "off-screen"})`);
   const electronApp = await _electron.launch({ executablePath, args, env, timeout });
   let out = "";
   electronApp.process().stderr.on("data", (d) => (out += d));
