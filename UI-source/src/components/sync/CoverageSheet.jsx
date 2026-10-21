@@ -23,12 +23,11 @@
 // ============================================================
 
 import React, { useEffect, useId, useMemo } from "react";
-import { AlertTriangle } from "lucide-react";
 import { Sheet } from "@/components/ui/overlay";
 import { cn } from "@/lib/utils";
 import { coverageModel } from "@/lib/chapterCoverage";
 import { CoverageGrid, CoverageHeadline, CoverageSummary } from "@/components/ChapterCoverage";
-import { ratingText, rowCandidate, rowCoverage, rowSites, unmeasured } from "./findView";
+import { ratingText, ratingTitle, rowCandidate, rowCoverage, rowSites, unmeasured } from "./findView";
 
 /**
  * @param {object} p
@@ -102,9 +101,8 @@ export default function CoverageSheet({ row, width, contained, busy, onClose, on
                   <label key={source.url} className={cn("flex min-w-0 cursor-pointer items-center gap-2 rounded px-2 py-1 text-xs hover:bg-accent", picked && "bg-primary/[.06]")} title={source.url}>
                     <input type="radio" name={name} className="accent-primary" checked={picked} disabled={busy} onChange={() => onPatch({ pickUrl: source.url })} />
                     <span className="w-28 shrink-0 truncate font-mono">{source.site}</span>
-                    <span className="flex w-12 shrink-0 items-center gap-1 font-mono text-[11px] text-muted-foreground" title={warn ? "Rating not measured from chapter pages" : undefined}>
+                    <span className={cn("w-20 shrink-0 truncate text-[11px] text-muted-foreground", warn ? "italic" : "font-mono")} title={ratingTitle(source)}>
                       {ratingText(source)}
-                      {warn && <AlertTriangle className="h-3 w-3 text-destructive" aria-label="Rating not measured from chapter pages" />}
                     </span>
                     <span className={cn("ml-auto text-[11px]", picked ? "font-medium text-primary" : "text-muted-foreground")}>{picked ? "downloads" : fallback ? `fallback ${fallback}` : ""}</span>
                   </label>

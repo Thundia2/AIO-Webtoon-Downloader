@@ -1057,6 +1057,79 @@ class MangaDexSiteHandler(BaseSiteHandler):
             })
         return entries
 
+    def match_fetch_window(
+        self, chapter: Dict, scraper, make_request, n_pages: Optional[int] = None,
+    ) -> Dict:
+        """Search-ranking page window (contract: BaseSiteHandler.match_fetch_window).
+
+        Overridden because get_chapter_images above downloads the WHOLE chapter
+        before returning: 56 s and 172 s for two Railgun chapters (2026-10-18),
+        for 5 pages the ranker uses, which held the probe phase to its deadline.
+        Here: one /at-home/server call, then only the window's pages, at most
+        one node swap for the ones that failed.
+
+        `data` files only, never the data-saver fallback: a saver page is a
+        smaller re-encode, so measuring it would rate MangaDex below what a
+        download gets. A fetch that raised (no HTTP status: timeout, reset,
+        SSL) counts as timed out, so a flaky MD@H node leaves MangaDex
+        `pending` rather than `unreachable`; HTTP errors count as failures."""
+        from .base import _PROBE_TIMEOUT_EXCEPTIONS, daemon_map
+
+        n = int(n_pages or self.MATCH_WINDOW_PAGES)
+        out: Dict = {"pages": [], "n_total": 0, "attempted": 0, "failed": 0, "timed_out": 0}
+        chapter_id = chapter.get("url") or chapter.get("hid")
+        if chapter.get("_locked") or not chapter_id:
+            out.update(attempted=1, failed=1)
+            return out
+        try:
+            assignment = self._fetch_at_home_assignment(scraper, str(chapter_id))
+        except _PROBE_TIMEOUT_EXCEPTIONS:
+            out.update(attempted=1, timed_out=1)
+            return out
+        except Exception:
+            out.update(attempted=1, failed=1)
+            return out
+        names = assignment["data_filenames"]
+        out["n_total"] = len(names)
+        order = self.match_window_order(len(names), n)
+        blobs: Dict[int, bytes] = {}
+        status_of: Dict[int, Optional[int]] = {}
+        for swap in range(2):
+            pending = [i for i in order if i not in blobs]
+            if not pending:
+                break
+            if swap:
+                try:
+                    assignment = self._fetch_at_home_assignment(scraper, str(chapter_id))
+                except Exception:
+                    break
+                if len(assignment["data_filenames"]) != len(names):
+                    break  # a different page list: the window would shift
+            base = f'{assignment["base_url"]}/data/{assignment["file_hash"]}/'
+            urls = {i: base + assignment["data_filenames"][i] for i in pending}
+            # daemon threads, not a ThreadPoolExecutor: the match session
+            # abandons a hung window, which must not pin interpreter exit
+            # (see base.daemon_map)
+            fetched = daemon_map(
+                lambda i: self._fetch_image_blob(scraper, urls[i]),
+                pending, self._IMAGE_WORKERS, "md-match",
+                default=(False, None, 0, 0, False, None),
+            )
+            for i, (ok, blob, nbytes, dur_ms, cached, status) in zip(pending, fetched):
+                self._report_to_mdah(urls[i], ok, nbytes, dur_ms, cached)
+                status_of[i] = status
+                if ok and blob:
+                    blobs[i] = blob
+        for i in order:
+            out["attempted"] += 1
+            if i in blobs:
+                out["pages"].append((i, blobs[i]))
+            elif status_of.get(i) is None:
+                out["timed_out"] += 1
+            else:
+                out["failed"] += 1
+        return out
+
     @staticmethod
     def _extension_from_filename(filename: str) -> str:
         """Extract the trailing extension (with dot) from an MD@H filename

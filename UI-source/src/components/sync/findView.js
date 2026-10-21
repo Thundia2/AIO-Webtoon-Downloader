@@ -9,7 +9,7 @@
 //    pinnedUrl, skip, error, searchedAt}
 //   candidate {title, canonicalTitle, year, best, sources[every site]}
 //   source {site, url, title, cover, rating, chapters, qualityBasis,
-//           titleMatch}
+//           qualityReason, edition, titleMatch}
 // (the runner's header owns the field meanings).
 //
 // WHAT A QUEUED ROW DOWNLOADS (rowQueueArgs): the Search tab's rules,
@@ -45,6 +45,7 @@
 // ============================================================
 
 import { buildPrefetchedAlts } from "../../lib/prefetchedAlts.js";
+import { measuredRating, measuredTitle, qualityStatus } from "../../lib/qualityDisplay.js";
 
 /**
  * The series match a row's download comes from: the FIRST candidate listing
@@ -99,7 +100,7 @@ export function rowQueueArgs(row) {
 }
 
 // The search orchestrator's own cut-offs for "this title match is strong"
-// (sites/search_orchestrator.py EXPENSIVE_PROBE_QUICK_THRESHOLD) and "these
+// (sites/search_orchestrator.py IS_OFFICIAL_REQUIRES_TITLE_MATCH) and "these
 // two are too close to call on title alone" (TIEBREAKER_WINDOW). Copied, not
 // read: the runner gets only the search JSON. Keep in sync by grep.
 const READY_TITLE_MATCH = 0.85;
@@ -248,28 +249,50 @@ function _site(x) {
   return x && "best" in x ? x.best : x;
 }
 
-/** "0.92 · ch.97" for a candidate's best site, or for one site. */
+// A row saved before qualityBasis existed has none: its rating came from the
+// pre-rework probe, which only stored a measured or seed number. It reads as
+// unmeasured ("seed"), like a source the search did not probe.
+function _basis(b) {
+  return (b && b.qualityBasis) || "seed";
+}
+
+/**
+ * The rating text: "0.92" when measured, else the reason label ("not
+ * compared", "unreachable", …) — the Search tab's rule (lib/qualityDisplay.js).
+ * Never the old `composite` (that was the title match; see the runner's header).
+ */
+export function ratingText(c) {
+  const b = _site(c);
+  if (!b) return "";
+  const r = measuredRating(_basis(b), b.rating);
+  if (r != null) return r.toFixed(2);
+  return qualityStatus(_basis(b), b.qualityReason)?.label || "";
+}
+
+/** "0.92 · ch.97" (or "not compared · ch.97") for a candidate's best site, or for one site. */
 export function candidateScore(c) {
   const b = _site(c);
   if (!b) return "";
   const parts = [];
-  // rating, never the old `composite` (that was the title match; see the
-  // runner's header): a row saved with only `composite` shows chapters only.
-  if (b.rating != null) parts.push(b.rating.toFixed(2));
+  const r = ratingText(b);
+  if (r) parts.push(r);
   if (b.chapters != null) parts.push(`ch.${b.chapters}`);
   return parts.join(" · ");
 }
 
-/** The rating alone ("0.92"), for the coverage list where the count column replaces ch.N. */
-export function ratingText(c) {
+/** Tooltip for the rating text: what a measured rating means, or why there is none. */
+export function ratingTitle(c) {
   const b = _site(c);
-  return b && b.rating != null ? b.rating.toFixed(2) : "";
+  if (!b) return undefined;
+  const basis = _basis(b);
+  if (measuredRating(basis, b.rating) != null) return measuredTitle(basis);
+  return qualityStatus(basis, b.qualityReason)?.title;
 }
 
-/** A rating not measured from chapter pages gets the red triangle (SearchSourceCard's rule). */
+/** True when the text is a reason label, not a number (the sheets mute it). */
 export function unmeasured(c) {
   const b = _site(c);
-  return !!(b && b.qualityBasis && b.qualityBasis !== "chapter_probe");
+  return !!b && measuredRating(_basis(b), b.rating) == null;
 }
 
 /**

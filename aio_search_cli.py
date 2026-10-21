@@ -66,7 +66,9 @@ from sites.search_orchestrator import (
     DEFAULT_PER_SITE_TIMEOUT_S,
     ImageQualityCache,
     ProbeFailureCache,
+    best_title_of,
     search_all,
+    source_rank_key,
 )
 
 
@@ -106,7 +108,7 @@ def _try_extract_seed_hit(query: str, fetch_memo=None) -> Optional[SearchHit]:
 
     ``fetch_memo`` (sites/fetch_memo.py, 2026-07-12): when provided, the
     context (and, for mangafire, the chapter list) this resolution already
-    fetched is pre-registered so the probe / T3 / winner-fetch phases reuse
+    fetched is pre-registered so the probe and winner-fetch phases reuse
     it instead of re-fetching. The seed's bare requests.Session is
     deliberately NOT registered as the memo scraper — it was configured with
     args=None and would drift from the args-configured scrapers the other
@@ -197,7 +199,7 @@ def _try_extract_seed_hit(query: str, fetch_memo=None) -> Optional[SearchHit]:
 
     # Pre-populate the per-run fetch memo with data this resolution already
     # paid for. Keyed on the SAME url the SearchHit below carries
-    # (comic.get("url") or q) so probe/T3/winner lookups — which key on
+    # (comic.get("url") or q) so probe/winner lookups — which key on
     # src.url == hit.url — hit it. Best-effort: memo failures must never
     # break seed resolution.
     if fetch_memo is not None:
@@ -524,21 +526,8 @@ def run_search_mode(
     if not query:
         sys.exit("--search requires a non-empty title.")
 
-    # Set the ML-rating gate BEFORE the orchestrator imports torch-backed
-    # modules. When False (the default), all torch/pyiqa/torchmetrics
-    # imports stay deferred — search startup never loads torch. This
-    # avoids the Python 3.13 + Windows WMI hang that bricked --search
-    # before the 2026-05-20 lazy-import refactor. set_ml_rating_enabled
-    # is idempotent so direct-URL multi-source paths can also call it.
-    # Cross-file: aio-dl.py argparse defines --enable-ml-rating;
-    # UI-source/src/components/SearchTab.jsx writes enableMlRating to
-    # settings.searchOpts; UI-source/electron/searcher.js translates that
-    # back to --enable-ml-rating on the spawn line — grep enableMlRating.
-    from sites.search_orchestrator import set_ml_rating_enabled
-    set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
-
     # Per-run fetch memo (sites/fetch_memo.py, 2026-07-12): shared by the
-    # probe phase, T3 pairwise, and the winner chapter fetch so each
+    # matched-page probe phase and the winner chapter fetch so each
     # (site, url)'s context + chapter list is fetched from the network at
     # most once per run. In-process only — dies with this invocation.
     fetch_memo = FetchMemo()
@@ -590,15 +579,11 @@ def run_search_mode(
         probe_failure_cache=cache,
         img_quality_cache=img_cache,
         seed_hits=seed_hits or None,
-        # Search mode always probes ALL sources (including the seed
-        # source, when --search was given a URL) so the JSON output
-        # surfaces a real comparable img_quality_score for every
-        # candidate. Quality skip is reserved for direct-URL
-        # --multi-source (find_alternatives_for_direct_url below),
-        # where the primary is already committed and probing it is
-        # waste. The SKIP_QUALITY_PROBE class-attr opt-out is honored
-        # unconditionally in search_orchestrator's per-source loop (a
-        # generic hook — no handler sets it today) — no plumbing here.
+        # Search mode probes every eligible source (including the seed
+        # source, when --search was given a URL) so the JSON output carries
+        # comparable ratings. The SKIP_QUALITY_PROBE class-attr opt-out is
+        # honored in search_orchestrator._probe_eligible (a generic hook - no
+        # handler sets it today) - no plumbing here.
         on_status=_status,
         seeded_only=bool(getattr(args, "seeded_only", False)),
         # Probe scope (2026-07-12, user decision): --auto-pick only ever
@@ -635,6 +620,8 @@ def run_search_mode(
             winner.sources[1:],  # skip top
             primary_host="",  # no primary-host yet; --auto-pick uses winner.sources[0]
             quality_min=quality_min,
+            primary_edition=getattr(winner.sources[0], "edition", None),
+            rank_pool=winner.sources,
         )
         # The winner candidate is reduced to: top source + eligible alts.
         from sites.search_orchestrator import SeriesCandidate
@@ -884,60 +871,62 @@ def take_latest_multi_source_state():
     return val
 
 
-def _filter_and_rank_alt_sources(sources, *, primary_host: str = "", quality_min: float = 0.65) -> list:
-    """Filter winner candidate sources down to a quality-and-host-clean
-    alternatives list, ranked by quality DESC.
+# Bases whose source served pages to the matched-page probe (sites/
+# match_session.py). User decision 2026-10-18 ("all measured"): every such
+# source is a fallback whatever its rating, ordered by quality; the seed floor
+# only gates sources the probe never measured.
+_SERVED_BASES = frozenset({"matched", "partial", "solo", "unmatched"})
 
-    Why filter:
-      - Sources with no seed entry default to seed_quality=0.50, which is
-        a TIE among most Madara/MangaThemesia extras. Without filtering,
-        the parallel-search-completion order picks an arbitrary one as
-        first (e.g., klikmanga, an Indonesian site, ranking ahead of
-        weebcentral for an English-language download).
-      - Quality threshold (default 0.65) excludes unknown-quality sites
-        which empirically correlate with foreign-language and parse-quirky
-        handlers.
-      - User can lower the threshold via --multi-source-quality-min for
-        broader fallback coverage when willing to accept language drift.
 
-    Sort key prefers measured img_quality_score over seed_quality, so a
-    site that has been probed and scored well still wins even if its seed
-    entry is missing. img_quality_score=None (unprobed) yields seed_quality
-    as the comparison value; img_quality_score=0.0 (probed but every page
-    failed — CDN poisoned) IS used as the rank input so a broken-CDN site
-    correctly drops to the bottom.
+def _edition_of(s) -> str:
+    """'alternate' for a fan-colored / different edition, else 'original'
+    (undecided counts as original). Mirror: editionOf in
+    UI-source/src/lib/prefetchedAlts.js."""
+    return "alternate" if getattr(s, "edition", None) == "alternate" else "original"
+
+
+def _filter_and_rank_alt_sources(
+    sources, *, primary_host: str = "", quality_min: float = 0.65,
+    primary_edition: Optional[str] = None, rank_pool=None,
+) -> list:
+    """Filter a winner candidate's sources down to the fallback list, in the
+    search's own source order (search_orchestrator.source_rank_key). That
+    order is chapter_merger's alignment input order, so it also breaks a
+    chapter-coverage tie for the anchor in favour of the better copy (plan
+    decision E) and orders the primary switch's targets.
+
+    Kept:
+      - every source that served pages to the matched-page probe (basis in
+        _SERVED_BASES), whatever its rating (user decision "all measured");
+      - an unmeasured source (pending / seed) when seed_quality >= quality_min:
+        unknown-quality extras default to 0.50 and are mostly foreign-language
+        (raise or lower with --multi-source-quality-min).
+    Dropped: the primary's host, SKIP_MULTI_SOURCE handlers, `unreachable`
+    sources (every page fetch failed), and sources of another edition than
+    the primary's (decision: a colored copy never fills a B&W download, nor the
+    reverse; primary_edition None = original).
+
+    rank_pool: the whole candidate's sources, when `sources` is a slice of it,
+    so the title band is measured from the candidate's best title match.
     """
+    want = "alternate" if primary_edition == "alternate" else "original"
     eligible = []
     for s in sources:
         if primary_host and urlparse(s.url).netloc.lower() == primary_host:
             continue
-        # Handlers that opt out of multi-source merging entirely via the
-        # SKIP_MULTI_SOURCE class attribute. This is a generic opt-out hook
-        # for a site whose chapter-list fetch is wildly more expensive than
-        # other handlers in absolute wall-clock terms (e.g. a single-threaded
-        # browser bridge), where adding it to the alternatives pool would
-        # delay --multi-source alignment for the user's primary download
-        # without buying real fallback coverage. NO handler sets it today —
-        # comix used to, but it's now a full multi-source participant (see
-        # sites/comix.py). Kept because the trade-off it guards is real and a
-        # future handler may need it. Treat the flag as equivalent to
-        # primary_host exclusion: drop before the quality_min check so a
-        # flagged site never reaches _fetch_chapters_for_winner.
+        # Generic opt-out for a handler whose chapter-list fetch is far more
+        # expensive than its peers'; NO handler sets it today (comix used
+        # to). Same check in build_alternatives_from_payload.
         handler = get_handler_by_name(s.site)
         if handler is not None and getattr(handler, "SKIP_MULTI_SOURCE", False):
             continue
-        # Sources qualify by either explicit seed_quality OR a measured
-        # img_quality_score >= 0.4 (rough "ok quality" floor). A measured
-        # 0.0 (CDN-poisoned probe) does NOT qualify via the img_quality
-        # path — that's the whole point of the multi-page aggregate fix.
-        if s.seed_quality >= quality_min:
+        basis = getattr(s, "basis", None)
+        if basis == "unreachable" or _edition_of(s) != want:
+            continue
+        if basis in _SERVED_BASES or s.seed_quality >= quality_min:
             eligible.append(s)
-        elif s.img_quality_score is not None and s.img_quality_score >= 0.4:
-            eligible.append(s)
-    # Stable sort, quality DESC. _q: prefer measured over seed (incl. 0.0).
-    def _q(s):
-        return s.img_quality_score if s.img_quality_score is not None else s.seed_quality
-    eligible.sort(key=_q, reverse=True)
+    best = best_title_of(list(rank_pool) if rank_pool is not None else list(sources))
+    eligible.sort(key=lambda s: source_rank_key(s, best))
     return eligible
 
 
@@ -1021,12 +1010,6 @@ def find_alternatives_for_direct_url(
     if on_status:
         on_status(f"[*] Multi-source: searching for alternatives to '{title}'...")
 
-    # Direct-URL multi-source enters here, separate from run_search_mode. Set
-    # the ML-rating gate here too so the orchestrator's lazy torch checks see
-    # the right state. Idempotent — calling twice in the same process is fine.
-    from sites.search_orchestrator import set_ml_rating_enabled
-    set_ml_rating_enabled(bool(getattr(args, "enable_ml_rating", False)))
-
     # Step 2: search.
     timeout = float(getattr(args, "search_timeout", DEFAULT_PER_SITE_TIMEOUT_S) or DEFAULT_PER_SITE_TIMEOUT_S)
     parallelism = max(1, int(getattr(args, "search_parallelism", 6) or 6))
@@ -1055,17 +1038,10 @@ def find_alternatives_for_direct_url(
         min_match=min_match,
         probe_failure_cache=cache,
         img_quality_cache=img_cache,
-        # Direct-URL --multi-source: the primary site is committed (we're
-        # downloading from primary_url regardless). Skip its image-quality
-        # probe — the score wouldn't affect our use of it, only ranking,
-        # and the primary_host filter below drops it from alternatives
-        # anyway so its score has no effect on the multi-source merge
-        # either. On the canonical primary, this cuts the chapter-list +
-        # image-fetch work that the probe would otherwise spend on the
-        # source we already chose.
-        skip_probe_sites=(
-            {primary_handler.name} if primary_handler is not None else None
-        ),
+        # Direct-URL --multi-source: the primary is committed (we download
+        # from primary_url regardless) but still probed, not skipped: its
+        # pages are what the alternatives are compared with, and its edition
+        # decides which alternatives qualify (_filter_and_rank_alt_sources).
         on_status=on_status,
         seeded_only=bool(getattr(args, "seeded_only", False)),
         # Only candidates[0] is consumed below — probing the sub-series
@@ -1096,10 +1072,16 @@ def find_alternatives_for_direct_url(
 
     quality_min = float(getattr(args, "multi_source_quality_min", 0.65) or 0.65)
     winner = candidates[0]
+    primary_entry = next(
+        (s for s in winner.sources
+         if primary_host and urlparse(s.url).netloc.lower() == primary_host),
+        None,
+    )
     alt_sources = _filter_and_rank_alt_sources(
         winner.sources,
         primary_host=primary_host,
         quality_min=quality_min,
+        primary_edition=getattr(primary_entry, "edition", None),
     )
     if not alt_sources:
         if on_status:

@@ -118,7 +118,7 @@ function buildCliArgs(args) {
     // "skip empty/null/undefined" filter below already keeps the
     // default-off spawn clean. metadataTagMinRank is similarly only
     // injected when it differs from the Python argparse default (50).
-    // Python side: aio-dl.py near --enable-ml-rating + sites/external_metadata.py.
+    // Python side: aio-dl.py's "--metadata-source" + sites/external_metadata.py.
     metadataSource: "--metadata-source",
     metadataTagMinRank: "--metadata-tag-min-rank",
   };

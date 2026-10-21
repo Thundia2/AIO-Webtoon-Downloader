@@ -134,16 +134,23 @@ Two departures from the desktop's arguments, both deliberate:
 | **comix is force-excluded** | It is the one handler that never went through the browser seam (grep `_comix_worker_loop`), so it can only spend fan-out budget failing. Its `search()` is required to swallow errors to `[]`, so leaving it in would not break a run — just slow it. Excluding it also keeps it out of the quality probe, the expensive half |
 | **Lower fan-out** | 4 by default against the desktop's 6. Fan-out opens one TLS connection per site and a phone radio handles that worse than an ethernet NIC. Resource Limits tightens it further (2/3/5), as a hard override |
 
-`--enable-ml-rating` is **never** emitted — torch is not installed, so the flag
-would buy a slower search that falls back to the same scoring.
+`--enable-ml-rating` is **never** emitted: the ML rating was removed from the
+desktop too (2026-10-21) and aio-dl.py no longer accepts the flag, so an old
+saved `enableMlRating` setting is ignored. The search ranker is numpy + Pillow
+only, the same on both platforms.
 
 Results are grouped by SERIES, not by site, because the orchestrator has already
 merged ~40 sites' hits into one candidate per series and ranked the sources
 inside it; a flat list would throw that away and make the user dedupe by eye.
-Each source shows its rating **and whether that rating was measured** — only
-`quality_basis == "chapter_probe"` means real chapter pages were fetched, and a
-per-site seed prior otherwise looks identical. The desktop flags this the same
-way (`SearchSourceCard.jsx`), at the user's explicit request.
+Each source shows a rating **only when it was measured**: `quality_basis`
+"matched" or "partial" means its pages were compared with other sites' copies of
+the same pages. Every other basis ("solo", "unmatched", "pending", "unreachable",
+"seed") shows a reason label such as "not compared" instead of a number, because
+a seed prior next to measured ratings reads as a measurement. A source of a
+different edition (e.g. fan-colored) says "Other edition", and copies of the same
+scan say "Same file as …" / "Same scan as …". The desktop follows the same rules
+(`UI-source/src/lib/qualityDisplay.js`); the Kotlin side is `SearchModels.kt`
+(grep `measuredRating`).
 
 A search cannot be cancelled: `--search` has no cancellation path, and the
 fan-out already stops waiting at its own barrier. The UI therefore offers no
@@ -402,7 +409,8 @@ degrades rather than crashes:
 - `patchright` / `zendriver` — desktop browsers, replaced by the WebView backend (M4).
 - `fastapi` / `uvicorn` — the REST server; Android calls Python in-process.
 - `pillow-jxl-plugin` — `--modernize` only. (Note Pillow 11, not 12, so no native AVIF either.)
-- torch / pyiqa / piq / torchmetrics / easyocr — opt-in ML rating, ~700 MB.
+- torch / pyiqa / piq / torchmetrics / easyocr — not needed by anything any more:
+  the opt-in ML rating that used them was removed (2026-10-21).
 
 ## Python source staging
 

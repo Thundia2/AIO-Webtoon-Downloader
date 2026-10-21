@@ -15,6 +15,17 @@ from unittest.mock import patch, MagicMock
 from sites.search_orchestrator import search_all
 
 
+def _isolated_probe_cache(tmp_path, **kw):
+    """ProbeFailureCache that neither reads nor writes the user's real
+    ~/.aio-dl/cache/probe_failures.json (its constructor loads that path and
+    record_failure saves to it; a test host used to land in the real file)."""
+    from sites.search_orchestrator import ProbeFailureCache
+    cache = ProbeFailureCache(**kw)
+    cache._state = {}
+    cache._snapshot_path = str(tmp_path / "probe_failures.json")
+    return cache
+
+
 def _empty_handler_iter():
     """Yields no handlers — simulates --seeded-only filtering everything."""
     return iter([])
@@ -98,12 +109,11 @@ def test_search_all_processes_seed_hits_when_no_eligible():
             assert result[0].sources[0].site == "mangadex"
 
 
-def test_search_all_handles_blocked_handlers():
+def test_search_all_handles_blocked_handlers(tmp_path):
     """When all eligible handlers are filtered out (e.g. probe-failure
     cache blocks every host), and no seed hits are provided, return []
     without spawning workers."""
     from sites.base import BaseSiteHandler
-    from sites.search_orchestrator import ProbeFailureCache
 
     # Mock handler whose primary domain is "blocked.example".
     class _MockHandler(BaseSiteHandler):
@@ -117,7 +127,7 @@ def test_search_all_handles_blocked_handlers():
         def get_group_name(self, *a, **kw): return None
 
     handler = _MockHandler()
-    cache = ProbeFailureCache(threshold=1, ttl_s=3600)
+    cache = _isolated_probe_cache(tmp_path, threshold=1, ttl_s=3600)
     cache.record_failure("blocked.example")  # one failure, threshold=1
 
     with patch(
@@ -140,38 +150,21 @@ def test_search_all_handles_blocked_handlers():
 
 
 # ────────────────────────────────────────────────────────────────────────
-# Official-publisher tiebreaker (2026-05-12).
-# Within a SeriesCandidate, sources where the handler sets
-# OFFICIAL_PUBLISHER=True must rank above aggregator sources regardless
-# of measured img_quality_score. Closes the ********.com vs ******* case
-# where the official publisher served PNGs at 720-800px (below the probe's
-# 800px res_score floor) and was losing to toonily's upscaled JPEG.
+# Official-publisher tiebreaker (2026-05-12), now step 3 of
+# search_orchestrator.source_rank_key. Within a SeriesCandidate an
+# OFFICIAL_PUBLISHER source in the title band (and itself >=
+# IS_OFFICIAL_REQUIRES_TITLE_MATCH) ranks above aggregators regardless of
+# measured quality. Closes the ********.com vs ******* case where the official
+# publisher served PNGs at 720-800px and lost to toonily's upscaled JPEG.
+# These tests call the shipped sort_sources (an earlier version tested a local
+# replica of the comparator, which had drifted from the shipped one).
 # ────────────────────────────────────────────────────────────────────────
 
 def _sort_sources(sources):
-    """Apply the same comparator logic the orchestrator uses internally,
-    so we test the wire-level behavior without needing to spin up a full
-    search_all + scraper_factory.
-    """
-    from functools import cmp_to_key
-    from sites.search_orchestrator import TIEBREAKER_WINDOW
-
-    def quality_for(s):
-        return s.img_quality_score if s.img_quality_score is not None else s.seed_quality
-
-    def cmp(a, b):
-        if a.dmca_likely != b.dmca_likely:
-            return 1 if a.dmca_likely else -1
-        if a.is_official != b.is_official:
-            return -1 if a.is_official else 1
-        if abs(a.title_match - b.title_match) <= TIEBREAKER_WINDOW:
-            qa, qb = quality_for(a), quality_for(b)
-            if qa != qb:
-                return -1 if qa > qb else 1
-            return 0
-        return -1 if a.title_match > b.title_match else 1
-
-    return sorted(sources, key=cmp_to_key(cmp))
+    from sites.search_orchestrator import sort_sources
+    out = list(sources)
+    sort_sources(out)
+    return out
 
 
 def _make_source(site, *, is_official=False, title_match=1.0,
@@ -187,9 +180,8 @@ def _make_source(site, *, is_official=False, title_match=1.0,
 
 
 def test_official_publisher_beats_aggregator_despite_lower_img_quality():
-    """The bug: linewebtoon (official, PNG @ 800px → res_score=0 → composite
-    ~0.51) was being outranked by toonily (aggregator, upscaled JPEG →
-    composite ~0.60). After the fix, official wins regardless of quality."""
+    """linewebtoon (official, lower measured score) must outrank toonily
+    (aggregator, upscaled JPEG) at equal title match."""
     linewebtoon = _make_source("linewebtoon", is_official=True,
                                seed_quality=0.92, img_quality_score=0.51)
     toonily = _make_source("toonily", is_official=False,
@@ -199,19 +191,16 @@ def test_official_publisher_beats_aggregator_despite_lower_img_quality():
     assert result[1].site == "toonily"
 
 
-def test_official_publisher_beats_aggregator_outside_tiebreaker_window():
-    """Even when title_match deltas are large, official wins within a
-    candidate — the union-find merge already established same-series
-    membership, so the publisher is canonical regardless of title spread.
-    Verifies the official check happens BEFORE the TIEBREAKER_WINDOW
-    branch."""
+def test_official_outside_the_title_band_does_not_jump_the_band():
+    """The official preference applies inside the title band only: an official
+    hit 0.15 below the best title match (TIEBREAKER_WINDOW is 0.10) ranks by
+    title, so a weak-match official listing can't outrank the series itself."""
     linewebtoon = _make_source("linewebtoon", is_official=True,
                                title_match=0.85, seed_quality=0.92)
     toonily = _make_source("toonily", is_official=False,
                            title_match=1.00, seed_quality=0.55)
-    # delta = 0.15, outside TIEBREAKER_WINDOW of 0.10.
-    result = _sort_sources([toonily, linewebtoon])
-    assert result[0].site == "linewebtoon"
+    result = _sort_sources([linewebtoon, toonily])
+    assert result[0].site == "toonily"
 
 
 def test_dmca_likely_still_beats_official():
@@ -228,8 +217,7 @@ def test_dmca_likely_still_beats_official():
 
 
 def test_two_aggregators_still_decided_by_quality():
-    """When neither source is official, the existing img_quality_score-or-
-    seed_quality tiebreaker takes over inside the title-match window."""
+    """Neither official, both unmeasured: seed_quality decides in the band."""
     mangadex = _make_source("mangadex", is_official=False,
                             title_match=1.0, seed_quality=0.93)
     toonily = _make_source("toonily", is_official=False,
@@ -239,14 +227,43 @@ def test_two_aggregators_still_decided_by_quality():
 
 
 def test_two_officials_still_decided_by_quality():
-    """Hypothetical: two official-publisher sources for the same series
-    (would only happen if voyceme + linewebtoon both republished it).
-    Quality decides among officials as well — the flag is a class tier,
-    not a free pass."""
+    """Two official sources: the flag is a class tier, not a free pass, so
+    quality decides among them."""
     off_hi = _make_source("a", is_official=True, seed_quality=0.92)
     off_lo = _make_source("b", is_official=True, seed_quality=0.55)
     result = _sort_sources([off_lo, off_hi])
     assert result[0].site == "a"
+
+
+def test_unreachable_sinks_and_matched_outranks_unmeasured():
+    """A source whose probe served nothing ranks last even with a high seed
+    (its 0.0 is a reliability verdict); a matched rating outranks an
+    unmeasured seed at equal title match (plan rev 3: unmatched after matched)."""
+    dead = _make_source("dead", seed_quality=0.99, img_quality_score=0.0)
+    dead.basis = "unreachable"
+    seeded = _make_source("seeded", seed_quality=0.95)
+    measured = _make_source("measured", seed_quality=0.40, img_quality_score=0.60)
+    measured.basis = "matched"
+    result = _sort_sources([dead, seeded, measured])
+    assert [s.site for s in result] == ["measured", "seeded", "dead"]
+
+
+def test_alternate_edition_ranks_after_original():
+    colored = _make_source("colored", seed_quality=0.9, img_quality_score=0.95)
+    colored.basis, colored.edition = "matched", "alternate"
+    bw = _make_source("bw", seed_quality=0.5, img_quality_score=0.6)
+    bw.basis, bw.edition = "matched", "original"
+    assert [s.site for s in _sort_sources([colored, bw])] == ["bw", "colored"]
+
+
+def test_tie_group_orders_by_coverage_not_rating():
+    """Copies in one tie group are the same scan; their rating gap is noise,
+    so chapter coverage orders them."""
+    a = _make_source("a", img_quality_score=0.95)
+    b = _make_source("b", img_quality_score=0.90)
+    for s, cov in ((a, 100), (b, 120)):
+        s.basis, s.tie_group, s.match_group, s.coverage = "matched", 0, 0, cov
+    assert [s.site for s in _sort_sources([a, b])] == ["b", "a"]
 
 
 def test_linewebtoon_handler_carries_official_publisher_flag():
@@ -273,9 +290,8 @@ def test_base_handler_defaults_official_publisher_to_false():
 # SiteBusyError, sites/mangafire.py:search, useDownloader.js strike fold.
 # ────────────────────────────────────────────────────────────────────────
 
-def test_busy_site_is_a_notice_not_a_failure():
+def test_busy_site_is_a_notice_not_a_failure(tmp_path):
     from sites.base import BaseSiteHandler, SearchHit, SiteBusyError
-    from sites.search_orchestrator import ProbeFailureCache
 
     class _Busy(BaseSiteHandler):
         name = "busysite"
@@ -293,7 +309,7 @@ def test_busy_site_is_a_notice_not_a_failure():
                               cover=None, alt_titles=[], year=None, language=None,
                               chapter_count_hint=5, raw_score=1.0)]
 
-    cache = ProbeFailureCache(threshold=1, ttl_s=3600)
+    cache = _isolated_probe_cache(tmp_path, threshold=1, ttl_s=3600)
     diagnostics = {}
     with patch("sites.iter_search_capable_handlers", lambda: iter([_Busy(), _Ok()])):
         with patch("sites.get_handler_by_name", lambda _: None):
@@ -453,3 +469,14 @@ def test_zero_count_source_sinks_below_peers_without_a_peer_hint():
             cands = search_all("Goblin Slayer", MagicMock(return_value=MagicMock()), MagicMock())
     sites = [s.site for s in cands[0].sources]
     assert sites == ["realsite", "zerosite"]
+
+
+def test_a_source_that_served_nothing_does_not_set_the_title_band():
+    """best_title_of ignores unreachable sources: a dead exact-title hit must
+    not push every live source out of band 0 (where quality and the official
+    preference decide)."""
+    from sites.search_orchestrator import best_title_of
+    dead = _make_source("dead", title_match=1.0)
+    dead.basis = "unreachable"
+    live = _make_source("live", title_match=0.85)
+    assert abs(best_title_of([dead, live]) - 0.85) < 1e-9

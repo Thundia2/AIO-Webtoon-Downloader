@@ -18,9 +18,9 @@ import org.json.JSONObject
  * The CLI has 99 flags and the desktop surfaces nearly all of them across a New
  * tab and a 2,890-line Settings tab. This is the phone: the fields below are
  * the ones that change what you get, and everything else keeps aio-dl.py's own
- * default. `--modernize` (JXL/AVIF) and `--enable-ml-rating` are deliberately
- * absent — neither has an Android wheel behind it (no pillow-jxl, no torch),
- * so offering them would offer a run that cannot work.
+ * default. `--modernize` (JXL/AVIF) is deliberately absent — it has no
+ * Android wheel behind it (no pillow-jxl), so offering it would offer a run
+ * that cannot work.
  *
  * Persisted as one JSON blob in SharedPreferences, so the form survives
  * rotation, process death and a reboot.

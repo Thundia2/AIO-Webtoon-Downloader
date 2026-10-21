@@ -54,7 +54,7 @@
 // ============================================================
 
 import React, { useEffect, useId, useMemo, useRef, useState } from "react";
-import { AlertTriangle, ArrowRight, Check, ChevronDown, Download, Link2, Loader2, Pin, Search, Settings2, X } from "lucide-react";
+import { ArrowRight, Check, ChevronDown, Download, Link2, Loader2, Pin, Search, Settings2, X } from "lucide-react";
 import { Badge, Button, Checkbox, Input } from "@/components/ui/primitives";
 import { Sheet } from "@/components/ui/overlay";
 import { cn } from "@/lib/utils";
@@ -64,7 +64,7 @@ import { Cover } from "./Ledger";
 import CoverageStrip from "./CoverageStrip";
 import CoverageSheet from "./CoverageSheet";
 import { configRefusalCopy } from "./copy";
-import { aliasFor, candidateScore, findQueueArgs, findRows, findStatusLine, otherMatches, ratingText, rowCandidate, rowCoverage, rowQueueArgs, rowSites, rowSource, searchable, siteCoverageState, unmeasured } from "./findView";
+import { aliasFor, candidateScore, findQueueArgs, findRows, findStatusLine, otherMatches, ratingText, ratingTitle, rowCandidate, rowCoverage, rowQueueArgs, rowSites, rowSource, searchable, siteCoverageState, unmeasured } from "./findView";
 
 const XS = "h-7 px-2 text-xs gap-1 [&_svg]:h-3.5 [&_svg]:w-3.5";
 
@@ -91,16 +91,16 @@ function RowState({ row }) {
 }
 
 /**
- * "0.91 · ch.181" plus the red triangle when the rating isn't measured from
- * chapter pages; `ratingOnly` drops the ch.N (the coverage list's count
- * column says it better).
+ * "0.91 · ch.181", or the reason label ("not compared · ch.181") in italics
+ * when the rating wasn't measured (findView.ratingText; user decision
+ * 2026-10-21: measured ratings are the only numbers); `ratingOnly` drops the
+ * ch.N (the coverage list's count column says it better).
  */
 function SiteScore({ source, ratingOnly, className }) {
   const warn = unmeasured(source);
   return (
-    <span className={cn("flex shrink-0 items-center gap-1 font-mono text-[11px] text-muted-foreground", className)} title={warn ? "Rating not measured from chapter pages" : undefined}>
+    <span className={cn("flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground", warn ? "italic" : "font-mono", className)} title={ratingTitle(source)}>
       {ratingOnly ? ratingText(source) : candidateScore(source)}
-      {warn && <AlertTriangle className="h-3 w-3 text-destructive" aria-label="Rating not measured from chapter pages" />}
     </span>
   );
 }
@@ -136,7 +136,7 @@ const NO_MAP_COPY = {
 
 // Widths shared by the site list's header and its rows.
 const COL_SITE = "w-28 shrink-0";
-const COL_RATING = "w-12";
+const COL_RATING = "w-20 truncate";
 const COL_COUNT = "w-[72px] shrink-0 whitespace-nowrap text-right";
 const COL_ROLE = "w-[72px] shrink-0 text-right";
 

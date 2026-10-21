@@ -73,7 +73,7 @@ from . import mangafire_vrf
 
 # All bare print() calls in this module emit to stderr by default. Why: this
 # handler logs progress/diagnostics via plain print(); when called from the
-# orchestrator's search-time probe (sites/search_orchestrator.py:_probe_one),
+# orchestrator's search-time probe (sites/match_session.py),
 # that chatter would otherwise land in stdout — which carries the JSON --search
 # output for piped consumers. Explicit file=sys.stdout still opts out.
 def _stderr_print(*args, **kwargs):

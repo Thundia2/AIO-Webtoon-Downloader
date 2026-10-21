@@ -72,9 +72,9 @@ import com.aio.downloader.ui.theme.aio
  * [Collapsible] grouped the way the desktop's Settings tab groups it, so a
  * reader who knows the desktop can find things where they expect.
  *
- * Deliberately ABSENT: `--modernize` (JXL/AVIF) and `--enable-ml-rating`.
- * Neither has an Android wheel behind it — no pillow-jxl, no torch — so
- * offering them would be offering a run that cannot work.
+ * Deliberately ABSENT: `--modernize` (JXL/AVIF). It has no Android wheel
+ * behind it — no pillow-jxl — so offering it would be offering a run that
+ * cannot work.
  */
 @Composable
 fun DownloadScreen(

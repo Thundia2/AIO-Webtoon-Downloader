@@ -81,14 +81,6 @@ const DEFAULT_OPTS = {
   searchTimeout: 20,
   searchMinMatch: 0.55,
   searchParallelism: 6,
-  // ML image-quality rating (CLIP-IQA + NIQE + paired DISTS). Default OFF
-  // because torch's Windows import path hits platform.machine() which Python
-  // 3.13 routes through WMI — that can hang indefinitely on degraded hosts,
-  // bricking --search for the whole session. See search_orchestrator.py's
-  // _ML_RATING_ENABLED docstring for the full rationale. The toggle wires
-  // through to electron/searcher.js (opts.enableMlRating → --enable-ml-rating)
-  // and aio_search_cli sets the orchestrator gate before search_all runs.
-  enableMlRating: false,
 };
 
 const DOWNLOAD_FORMATS = [
@@ -639,8 +631,10 @@ export default function SearchTab({
                 disabled={isRunning}
               />
               <p className="text-[10px] text-muted-foreground mt-1">
-                Sources below this seed/measured quality won't be used as fallbacks.
-                Default 0.65 keeps unknown-language Madara extras out.
+                Applies to unmeasured sources (their seed rating): below it they
+                won't be used as fallbacks. Measured sources that served pages
+                qualify at any rating. Default 0.65 keeps unknown-language Madara
+                extras out.
               </p>
             </div>
           )}
@@ -710,27 +704,6 @@ export default function SearchTab({
                 onChange={(e) => set("searchParallelism", parseInt(e.target.value, 10) || 6)}
                 disabled={isRunning}
                 className="w-20 h-8 text-xs"
-              />
-            </div>
-            {/* ML image-quality rating — opt-in. Forwards to --enable-ml-rating
-                via electron/searcher.js (opts.enableMlRating). Off by default;
-                see DEFAULT_OPTS above for the WMI-hang rationale. */}
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <Label htmlFor="opt-ml-rating" className="text-xs font-medium">
-                  ML image rating
-                </Label>
-                <p className="text-[10px] text-muted-foreground">
-                  Torch-backed CLIP-IQA + NIQE + DISTS for sharper ranking
-                  on borderline matches. Adds ~5 s startup and ~150 MB of
-                  model weights on first use. Default off.
-                </p>
-              </div>
-              <Switch
-                id="opt-ml-rating"
-                checked={opts.enableMlRating}
-                onCheckedChange={(v) => set("enableMlRating", v)}
-                disabled={isRunning}
               />
             </div>
           </div>

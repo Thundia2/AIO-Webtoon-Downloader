@@ -53,9 +53,12 @@
 //     one shape feeds both tabs). It holds one entry per chapter per site,
 //     so it is most of a row's bytes; it is read, never edited, here.
 //   source: {site, url, title, cover, rating, chapters, qualityBasis,
-//            titleMatch}
-//     rating = the Search tab's displayed rating (SearchSourceCard.jsx
-//     `final`): the measured image-quality score, else the site's seed prior.
+//            qualityReason, edition, titleMatch}
+//     rating = the measured image-quality score, else the site's seed prior;
+//     the renderer shows it as a number only when qualityBasis says it was
+//     measured (src/lib/qualityDisplay.js measuredRating), otherwise a
+//     reason label built from qualityBasis + qualityReason
+//     (img_quality_metadata.reason, sites/match_session.py SourceVerdict).
 //     NOT composite_score, which in the current search IS the title match
 //     (search_orchestrator.py "composite = title_match"). Rows saved before
 //     this field (they stored `composite`) show no rating until re-searched.
@@ -129,6 +132,9 @@ function _source(s) {
     rating: _num(s.img_quality_score) != null ? s.img_quality_score : _num(s.seed_quality),
     chapters: _num(s.actual_chapter_count) != null ? s.actual_chapter_count : _num(s.chapter_count_hint),
     qualityBasis: s.quality_basis || null,
+    qualityReason: (s.img_quality_metadata && s.img_quality_metadata.reason) || null,
+    // fallback funnel (src/lib/prefetchedAlts.js) keeps only the primary's edition
+    edition: s.edition || null,
     titleMatch: _num(s.title_match),
   };
 }

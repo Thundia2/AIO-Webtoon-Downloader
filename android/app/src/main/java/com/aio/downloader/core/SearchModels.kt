@@ -15,16 +15,19 @@ import org.json.JSONObject
  * Nothing here re-derives any of that; it parses.
  *
  * ── THE ONE THING WORTH KNOWING ABOUT THE RATINGS ──────────────────────────
- * A source's displayed rating is not always measured. `quality_basis` says
- * where it came from: "chapter_probe" means real chapter pages were fetched and
- * scored, "cover" means only the cover image was, and "seed" means it is a
- * per-site prior with nothing measured at all. [SearchSource.ratingIsMeasured]
- * is that distinction, and the UI flags the other two — the desktop shows a red
- * triangle for exactly this (SearchSourceCard.jsx), because a seed rating
- * looks identical to a measured one otherwise.
+ * A rating is measured only when the source's pages were compared with other
+ * sites' copies of the same pages (`sites/match_session.py`, rate_sources):
+ * `quality_basis` "matched", or "partial" (compared within a smaller group of
+ * sites). Every other basis — "solo", "unmatched", "pending", "unreachable",
+ * "seed" (not probed) — has no comparable number, and shows a reason label
+ * instead of one (user decision 2026-10-21, plan
+ * sync-temp/plans/image-ranker-rework.md "P4 design"): a seed prior next to
+ * measured ratings reads as a measurement. [SearchSource.measuredRating] and
+ * [SearchSource.qualityLabel] are that rule, the same as the desktop's
+ * UI-source/src/lib/qualityDisplay.js (grep measuredRating there).
  *
  * Cross-file: aio_android.search (the payload), SearchRepository.kt (the
- * caller), UI-source/src/components/SearchSourceCard.jsx (the behaviour ported).
+ * caller), SearchSourceCard.jsx + lib/qualityDisplay.js (the behaviour ported).
  */
 
 /** One site's copy of a series. */
@@ -46,15 +49,57 @@ data class SearchSource(
     val actualChapterCount: Int?,
     val dmcaLikely: Boolean,
     val isOfficial: Boolean,
+    /** "original" | "alternate" (a different edition, e.g. fan-colored) | "undecided". */
+    val edition: String = "undecided",
+    /** This source's pages are in color (`img_quality_metadata.colored`); null = unknown. */
+    val colored: Boolean? = null,
+    /** Why there is no measured rating (`img_quality_metadata.reason`), when the probe recorded one. */
+    val qualityReason: String? = null,
+    /** Sites serving byte- or pixel-identical pages (`img_quality_metadata.same_file`). */
+    val sameFile: List<String> = emptyList(),
+    /** Sites serving the same scan re-encoded (`img_quality_metadata.same_scan`). */
+    val sameScan: List<String> = emptyList(),
 ) {
-    /** True only when the rating came from measured chapter pages. */
-    val ratingIsMeasured: Boolean get() = qualityBasis == "chapter_probe"
+    /** The rating to show as a number, or null when it was not measured. */
+    val measuredRating: Double? get() = imgQuality?.takeIf { qualityBasis in MEASURED_BASES }
+
+    /** Shown in place of the number when [measuredRating] is null. */
+    val qualityLabel: String
+        get() = when (qualityBasis) {
+            "solo", "unmatched" -> "not compared"
+            "unreachable" -> "unreachable"
+            "pending" -> if (qualityReason?.contains("timeout") == true) "timed out" else "not measured"
+            else -> "not measured"
+        }
+
+    /** A different edition from most sites': never another download's fallback. */
+    val isOtherEdition: Boolean get() = edition == "alternate"
+
+    /** Which way an other-edition source differs, or null. */
+    val editionNote: String?
+        get() = if (!isOtherEdition) null else when (colored) {
+            true -> "colored, where most sites are black-and-white"
+            false -> "black-and-white, where most sites are in color"
+            null -> "pages differ from most sites' copies"
+        }
+
+    /** "Same file as atsu; same scan as mangapill", or null. */
+    val sameNote: String?
+        get() {
+            val parts = buildList {
+                if (sameFile.isNotEmpty()) add("same file as ${sameFile.joinToString(", ")}")
+                if (sameScan.isNotEmpty()) add("same scan as ${sameScan.joinToString(", ")}")
+            }
+            return parts.joinToString("; ").takeIf { it.isNotEmpty() }?.replaceFirstChar { it.uppercase() }
+        }
 
     /** What to show as the chapter count, preferring the counted value. */
     val chapterCount: Int? get() = actualChapterCount ?: chapterCountHint
 
-    /** The rating actually displayed: measured if present, else the seed prior. */
-    val displayRating: Double get() = imgQuality ?: seedQuality
+    private companion object {
+        /** Bases with a measured rating (match_session.rate_sources). */
+        val MEASURED_BASES = setOf("matched", "partial")
+    }
 }
 
 /** One series, with every site that has it. */
@@ -97,11 +142,16 @@ private fun JSONObject.intOrNull(key: String): Int? =
 private fun JSONObject.doubleOrNull(key: String): Double? =
     if (isNull(key)) null else optDouble(key).takeIf { !it.isNaN() }
 
+private fun JSONArray?.strings(): List<String> =
+    if (this == null) emptyList() else (0 until length()).mapNotNull { optString(it).takeIf { s -> s.isNotBlank() } }
+
 private fun parseSource(o: JSONObject): SearchSource? {
     val url = o.optString("url").orEmpty()
     // A source with no URL cannot be downloaded, so it has no reason to be on
     // screen — this is the same "drop, do not crash" rule parseSeries uses.
     if (url.isBlank()) return null
+    // match_session.quality_metadata; absent for sources the search did not probe
+    val meta = o.optJSONObject("img_quality_metadata")
     return SearchSource(
         site = o.optString("site").orEmpty(),
         url = url,
@@ -116,6 +166,12 @@ private fun parseSource(o: JSONObject): SearchSource? {
         actualChapterCount = o.intOrNull("actual_chapter_count"),
         dmcaLikely = o.optBoolean("dmca_likely", false),
         isOfficial = o.optBoolean("is_official", false),
+        // optString turns a JSON null into "null"
+        edition = o.optString("edition").takeIf { it.isNotBlank() && it != "null" } ?: "undecided",
+        colored = meta?.takeIf { it.has("colored") && !it.isNull("colored") }?.optBoolean("colored"),
+        qualityReason = meta?.takeIf { !it.isNull("reason") }?.optString("reason")?.takeIf { it.isNotBlank() },
+        sameFile = meta?.optJSONArray("same_file").strings(),
+        sameScan = meta?.optJSONArray("same_scan").strings(),
     )
 }
 

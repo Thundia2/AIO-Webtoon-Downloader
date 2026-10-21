@@ -66,13 +66,13 @@ import kotlin.math.roundToInt
  * deduplication by eye. So the card is the series; the sources are a detail you
  * open only when you disagree with the ranking.
  *
- * ── THE RATING NEEDS ITS CAVEAT SHOWN ──────────────────────────────────────
- * A source's rating is measured from real chapter pages only when
- * `quality_basis == "chapter_probe"`; otherwise it is a cover-image reading or
- * a per-site prior, and looks identical unless the UI says so. The desktop
- * flags this with a red triangle (SearchSourceCard.jsx) at the user's explicit
- * request; [SourceRow] does the same. Presenting a seed prior as a measurement
- * is the one thing this screen must not do.
+ * ── ONLY A MEASURED RATING IS A NUMBER ─────────────────────────────────────
+ * A source's rating is measured only when its pages were compared with other
+ * sites' copies of the same pages ([SearchSource.measuredRating]); otherwise
+ * [RatingLine] shows the reason ("not compared", "unreachable", …) where the
+ * number would be (user decision 2026-10-21, the desktop's rule in
+ * lib/qualityDisplay.js). Presenting a seed prior as a measurement is the one
+ * thing this screen must not do.
  *
  * ── SEARCH IS SLOW AND THAT IS NORMAL ──────────────────────────────────────
  * 40-100 seconds, because it fans out to every site and then fetches sample
@@ -338,6 +338,20 @@ private fun SourceRow(source: SearchSource, onDownload: (String) -> Unit) {
                 }
             }
             RatingLine(source)
+            source.sameNote?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.aio.mutedForeground,
+                )
+            }
+            source.editionNote?.let {
+                Text(
+                    "Other edition: $it",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.aio.warning,
+                )
+            }
             if (source.dmcaLikely) {
                 Text(
                     "May be missing chapters (DMCA)",
@@ -396,26 +410,24 @@ private fun RemoteCover(url: String?, title: String, modifier: Modifier = Modifi
 }
 
 /**
- * Rating plus, when the rating was not measured from chapter pages, the warning
- * that says so. See the screen header for why this is not optional.
+ * "Quality 92%", or "Quality: not compared" when the rating was not measured
+ * (see the screen header for why a seed number is never shown), then chapters
+ * and title match.
  */
 @Composable
 private fun RatingLine(source: SearchSource) {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        if (!source.ratingIsMeasured) {
-            Icon(
-                Icons.Filled.Warning,
-                contentDescription = "Rating not measured from chapter pages",
-                tint = MaterialTheme.aio.warning,
-                modifier = Modifier.size(12.dp),
-            )
-            Spacer(Modifier.width(4.dp))
-        }
         Text(
             buildString {
-                append("Quality ")
-                append((source.displayRating * 100).roundToInt())
-                append("%")
+                val r = source.measuredRating
+                if (r != null) {
+                    append("Quality ")
+                    append((r * 100).roundToInt())
+                    append("%")
+                } else {
+                    append("Quality: ")
+                    append(source.qualityLabel)
+                }
                 source.chapterCount?.let { append("  ·  $it ch") }
                 append("  ·  ")
                 append((source.titleMatch * 100).roundToInt())

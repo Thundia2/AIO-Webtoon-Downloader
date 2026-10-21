@@ -1883,9 +1883,9 @@ def build_search_argv(query: str, settings: Optional[Dict[str, Any]] = None) -> 
         argv.append("--multi-source")
     if settings.get("collapseSplits") is True:
         argv.append("--collapse-splits")
-    # --enable-ml-rating is never emitted: torch is not installed (see the
-    # dependency triage in android/README.md), and the flag would only produce
-    # a slower search that falls back to the same non-ML scoring.
+    # An old saved enableMlRating setting is ignored: the ML rating was removed
+    # with the image-ranker rework (2026-10-21) and aio-dl.py no longer accepts
+    # --enable-ml-rating, so emitting it would fail the whole search.
 
     disabled = settings.get("disabledSites")
     names: List[str] = []

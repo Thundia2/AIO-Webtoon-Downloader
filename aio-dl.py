@@ -4431,10 +4431,9 @@ def _page_is_grayscale(im, chroma_thresh: int = 16, area_frac: float = 0.005) ->
 
     Full-resolution colored-area fraction, not a downscaled probe: a small but
     real color element (e.g. a 5%-area panel) survives at full res but gets
-    averaged away by a 20x20 thumbnail — which is why we do NOT reuse
-    sites.search_orchestrator._is_grayscale_pil (its p90/thumbnail probe was
-    built for whole-series classification, not per-page color preservation, and
-    importing it would couple this hot path to the search/ML module). Counting
+    averaged away by a 20x20 thumbnail — which is why this is not a thumbnail
+    probe (the removed search scorer's p90/thumbnail grayscale test was built for
+    whole-series classification, not per-page color preservation). Counting
     the fraction of pixels whose channel spread exceeds chroma_thresh is robust
     to JPEG chroma ringing on B&W scans (low-amplitude, sub-threshold) yet
     catches genuine local color. Thresholds are starting points — tune against
@@ -4442,7 +4441,7 @@ def _page_is_grayscale(im, chroma_thresh: int = 16, area_frac: float = 0.005) ->
     """
     if getattr(im, "mode", None) in ("L", "LA", "1"):
         return True
-    import numpy as np  # hard dep (requirements.txt); lazy like _is_grayscale_pil
+    import numpy as np  # hard dep (requirements.txt); lazy to keep module import cheap
     arr = np.asarray(im.convert("RGB"), dtype=np.int16)
     chroma = arr.max(axis=2) - arr.min(axis=2)  # per-pixel max channel spread
     return float((chroma > chroma_thresh).mean()) < area_frac
@@ -6727,7 +6726,7 @@ def _save_download_params(out_dir: str, url: str, args, title: str) -> None:
         # description, diverging from the original download's enriched
         # ComicInfo (Tags / SpoilerTags / TagsExtended / CountryOfOrigin /
         # MediaFormat / AnilistId / MalId). Cross-file: the argparse
-        # registration is near --enable-ml-rating (grep --metadata-source);
+        # registration: grep '"--metadata-source"';
         # enrichment runs in main() at the
         # `if getattr(args, "metadata_source", "none") == "anilist":`
         # check; the replay branch lives in _append_saved_update_options.
@@ -8834,8 +8833,9 @@ def main():
         "--multi-source-quality-min",
         type=float,
         default=0.65,
-        help="Minimum seed_quality (or measured img_quality_score) for a "
-             "source to be eligible as a multi-source alternative. Default "
+        help="Minimum seed_quality for an UNMEASURED source to be eligible "
+             "as a multi-source alternative (a source whose pages the search "
+             "measured qualifies at any rating unless unreachable). Default "
              "0.65 excludes unknown-quality sites (default 0.50) which are "
              "mostly foreign-language Madara/MangaThemesia extras. Set lower "
              "(e.g., 0.4) to opt those back in if you want broader fallback "
@@ -8866,26 +8866,6 @@ def main():
              "candidates and multi-source alternatives are dropped. Parsed by "
              "aio_search_cli.parse_disable_sites; excluded sites also get no "
              "site_health entry in --search-json (they're already opted out).",
-    )
-    p.add_argument(
-        "--enable-ml-rating",
-        action="store_true",
-        default=os.environ.get("AIO_ENABLE_ML_RATING", "").lower() in (
-            "1", "true", "yes", "on",
-        ),
-        help="Enable ML-based image quality scoring (torch + pyiqa + "
-             "torchmetrics). Off by default. When enabled, the search "
-             "ranker uses T2 (CLIP-IQA + NIQE) and T3 (paired DISTS) on "
-             "top of T1 (pixel-level numpy/PIL scoring), giving ~3-8%% "
-             "more accurate rankings on borderline matches. Cost: torch "
-             "import adds ~2-5 s of process startup, model weights are "
-             "~150 MB on first-use download, and per-source probe gains "
-             "~2-5 s. The default-off rationale (2026-05-20): torch's "
-             "Windows import path calls platform.machine() which Python "
-             "3.13 implements via WMI — that can stall indefinitely on "
-             "hosts with a degraded WMI service, hanging --search forever. "
-             "Honors AIO_ENABLE_ML_RATING=1 env var so power users can "
-             "set the preference once.",
     )
     # --- External metadata enrichment (opt-in, single-source AniList) ---
     # When enabled, queries https://graphql.anilist.co for ranked
@@ -11165,7 +11145,7 @@ def main():
     # persist).
     # Failures are swallowed — site-only metadata is the fallback path.
     # Cross-file: sites/external_metadata.py owns the client; CLI flags
-    # registered near --enable-ml-rating; cache key in .aio_series.json
+    # registered next to --metadata-source; cache key in .aio_series.json
     # is "anilist_id" (must match _load_cached_anilist_id reader).
     if getattr(args, "metadata_source", "none") == "anilist":
         try:

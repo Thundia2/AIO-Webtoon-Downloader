@@ -421,3 +421,78 @@ def test_search_count_excludes_external_rows():
     count_urls = [u for u in calls if "/chapter?" in u]
     assert count_urls and all("includeExternalUrl=0" in u for u in count_urls)
     assert hits[0].actual_chapter_count == 0
+
+
+# --- match_fetch_window (search ranking; contract in sites/base.py) ---------
+
+def _window_handler(monkeypatch, n_pages=20, statuses=None, swap_names=None):
+    """A handler whose /at-home/server and MD@H fetches are stubbed.
+    statuses: page index -> list of per-attempt statuses (None = the fetch
+    raised, int = HTTP status; 200 serves bytes). Unlisted pages serve."""
+    h = MangaDexSiteHandler()
+    calls = {"assign": 0, "urls": []}
+    names = [f"{i + 1}-h{i}.png" for i in range(n_pages)]
+
+    def assign(scraper, cid):
+        calls["assign"] += 1
+        lst = swap_names if (swap_names is not None and calls["assign"] > 1) else names
+        return {"base_url": f"https://node{calls['assign']}.mangadex.network", "file_hash": "fh",
+                "data_filenames": list(lst), "saver_filenames": [f"s{i}.jpg" for i in range(n_pages)]}
+
+    tries = {}
+
+    def fetch(scraper, url):
+        calls["urls"].append(url)
+        idx = names.index(url.rsplit("/", 1)[1])
+        k = tries[idx] = tries.get(idx, -1) + 1
+        seq = (statuses or {}).get(idx, [200])
+        st = seq[min(k, len(seq) - 1)]
+        if st == 200:
+            return True, b"img%d" % idx, 4, 1, False, 200
+        return False, None, 0, 1, False, st
+
+    monkeypatch.setattr(h, "_fetch_at_home_assignment", assign)
+    monkeypatch.setattr(h, "_fetch_image_blob", fetch)
+    monkeypatch.setattr(h, "_report_to_mdah", lambda *a, **k: None)
+    return h, calls
+
+
+def test_match_window_fetches_only_the_window_pages_in_data_mode(monkeypatch):
+    """The window, not the chapter: get_chapter_images downloads every page,
+    which held the search probe to its deadline. Full-quality `data` files
+    only - a data-saver page would rate MangaDex below a download."""
+    h, calls = _window_handler(monkeypatch)
+    res = h.match_fetch_window({"url": "cid"}, None, None)
+    want = MangaDexSiteHandler.match_window_order(20, 5)
+    assert sorted(i for i, _ in res["pages"]) == sorted(want)
+    assert len(calls["urls"]) == 5 and calls["assign"] == 1
+    assert all("/data/fh/" in u for u in calls["urls"])
+    assert res == {**res, "n_total": 20, "attempted": 5, "failed": 0, "timed_out": 0}
+
+
+def test_match_window_swaps_once_and_splits_timeouts_from_failures(monkeypatch):
+    want = MangaDexSiteHandler.match_window_order(20, 5)
+    a, b, c = want[0], want[1], want[2]
+    # a: fails then serves on the swapped node; b: raises twice (timeout);
+    # c: 404 twice (a failure)
+    h, calls = _window_handler(monkeypatch, statuses={a: [500, 200], b: [None], c: [404]})
+    res = h.match_fetch_window({"url": "cid"}, None, None)
+    got = {i for i, _ in res["pages"]}
+    assert a in got and b not in got and c not in got
+    assert calls["assign"] == 2
+    assert (res["attempted"], res["failed"], res["timed_out"]) == (5, 1, 1)
+
+
+def test_match_window_does_not_swap_onto_a_different_page_list(monkeypatch):
+    want = MangaDexSiteHandler.match_window_order(20, 5)
+    h, calls = _window_handler(monkeypatch, statuses={want[0]: [500]},
+                               swap_names=[f"x{i}.png" for i in range(18)])
+    res = h.match_fetch_window({"url": "cid"}, None, None)
+    assert len(calls["urls"]) == 5          # no second-round fetches
+    assert res["failed"] == 1 and len(res["pages"]) == 4
+
+
+def test_match_window_link_out_makes_no_request(monkeypatch):
+    h, calls = _window_handler(monkeypatch)
+    res = h.match_fetch_window({"url": "cid", "_locked": True}, None, None)
+    assert calls["assign"] == 0 and res["failed"] == 1 and res["pages"] == []

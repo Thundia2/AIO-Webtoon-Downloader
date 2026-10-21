@@ -1360,8 +1360,8 @@ class _SignerSession:
             # A verdict reached ONLY because we weren't allowed to prompt is
             # provisional: one process legitimately holds both contexts. A
             # --multi-source download probes with the permission explicitly OFF
-            # (search_orchestrator.py:_probe_one) and then downloads with it ON,
-            # and there is one _SignerSession per process — so a sticky
+            # (match_session.py, grep interactive_solving) and then downloads
+            # with it ON, and there is one _SignerSession per process — so a sticky
             # background verdict would poison the download that follows it.
             # Re-open the question only when the answer could actually differ.
             if not self._cf_blocked_background:

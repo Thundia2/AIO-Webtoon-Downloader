@@ -300,7 +300,7 @@ tests pin the two deliberately Kotlin-only fields (`AppSettingsTest.kt:80-86`, `
 | `disabledSites` (block list half) | The one site that cannot work (comix) is already force-excluded in Python | `ui/screens/SettingsScreen.kt:93-96`; `aio_android.py:1238` |
 | `jobs` | "parallel runs inside one Chaquopy interpreter would corrupt aio-dl.py's process-wide backoff and prefetch globals" | `ui/AioViewModel.kt:63-67` |
 | `modernize` ×8 (`modernize`, `…Reversible`, `…Format`, `…Quality`, `…Distance`, `…MinSaving`, `…Effort`, `…AvifSpeed`) | "neither has an Android wheel behind it (no pillow-jxl, no torch)" | `core/DownloadForm.kt:20-23`; `ui/screens/DownloadScreen.kt:75-77`; `ui/screens/SettingsScreen.kt:97-98`; `android/README.md:404` |
-| `enableMlRating` | torch absent; the flag "would only produce a slower search that falls back to the same non-ML scoring" | `aio_android.py:1279-1281` |
+| `enableMlRating` | removed on desktop too (2026-10-21); aio-dl.py no longer accepts `--enable-ml-rating`, so a stale saved value is ignored | grep `enableMlRating` in `aio_android.py` |
 | `mangafireImageConcurrency` | Pre-2026-05-13 back-compat alias; Android has no settings predating the rename | `aio_android.py:953-956` |
 | `promptUrls` | "there is no stdin under Chaquopy" | `aio_android.py:979-980` |
 | `verbose` on resume | "Resuming a 200-chapter series would otherwise bury the Logs screen" | `aio_android.py:1936-1939` |
@@ -515,7 +515,7 @@ reproducible from its rows, which yield 7 DELIBERATE / 7 N/A / 13 GAP.
 |---|---|---|
 | `--serve` (+ `--api-host`/`--api-port`) | fastapi/uvicorn not installed; `api.py` is **not even staged into the APK** | `android/app/build.gradle.kts:33`, `:224`; `aio-dl.py:8612-8618` |
 | `--prompt-urls` | No stdin under Chaquopy | `aio_android.py:979-980` |
-| `--enable-ml-rating` | torch absent; would only be a slower search with the same scoring | `aio_android.py:1279-1281`; `build.gradle.kts:226` |
+| `--enable-ml-rating` | removed from aio-dl.py (2026-10-21); not a parity gap any more | grep `enableMlRating` in `aio_android.py` |
 | `--modernize` ×7 | No pillow-jxl wheel; Pillow pinned 11.0.0 so no native AVIF either | `build.gradle.kts:186`, `:225-226` |
 | `--comix-headless` / `--comix-allow-gapped-chapters` / `--comix-login` | comix cannot run at all | `aio_android.py:1224-1229`, `:1238` |
 | `--mangafire-image-concurrency` | Suppressed back-compat alias | `aio_android.py:953-956` |
@@ -571,7 +571,7 @@ including the two that hard-error. Developer surface, not a shipped control.
 | curl_cffi | no | fast-download, `--image-concurrency` | auto-degrades to ThreadPool (`sites/base.py:46-51`, `:806-810`) |
 | impit | no | weebcentral CF/zstd rescue | `RuntimeError` → **D6** |
 | pyvips | no | `webp_q85` fast path | falls back to PIL, which also cannot encode WebP |
-| torch/pyiqa | no | `--enable-ml-rating` | lazy import; flag never emitted |
+| torch/pyiqa | no | nothing (the ML rating that used them was removed 2026-10-21) | not needed |
 | fastapi/uvicorn | no | `--serve` | `api.py` not staged |
 | patchright/zendriver | **replaced** by `_WebViewBackend` (`aio_android.py:294-377`) | CF, vrf, playwright | works except comix and the two gated Madara call sites |
 | pywidevine | no | kagane downloads | guarded raise |

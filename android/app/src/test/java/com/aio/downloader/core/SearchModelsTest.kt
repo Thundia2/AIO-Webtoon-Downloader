@@ -33,8 +33,9 @@ class SearchModelsTest {
     private val fullSource = """
         {"site":"mangadex","url":"https://mangadex.org/title/abc","title":"Sousou no Frieren",
          "cover":"https://cdn/x.jpg","title_match":0.9231,"seed_quality":0.74,
-         "img_quality_score":0.8123,"img_quality_metadata":{"samples_succeeded":6},
-         "quality_basis":"chapter_probe","composite_score":0.8712,
+         "img_quality_score":0.8123,"img_quality_metadata":{"samples_succeeded":6,
+           "reason":null,"colored":false,"same_file":["mangapill"],"same_scan":[]},
+         "quality_basis":"matched","edition":"original","composite_score":0.8712,
          "chapter_count_hint":120,"actual_chapter_count":128,
          "dmca_likely":false,"is_official":true}
     """.trimIndent()
@@ -85,40 +86,70 @@ class SearchModelsTest {
 
     // ── the rating caveat ──────────────────────────────────────────────────
 
+    private fun withBasis(basis: String, score: String = "0.8123", reason: String = "null") =
+        parseSearchOutcome("f", payload(fullSource
+            .replace("\"quality_basis\":\"matched\"", "\"quality_basis\":\"$basis\"")
+            .replace("\"img_quality_score\":0.8123", "\"img_quality_score\":$score")
+            .replace("\"reason\":null", "\"reason\":$reason")
+        )).candidates.first().sources.first()
+
     @Test
-    fun `only a chapter probe counts as a measured rating`() {
-        for ((basis, measured) in listOf(
-            "chapter_probe" to true, "cover" to false, "seed" to false, "" to false,
-        )) {
-            val src = fullSource.replace("\"quality_basis\":\"chapter_probe\"", "\"quality_basis\":\"$basis\"")
-            val s = parseSearchOutcome("f", payload(src)).candidates.first().sources.first()
-            assertEquals("basis=$basis", measured, s.ratingIsMeasured)
+    fun `only matched and partial ratings are numbers`() {
+        // match_session.rate_sources: matched/partial carry a rating compared
+        // against other sites' copies; everything else has none to show.
+        assertEquals(0.8123, withBasis("matched").measuredRating!!, 1e-6)
+        assertEquals(0.8123, withBasis("partial").measuredRating!!, 1e-6)
+        for (basis in listOf("solo", "unmatched", "pending", "seed", "chapter_probe", "")) {
+            assertNull("basis=$basis", withBasis(basis, score = "null").measuredRating)
         }
     }
 
     @Test
-    fun `display rating falls back to the seed prior when nothing was measured`() {
-        // Both fields move together: Python's _quality_basis returns "seed"
-        // whenever img_quality_score is None, so a null score paired with
-        // "chapter_probe" is a payload the producer cannot emit.
-        val src = fullSource
-            .replace("\"img_quality_score\":0.8123", "\"img_quality_score\":null")
-            .replace("\"quality_basis\":\"chapter_probe\"", "\"quality_basis\":\"seed\"")
-        val s = parseSearchOutcome("f", payload(src)).candidates.first().sources.first()
-        assertNull(s.imgQuality)
-        assertEquals(0.74, s.displayRating, 1e-6)
-        assertFalse(s.ratingIsMeasured)
+    fun `an unreachable source shows no number, not its 0 score`() {
+        // the producer sets 0.0 for unreachable (it sorts last); 0% would read
+        // as a measured terrible copy
+        val s = withBasis("unreachable", score = "0.0", reason = "\"pages_failed\"")
+        assertNull(s.measuredRating)
+        assertEquals("unreachable", s.qualityLabel)
     }
 
     @Test
-    fun `the rating caveat keys on quality_basis, not on the score being present`() {
-        // quality_basis is the authoritative provenance field: a score that
-        // came from the COVER is still a number, and calling it measured would
-        // be exactly the misrepresentation this flag exists to prevent.
-        val src = fullSource.replace("\"quality_basis\":\"chapter_probe\"", "\"quality_basis\":\"cover\"")
-        val s = parseSearchOutcome("f", payload(src)).candidates.first().sources.first()
-        assertEquals(0.8123, s.imgQuality!!, 1e-6)
-        assertFalse(s.ratingIsMeasured)
+    fun `the reason label says why there is no number`() {
+        assertEquals("not compared", withBasis("unmatched", score = "null").qualityLabel)
+        assertEquals("not compared", withBasis("solo", score = "null").qualityLabel)
+        assertEquals("timed out", withBasis("pending", score = "null", reason = "\"pages_timeout\"").qualityLabel)
+        assertEquals("not measured", withBasis("pending", score = "null", reason = "\"not_run\"").qualityLabel)
+        assertEquals("not measured", withBasis("seed", score = "null").qualityLabel)
+    }
+
+    @Test
+    fun `same file and same scan sites become one note`() {
+        val s = parseSearchOutcome("f", payload(fullSource.replace(
+            "\"same_scan\":[]", "\"same_scan\":[\"atsu\",\"weebcentral\"]",
+        ))).candidates.first().sources.first()
+        assertEquals("Same file as mangapill; same scan as atsu, weebcentral", s.sameNote)
+        assertNull(parseSearchOutcome("f", payload(fullSource.replace("[\"mangapill\"]", "[]")))
+            .candidates.first().sources.first().sameNote)
+    }
+
+    @Test
+    fun `an alternate edition says which way it differs`() {
+        val orig = parseSearchOutcome("f", payload(fullSource)).candidates.first().sources.first()
+        assertFalse(orig.isOtherEdition)
+        assertNull(orig.editionNote)
+        val colored = parseSearchOutcome("f", payload(fullSource
+            .replace("\"edition\":\"original\"", "\"edition\":\"alternate\"")
+            .replace("\"colored\":false", "\"colored\":true"))).candidates.first().sources.first()
+        assertTrue(colored.isOtherEdition)
+        assertEquals("colored, where most sites are black-and-white", colored.editionNote)
+    }
+
+    @Test
+    fun `a null edition reads as undecided`() {
+        val s = parseSearchOutcome("f", payload(fullSource.replace("\"edition\":\"original\"", "\"edition\":null")))
+            .candidates.first().sources.first()
+        assertEquals("undecided", s.edition)
+        assertFalse(s.isOtherEdition)
     }
 
     // ── degenerate payloads ────────────────────────────────────────────────

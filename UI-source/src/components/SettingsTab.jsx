@@ -40,11 +40,6 @@ const DEFAULT_SEARCH_OPTS = {
   searchTimeout: 20,
   searchMinMatch: 0.55,
   searchParallelism: 6,
-  // Mirror of SearchTab.jsx DEFAULT_OPTS.enableMlRating. The UI control is
-  // in SearchTab's "Advanced search options" Collapsible (not surfaced here)
-  // so the shared settings.searchOpts namespace stays schema-aligned across
-  // both surfaces. See SearchTab.jsx for the WMI-hang rationale.
-  enableMlRating: false,
 };
 
 // ── IntInput ──
@@ -283,7 +278,7 @@ export const DEFAULT_SETTINGS = {
   // electronAPI.startDownload, so it's a true app-wide preference rather
   // than a per-download form value. Defaults match the Python argparse
   // defaults so a Save with the section untouched is a no-op for the
-  // spawn line. Python side: aio-dl.py near --enable-ml-rating (flag
+  // spawn line. Python side: aio-dl.py's "--metadata-source" (flag
   // registration) + sites/external_metadata.py (the AniList GraphQL
   // client). Grep cross-file: metadataSource, metadata-source.
   metadataSource: "none",

@@ -10,7 +10,8 @@ The argv tests are the load-bearing ones. Two flags here exist for
 Android-specific reasons and would look like noise to someone tidying up:
 comix is force-excluded because it drives its own Patchright session rather
 than going through the WebView seam, and --enable-ml-rating must NEVER be
-emitted because torch is not installed.
+emitted: the flag no longer exists (the ML rating was removed 2026-10-21), so a
+stale saved enableMlRating setting would otherwise fail every search.
 
 Cross-file: aio_android.build_search_argv / search (the code),
 UI-source/electron/searcher.js:buildSearchArgs (the reference being ported),
@@ -105,8 +106,8 @@ def test_disabled_sites_accepts_a_comma_string_too():
 
 
 def test_ml_rating_is_never_emitted():
-    """torch is not installed on Android. The flag would produce a slower
-    search that falls back to the same scoring."""
+    """aio-dl.py no longer accepts --enable-ml-rating (ML rating removed), so
+    an old saved enableMlRating value must not reach the argv."""
     for settings in ({}, {"enableMlRating": True}, {"enableMlRating": "true"}):
         assert "--enable-ml-rating" not in aio_android.build_search_argv("x", settings)
 

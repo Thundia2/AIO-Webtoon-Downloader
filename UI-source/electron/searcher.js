@@ -60,13 +60,10 @@ function buildSearchArgs(query, opts = {}) {
   // safer default). aio-dl.py's argparse keeps --no-collapse-splits as a
   // hidden alias for script users; we don't emit it.
   if (opts.collapseSplits === true) args.push("--collapse-splits");
-  // enableMlRating defaults FALSE (production default; matches argparse).
-  // Only emit the flag when explicitly enabled. Wiring this through so
-  // users can opt into torch-backed T2/T3 image-quality scoring (CLIP-IQA,
-  // NIQE, paired DISTS). Off by default because torch's Windows import
-  // can stall on WMI degraded states — see search_orchestrator.py's
-  // _ML_RATING_ENABLED docstring for the full rationale.
-  if (opts.enableMlRating) args.push("--enable-ml-rating");
+  // No ML-rating flag: the opt-in ML image rating was removed with the
+  // image-ranker rework (2026-10-21) and aio-dl.py no longer accepts
+  // --enable-ml-rating. An old saved searchOpts.enableMlRating is simply
+  // never read (this builder maps keys explicitly; nothing iterates opts).
 
   // User-disabled search sites (Settings → Search → "Search Sources", or the
   // SlowSitesCallout's "Disable & re-search"). Comma-joined handler names →

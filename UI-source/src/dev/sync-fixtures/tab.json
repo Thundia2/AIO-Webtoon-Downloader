@@ -11555,7 +11555,7 @@
                 "cover": null,
                 "rating": 0.91,
                 "chapters": 181,
-                "qualityBasis": "chapter_probe",
+                "qualityBasis": "matched",
                 "edition": null,
                 "titleMatch": 1
               },
@@ -11567,7 +11567,7 @@
                   "cover": null,
                   "rating": 0.91,
                   "chapters": 181,
-                  "qualityBasis": "chapter_probe",
+                  "qualityBasis": "matched",
                   "edition": null,
                   "titleMatch": 1
                 },
@@ -11578,7 +11578,7 @@
                   "cover": null,
                   "rating": 0.84,
                   "chapters": 181,
-                  "qualityBasis": "chapter_probe",
+                  "qualityBasis": "matched",
                   "edition": null,
                   "titleMatch": 1
                 },
@@ -11589,7 +11589,7 @@
                   "cover": null,
                   "rating": 0.82,
                   "chapters": 180,
-                  "qualityBasis": "chapter_probe",
+                  "qualityBasis": "matched",
                   "edition": null,
                   "titleMatch": 1
                 },
@@ -11600,7 +11600,7 @@
                   "cover": null,
                   "rating": 0.78,
                   "chapters": 179,
-                  "qualityBasis": "cover",
+                  "qualityBasis": "unmatched",
                   "edition": null,
                   "titleMatch": 1
                 },
@@ -11611,7 +11611,7 @@
                   "cover": null,
                   "rating": 0.74,
                   "chapters": 181,
-                  "qualityBasis": "chapter_probe",
+                  "qualityBasis": "matched",
                   "edition": null,
                   "titleMatch": 1
                 },
@@ -17798,7 +17798,7 @@
                 "cover": null,
                 "rating": 0.88,
                 "chapters": 212,
-                "qualityBasis": "chapter_probe",
+                "qualityBasis": "matched",
                 "edition": null,
                 "titleMatch": 0.87
               },
@@ -17810,7 +17810,7 @@
                   "cover": null,
                   "rating": 0.88,
                   "chapters": 212,
-                  "qualityBasis": "chapter_probe",
+                  "qualityBasis": "matched",
                   "edition": null,
                   "titleMatch": 0.87
                 },
@@ -17821,7 +17821,7 @@
                   "cover": null,
                   "rating": 0.83,
                   "chapters": 210,
-                  "qualityBasis": "chapter_probe",
+                  "qualityBasis": "matched",
                   "edition": null,
                   "titleMatch": 0.87
                 },

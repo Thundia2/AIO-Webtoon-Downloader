@@ -465,7 +465,8 @@ Tap **Search**, type `frieren`, tap Search, and wait. Then:
 |---|---|
 | Results appear | one card per SERIES, not per site. A card says "N sites" |
 | Expanding a card | lists each site with a quality %, chapter count and match % |
-| The warning triangle | appears next to any rating whose `quality_basis` is not `chapter_probe`. Some sources having it is CORRECT — it means the rating is a seed prior, not a measurement |
+| The rating | reads "Quality N%" only for `quality_basis` "matched"/"partial"; every other source reads "Quality: not compared" / "not measured" / "timed out" / "unreachable". Some sources having a label is CORRECT — they were not compared with another site's pages |
+| Edition / same-scan notes | an "Other edition: …" line on a fan-colored or otherwise different copy; "Same file as …" / "Same scan as …" under sources that serve copies of one scan |
 | Tapping Get/Download | switches to **New** with the URL filled in |
 | `python.stderr` | shows the fan-out (`Searching N sites`) and per-site timings |
 | No comix | it is force-excluded on Android; seeing it means `--disable-sites` broke |

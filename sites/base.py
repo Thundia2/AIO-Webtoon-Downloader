@@ -8,11 +8,10 @@ import re
 import socket
 import statistics
 import threading
-import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup, FeatureNotFound
 
@@ -139,16 +138,14 @@ def _fast_dl_retry_options(timeout: float) -> Dict[Any, Any]:
 
 
 # Exceptions from a probe fetch that mean "we couldn't MEASURE this page in time"
-# (slowness), NOT "the page/CDN is definitively broken". The image-quality probe
-# (_probe_chapter_aggregate) EXCLUDES these from the quality aggregate instead of
-# scoring them 0.0, so a merely-slow-to-probe site (e.g. atsumaru: WebP-native,
-# fast to download but slow to breadth-probe 8 full-res color chapters) isn't
-# mislabeled as broken. requests.exceptions.Timeout already covers BOTH
-# ConnectTimeout and ReadTimeout. Base requests.exceptions.ConnectionError
-# (refused / reset / DNS) is DELIBERATELY NOT here — that's a genuine
-# reachability failure and must stay a scored 0.0 (it's what keeps rizzcomic's
-# connection-poison detection working). Grep _PROBE_TIMEOUT_EXCEPTIONS:
-# _fetch_probe_item_bytes_ex + _probe_one_pick.
+# (slowness), NOT "the page/CDN is definitively broken". The matched-page probe
+# (sites/match_session.py) counts these as timeouts, never as failures, so a
+# merely-slow site is not rated `unreachable`. requests.exceptions.Timeout
+# already covers BOTH ConnectTimeout and ReadTimeout. Base
+# requests.exceptions.ConnectionError (refused / reset / DNS) is DELIBERATELY
+# NOT here — that's a genuine reachability failure and must count as a failed
+# fetch. Grep _PROBE_TIMEOUT_EXCEPTIONS: _fetch_probe_item_bytes_ex,
+# match_fetch_window, match_session, mangadex's match_fetch_window override.
 try:
     import requests as _requests
     _PROBE_TIMEOUT_EXCEPTIONS = (_requests.exceptions.Timeout, socket.timeout)
@@ -498,7 +495,8 @@ def is_placeholder_chapter(chapter: Any) -> bool:
     --multi-source can fill it from another site. Everything that must not
     treat one as content goes through this helper or readable_chapters:
     select_best_chapter_version, build_group_census, aio_search_cli's alt
-    chapter lists, the search T3 pairwise sampler (grep both names).
+    chapter lists, the search match probe's match_readable_versions (grep
+    both names).
     """
     if not isinstance(chapter, dict):
         return False
@@ -508,6 +506,57 @@ def is_placeholder_chapter(chapter: Any) -> bool:
 def readable_chapters(chapters: Optional[List[Dict]]) -> List[Dict]:
     """The rows of `chapters` that are real content (see is_placeholder_chapter)."""
     return [c for c in (chapters or []) if not is_placeholder_chapter(c)]
+
+
+def daemon_map(fn: Callable, items: Iterable, width: int, name: str, default: Any = None) -> List:
+    """`[fn(x) for x in items]` on up to `width` DAEMON threads, in input
+    order; an item whose call raised gets `default`. Each call runs in a copy
+    of the CALLER's context, taken here before any thread starts (worker
+    threads start with an empty one: memory contextvar-worker-thread-trap).
+
+    Daemon threads, NOT ThreadPoolExecutor: concurrent.futures joins its
+    workers at interpreter exit even after shutdown(wait=False), so one fetch
+    hung on a trickling TLS read holds the process open after the search has
+    printed its result (real case in sites/mangadex.py's _REPORT_QUEUE
+    comment). The match session abandons such fetches at the source budget
+    (grep _abandon_over_budget in match_session.py), so they must not pin exit.
+    This call itself still waits for every item; its caller is the one that
+    gets abandoned."""
+    import contextvars
+
+    items = list(items)
+    out: List[Any] = [default] * len(items)
+    width = max(1, min(int(width or 1), len(items)))
+    if len(items) <= 1 or width == 1:
+        for i, x in enumerate(items):
+            try:
+                out[i] = fn(x)
+            except Exception:
+                pass
+        return out
+    # one context per item: a Context cannot be entered by two threads at once
+    ctxs = [contextvars.copy_context() for _ in items]
+    work: "queue.Queue" = queue.Queue()
+    for i, x in enumerate(items):
+        work.put((i, x))
+
+    def _run() -> None:
+        while True:
+            try:
+                i, x = work.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                out[i] = ctxs[i].run(fn, x)
+            except Exception:
+                pass
+
+    threads = [threading.Thread(target=_run, name=name, daemon=True) for _ in range(width)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return out
 
 
 def build_group_census(
@@ -548,25 +597,18 @@ def build_group_census(
     return census, readable_total
 
 
-# --- Search image-quality probe: breadth-sample concurrency -----------------
-# How many of a source's breadth-sample chapters BaseSiteHandler.
-# _probe_chapter_aggregate probes CONCURRENTLY. The breadth pass fetches 1 page
-# from each of up to 8 chapters; those fetches used to run SERIALLY, so an
-# HTML-scraped site whose page-image list lives in the chapter HTML (mangakatana:
-# every sample = a full Cloudflare-fronted origin GET) cost ~40s cold-cache for
-# a probe an actual chapter download does in ~4s. A small bounded daemon pool
-# collapses that to ceil(picks / N) waves.
-#
-# BYTE-IDENTICAL to serial: WHICH chapter+page each sample fetches is fixed
-# before any I/O by two pure pickers (_pick_representative_chapters /
-# _pick_random_middle_page_index) and the aggregation (median/mean, Counter
-# votes) is order-independent — concurrency only reorders the fetches. Default 4
-# keeps the per-host origin burst modest (get_chapter_images routes through
-# make_request -> _respect_rate_limit, which backs off on 429/503). Env override
-# tunes the fleet default without a release (mirrors search_orchestrator.
-# _FANOUT_MAX); a subclass sets PROBE_BREADTH_CONCURRENCY=1 to force serial
-# (e.g. a future browser handler avoiding concurrent tabs). comix is unaffected
-# (whole-method override). Grep target: PROBE_BREADTH_CONCURRENCY.
+# --- Search matched-page probe: per-window fetch concurrency ----------------
+# How many of one match window's pages BaseSiteHandler.match_fetch_window
+# fetches CONCURRENTLY on a bounded daemon pool (daemon_map). Serial fetches
+# made a slow-per-request host cost the window's page count times its latency;
+# the pool collapses that to ceil(pages / N) waves. Which pages are fetched is
+# fixed before any I/O (match_window_order), so concurrency only reorders the
+# fetches. Default 4 keeps the per-host burst modest. Env override tunes the
+# fleet default without a release (mirrors search_orchestrator._FANOUT_MAX); a
+# subclass sets PROBE_BREADTH_CONCURRENCY=1 to force serial (e.g. a browser
+# handler avoiding concurrent tabs). Grep target: PROBE_BREADTH_CONCURRENCY.
+# ("BREADTH" is historical: the knob first bounded the old breadth-sampling
+# probe, and the name was kept so handler overrides and the env var still apply.)
 _PROBE_BREADTH_CONCURRENCY = 4
 try:
     _PROBE_BREADTH_CONCURRENCY = max(
@@ -575,33 +617,6 @@ try:
     )
 except (TypeError, ValueError):
     pass
-
-
-@dataclass(frozen=True)
-class _ProbeSample:
-    """One breadth-sample chapter's probe result, written by a worker into a
-    preallocated slot in _probe_chapter_aggregate's concurrent breadth pass.
-
-    ``metadata is not None`` is the SINGLE "full success" discriminator — it
-    drives the compacted ``per_chapter_metas`` rebuild. A FAILED sample carries
-    ``metadata=None`` but may still carry ``image_items`` / ``picked_page_idx`` /
-    ``blob`` (whatever it had computed before failing), exactly mirroring the
-    per-branch field population of the former serial loop so the re-score pass
-    and throttle tail see identical state.
-
-    ``is_timeout`` marks a sample that could not be MEASURED in time (a network
-    timeout in get_chapter_images / the image fetch, or a budget-miss slot swept
-    after PROBE_SOURCE_BUDGET_S expired) — as opposed to a genuine content/CDN
-    failure. Timeouts are EXCLUDED from the score aggregate (a slow site is not a
-    broken one); genuine failures keep their 0.0. Default False so the existing
-    positional constructors (successes + genuine failures) are unchanged.
-    """
-    score: float
-    metadata: Optional[Dict]
-    image_items: Optional[List]
-    picked_page_idx: Optional[int]
-    blob: Optional[bytes]
-    is_timeout: bool = False
 
 
 class BaseSiteHandler:
@@ -616,14 +631,13 @@ class BaseSiteHandler:
     # Shared chapter-number extractor for _chapter_number_from_text (grep it).
     # ~11 handlers inlined this exact `(\d+(?:\.\d+)?)` group; now one regex.
     _CHAPTER_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
-    # When True, the orchestrator's image-quality probe phase clamps to a
-    # SINGLE sample for low-title-match results (below
-    # EXPENSIVE_PROBE_QUICK_THRESHOLD in search_orchestrator.py). Default
-    # False — pure-HTTP handlers don't pay much for 5 samples, and we want
-    # the full aggregate signal for them. Override to True on handlers
-    # whose per-chapter fetch is expensive (e.g. browser-driven capture).
-    # No handler sets this today (MangaFire's 2026 REST-API rewrite dropped
-    # its VRF cost); browser-based handlers can opt in.
+    # True on handlers whose per-chapter fetch is expensive by design (e.g.
+    # browser-driven capture). Its one reader today is the search site-health
+    # verdict: such a handler is "constitutionally slow" and exempt from the
+    # slow-probe signal, so a healthy slow probe never gets the site
+    # recommended for disabling (grep EXPENSIVE_PROBE in
+    # search_orchestrator.py, _classify_site_health). No handler sets it
+    # today (MangaFire's 2026 REST-API rewrite dropped its VRF cost).
     EXPENSIVE_PROBE: bool = False
 
     # Relative cost class of this handler's search() for the search
@@ -666,16 +680,16 @@ class BaseSiteHandler:
     # the canonical bytes originate; do NOT set on aggregators that re-host
     # other publishers' content (toonily, asura, mangafire, etc.).
     #
-    # Why this matters: the image-quality probe scores resolution + format
-    # + decode quality. Webtoons.com serves vertical-scroll PNGs at the
-    # intentional 720–800px width — below the probe's res_score 800px floor,
-    # so res_score contributes 0/1.0 to the composite. Aggregators that
-    # upscale to 1500–2000px JPEG get a HIGHER res_score even though their
-    # content is generation-loss from the official PNGs. Without this flag
-    # the probe was confidently choosing toonily over webtoons.com despite
-    # the latter being the literal publisher. Cross-file:
-    # sites/search_orchestrator.py:SourceEntry.is_official + _cmp consume
-    # this flag; grep OFFICIAL_PUBLISHER for the consumer side.
+    # Why this matters: webtoons.com serves vertical-scroll PNGs at the
+    # intentional 720–800px width while aggregators re-host them upscaled to
+    # 1500–2000px JPEG, which is generation loss from the official files.
+    # The old single-image scorer rewarded that resolution, and without this
+    # flag search confidently chose toonily over the literal publisher. The
+    # matched-page ranker (sites/page_ranker.py) gates its resolution credit
+    # on an enlargement test, but the publisher still wins its tie here
+    # regardless of measured quality. Cross-file:
+    # sites/search_orchestrator.py:SourceEntry.is_official + source_rank_key
+    # consume this flag; grep OFFICIAL_PUBLISHER for the consumer side.
     #
     # Current opt-ins (lowercase handler names): linewebtoon.
     OFFICIAL_PUBLISHER: bool = False
@@ -1864,206 +1878,132 @@ class BaseSiteHandler:
         """
         return []
 
-    @staticmethod
-    def _pick_representative_chapters(
-        chapters: List[Dict], n: int = 8,
-    ) -> "List[Tuple[int, Dict]]":
-        """Pick up to N chapters spread across the series for breadth sampling.
+    # --- Matched-page search ranking (sites/match_session.py) --------------
+    # The search ranker fetches the SAME chapter numbers from every source and
+    # compares the same pages (plan sync-temp/plans/image-ranker-rework.md, P2).
+    # These two methods are its whole handler surface, split so the session can
+    # schedule them as separate tasks: the list first (to agree on targets),
+    # then one window per target. Overridable per handler: mangadex overrides
+    # match_fetch_window (its get_chapter_images downloads the whole chapter).
 
-        Returns a list of `(absolute_index_in_chapters_list, chapter_dict)`
-        tuples — the absolute index is needed by
-        _pick_random_middle_page_index so the deterministic seed is stable
-        across runs (cache replay relies on this).
+    # Pages per window: the one at the chapter's relative middle and +-2 around
+    # it. P2.2: +-2 found 5% more matches than +-1 (credit pages and split pages
+    # shift a peer's index by one or two).
+    MATCH_WINDOW_PAGES = 5
 
-        Strategy:
-          - Skip first 1 + last 1 chapter (chapter 1 often differs in cover-
-            page treatment; latest chapter may be partial / TBA placeholder).
-          - From the trimmed pool, prefer whole-numbered chapters (skipping
-            omake .5/.1 fragments that have atypical page counts).
-          - Pick N evenly-spaced chapters from the preferred pool; if there
-            are fewer than N whole-numbered chapters, fill the remainder
-            from the full pool to hit N total.
+    def match_readable_versions(self, chapters: Optional[List[Dict]]) -> Dict[int, Dict]:
+        """Integer chapter number -> the ONE version a download would pick.
 
-        Degenerate cases:
-          - Empty list → []
-          - 1 chapter (oneshot) → [(0, that_chapter)]
-          - 2-3 chapters → returns the chapter(s) after skipping first/last
-            (down to 1 if all that's left)
-          - Long series → up to N indices spread evenly
-
-        Cross-file: called by _probe_chapter_aggregate (this file, post-Phase-2
-        rewrite) and by calibrate_quality_probe.py via the same delegation.
-        The v5 sampling strategy is documented in
-        ~/.claude/plans/how-robust-is-the-memoized-koala.md (Phase 2 section).
-        """
-        if not chapters:
-            return []
-        total = len(chapters)
-        # Oneshot — only one chapter, return it (skipping first/last would
-        # leave nothing, defeating the probe).
-        if total == 1:
-            return [(0, chapters[0])]
-        # Trim first and last 1 chapter when there's room. For total in
-        # [2, 3], trimming both would leave 0-1 chapters; trim only as much
-        # as keeps the pool non-empty.
-        if total >= 4:
-            trim_start, trim_end = 1, 1
-        elif total == 3:
-            trim_start, trim_end = 1, 0  # keep middle + last
-        else:  # total == 2
-            trim_start, trim_end = 0, 0  # keep both
-        trimmed = list(enumerate(chapters))[trim_start: total - trim_end]
-        if not trimmed:
-            # Defensive (shouldn't hit given the conditions above).
-            trimmed = list(enumerate(chapters))
-
-        # Preferred pool: whole-numbered chapters only.
-        whole_pool: List[Tuple[int, Dict]] = []
-        for abs_idx, ch in trimmed:
-            chap = ch.get("chap")
-            if chap is None:
+        Same bucketing as aio-dl.py's download path (grep `chapters_by_num`:
+        `:g` labels, "Oneshot" -> 1) and the same ranker with a per-series
+        census (build_group_census + select_best_chapter_version), so the pages
+        compared are the pages the user would get. Placeholders never count.
+        Only whole numbers are kept: .5 extras rarely exist on every site.
+        A list with no whole number but exactly one readable chapter (a oneshot
+        under a non-numeric label) maps it to 1."""
+        readable = readable_chapters(chapters)
+        by_num: Dict[str, List[Dict]] = {}
+        for ch in readable:
+            raw = ch.get("chap")
+            if raw is None:
                 continue
+            label = f"{raw:g}" if isinstance(raw, (int, float)) else str(raw)
+            if label.strip().lower() in ("oneshot", "one-shot"):
+                label = "1"
             try:
-                f = float(chap)
+                value = float(label)
             except (TypeError, ValueError):
                 continue
-            if f == int(f):
-                whole_pool.append((abs_idx, ch))
+            if value != int(value):
+                continue
+            by_num.setdefault(str(int(value)), []).append({**ch, "chap": str(int(value))})
+        if not by_num:
+            return {1: readable[0]} if len(readable) == 1 else {}
+        census, total = build_group_census(self, by_num)
+        policy = GroupSelectionPolicy(census=census or None, census_total=total)
+        out: Dict[int, Dict] = {}
+        for label, versions in by_num.items():
+            try:
+                best = self.select_best_chapter_version(
+                    versions, [], False, selection_policy=policy,
+                )
+            except Exception:
+                best = versions[0]
+            if best is not None and not is_placeholder_chapter(best):
+                out[int(label)] = best
+        return out
 
-        # If the whole-numbered pool meets the budget, sample evenly from it.
-        # Otherwise fill from the full trimmed pool — partial chapters are
-        # better than no sample.
-        primary_pool = whole_pool if whole_pool else trimmed
-        if len(primary_pool) <= n:
-            base_picks = list(primary_pool)
-        else:
-            # Evenly-spaced sampling: step = len/N, take indices at
-            # step/2, step*3/2, step*5/2, ... so we hit the middle of each
-            # bucket (avoids over-weighting endpoints which trim already
-            # handled, but bucketing center is still cleaner than edge picks).
-            step = len(primary_pool) / n
-            picks_idx = [min(int(step * (i + 0.5)), len(primary_pool) - 1) for i in range(n)]
-            base_picks = [primary_pool[i] for i in picks_idx]
+    def match_fetch_window(
+        self, chapter: Dict, scraper, make_request, n_pages: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Fetch the page window of one chapter for matching.
 
-        # Top up from the full trimmed pool if we under-shot N (only when
-        # whole_pool was the smaller primary pool).
-        if len(base_picks) < n and primary_pool is whole_pool:
-            seen = {abs_idx for abs_idx, _ in base_picks}
-            for abs_idx, ch in trimmed:
-                if abs_idx in seen:
-                    continue
-                base_picks.append((abs_idx, ch))
-                seen.add(abs_idx)
-                if len(base_picks) >= n:
-                    break
-
-        # Sort by absolute index for predictable ordering (matches v4's
-        # chapter-list traversal direction so cache keys stay stable when
-        # the sampler is re-run).
-        base_picks.sort(key=lambda t: t[0])
-        return base_picks[:n]
-
-    @staticmethod
-    def _pick_random_middle_page_index(
-        n_pages: int, series_url: str, chapter_index: int,
-        chapter: "Optional[Dict]" = None,
-    ) -> "Optional[int]":
-        """Deterministically pick a page index from the middle 50% of a chapter.
-
-        Returns an int in [n_pages//4, 3*n_pages//4) for non-trivial chapters
-        and a safe-middle for very short ones. The seed comes from
-        SHA-1((series_url, stable_chapter_key)) where stable_chapter_key
-        prefers identifiers that DON'T shift when the chapter list grows:
-          1. ``chapter["url"]``    — the chapter URL is the most stable
-                                     identifier upstream produces.
-          2. ``chapter["chap"]``   — the chapter number (string-coerced
-                                     so "47" == 47).
-          3. ``chapter["hid"]``    — handler-specific hash ID where present.
-          4. ``chapter["id"]``     — MangaDex-style UUID where present.
-          5. ``str(chapter_index)``— positional fallback. PRE-v8 behavior;
-                                     drifts on list growth but kept so
-                                     callers that don't pass ``chapter``
-                                     (legacy + tests) work unchanged.
-
-        Why this matters: the previous seed `f"{series_url}:{chapter_index}"`
-        keyed on the absolute position in the chapter list. When the
-        publisher adds a new chapter (typically prepended → newest-first),
-        every existing chapter's absolute index shifts by 1, every SHA-1
-        seed changes, and cache replays fetch a DIFFERENT middle page than
-        the original probe — defeating the "stable across sessions" claim.
-        Keying on an intrinsic identifier preserves the invariant.
-
-        Why stratify to middle 50%: the first quarter of a chapter often
-        has cover/title splashes that compress better than typical content;
-        the last quarter has credits / translator notes / promo pages that
-        aren't representative. The middle is where the actual story content
-        lives.
-
-        Returns None when n_pages <= 0 (no pages to pick from).
-
-        Cross-file: consumed by _probe_chapter_aggregate (this file). The
-        same function is called from T3 pairwise + paired-comparison in
-        sites/search_orchestrator.py — those call sites already pass the
-        chapter NUMBER (int(chap_num)) as ``chapter_index`` rather than a
-        positional list index, so they already get stability-by-number;
-        the ``chapter`` kwarg just adds another preference layer.
-        """
-        if n_pages <= 0:
-            return None
-        if n_pages <= 4:
-            return n_pages // 2  # very short chapter — just take the middle
-        import hashlib
-        stable_key: "Optional[str]" = None
-        if isinstance(chapter, dict):
-            for field in ("url", "chap", "hid", "id"):
-                val = chapter.get(field)
-                if val is not None and val != "":
-                    stable_key = str(val)
-                    break
-        if stable_key is None:
-            stable_key = str(chapter_index)
-        seed_input = f"{series_url}:{stable_key}".encode("utf-8")
-        digest = hashlib.sha1(seed_input).hexdigest()
-        seed_int = int(digest[:8], 16)
-        low = n_pages // 4
-        high = (3 * n_pages) // 4  # exclusive
-        if high <= low:
-            return n_pages // 2
-        span = high - low
-        return low + (seed_int % span)
+        Returns {"pages": [(index, bytes)], "n_total": pages in the chapter,
+        "attempted": fetches tried, "failed": non-timeout failures,
+        "timed_out": timeouts}. The image-list call counts as one attempt when
+        it fails (a chapter whose list cannot be read served nothing). Never
+        raises. Timeouts are counted apart because slowness is not a quality
+        verdict: the session rates a source `unreachable` only when every
+        non-timeout fetch failed (grep `unreachable` in match_session.py)."""
+        n = int(n_pages or self.MATCH_WINDOW_PAGES)
+        out: Dict[str, Any] = {"pages": [], "n_total": 0, "attempted": 0, "failed": 0, "timed_out": 0}
+        try:
+            items = self.get_chapter_images(chapter, scraper, make_request)
+        except (_PROBE_TIMEOUT_EXCEPTIONS, SiteBusyError):
+            # SiteBusyError: this machine failed the call, not the site
+            out.update(attempted=1, timed_out=1)
+            return out
+        except Exception:
+            items = None
+        if not items:
+            out.update(attempted=1, failed=1)
+            return out
+        total = len(items)
+        out["n_total"] = total
+        order = self.match_window_order(total, n)
+        # The window's pages are fetched concurrently, PROBE_BREADTH_CONCURRENCY
+        # at a time (the same per-source knob the old probe used; a handler that
+        # sets 1 is fetched serially), on daemon threads that carry the
+        # session's interactive_solving(False) (see daemon_map).
+        results = daemon_map(
+            lambda i: self._fetch_probe_item_bytes_ex(items[i], scraper),
+            order, self.PROBE_BREADTH_CONCURRENCY, "match-page", default=(None, False),
+        )
+        for i, (blob, timed_out) in zip(order, results):
+            out["attempted"] += 1
+            if blob:
+                out["pages"].append((i, blob))
+            elif timed_out:
+                out["timed_out"] += 1
+            else:
+                out["failed"] += 1
+        return out
 
     @staticmethod
-    def _pick_sample_indices(n: int) -> List[int]:
-        """Pick up to 5 evenly-spaced page indices from a 0..n-1 image list.
-
-        Targets: start, start-middle, middle, middle-last, last. For short
-        chapters (<5 pages) returns all available indices. Dedupes for
-        small N (e.g. n=3 → [0,1,2]).
-
-        The 5-point spread is the multi-page probe's core idea: a single-
-        sample probe can't tell a healthy site from one whose CDN throttles
-        after the first request. By sampling 5 across the chapter we surface
-        per-page failures (treated as 0 in the aggregate) — a 1-of-5 site
-        scores ~20% of its peak quality, accurately reflecting "this CDN
-        can't reliably serve a chapter".
-        """
-        if n <= 0:
-            return []
-        if n >= 5:
-            raw = [0, n // 4, n // 2, (3 * n) // 4, n - 1]
-        else:
-            raw = list(range(n))
-        return sorted(set(raw))
+    def match_window_order(total: int, n: int) -> List[int]:
+        """Page indices of a match window over a `total`-page chapter: the page
+        at the relative middle, then -1, +1, -2, +2 (most likely matches
+        first). Shared by every match_fetch_window override, so all sources
+        sample the same relative positions."""
+        centre = int(round(0.5 * (total - 1)))
+        order: List[int] = []
+        for d in range(n):
+            off = (d + 1) // 2 * (1 if d % 2 == 0 else -1)
+            i = centre + off
+            if 0 <= i < total and i not in order:
+                order.append(i)
+        return order
 
     def _fetch_probe_item_bytes_ex(self, item, scraper) -> Tuple[Optional[bytes], bool]:
         """Fetch image bytes for a single probe item, reporting timeout-vs-not.
 
         Returns ``(bytes_or_None, timed_out)``. ``timed_out`` is True ONLY when a
-        network timeout (``_PROBE_TIMEOUT_EXCEPTIONS``) was raised — the caller
-        EXCLUDES those from the quality aggregate (slowness, not a quality
-        signal). A definitive failure (non-image dict, HTTP >= 400, non-image
-        bytes, or any non-timeout exception) returns ``(None, False)`` so it
-        still scores as a genuine 0.0.
+        network timeout (``_PROBE_TIMEOUT_EXCEPTIONS``) was raised — the match
+        session counts those apart (slowness, not a quality signal). A
+        definitive failure (non-image dict, HTTP >= 400, non-image bytes, or
+        any non-timeout exception) returns ``(None, False)`` and counts as a
+        failed fetch. Called by match_fetch_window (and its overrides); never
+        raises.
 
         Handles both `get_chapter_images` return shapes:
           - `str` (most handlers): URL — fetched via scraper.get
@@ -2079,7 +2019,7 @@ class BaseSiteHandler:
             try:
                 # Image Accept, same reason as the download path: a wrapper-page
                 # response is a 200 that fails looks_like_real_image, which would
-                # score every page 0.0 and rate the whole site unusable on a
+                # fail every page and rate the whole site unreachable on a
                 # purely request-side mistake. Grep IMAGE_ACCEPT.
                 response = scraper.get(
                     item, timeout=15, headers=IMAGE_ACCEPT_HEADERS
@@ -2096,666 +2036,24 @@ class BaseSiteHandler:
                 return None, False
         return None, False
 
-    def _fetch_probe_item_bytes(self, item, scraper) -> Optional[bytes]:
-        """Bytes-only wrapper over _fetch_probe_item_bytes_ex for callers that
-        don't need to know WHY a fetch failed (the throttle tail). Keeps the
-        tail's cdn_reliability accounting unchanged."""
-        return self._fetch_probe_item_bytes_ex(item, scraper)[0]
-
-    def _probe_one_pick(
-        self, abs_idx, chapter, hit, scraper, make_request, score_fn,
-    ) -> "_ProbeSample":
-        """Probe ONE breadth-sample chapter -> a _ProbeSample.
-
-        Extracted VERBATIM from _probe_chapter_aggregate's former serial loop
-        body so the serial and concurrent breadth paths share ONE implementation
-        (any divergence would break the byte-identity guarantee). The four
-        failure branches reproduce the exact field combinations the serial loop
-        wrote: a failure keeps whatever it had computed so far (image_items once
-        fetched, picked_page_idx once chosen, blob once downloaded) so the
-        re-score pass + throttle tail see the same state. ``metadata`` is
-        non-None ONLY on a fully scored page (the compacted-metas discriminator).
-
-        ``score_fn`` is passed in rather than importing _score_image_blob here so
-        this method stays clear of the search_orchestrator circular-import dance
-        the caller already does at its late-import site (grep _score_image_blob).
-        Must never raise: get_chapter_images failures are swallowed; the caller's
-        worker wraps this in a further guard for anything unforeseen.
-        """
-        try:
-            image_items = self.get_chapter_images(chapter, scraper, make_request)
-        except _PROBE_TIMEOUT_EXCEPTIONS:
-            # Slow/timeout, not a content failure — mark not-measured so the
-            # aggregate excludes it instead of scoring a broken-CDN 0.0.
-            return _ProbeSample(0.0, None, None, None, None, is_timeout=True)
-        except Exception:
-            image_items = None
-        if not image_items:
-            return _ProbeSample(0.0, None, None, None, None)
-        page_idx = self._pick_random_middle_page_index(
-            len(image_items), hit.url, abs_idx, chapter=chapter,
-        )
-        if page_idx is None:
-            return _ProbeSample(0.0, None, image_items, None, None)
-        blob, timed_out = self._fetch_probe_item_bytes_ex(image_items[page_idx], scraper)
-        if not blob:
-            return _ProbeSample(0.0, None, image_items, page_idx, None, is_timeout=timed_out)
-        result = score_fn(blob)
-        if result is None:
-            # keep blob in case re-score works (mirrors the serial base path)
-            return _ProbeSample(0.0, None, image_items, page_idx, blob)
-        score, metadata = result
-        return _ProbeSample(score, metadata, image_items, page_idx, blob)
-
-    # Throttle-probe tail constants. The throttle-probe tail re-fetches up to
-    # N additional pages from the highest-scoring chapter to compute a
-    # cdn_reliability ratio. This is the v5 mitigation for the lost throttle-
-    # detection signal that came free with the v4 "5 pages × 1 chapter"
-    # probe. With breadth sampling we now do "1 page × 8 chapters" which
-    # spreads samples across the series (better statistical signal) but only
-    # tests the CDN once per chapter — a CDN that throttles after the first
-    # request per chapter still serves every breadth sample. The throttle-
-    # probe tail catches that by sequentially fetching THROTTLE_TAIL_PAGES
-    # additional pages from one chapter, mimicking single-worker download
-    # behavior. Stored in metadata as cdn_reliability (succeeded / attempted);
-    # NOT folded into the composite score directly so a sleeping CDN doesn't
-    # demote an otherwise quality source. Rizzcomic's handler override at
-    # sites/rizzcomic.py consumes this field to bottom-out the composite
-    # when a CDN is poisoned (cdn_reliability == 0).
-    THROTTLE_TAIL_PAGES = 3
-
-    # Per-SOURCE wall-clock budget for one _probe_chapter_aggregate call
-    # (2026-07-12). Found live on the Frieren benchmark: a host whose chapter
-    # pages TIME OUT (rather than fail fast) costs ~40-55s per sampled
-    # chapter under the search request shim (2 attempts × 20s + a 15s page
-    # fetch), so a full 8-chapter breadth probe needs >240s — it held the
-    # orchestrator's ENTIRE probe phase to its PROBE_PHASE_DEADLINE_S on
-    # every single search, and because the abandoned worker died with the
-    # process, its result NEVER cached, so the 240s was re-paid every run
-    # (mangakatana was the live culprit; the pre-2026-07-12 pipeline had the
-    # same flaw, just masked by everything else being slow too). When the
-    # budget expires mid-sampling, the REMAINING chapters count as failures
-    # (0.0 — the same "honest broken-CDN" contract failed fetches already
-    # use: a site that can't serve chapter pages promptly IS degraded) and
-    # the partial aggregate returns + caches, so the cost is paid once per
-    # TTL instead of once per search. 120s = half the phase deadline; a
-    # healthy source's 8 samples finish in well under 30s. Not applied to
-    # comix's override (its own browser time budgets bound it).
+    # Per-SOURCE wall-clock budget for the search's matched-page probe, read by
+    # sites/match_session.py (grep PROBE_SOURCE_BUDGET_S there): counted while
+    # at least one of the source's tasks is running; once spent, its unrun
+    # windows are skipped like the phase deadline's, and the source is rated on
+    # what it already served (slowness is never a quality verdict). Exists
+    # because a host whose pages TIME OUT rather than fail fast costs ~40-55 s
+    # per chapter under the search request shim (2 attempts x 20 s + a 15 s page
+    # fetch), which used to hold the whole probe phase to its deadline
+    # (search_orchestrator.PROBE_PHASE_DEADLINE_S) on every search. 120 s = half
+    # the phase deadline. A handler whose fetches are slow by design may raise it.
     PROBE_SOURCE_BUDGET_S = 120.0
 
-    # Breadth-sample concurrency for _probe_chapter_aggregate (module default
-    # _PROBE_BREADTH_CONCURRENCY, env AIO_PROBE_BREADTH_CONCURRENCY). 1 = serial.
-    # A subclass whose per-chapter fetch must not run concurrently (e.g. a
-    # browser handler) overrides this to 1. See the module-level constant's
-    # comment for the full rationale + the byte-identity guarantee.
+    # How many of one chapter's match-window pages match_fetch_window fetches at
+    # once (module default _PROBE_BREADTH_CONCURRENCY, env
+    # AIO_PROBE_BREADTH_CONCURRENCY). 1 = serial: a handler whose page fetches
+    # must not run concurrently (e.g. a browser handler) sets 1; one whose CDN
+    # is slow per request but tolerates bursts may raise it (atsumaru does).
     PROBE_BREADTH_CONCURRENCY: int = _PROBE_BREADTH_CONCURRENCY
-
-    def _probe_chapter_aggregate(
-        self, hit: "SearchHit", scraper, make_request,
-        max_samples: "Optional[int]" = None,
-        fetch_memo=None,
-    ) -> "Optional[tuple]":
-        """Breadth-sampled chapter probe — fetches 1 page from each of 8
-        chapters spread across the series, plus a throttle-probe tail.
-
-        ``max_samples`` (v5 semantics, BREAKING from v4): when set, clamps
-        the probe to that many CHAPTERS (was: that many pages within 1
-        chapter). The orchestrator passes ``max_samples=2`` for low-title-
-        match results on EXPENSIVE_PROBE handlers (browser-driven ones) per
-        the Phase 5 quick-probe clamp. None (default) probes 8 chapters.
-
-        Why breadth instead of depth: research (~/.claude/plans/how-robust-
-        is-the-memoized-koala-agent-a42650755ce151e5a.md) showed that
-        between-chapter variance (different scanners / dates / encoder
-        settings) dwarfs within-chapter variance. Sampling 1 page across
-        8 chapters is statistically a much better estimator of "site
-        quality" than 5 pages of 1 chapter. The user's request was the
-        trigger: "We take 5 images from 5 different chapters and give an
-        average rating" — their description was inaccurate (we sampled
-        1 chapter, not 5) but the underlying intent was right.
-
-        Throttle-probe tail: after the 8 breadth samples, pick the chapter
-        whose page scored highest, and sequentially fetch up to N additional
-        pages from it (THROTTLE_TAIL_PAGES, default 3). The
-        succeeded/attempted ratio becomes ``metadata["cdn_reliability"]``.
-        This preserves the v4 throttle-detection signal (rizzchoros.cloud
-        poisoning case from 2026-05-07) without polluting the composite —
-        a sleeping CDN that revives mid-probe shouldn't crater the score
-        of an otherwise high-quality source.
-
-        Returns (aggregate_score, metadata) or None if every chapter failed
-        (orchestrator falls back to cover probe). When all 8 chapters
-        produce zero successful image fetches but the chapter list itself
-        was readable, returns (0.0, samples=0/8 metadata) directly — same
-        v4 "honest broken-CDN" semantics, just at chapter-granularity.
-
-        Cross-file: scoring delegated to
-        sites.search_orchestrator._score_image_blob via late import; the
-        deterministic page-picker comes from _pick_random_middle_page_index
-        (this file) so cache replays stay stable.
-        """
-        # Late import to avoid module-level circular dep with search_orchestrator.
-        from .search_orchestrator import _score_image_blob
-
-        if not hit or not hit.url:
-            return None
-        # Context + chapter list, optionally through the per-run FetchMemo
-        # (sites/fetch_memo.py, 2026-07-12). The probe is the FIRST of up to
-        # three phases (probe → T3 pairwise → winner chapter fetch) that all
-        # need this source's context + chapter list; routing through the
-        # memo lets the later phases reuse this fetch instead of re-hitting
-        # the site. Failure semantics identical to the direct path: any
-        # exception or empty list → None (orchestrator falls back to the
-        # cover probe), and the memo stores nothing on failure (no negative
-        # caching — the winner fetch retries with its own policy).
-        if fetch_memo is not None:
-            try:
-                chapters = fetch_memo.get_chapters(
-                    self, hit.url, "en", scraper, make_request,
-                )
-            except Exception:
-                return None
-        else:
-            try:
-                context = self.fetch_comic_context(hit.url, scraper, make_request)
-            except Exception:
-                return None
-            if context is None:
-                return None
-            try:
-                chapters = self.get_chapters(context, scraper, "en", make_request)
-            except Exception:
-                return None
-        if not chapters:
-            return None
-
-
-        # v5 breadth sampling: pick N chapters (default 8, or max_samples
-        # when caller clamps for quick-probe). _pick_representative_chapters
-        # returns (absolute_index, chapter_dict) tuples; the absolute index
-        # feeds _pick_random_middle_page_index's deterministic seed so cache
-        # replays pick the same page.
-        n_chapters = max_samples if (max_samples is not None and max_samples >= 1) else 8
-        chapter_picks = self._pick_representative_chapters(chapters, n=n_chapters)
-        if not chapter_picks:
-            return None
-
-        # Each chapter contributes at most 1 page; failures (get_chapter_images
-        # raised, empty image list, image fetch failed, unscoreable bytes) count
-        # as 0.0 — the "honest broken-CDN" contract, at chapter-granularity.
-        #
-        # v5.1: pass 1 scores with content_type="unknown" (== bw_manga
-        # weights, the v5 default). We need the per-page metadata to
-        # classify the series, but classification requires aggregating
-        # across all pages — chicken-and-egg. The pragmatic resolution:
-        # score once with "unknown", classify from aggregated metadata,
-        # then re-score iff the classification produced a non-trivial
-        # content_type (re-scoring with "unknown" would be a no-op). The
-        # re-score path keeps the cached blob in `per_chapter_blobs` so
-        # we don't re-fetch from the CDN.
-        # Breadth pass: probe each picked chapter's single sample page. Formerly
-        # a serial for-loop; now a bounded daemon pool (PROBE_BREADTH_CONCURRENCY)
-        # so an HTML site paying a full origin GET per sample isn't N-times
-        # serial. BYTE-IDENTICAL to serial: the (chapter, page) set is fixed
-        # before any I/O by the pure pickers above, and the aggregation below is
-        # order-independent. Each worker owns a distinct PREALLOCATED slot
-        # (list[i]=x is atomic under the GIL) so there are no append races; the
-        # sweep afterward rebuilds the four index-aligned lists + the compacted
-        # per_chapter_metas in slot (= pick) order, matching the old append
-        # semantics exactly.
-        #
-        # Per-source budget (see PROBE_SOURCE_BUDGET_S): probe_deadline gates
-        # BOTH task start (a worker that pulls a pick past the deadline records a
-        # failure without fetching — the concurrent analogue of the old
-        # per-iteration skip) AND the wall-clock join (a worker blocked in a hung
-        # GET can't stall the source past the budget). Any slot still None after
-        # the join is a miss (never pulled / gated / in-flight at timeout) and is
-        # swept to a 0.0 failure — the same "honest broken-CDN" contract. Daemon
-        # pattern mirrors the orchestrator's probe-phase pool (grep _worker_loop
-        # in search_orchestrator.py).
-        probe_deadline = time.monotonic() + self.PROBE_SOURCE_BUDGET_S
-        n_workers = max(
-            1, min(int(self.PROBE_BREADTH_CONCURRENCY or 1), len(chapter_picks))
-        )
-        sample_results: List[Optional[_ProbeSample]] = [None] * len(chapter_picks)
-
-        if n_workers <= 1:
-            # Serial path: a single pick (max_samples=1) or a subclass forcing
-            # concurrency 1. No thread/queue overhead; identical to the old loop.
-            for slot, (abs_idx, chapter) in enumerate(chapter_picks):
-                if time.monotonic() > probe_deadline:
-                    break  # remaining slots stay None -> swept to failures
-                sample_results[slot] = self._probe_one_pick(
-                    abs_idx, chapter, hit, scraper, make_request, _score_image_blob,
-                )
-        else:
-            work_q: "queue.Queue" = queue.Queue()
-            for slot, (abs_idx, chapter) in enumerate(chapter_picks):
-                work_q.put((slot, abs_idx, chapter))
-
-            def _breadth_worker() -> None:
-                while True:
-                    try:
-                        slot, abs_idx, chapter = work_q.get_nowait()
-                    except queue.Empty:
-                        return
-                    if time.monotonic() > probe_deadline:
-                        return  # task-start gate: don't begin a fetch past budget
-                    try:
-                        sample_results[slot] = self._probe_one_pick(
-                            abs_idx, chapter, hit, scraper, make_request,
-                            _score_image_blob,
-                        )
-                    except Exception:
-                        # Belt-and-suspenders: a worker must never propagate and
-                        # kill the pool (_probe_one_pick already swallows fetch
-                        # errors; this covers anything unforeseen).
-                        sample_results[slot] = _ProbeSample(0.0, None, None, None, None)
-
-            workers = [
-                threading.Thread(
-                    target=_breadth_worker, name="probe-breadth", daemon=True,
-                )
-                for _ in range(n_workers)
-            ]
-            for t in workers:
-                t.start()
-            for t in workers:
-                remaining = probe_deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                t.join(timeout=remaining)
-
-        # Sweep in slot (= pick) order. A surviving None = a budget miss ->
-        # recorded as a 0.0 failure. Rebuild the four index-aligned lists (one
-        # entry per pick) + the compacted per_chapter_metas (successes only, in
-        # pick order) so every downstream consumer (re-score stitch, throttle
-        # tail, chapter_indices_sampled) is unchanged.
-        budget_exhausted = any(r is None for r in sample_results)
-        per_chapter_scores: List[float] = []
-        per_chapter_metas: List[Dict] = []
-        per_chapter_image_lists: List[Optional[List]] = []  # for throttle tail
-        per_chapter_picked_page_idx: List[Optional[int]] = []
-        per_chapter_blobs: List[Optional[bytes]] = []  # v5.1: kept for re-score pass
-        # Pick-aligned "was this sample NOT measured (timeout / budget-miss)?"
-        # flags. A surviving None slot = a budget miss = a timeout (never
-        # fetched). Timeouts keep a 0.0 in per_chapter_scores for POSITIONAL
-        # alignment (the throttle tail + re-score pass index into it by slot),
-        # but are excluded from the score AGGREGATE below so a slow site isn't
-        # penalized as broken. Grep per_chapter_is_timeout.
-        per_chapter_is_timeout: List[bool] = []
-        for r in sample_results:
-            if r is None:
-                r = _ProbeSample(0.0, None, None, None, None, is_timeout=True)
-            per_chapter_scores.append(r.score)
-            per_chapter_is_timeout.append(r.is_timeout)
-            per_chapter_image_lists.append(r.image_items)
-            per_chapter_picked_page_idx.append(r.picked_page_idx)
-            per_chapter_blobs.append(r.blob)
-            if r.metadata is not None:
-                per_chapter_metas.append(r.metadata)
-
-        # v5.1: classify series content_type from successful pages' metadata.
-        # The classifier reads width / height / aspect / is_grayscale /
-        # chroma_var — all are fields _score_image_blob already populates.
-        # When content_type != "unknown" AND differs from the default
-        # bw_manga weights, re-score each blob with the classified
-        # content_type so the final T1 reflects per-content-type tuning.
-        series_content_type = "unknown"
-        if per_chapter_metas:
-            try:
-                from .search_orchestrator import _classify_series_content
-                feature_view = [
-                    {
-                        "width": m.get("width", 0),
-                        "height": m.get("height", 0),
-                        "aspect": (m.get("width", 0) / m["height"]) if m.get("height") else 1.0,
-                        "is_grayscale_page": bool(m.get("is_grayscale", False)),
-                        "chroma_var": float(m.get("chroma_var", 0.0)),
-                    }
-                    for m in per_chapter_metas
-                ]
-                series_content_type = _classify_series_content(feature_view)
-            except Exception:
-                series_content_type = "unknown"
-
-            # Re-score with the classified content_type only when it would
-            # change weights/targets. "unknown" maps to bw_manga defaults
-            # so we skip the re-score work in that branch (a no-op).
-            if series_content_type not in ("unknown", "bw_manga"):
-                rescored_scores: List[float] = []
-                rescored_metas: List[Dict] = []
-                rescore_idx = 0
-                for chapter_idx, score in enumerate(per_chapter_scores):
-                    if score <= 0.0:
-                        # Failure stays a failure regardless of content_type.
-                        continue
-                    blob = per_chapter_blobs[chapter_idx]
-                    if blob is None:
-                        # Defensive: success score but no blob is impossible.
-                        rescored_scores.append(score)
-                        rescored_metas.append(per_chapter_metas[rescore_idx])
-                        rescore_idx += 1
-                        continue
-                    new_result = _score_image_blob(
-                        blob, content_type=series_content_type,
-                    )
-                    if new_result is None:
-                        rescored_scores.append(score)
-                        rescored_metas.append(per_chapter_metas[rescore_idx])
-                    else:
-                        new_score, new_meta = new_result
-                        rescored_scores.append(new_score)
-                        rescored_metas.append(new_meta)
-                    rescore_idx += 1
-                # Stitch the rescored successes back into per_chapter_scores
-                # while preserving alignment with per_chapter_image_lists and
-                # per_chapter_picked_page_idx (which track ALL chapters
-                # including failed ones).
-                new_per_chapter_scores: List[float] = []
-                rescored_iter = iter(rescored_scores)
-                for old_score in per_chapter_scores:
-                    if old_score <= 0.0:
-                        new_per_chapter_scores.append(old_score)
-                    else:
-                        try:
-                            new_per_chapter_scores.append(next(rescored_iter))
-                        except StopIteration:
-                            new_per_chapter_scores.append(old_score)
-                per_chapter_scores = new_per_chapter_scores
-                per_chapter_metas = rescored_metas
-
-        # All chapters produced 0 — site served chapter lists but no real
-        # pages. v4-equivalent canonical broken-CDN signal at chapter
-        # granularity. Returning 0.0 (not None) so the orchestrator records
-        # the measured failure rather than camouflaging it via cover-probe
-        # fallback (rizzchoros.cloud lesson from 2026-05-07).
-        if not per_chapter_metas:
-            # No chapter yielded a scoreable page. Distinguish "couldn't measure
-            # anything IN TIME" from "measured, and it's broken":
-            if all(per_chapter_is_timeout):
-                # Every pick timed out / was budget-missed — we measured NOTHING.
-                # Don't fabricate a 0.0 "broken" verdict for a merely-slow site;
-                # return None so the orchestrator falls back to the cover probe /
-                # seed prior (quality_basis becomes "seed"/"cover" → red triangle).
-                return None
-            # At least one GENUINE failure (empty list / 4xx / non-image /
-            # unscoreable) and zero successes → honest broken-CDN 0.0, unchanged
-            # (rizzchoros contract; rizzcomic's None→0.0 override relies on this).
-            return 0.0, {
-                "width": 0,
-                "height": 0,
-                "format": "FAILED",
-                "size_bytes": 0,
-                "samples_attempted": len(chapter_picks),
-                "samples_succeeded": 0,
-                "samples_measured": sum(1 for to in per_chapter_is_timeout if not to),
-                "samples_timed_out": sum(1 for to in per_chapter_is_timeout if to),
-                "cdn_reliability": 0.0,
-                "probe_budget_exhausted": budget_exhausted,
-            }
-
-        # Hybrid median/mean aggregation across chapters (was: across pages
-        # within one chapter), computed over MEASURED samples only (successes +
-        # genuine failures). v5.2: timeouts / budget-misses are EXCLUDED, so a
-        # slow site is scored on what we could actually fetch, not penalized for
-        # pages we never reached. measured_scores is guaranteed non-empty here
-        # (per_chapter_metas is non-empty ⇒ ≥1 success). Same hybrid rule as v4:
-        # median when every measured sample succeeded (suppresses cross-chapter
-        # content variance — e.g. a color splash chapter vs a B&W one), mean when
-        # any measured sample was a GENUINE failure (preserves the throttle/
-        # failure signal). Grep per_chapter_is_timeout.
-        measured_scores = [
-            s for s, to in zip(per_chapter_scores, per_chapter_is_timeout) if not to
-        ]
-        if all(s > 0.0 for s in measured_scores):
-            aggregate_score = statistics.median(measured_scores)
-        else:
-            aggregate_score = sum(measured_scores) / len(measured_scores)
-
-        # Throttle-probe tail: pick the highest-scoring chapter index from
-        # the breadth pass and sequentially fetch THROTTLE_TAIL_PAGES more
-        # pages from it. This re-introduces the v4 sequential-throttle
-        # detection signal that the breadth pass loses (1 page per chapter
-        # only tests the CDN's first-request behavior).
-        #
-        # Gate (v8): skip the entire tail when the caller clamped
-        # ``max_samples`` (non-top candidates / quick-probe path in the
-        # orchestrator). The tail costs THROTTLE_TAIL_PAGES extra image
-        # GETs which dominates the per-source budget for clamped probes:
-        # max_samples=1 was supposed to cost 1 GET; the unconditional
-        # tail made it cost 4. For the orchestrator's PROBE_PHASE_DEADLINE_S
-        # budget that's a 4x overrun, so clamped probes were getting
-        # guillotined before completing on slow / CF-protected sites.
-        # The tail's value (sequential throttle detection) needs a
-        # representative breadth pass to be meaningful — there's no point
-        # measuring CDN-reliability on a source where we already gave up
-        # on breadth.
-        cdn_reliability: Optional[float] = None
-        tail_attempted = 0
-        tail_succeeded = 0
-        # Tail also respects the per-source budget: its 3 sequential fetches
-        # cost up to ~45s against a timing-out host, and a budget-exhausted
-        # breadth pass already established the degradation signal.
-        if (
-            per_chapter_scores and max_samples is None
-            and time.monotonic() <= probe_deadline
-        ):
-            best_chapter_local_idx = max(
-                range(len(per_chapter_scores)),
-                key=lambda i: per_chapter_scores[i],
-            )
-            image_items = per_chapter_image_lists[best_chapter_local_idx]
-            picked_page_idx = per_chapter_picked_page_idx[best_chapter_local_idx]
-            if image_items and picked_page_idx is not None:
-                n_pages = len(image_items)
-                # Walk forward from the already-fetched page. Dedup against
-                # both the picked page AND prior candidates: on short
-                # chapters (n_pages <= THROTTLE_TAIL_PAGES) the wrap puts
-                # us on the same page twice, and the previous `!=` filter
-                # left the duplicates in place — tail_attempted counted
-                # repeats while only one distinct page was actually probed,
-                # so cdn_reliability mis-reported sequential CDN behavior
-                # (re-fetched URL hits the CDN cache from attempt 1 on the
-                # success side, or returns the same 5xx on the failure
-                # side). Order-preserving set dedup keeps the walk-forward
-                # ordering while guaranteeing each page is fetched at most
-                # once.
-                seen_tail_pages: set = {picked_page_idx}
-                candidate_pages: List[int] = []
-                for i in range(self.THROTTLE_TAIL_PAGES):
-                    p = (picked_page_idx + 1 + i) % n_pages
-                    if p in seen_tail_pages:
-                        continue
-                    seen_tail_pages.add(p)
-                    candidate_pages.append(p)
-                for p_idx in candidate_pages:
-                    tail_attempted += 1
-                    blob = self._fetch_probe_item_bytes(image_items[p_idx], scraper)
-                    if blob:
-                        tail_succeeded += 1
-                if tail_attempted > 0:
-                    cdn_reliability = tail_succeeded / tail_attempted
-
-        # Metadata aggregation: mean across SUCCESSFUL samples for numeric
-        # fields; majority vote for booleans; most-common for categorical.
-        # The per-sample metadata schema is now the v5 _compute_t1_score
-        # output (see sites/search_orchestrator.py:_compute_t1_score) with
-        # many more fields than v4's 4-field schema. We aggregate every
-        # numeric field we recognize; unknown fields pass through from the
-        # first sample only (forward-compat — new component additions in
-        # _compute_t1_score don't require updates here).
-        from collections import Counter
-
-        def _mean_field(field: str) -> Optional[float]:
-            vals = [m.get(field) for m in per_chapter_metas]
-            vals = [float(v) for v in vals if isinstance(v, (int, float))]
-            if not vals:
-                return None
-            return round(sum(vals) / len(vals), 4)
-
-        avg_w = sum(int(m.get("width", 0) or 0) for m in per_chapter_metas) // len(per_chapter_metas)
-        avg_h = sum(int(m.get("height", 0) or 0) for m in per_chapter_metas) // len(per_chapter_metas)
-        avg_size = sum(int(m.get("size_bytes", 0) or 0) for m in per_chapter_metas) // len(per_chapter_metas)
-        fmts = [m.get("format", "UNKNOWN") for m in per_chapter_metas]
-        most_common_fmt = Counter(fmts).most_common(1)[0][0] if fmts else "UNKNOWN"
-
-        gs_count = sum(1 for m in per_chapter_metas if m.get("is_grayscale"))
-        lossless_count = sum(1 for m in per_chapter_metas if m.get("is_lossless"))
-        # v5.1: outlier aggregation uses majority vote (≥half of probed
-        # pages must share the same outlier type for the aggregate to
-        # inherit it). The v5 "first-found wins" rule was set when there
-        # was only one source-level outlier type (webp_below_floor). v5.1
-        # added per-page outliers (low_chroma, fake_sharpened,
-        # heavy_watermark) that legitimately VARY across pages — e.g.
-        # linewebtoon serves mostly PNG but a stray JPEG proxy thumbnail
-        # would mark the whole source as low_chroma under first-found.
-        # Majority vote also preserves the rizzchoros throttle_detected
-        # signal (which fires uniformly across all pages when the CDN is
-        # broken).
-        outlier_counts = Counter(
-            m.get("outlier") for m in per_chapter_metas if m.get("outlier")
-        )
-        majority_threshold = max(1, (len(per_chapter_metas) + 1) // 2)
-        majority_outlier = next(
-            (name for name, cnt in outlier_counts.most_common()
-             if cnt >= majority_threshold),
-            None,
-        )
-
-        aggregate_metadata: Dict[str, Any] = {
-            "width": int(avg_w),
-            "height": int(avg_h),
-            "format": most_common_fmt,
-            "size_bytes": int(avg_size),
-            "samples_attempted": len(chapter_picks),
-            "samples_succeeded": len(per_chapter_metas),
-            # v5.2 (2026-07-14): samples that could not be MEASURED in time
-            # (network timeout or budget-miss) — EXCLUDED from the score
-            # aggregate above (slow != broken). samples_measured = attempted -
-            # timed_out = successes + genuine failures. Drives the UI partial-
-            # probe Clock hint (SearchSourceCard.jsx keys on samples_timed_out).
-            "samples_measured": sum(1 for to in per_chapter_is_timeout if not to),
-            "samples_timed_out": sum(1 for to in per_chapter_is_timeout if to),
-            # Numeric T1 components (mean across successful samples).
-            "bpp": _mean_field("bpp"),
-            "decode_quality": _mean_field("decode_quality"),
-            "res_norm": _mean_field("res_norm"),
-            "blockiness": _mean_field("blockiness"),
-            "fft_hf_ratio": _mean_field("fft_hf_ratio"),
-            "tenengrad": _mean_field("tenengrad"),
-            "tenengrad_norm": _mean_field("tenengrad_norm"),
-            # v5.1 USM-damped Tenengrad — REQUIRED for the v6 cache-load
-            # gate (sites/search_orchestrator.py:REQUIRED_V6_FIELDS). Without
-            # this aggregate-level entry, every chapter-probe cache write
-            # got DROPPED on next-session load because the gate's
-            # `all(f in meta for f in REQUIRED_V6_FIELDS)` check failed
-            # → 30-day TTL had zero effect on the dominant probe path,
-            # every search re-probed from scratch. Grep target:
-            # tenengrad_clean. Per-page metadata writes the field at
-            # search_orchestrator.py:_compute_t1_score / _compute_t1_score_bw.
-            "tenengrad_clean": _mean_field("tenengrad_clean"),
-            "jpeg_qf": _mean_field("jpeg_qf"),
-            "jpeg_qf_norm": _mean_field("jpeg_qf_norm"),
-            "jpeg_nse": _mean_field("jpeg_nse"),
-            "t1_score": _mean_field("t1_score"),
-            # Majority vote for content-type classifiers. Edge case: 1 color
-            # splash + 7 B&W → reports B&W (correct — dominant content type).
-            "is_grayscale": gs_count >= max(1, len(per_chapter_metas) // 2 + 1),
-            "is_lossless": lossless_count >= max(1, len(per_chapter_metas) // 2 + 1),
-            # v5.1: majority-vote outlier (≥half of probed pages share it).
-            # See `majority_outlier` derivation above for rationale — first-
-            # found was too noisy for per-page outliers added in v5.1.
-            "outlier": majority_outlier,
-            # Throttle-probe tail result — drives the rizzcomic override
-            # short-circuit at sites/rizzcomic.py. None when the tail
-            # couldn't run (e.g. only 1 chapter probed total).
-            "cdn_reliability": cdn_reliability,
-            # True when PROBE_SOURCE_BUDGET_S expired mid-sampling and the
-            # remaining chapters were recorded as failures — the score is a
-            # bounded partial aggregate of a timing-out host. Cache-audit /
-            # UI-tooltip diagnostic; not read by ranking.
-            "probe_budget_exhausted": budget_exhausted,
-            # Provenance for debugging / cache audit. The picked chapter
-            # indices let calibration replay deterministically what was
-            # measured.
-            "chapter_indices_sampled": [abs_idx for abs_idx, _ in chapter_picks],
-            # v5.1 (Phase 4): series-level content_type from
-            # _classify_series_content (search_orchestrator.py). The string
-            # drives per-content-type T1 weights + res_norm targets in
-            # _compute_t1_score; the rescored per-page metadata in
-            # per_chapter_metas already reflects the classification.
-            "content_type": series_content_type,
-            # Mean chroma variance across successful pages — useful for the
-            # classifier's color/B&W discrimination and for the UI tooltip.
-            "chroma_var": _mean_field("chroma_var"),
-        }
-        # T2/T3 placeholders propagate from per-sample metadata (every sample
-        # carries these; we surface the t2_available bit and any populated
-        # T2 fields as means). Phase 3 will populate t2_score / clip_iqa /
-        # niqe; Phase 4 populates paired_quality_adjustment.
-        aggregate_metadata.setdefault(
-            "t2_available",
-            any(m.get("t2_available") for m in per_chapter_metas),
-        )
-        for f in ("t2_score", "clip_iqa_mean", "niqe_score", "niqe_norm"):
-            aggregate_metadata.setdefault(f, _mean_field(f))
-        # clip_iqa_scores is a per-prompt dict; preserve from first sample
-        # that has it populated (all should agree per Phase 3 design).
-        for m in per_chapter_metas:
-            if m.get("clip_iqa_scores"):
-                aggregate_metadata.setdefault("clip_iqa_scores", m["clip_iqa_scores"])
-                break
-        else:
-            aggregate_metadata.setdefault("clip_iqa_scores", None)
-        # T3 fields default null (populated post-probe by orchestrator).
-        aggregate_metadata.setdefault("paired_quality_adjustment", None)
-        aggregate_metadata.setdefault("paired_anchor_site", None)
-        aggregate_metadata.setdefault("paired_dists_median", None)
-        aggregate_metadata.setdefault("paired_pairs_compared", 0)
-
-        return aggregate_score, aggregate_metadata
-
-    def _probe_cover_image(
-        self, hit: "SearchHit", scraper, make_request
-    ) -> Optional[bytes]:
-        """Cover-image fallback when chapter probe fails.
-
-        Faster than chapter probe (1 HTTP request vs 3-4) but biased
-        per-site because covers and chapter pages have different
-        compression policies on most aggregator CDNs. Override when the
-        cover URL needs site-specific cleanup before fetching (see
-        MangaFire's _probe_cover_image which strips the @<digits>
-        thumbnail token).
-        """
-        if not hit or not getattr(hit, "cover", None):
-            return None
-        cover_url = hit.cover
-        if isinstance(cover_url, str) and cover_url.startswith("localfile://"):
-            try:
-                parsed = urlparse(cover_url)
-                path = unquote(parsed.path or "")
-                if os.name == "nt" and path.startswith("/") and len(path) > 2 and path[2] == ":":
-                    path = path[1:]
-                with open(path, "rb") as f:
-                    data = f.read()
-                if not looks_like_real_image(data):
-                    return None
-                return data
-            except Exception:
-                return None
-        try:
-            response = scraper.get(
-                cover_url, timeout=10, headers=IMAGE_ACCEPT_HEADERS
-            )
-            if response.status_code >= 400:
-                return None
-            data = response.content
-            if not looks_like_real_image(data):
-                return None
-            return data
-        except Exception:
-            return None
 
 
 __all__ = [
