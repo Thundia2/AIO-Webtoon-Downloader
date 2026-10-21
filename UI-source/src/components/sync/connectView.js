@@ -88,7 +88,9 @@ function hasWork(n) {
  */
 export function workLine(job, targetId) {
   if (!job || job.state !== "running" || job.targetId !== targetId) return null;
-  if (job.phase !== "plan" && job.phase !== "verify") return null;
+  // A refresh (the top-up after a review decision) runs the same steps; it
+  // shows here only while there's no plan to show (after a needs-mode pick).
+  if (job.phase !== "plan" && job.phase !== "verify" && job.phase !== "refresh") return null;
   const p = job.progress || {};
   const n = pct(p.filesDone, p.filesTotal);
   const at = n == null ? "" : ` (${n}%)`;
@@ -346,7 +348,8 @@ function lastRunAlarms(lastRun, dismissedRunId) {
  *          question, not a fault), a plan that failed with nothing to show,
  *          a failed / cut-off last run not dismissed, or a configured
  *          tablet that is unauthorized / has no USB permission.
- *   pulse  a job runs that isn't an automatic plan (a user's Re-check does).
+ *   pulse  a job runs that isn't an automatic plan or a refresh (a user's
+ *          Re-check does).
  * Red wins over pulse; the count shows beside either.
  */
 export function railBadge({ targets, plans, devices, folderPresence, job, dismissed }) {
@@ -366,7 +369,8 @@ export function railBadge({ targets, plans, devices, folderPresence, job, dismis
     for (const r of (pv.summary && pv.summary.series) || []) if (rowView(r).selected > 0) keys.add(r.seriesKey);
   }
   const running = job && job.state === "running";
-  const pulse = !!running && !(job.phase === "plan" && job.auto);
+  // A refresh is always automatic (a decision's top-up), so it never pulses.
+  const pulse = !!running && !((job.phase === "plan" && job.auto) || job.phase === "refresh");
   return { count: keys.size, dot: red ? "red" : pulse ? "pulse" : null };
 }
 

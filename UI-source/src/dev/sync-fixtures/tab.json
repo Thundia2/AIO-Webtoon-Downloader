@@ -76,7 +76,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t36edc5d7bf",
+              "id": "t80c046cd13",
               "deletePolicy": "guarded",
               "excludes": [],
               "aliases": [],
@@ -100,18 +100,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t36edc5d7bf": true
+          "t80c046cd13": true
         },
         "job": {
           "job": {
             "runId": 1,
             "phase": "plan",
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "serial": null,
             "auto": true,
             "state": "done",
-            "startedAt": 1792266560992,
-            "finishedAt": 1792266561052,
+            "startedAt": 1792575341677,
+            "finishedAt": 1792575341735,
             "progress": {
               "bytesDone": 127108,
               "bytesTotal": 127108,
@@ -132,13 +132,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792266561044
+              "at": 1792575341726
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "t36edc5d7bf",
-                "asOf": 1792266561044,
+                "targetId": "t80c046cd13",
+                "asOf": 1792575341726,
                 "firstSync": true,
                 "totals": {
                   "push": {
@@ -430,15 +430,15 @@
                 "gen": 1,
                 "warnings": [],
                 "capacity": {
-                  "free": 226252926976,
+                  "free": 196508323840,
                   "total": 1999343972352,
                   "needed": 127108,
                   "reserve": 1073741824,
                   "freeable": 0,
                   "freeableEarly": 0,
-                  "after": 226252799868,
+                  "after": 196508196732,
                   "fits": true,
-                  "asOf": 1792266561006
+                  "asOf": 1792575341693
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -451,10 +451,10 @@
           "queue": []
         },
         "plans": {
-          "t36edc5d7bf": {
+          "t80c046cd13": {
             "summary": {
-              "targetId": "t36edc5d7bf",
-              "asOf": 1792266561044,
+              "targetId": "t80c046cd13",
+              "asOf": 1792575341726,
               "firstSync": true,
               "totals": {
                 "push": {
@@ -746,15 +746,15 @@
               "gen": 1,
               "warnings": [],
               "capacity": {
-                "free": 226252926976,
+                "free": 196508323840,
                 "total": 1999343972352,
                 "needed": 127108,
                 "reserve": 1073741824,
                 "freeable": 0,
                 "freeableEarly": 0,
-                "after": 226252799868,
+                "after": 196508196732,
                 "fits": true,
-                "asOf": 1792266561006
+                "asOf": 1792575341693
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -764,6 +764,8 @@
             },
             "refusal": null,
             "stale": false,
+            "updating": false,
+            "links": [],
             "lastRun": null,
             "gen": 1,
             "selSeq": null,
@@ -772,7 +774,7 @@
               "status": "completed",
               "auto": true,
               "reason": null,
-              "at": 1792266561052
+              "at": 1792575341735
             }
           }
         },
@@ -863,7 +865,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t36edc5d7bf",
+              "id": "t80c046cd13",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -898,24 +900,26 @@
         },
         "devices": [],
         "folderPresence": {
-          "t36edc5d7bf": true
+          "t80c046cd13": true
         },
         "job": {
           "job": {
-            "runId": 6,
+            "runId": 4,
             "phase": "plan",
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792266562135,
-            "finishedAt": 1792266562166,
+            "startedAt": 1792575342770,
+            "finishedAt": 1792575342839,
             "progress": {
-              "bytesDone": 91442,
-              "bytesTotal": 91442,
-              "filesDone": 31,
-              "filesTotal": 31,
-              "current": null,
+              "bytesDone": 3001,
+              "bytesTotal": 3001,
+              "filesDone": 1,
+              "filesTotal": 1,
+              "current": {
+                "folder": "Frieren"
+              },
               "preflight": {
                 "kind": "folder",
                 "caps": {
@@ -929,14 +933,15 @@
                 "mayNeedMode": false,
                 "refusal": null
               },
-              "step": "planning",
-              "at": 1792266562164
+              "step": "verify",
+              "at": 1792575342819,
+              "lane": null
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "t36edc5d7bf",
-                "asOf": 1792266562164,
+                "targetId": "t80c046cd13",
+                "asOf": 1792575342806,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -974,7 +979,7 @@
                   "count": 1
                 },
                 "needsVerify": 0,
-                "settleAt": 1792266586948,
+                "settleAt": 1792575367691,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -1325,7 +1330,7 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "5b0cf175429f5ae6",
+                    "shardId": "55f595b2710b4a7b",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
@@ -1390,15 +1395,15 @@
                 "gen": 5,
                 "warnings": [],
                 "capacity": {
-                  "free": 226252673024,
+                  "free": 196508090368,
                   "total": 1999343972352,
                   "needed": 60912,
                   "reserve": 1073741824,
                   "freeable": 36078,
                   "freeableEarly": 36078,
-                  "after": 226252648190,
+                  "after": 196508065534,
                   "fits": true,
-                  "asOf": 1792266562154
+                  "asOf": 1792575342787
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -1411,10 +1416,10 @@
           "queue": []
         },
         "plans": {
-          "t36edc5d7bf": {
+          "t80c046cd13": {
             "summary": {
-              "targetId": "t36edc5d7bf",
-              "asOf": 1792266562164,
+              "targetId": "t80c046cd13",
+              "asOf": 1792575342806,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -1452,7 +1457,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792266586948,
+              "settleAt": 1792575367691,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -1803,7 +1808,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "5b0cf175429f5ae6",
+                  "shardId": "55f595b2710b4a7b",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -1868,15 +1873,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 226252673024,
+                "free": 196508090368,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 36078,
                 "freeableEarly": 36078,
-                "after": 226252648190,
+                "after": 196508065534,
                 "fits": true,
-                "asOf": 1792266562154
+                "asOf": 1792575342787
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -1886,12 +1891,14 @@
             },
             "refusal": null,
             "stale": false,
+            "updating": false,
+            "links": [],
             "lastRun": {
               "runId": 2,
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792266561831,
+              "at": 1792575342559,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -1916,11 +1923,11 @@
             "gen": 5,
             "selSeq": null,
             "lastPlan": {
-              "runId": 6,
+              "runId": 4,
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792266562166
+              "at": 1792575342839
             }
           }
         },
@@ -2011,7 +2018,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t36edc5d7bf",
+              "id": "t80c046cd13",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -2046,24 +2053,26 @@
         },
         "devices": [],
         "folderPresence": {
-          "t36edc5d7bf": true
+          "t80c046cd13": true
         },
         "job": {
           "job": {
-            "runId": 6,
+            "runId": 4,
             "phase": "plan",
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792266562135,
-            "finishedAt": 1792266562166,
+            "startedAt": 1792575342770,
+            "finishedAt": 1792575342839,
             "progress": {
-              "bytesDone": 91442,
-              "bytesTotal": 91442,
-              "filesDone": 31,
-              "filesTotal": 31,
-              "current": null,
+              "bytesDone": 3001,
+              "bytesTotal": 3001,
+              "filesDone": 1,
+              "filesTotal": 1,
+              "current": {
+                "folder": "Frieren"
+              },
               "preflight": {
                 "kind": "folder",
                 "caps": {
@@ -2077,14 +2086,15 @@
                 "mayNeedMode": false,
                 "refusal": null
               },
-              "step": "planning",
-              "at": 1792266562164
+              "step": "verify",
+              "at": 1792575342819,
+              "lane": null
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "t36edc5d7bf",
-                "asOf": 1792266562164,
+                "targetId": "t80c046cd13",
+                "asOf": 1792575342806,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -2122,7 +2132,7 @@
                   "count": 1
                 },
                 "needsVerify": 0,
-                "settleAt": 1792266586948,
+                "settleAt": 1792575367691,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -2473,7 +2483,7 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "5b0cf175429f5ae6",
+                    "shardId": "55f595b2710b4a7b",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
@@ -2538,15 +2548,15 @@
                 "gen": 5,
                 "warnings": [],
                 "capacity": {
-                  "free": 226252673024,
+                  "free": 196508090368,
                   "total": 1999343972352,
                   "needed": 60912,
                   "reserve": 1073741824,
                   "freeable": 36078,
                   "freeableEarly": 36078,
-                  "after": 226252648190,
+                  "after": 196508065534,
                   "fits": true,
-                  "asOf": 1792266562154
+                  "asOf": 1792575342787
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -2559,10 +2569,10 @@
           "queue": []
         },
         "plans": {
-          "t36edc5d7bf": {
+          "t80c046cd13": {
             "summary": {
-              "targetId": "t36edc5d7bf",
-              "asOf": 1792266562164,
+              "targetId": "t80c046cd13",
+              "asOf": 1792575342806,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -2600,7 +2610,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792266586948,
+              "settleAt": 1792575367691,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -2952,7 +2962,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "5b0cf175429f5ae6",
+                  "shardId": "55f595b2710b4a7b",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -3017,15 +3027,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 226252673024,
+                "free": 196508090368,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 39081,
                 "freeableEarly": 39081,
-                "after": 226252651193,
+                "after": 196508068537,
                 "fits": true,
-                "asOf": 1792266562154
+                "asOf": 1792575342787
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -3035,12 +3045,14 @@
             },
             "refusal": null,
             "stale": false,
+            "updating": false,
+            "links": [],
             "lastRun": {
               "runId": 2,
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792266561831,
+              "at": 1792575342559,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -3065,11 +3077,11 @@
             "gen": 5,
             "selSeq": 5,
             "lastPlan": {
-              "runId": 6,
+              "runId": 4,
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792266562166
+              "at": 1792575342839
             }
           }
         },
@@ -3160,7 +3172,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t36edc5d7bf",
+              "id": "t80c046cd13",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -3195,17 +3207,17 @@
         },
         "devices": [],
         "folderPresence": {
-          "t36edc5d7bf": true
+          "t80c046cd13": true
         },
         "job": {
           "job": {
-            "runId": 7,
+            "runId": 5,
             "phase": "apply",
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "serial": null,
             "auto": false,
             "state": "running",
-            "startedAt": 1792266562586,
+            "startedAt": 1792575343239,
             "finishedAt": null,
             "progress": {
               "bytesDone": 3402,
@@ -3230,7 +3242,7 @@
                 "refusal": null
               },
               "step": "apply",
-              "at": 1792266562654,
+              "at": 1792575343299,
               "lane": {
                 "seriesKey": "pc:Eleceed",
                 "landed": 1,
@@ -3243,10 +3255,10 @@
           "queue": []
         },
         "plans": {
-          "t36edc5d7bf": {
+          "t80c046cd13": {
             "summary": {
-              "targetId": "t36edc5d7bf",
-              "asOf": 1792266562164,
+              "targetId": "t80c046cd13",
+              "asOf": 1792575342806,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -3284,7 +3296,7 @@
                 "count": 1
               },
               "needsVerify": 0,
-              "settleAt": 1792266586948,
+              "settleAt": 1792575367691,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -3636,7 +3648,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "5b0cf175429f5ae6",
+                  "shardId": "55f595b2710b4a7b",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -3701,15 +3713,15 @@
               "gen": 5,
               "warnings": [],
               "capacity": {
-                "free": 226252673024,
+                "free": 196508090368,
                 "total": 1999343972352,
                 "needed": 60912,
                 "reserve": 1073741824,
                 "freeable": 39081,
                 "freeableEarly": 39081,
-                "after": 226252651193,
+                "after": 196508068537,
                 "fits": true,
-                "asOf": 1792266562154
+                "asOf": 1792575342787
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -3719,12 +3731,14 @@
             },
             "refusal": null,
             "stale": false,
+            "updating": false,
+            "links": [],
             "lastRun": {
               "runId": 2,
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792266561831,
+              "at": 1792575342559,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -3749,11 +3763,11 @@
             "gen": 5,
             "selSeq": 5,
             "lastPlan": {
-              "runId": 6,
+              "runId": 4,
               "status": "completed",
               "auto": false,
               "reason": null,
-              "at": 1792266562166
+              "at": 1792575342839
             }
           }
         },
@@ -3844,7 +3858,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t36edc5d7bf",
+              "id": "t80c046cd13",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -3878,18 +3892,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t36edc5d7bf": true
+          "t80c046cd13": true
         },
         "job": {
           "job": {
-            "runId": 8,
+            "runId": 6,
             "phase": "plan",
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "serial": null,
             "auto": true,
             "state": "done",
-            "startedAt": 1792266565540,
-            "finishedAt": 1792266565577,
+            "startedAt": 1792575346157,
+            "finishedAt": 1792575346186,
             "progress": {
               "bytesDone": 91442,
               "bytesTotal": 91442,
@@ -3910,13 +3924,13 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792266565576
+              "at": 1792575346185
             },
             "status": "completed",
             "summary": {
               "plan": {
-                "targetId": "t36edc5d7bf",
-                "asOf": 1792266565576,
+                "targetId": "t80c046cd13",
+                "asOf": 1792575346185,
                 "firstSync": false,
                 "totals": {
                   "push": {
@@ -3954,7 +3968,7 @@
                   "count": 0
                 },
                 "needsVerify": 0,
-                "settleAt": 1792266586948,
+                "settleAt": 1792575367691,
                 "series": [
                   {
                     "seriesKey": "pc:Blue Lock",
@@ -4251,7 +4265,7 @@
                     "key": "dev:Berserk",
                     "name": "Berserk",
                     "state": "orphaned",
-                    "shardId": "5b0cf175429f5ae6",
+                    "shardId": "55f595b2710b4a7b",
                     "listed": true,
                     "files": 5,
                     "bytes": 15015,
@@ -4306,15 +4320,15 @@
                 "gen": 6,
                 "warnings": [],
                 "capacity": {
-                  "free": 226252054528,
+                  "free": 196504965120,
                   "total": 1999343972352,
                   "needed": 0,
                   "reserve": 1073741824,
                   "freeable": 0,
                   "freeableEarly": 0,
-                  "after": 226252054528,
+                  "after": 196504965120,
                   "fits": true,
-                  "asOf": 1792266565561
+                  "asOf": 1792575346174
                 },
                 "policy": {
                   "deletePolicy": "guarded",
@@ -4327,10 +4341,10 @@
           "queue": []
         },
         "plans": {
-          "t36edc5d7bf": {
+          "t80c046cd13": {
             "summary": {
-              "targetId": "t36edc5d7bf",
-              "asOf": 1792266565576,
+              "targetId": "t80c046cd13",
+              "asOf": 1792575346185,
               "firstSync": false,
               "totals": {
                 "push": {
@@ -4368,7 +4382,7 @@
                 "count": 0
               },
               "needsVerify": 0,
-              "settleAt": 1792266586948,
+              "settleAt": 1792575367691,
               "series": [
                 {
                   "seriesKey": "pc:Blue Lock",
@@ -4665,7 +4679,7 @@
                   "key": "dev:Berserk",
                   "name": "Berserk",
                   "state": "orphaned",
-                  "shardId": "5b0cf175429f5ae6",
+                  "shardId": "55f595b2710b4a7b",
                   "listed": true,
                   "files": 5,
                   "bytes": 15015,
@@ -4720,15 +4734,15 @@
               "gen": 6,
               "warnings": [],
               "capacity": {
-                "free": 226252054528,
+                "free": 196504965120,
                 "total": 1999343972352,
                 "needed": 0,
                 "reserve": 1073741824,
                 "freeable": 0,
                 "freeableEarly": 0,
-                "after": 226252054528,
+                "after": 196504965120,
                 "fits": true,
-                "asOf": 1792266565561
+                "asOf": 1792575346174
               },
               "policy": {
                 "deletePolicy": "guarded",
@@ -4738,12 +4752,14 @@
             },
             "refusal": null,
             "stale": false,
+            "updating": false,
+            "links": [],
             "lastRun": {
-              "runId": 7,
+              "runId": 5,
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792266565540,
+              "at": 1792575346157,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -4777,11 +4793,11 @@
             "gen": 6,
             "selSeq": 5,
             "lastPlan": {
-              "runId": 8,
+              "runId": 6,
               "status": "completed",
               "auto": true,
               "reason": null,
-              "at": 1792266565577
+              "at": 1792575346186
             }
           }
         },
@@ -4872,7 +4888,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t36edc5d7bf",
+              "id": "t80c046cd13",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -4906,18 +4922,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t36edc5d7bf": true
+          "t80c046cd13": true
         },
         "job": {
           "job": {
-            "runId": 9,
+            "runId": 7,
             "phase": "plan",
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792266565719,
-            "finishedAt": 1792266565740,
+            "startedAt": 1792575346311,
+            "finishedAt": 1792575346327,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -4945,7 +4961,7 @@
                 }
               },
               "step": "device-ready",
-              "at": 1792266565720
+              "at": 1792575346311
             },
             "status": "failed",
             "summary": {
@@ -4963,7 +4979,7 @@
           "queue": []
         },
         "plans": {
-          "t36edc5d7bf": {
+          "t80c046cd13": {
             "summary": null,
             "refusal": {
               "fields": [
@@ -4975,12 +4991,14 @@
               "warnings": []
             },
             "stale": false,
+            "updating": false,
+            "links": [],
             "lastRun": {
-              "runId": 7,
+              "runId": 5,
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792266565540,
+              "at": 1792575346157,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -5014,11 +5032,11 @@
             "gen": null,
             "selSeq": 5,
             "lastPlan": {
-              "runId": 9,
+              "runId": 7,
               "status": "failed",
               "auto": false,
               "reason": "record-mismatch",
-              "at": 1792266565740
+              "at": 1792575346327
             }
           }
         },
@@ -5109,7 +5127,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t36edc5d7bf",
+              "id": "t80c046cd13",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -5143,18 +5161,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t36edc5d7bf": true
+          "t80c046cd13": true
         },
         "job": {
           "job": {
-            "runId": 10,
+            "runId": 8,
             "phase": "plan",
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792266565893,
-            "finishedAt": 1792266565918,
+            "startedAt": 1792575346469,
+            "finishedAt": 1792575346489,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -5181,7 +5199,7 @@
                 }
               },
               "step": "device-ready",
-              "at": 1792266565915
+              "at": 1792575346488
             },
             "status": "failed",
             "summary": {
@@ -5198,7 +5216,7 @@
           "queue": []
         },
         "plans": {
-          "t36edc5d7bf": {
+          "t80c046cd13": {
             "summary": null,
             "refusal": {
               "detail": "empty-root",
@@ -5209,12 +5227,14 @@
               "warnings": []
             },
             "stale": false,
+            "updating": false,
+            "links": [],
             "lastRun": {
-              "runId": 7,
+              "runId": 5,
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792266565540,
+              "at": 1792575346157,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -5248,11 +5268,11 @@
             "gen": null,
             "selSeq": 5,
             "lastPlan": {
-              "runId": 10,
+              "runId": 8,
               "status": "failed",
               "auto": false,
               "reason": "device-listing-suspect",
-              "at": 1792266565918
+              "at": 1792575346489
             }
           }
         },
@@ -5343,7 +5363,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t36edc5d7bf",
+              "id": "t80c046cd13",
               "deletePolicy": "guarded",
               "excludes": [
                 {
@@ -5377,18 +5397,18 @@
         },
         "devices": [],
         "folderPresence": {
-          "t36edc5d7bf": false
+          "t80c046cd13": false
         },
         "job": {
           "job": {
-            "runId": 10,
+            "runId": 8,
             "phase": "plan",
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792266565893,
-            "finishedAt": 1792266565918,
+            "startedAt": 1792575346469,
+            "finishedAt": 1792575346489,
             "progress": {
               "bytesDone": 0,
               "bytesTotal": 0,
@@ -5415,7 +5435,7 @@
                 }
               },
               "step": "device-ready",
-              "at": 1792266565915
+              "at": 1792575346488
             },
             "status": "failed",
             "summary": {
@@ -5432,7 +5452,7 @@
           "queue": []
         },
         "plans": {
-          "t36edc5d7bf": {
+          "t80c046cd13": {
             "summary": null,
             "refusal": {
               "detail": "empty-root",
@@ -5443,12 +5463,14 @@
               "warnings": []
             },
             "stale": false,
+            "updating": false,
+            "links": [],
             "lastRun": {
-              "runId": 7,
+              "runId": 5,
               "phase": "apply",
               "status": "completed",
               "auto": false,
-              "at": 1792266565540,
+              "at": 1792575346157,
               "summary": {
                 "skipped": [],
                 "skippedReasons": {},
@@ -5482,11 +5504,11 @@
             "gen": null,
             "selSeq": 5,
             "lastPlan": {
-              "runId": 10,
+              "runId": 8,
               "status": "failed",
               "auto": false,
               "reason": "device-listing-suspect",
-              "at": 1792266565918
+              "at": 1792575346489
             }
           }
         },
@@ -5577,7 +5599,7 @@
           "adbPath": null,
           "targets": [
             {
-              "id": "t55a9ce39c6",
+              "id": "t8ff4dc7b57",
               "deletePolicy": "guarded",
               "excludes": [],
               "aliases": [],
@@ -5616,12 +5638,12 @@
           "job": {
             "runId": 1,
             "phase": "plan",
-            "targetId": "t55a9ce39c6",
+            "targetId": "t8ff4dc7b57",
             "serial": "R5CW71ABCDE",
             "auto": true,
             "state": "done",
-            "startedAt": 1792266576054,
-            "finishedAt": 1792266576177,
+            "startedAt": 1792575351731,
+            "finishedAt": 1792575351838,
             "progress": {
               "bytesDone": 136526,
               "bytesTotal": 136526,
@@ -5648,7 +5670,7 @@
                 "refusal": null
               },
               "step": "planning",
-              "at": 1792266576175
+              "at": 1792575351837
             },
             "status": "failed",
             "summary": {
@@ -5672,7 +5694,7 @@
           "queue": []
         },
         "plans": {
-          "t55a9ce39c6": {
+          "t8ff4dc7b57": {
             "summary": null,
             "refusal": {
               "folders": [
@@ -5690,6 +5712,8 @@
               "warnings": []
             },
             "stale": false,
+            "updating": false,
+            "links": [],
             "lastRun": null,
             "gen": null,
             "selSeq": null,
@@ -5698,7 +5722,7 @@
               "status": "failed",
               "auto": true,
               "reason": "needs-mode",
-              "at": 1792266576177
+              "at": 1792575351838
             }
           }
         },
@@ -5715,6 +5739,947 @@
           "at": null
         },
         "logDir": "D:\\Sync-fixture\\tab-ud2\\sync\\logs"
+      },
+      "linking": {
+        "ok": true,
+        "enabled": true,
+        "settings": {
+          "syncEnabled": true,
+          "syncPromptOnConnect": false,
+          "syncDeletePolicy": "guarded",
+          "syncHashMode": "cached",
+          "syncErrorBudget": 3,
+          "syncSizeWarnPct": 30,
+          "syncChapterPatterns": "",
+          "syncDiagnosticLog": true,
+          "chapterPatternErrors": []
+        },
+        "specs": {
+          "syncEnabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "syncPromptOnConnect": {
+            "type": "boolean",
+            "default": true
+          },
+          "syncDeletePolicy": {
+            "type": "enum",
+            "default": "guarded",
+            "presets": [
+              "guarded",
+              "add-only"
+            ]
+          },
+          "syncHashMode": {
+            "type": "enum",
+            "default": "cached",
+            "presets": [
+              "cached",
+              "rehash"
+            ]
+          },
+          "syncErrorBudget": {
+            "type": "enum",
+            "default": 3,
+            "presets": [
+              1,
+              3,
+              5,
+              10
+            ]
+          },
+          "syncSizeWarnPct": {
+            "type": "enum",
+            "default": 30,
+            "presets": [
+              0,
+              15,
+              30,
+              50
+            ]
+          },
+          "syncChapterPatterns": {
+            "type": "patterns",
+            "default": ""
+          },
+          "syncDiagnosticLog": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "config": {
+          "version": 1,
+          "adbPath": null,
+          "targets": [
+            {
+              "id": "t9a66aeb2cc",
+              "deletePolicy": "guarded",
+              "excludes": [],
+              "aliases": [],
+              "ignoredSuggestions": [],
+              "acknowledged": [],
+              "name": "Galaxy Tab",
+              "kind": "folder",
+              "root": "D:\\Sync-fixture\\Tablet4\\Komikku",
+              "profile": "komikku"
+            }
+          ]
+        },
+        "adb": {
+          "binary": null,
+          "serverVersion": null,
+          "error": null,
+          "candidates": null,
+          "tracking": "stopped",
+          "trackingError": null,
+          "at": null
+        },
+        "devices": [],
+        "folderPresence": {
+          "t9a66aeb2cc": true
+        },
+        "job": {
+          "job": {
+            "runId": 2,
+            "phase": "plan",
+            "targetId": "t9a66aeb2cc",
+            "serial": null,
+            "auto": false,
+            "state": "running",
+            "startedAt": 1792575351979,
+            "finishedAt": null,
+            "progress": {
+              "bytesDone": 0,
+              "bytesTotal": 0,
+              "filesDone": 0,
+              "filesTotal": 0,
+              "current": null,
+              "preflight": null,
+              "step": "probe",
+              "at": 1792575351980
+            },
+            "status": null,
+            "summary": null
+          },
+          "queue": []
+        },
+        "plans": {
+          "t9a66aeb2cc": {
+            "summary": {
+              "targetId": "t9a66aeb2cc",
+              "asOf": 1792575351901,
+              "firstSync": true,
+              "totals": {
+                "push": {
+                  "count": 1,
+                  "bytes": 2801
+                },
+                "update": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "replace": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "rename": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "delete": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "series": 1,
+                "files": 1,
+                "bytes": 2801
+              },
+              "losses": 0,
+              "massDelete": {
+                "required": false,
+                "count": 0,
+                "series": 0
+              },
+              "massRepush": {
+                "required": false,
+                "count": 0
+              },
+              "needsVerify": 0,
+              "settleAt": null,
+              "series": [
+                {
+                  "seriesKey": "pc:Hajime no Ippo",
+                  "title": "Hajime no Ippo",
+                  "folder": "Hajime no Ippo",
+                  "deviceFolder": "Hajime no Ippo",
+                  "state": "new",
+                  "heldReason": null,
+                  "removing": false,
+                  "counts": {
+                    "inSync": 0,
+                    "kept": 0,
+                    "settling": 0,
+                    "unhashed": 0,
+                    "unmanaged": 0,
+                    "push": 0,
+                    "update": 0,
+                    "replace": 0,
+                    "rename": 0,
+                    "delete": 0,
+                    "bytes": 0,
+                    "loss": 0,
+                    "offered": 2,
+                    "preselected": 0
+                  },
+                  "tags": [],
+                  "anomalies": 1,
+                  "attention": [
+                    "anomaly",
+                    "suggestion"
+                  ],
+                  "suggestions": 1,
+                  "hasLoss": false,
+                  "rebind": null,
+                  "strip": [
+                    {
+                      "state": "absent",
+                      "count": 2,
+                      "from": "1",
+                      "to": "2"
+                    }
+                  ]
+                },
+                {
+                  "seriesKey": "pc:Kaiju No. 8",
+                  "title": "Kaiju No. 8",
+                  "folder": "Kaiju No. 8",
+                  "deviceFolder": "Kaiju No. 8",
+                  "state": "new",
+                  "heldReason": null,
+                  "removing": false,
+                  "counts": {
+                    "inSync": 0,
+                    "kept": 0,
+                    "settling": 0,
+                    "unhashed": 0,
+                    "unmanaged": 0,
+                    "push": 1,
+                    "update": 0,
+                    "replace": 0,
+                    "rename": 0,
+                    "delete": 0,
+                    "bytes": 2801,
+                    "loss": 0,
+                    "offered": 1,
+                    "preselected": 1
+                  },
+                  "tags": [],
+                  "anomalies": 1,
+                  "attention": [
+                    "anomaly"
+                  ],
+                  "suggestions": 0,
+                  "hasLoss": false,
+                  "rebind": null,
+                  "strip": [
+                    {
+                      "state": "push",
+                      "count": 1,
+                      "from": "1",
+                      "to": "1"
+                    }
+                  ]
+                },
+                {
+                  "seriesKey": "pc:Mob Psycho 100",
+                  "title": "Mob Psycho 100",
+                  "folder": "Mob Psycho 100",
+                  "deviceFolder": "Mob Psycho 100",
+                  "state": "new",
+                  "heldReason": null,
+                  "removing": false,
+                  "counts": {
+                    "inSync": 0,
+                    "kept": 0,
+                    "settling": 0,
+                    "unhashed": 0,
+                    "unmanaged": 0,
+                    "push": 0,
+                    "update": 0,
+                    "replace": 0,
+                    "rename": 0,
+                    "delete": 0,
+                    "bytes": 0,
+                    "loss": 0,
+                    "offered": 3,
+                    "preselected": 0
+                  },
+                  "tags": [],
+                  "anomalies": 1,
+                  "attention": [
+                    "anomaly",
+                    "suggestion"
+                  ],
+                  "suggestions": 1,
+                  "hasLoss": false,
+                  "rebind": null,
+                  "strip": [
+                    {
+                      "state": "absent",
+                      "count": 3,
+                      "from": "1",
+                      "to": "3"
+                    }
+                  ]
+                }
+              ],
+              "deviceOnly": [
+                {
+                  "key": "dev:Hajime no Ippo (old)",
+                  "name": "Hajime no Ippo (old)",
+                  "state": "preserved",
+                  "shardId": null,
+                  "listed": true,
+                  "files": 2,
+                  "bytes": 6203,
+                  "chapterFiles": 2,
+                  "ours": 0,
+                  "suggestions": [
+                    "link:pc:Hajime no Ippo=>Hajime no Ippo (old)"
+                  ],
+                  "query": "Hajime no Ippo (old)"
+                },
+                {
+                  "key": "dev:Mob Psycho (2019)",
+                  "name": "Mob Psycho (2019)",
+                  "state": "preserved",
+                  "shardId": null,
+                  "listed": true,
+                  "files": 3,
+                  "bytes": 8706,
+                  "chapterFiles": 3,
+                  "ours": 0,
+                  "suggestions": [
+                    "link:pc:Mob Psycho 100=>Mob Psycho (2019)"
+                  ],
+                  "query": "Mob Psycho (2019)"
+                }
+              ],
+              "anomalies": 3,
+              "suggestions": 2,
+              "suggestionList": [
+                {
+                  "id": "link:pc:Hajime no Ippo=>Hajime no Ippo (old)",
+                  "seriesKey": "pc:Hajime no Ippo",
+                  "deviceFolder": "Hajime no Ippo (old)",
+                  "tier": "content",
+                  "strong": true
+                },
+                {
+                  "id": "link:pc:Mob Psycho 100=>Mob Psycho (2019)",
+                  "seriesKey": "pc:Mob Psycho 100",
+                  "deviceFolder": "Mob Psycho (2019)",
+                  "tier": "content",
+                  "strong": true
+                }
+              ],
+              "gen": 1,
+              "warnings": [],
+              "capacity": {
+                "free": 196504875008,
+                "total": 1999343972352,
+                "needed": 2801,
+                "reserve": 1073741824,
+                "freeable": 0,
+                "freeableEarly": 0,
+                "after": 196504872207,
+                "fits": true,
+                "asOf": 1792575351873
+              },
+              "policy": {
+                "deletePolicy": "guarded",
+                "hashMode": "cached",
+                "verifyMode": null
+              }
+            },
+            "refusal": null,
+            "stale": true,
+            "updating": true,
+            "links": [
+              {
+                "suggestionId": "link:pc:Hajime no Ippo=>Hajime no Ippo (old)",
+                "seriesKey": "pc:Hajime no Ippo",
+                "deviceFolder": "Hajime no Ippo (old)",
+                "bound": false
+              }
+            ],
+            "lastRun": null,
+            "gen": 1,
+            "selSeq": null,
+            "lastPlan": {
+              "runId": 1,
+              "status": "completed",
+              "auto": true,
+              "reason": null,
+              "at": 1792575351906
+            }
+          }
+        },
+        "prompt": null,
+        "prompts": [],
+        "pending": [],
+        "find": null,
+        "prewarm": {
+          "state": "idle",
+          "done": 0,
+          "total": 0,
+          "bytesDone": 0,
+          "bytesTotal": 0,
+          "at": null
+        },
+        "logDir": "D:\\Sync-fixture\\link-ud\\sync\\logs"
+      },
+      "verifying": {
+        "ok": true,
+        "enabled": true,
+        "settings": {
+          "syncEnabled": true,
+          "syncPromptOnConnect": false,
+          "syncDeletePolicy": "guarded",
+          "syncHashMode": "cached",
+          "syncErrorBudget": 3,
+          "syncSizeWarnPct": 30,
+          "syncChapterPatterns": "",
+          "syncDiagnosticLog": true,
+          "chapterPatternErrors": []
+        },
+        "specs": {
+          "syncEnabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "syncPromptOnConnect": {
+            "type": "boolean",
+            "default": true
+          },
+          "syncDeletePolicy": {
+            "type": "enum",
+            "default": "guarded",
+            "presets": [
+              "guarded",
+              "add-only"
+            ]
+          },
+          "syncHashMode": {
+            "type": "enum",
+            "default": "cached",
+            "presets": [
+              "cached",
+              "rehash"
+            ]
+          },
+          "syncErrorBudget": {
+            "type": "enum",
+            "default": 3,
+            "presets": [
+              1,
+              3,
+              5,
+              10
+            ]
+          },
+          "syncSizeWarnPct": {
+            "type": "enum",
+            "default": 30,
+            "presets": [
+              0,
+              15,
+              30,
+              50
+            ]
+          },
+          "syncChapterPatterns": {
+            "type": "patterns",
+            "default": ""
+          },
+          "syncDiagnosticLog": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "config": {
+          "version": 1,
+          "adbPath": null,
+          "targets": [
+            {
+              "id": "t9a66aeb2cc",
+              "deletePolicy": "guarded",
+              "excludes": [],
+              "aliases": [],
+              "ignoredSuggestions": [],
+              "acknowledged": [],
+              "name": "Galaxy Tab",
+              "kind": "folder",
+              "root": "D:\\Sync-fixture\\Tablet4\\Komikku",
+              "profile": "komikku"
+            }
+          ]
+        },
+        "adb": {
+          "binary": null,
+          "serverVersion": null,
+          "error": null,
+          "candidates": null,
+          "tracking": "stopped",
+          "trackingError": null,
+          "at": null
+        },
+        "devices": [],
+        "folderPresence": {
+          "t9a66aeb2cc": true
+        },
+        "job": {
+          "job": {
+            "runId": 4,
+            "phase": "refresh",
+            "targetId": "t9a66aeb2cc",
+            "serial": null,
+            "auto": true,
+            "state": "done",
+            "startedAt": 1792575352130,
+            "finishedAt": 1792575352147,
+            "progress": {
+              "bytesDone": 8706,
+              "bytesTotal": 8706,
+              "filesDone": 1,
+              "filesTotal": 1,
+              "current": {
+                "folder": "Mob Psycho (2019)"
+              },
+              "preflight": null,
+              "step": "verify",
+              "at": 1792575352139,
+              "lane": null
+            },
+            "status": "completed",
+            "summary": {
+              "plan": {
+                "targetId": "t9a66aeb2cc",
+                "asOf": 1792575352146,
+                "firstSync": true,
+                "totals": {
+                  "push": {
+                    "count": 1,
+                    "bytes": 2801
+                  },
+                  "update": {
+                    "count": 0,
+                    "bytes": 0
+                  },
+                  "replace": {
+                    "count": 0,
+                    "bytes": 0
+                  },
+                  "rename": {
+                    "count": 0,
+                    "bytes": 0
+                  },
+                  "delete": {
+                    "count": 0,
+                    "bytes": 0
+                  },
+                  "series": 1,
+                  "files": 1,
+                  "bytes": 2801
+                },
+                "losses": 0,
+                "massDelete": {
+                  "required": false,
+                  "count": 0,
+                  "series": 0
+                },
+                "massRepush": {
+                  "required": false,
+                  "count": 0
+                },
+                "needsVerify": 0,
+                "settleAt": null,
+                "series": [
+                  {
+                    "seriesKey": "pc:Hajime no Ippo",
+                    "title": "Hajime no Ippo",
+                    "folder": "Hajime no Ippo",
+                    "deviceFolder": "Hajime no Ippo (old)",
+                    "state": "bound",
+                    "heldReason": null,
+                    "removing": false,
+                    "counts": {
+                      "inSync": 2,
+                      "kept": 0,
+                      "settling": 0,
+                      "unhashed": 0,
+                      "unmanaged": 0,
+                      "push": 0,
+                      "update": 0,
+                      "replace": 0,
+                      "rename": 0,
+                      "delete": 0,
+                      "bytes": 0,
+                      "loss": 0,
+                      "offered": 0,
+                      "preselected": 0
+                    },
+                    "tags": [],
+                    "anomalies": 1,
+                    "attention": [
+                      "anomaly"
+                    ],
+                    "suggestions": 0,
+                    "hasLoss": false,
+                    "rebind": null,
+                    "strip": [
+                      {
+                        "state": "synced",
+                        "count": 2,
+                        "from": "1",
+                        "to": "2"
+                      }
+                    ]
+                  },
+                  {
+                    "seriesKey": "pc:Kaiju No. 8",
+                    "title": "Kaiju No. 8",
+                    "folder": "Kaiju No. 8",
+                    "deviceFolder": "Kaiju No. 8",
+                    "state": "new",
+                    "heldReason": null,
+                    "removing": false,
+                    "counts": {
+                      "inSync": 0,
+                      "kept": 0,
+                      "settling": 0,
+                      "unhashed": 0,
+                      "unmanaged": 0,
+                      "push": 1,
+                      "update": 0,
+                      "replace": 0,
+                      "rename": 0,
+                      "delete": 0,
+                      "bytes": 2801,
+                      "loss": 0,
+                      "offered": 1,
+                      "preselected": 1
+                    },
+                    "tags": [],
+                    "anomalies": 1,
+                    "attention": [
+                      "anomaly"
+                    ],
+                    "suggestions": 0,
+                    "hasLoss": false,
+                    "rebind": null,
+                    "strip": [
+                      {
+                        "state": "push",
+                        "count": 1,
+                        "from": "1",
+                        "to": "1"
+                      }
+                    ]
+                  },
+                  {
+                    "seriesKey": "pc:Mob Psycho 100",
+                    "title": "Mob Psycho 100",
+                    "folder": "Mob Psycho 100",
+                    "deviceFolder": "Mob Psycho (2019)",
+                    "state": "bound",
+                    "heldReason": null,
+                    "removing": false,
+                    "counts": {
+                      "inSync": 3,
+                      "kept": 0,
+                      "settling": 0,
+                      "unhashed": 0,
+                      "unmanaged": 0,
+                      "push": 0,
+                      "update": 0,
+                      "replace": 0,
+                      "rename": 0,
+                      "delete": 0,
+                      "bytes": 0,
+                      "loss": 0,
+                      "offered": 0,
+                      "preselected": 0
+                    },
+                    "tags": [],
+                    "anomalies": 1,
+                    "attention": [
+                      "anomaly"
+                    ],
+                    "suggestions": 0,
+                    "hasLoss": false,
+                    "rebind": null,
+                    "strip": [
+                      {
+                        "state": "synced",
+                        "count": 3,
+                        "from": "1",
+                        "to": "3"
+                      }
+                    ]
+                  }
+                ],
+                "deviceOnly": [],
+                "anomalies": 3,
+                "suggestions": 0,
+                "suggestionList": [],
+                "gen": 6,
+                "warnings": [],
+                "capacity": {
+                  "free": 196504866816,
+                  "total": 1999343972352,
+                  "needed": 2801,
+                  "reserve": 1073741824,
+                  "freeable": 0,
+                  "freeableEarly": 0,
+                  "after": 196504864015,
+                  "fits": true,
+                  "asOf": 1792575351985
+                },
+                "policy": {
+                  "deletePolicy": "guarded",
+                  "hashMode": "cached",
+                  "verifyMode": null
+                }
+              },
+              "warnings": []
+            }
+          },
+          "queue": []
+        },
+        "plans": {
+          "t9a66aeb2cc": {
+            "summary": {
+              "targetId": "t9a66aeb2cc",
+              "asOf": 1792575352129,
+              "firstSync": true,
+              "totals": {
+                "push": {
+                  "count": 1,
+                  "bytes": 2801
+                },
+                "update": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "replace": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "rename": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "delete": {
+                  "count": 0,
+                  "bytes": 0
+                },
+                "series": 1,
+                "files": 1,
+                "bytes": 2801
+              },
+              "losses": 0,
+              "massDelete": {
+                "required": false,
+                "count": 0,
+                "series": 0
+              },
+              "massRepush": {
+                "required": false,
+                "count": 0
+              },
+              "needsVerify": 1,
+              "settleAt": null,
+              "series": [
+                {
+                  "seriesKey": "pc:Hajime no Ippo",
+                  "title": "Hajime no Ippo",
+                  "folder": "Hajime no Ippo",
+                  "deviceFolder": "Hajime no Ippo (old)",
+                  "state": "bound",
+                  "heldReason": null,
+                  "removing": false,
+                  "counts": {
+                    "inSync": 2,
+                    "kept": 0,
+                    "settling": 0,
+                    "unhashed": 0,
+                    "unmanaged": 0,
+                    "push": 0,
+                    "update": 0,
+                    "replace": 0,
+                    "rename": 0,
+                    "delete": 0,
+                    "bytes": 0,
+                    "loss": 0,
+                    "offered": 0,
+                    "preselected": 0
+                  },
+                  "tags": [],
+                  "anomalies": 1,
+                  "attention": [
+                    "anomaly"
+                  ],
+                  "suggestions": 0,
+                  "hasLoss": false,
+                  "rebind": null,
+                  "strip": [
+                    {
+                      "state": "synced",
+                      "count": 2,
+                      "from": "1",
+                      "to": "2"
+                    }
+                  ]
+                },
+                {
+                  "seriesKey": "pc:Kaiju No. 8",
+                  "title": "Kaiju No. 8",
+                  "folder": "Kaiju No. 8",
+                  "deviceFolder": "Kaiju No. 8",
+                  "state": "new",
+                  "heldReason": null,
+                  "removing": false,
+                  "counts": {
+                    "inSync": 0,
+                    "kept": 0,
+                    "settling": 0,
+                    "unhashed": 0,
+                    "unmanaged": 0,
+                    "push": 1,
+                    "update": 0,
+                    "replace": 0,
+                    "rename": 0,
+                    "delete": 0,
+                    "bytes": 2801,
+                    "loss": 0,
+                    "offered": 1,
+                    "preselected": 1
+                  },
+                  "tags": [],
+                  "anomalies": 1,
+                  "attention": [
+                    "anomaly"
+                  ],
+                  "suggestions": 0,
+                  "hasLoss": false,
+                  "rebind": null,
+                  "strip": [
+                    {
+                      "state": "push",
+                      "count": 1,
+                      "from": "1",
+                      "to": "1"
+                    }
+                  ]
+                },
+                {
+                  "seriesKey": "pc:Mob Psycho 100",
+                  "title": "Mob Psycho 100",
+                  "folder": "Mob Psycho 100",
+                  "deviceFolder": "Mob Psycho (2019)",
+                  "state": "needs-verify",
+                  "heldReason": null,
+                  "removing": false,
+                  "counts": {
+                    "inSync": 0,
+                    "kept": 0,
+                    "settling": 0,
+                    "unhashed": 0,
+                    "unmanaged": 0,
+                    "push": 0,
+                    "update": 0,
+                    "replace": 0,
+                    "rename": 0,
+                    "delete": 0,
+                    "bytes": 0,
+                    "loss": 0,
+                    "offered": 3,
+                    "preselected": 0
+                  },
+                  "tags": [],
+                  "anomalies": 1,
+                  "attention": [
+                    "anomaly",
+                    "needs-verify",
+                    "replace-unticked"
+                  ],
+                  "suggestions": 0,
+                  "hasLoss": false,
+                  "rebind": null,
+                  "strip": [
+                    {
+                      "state": "warn",
+                      "count": 3,
+                      "from": "1",
+                      "to": "3"
+                    }
+                  ]
+                }
+              ],
+              "deviceOnly": [],
+              "anomalies": 3,
+              "suggestions": 0,
+              "suggestionList": [],
+              "gen": 5,
+              "warnings": [],
+              "capacity": {
+                "free": 196504866816,
+                "total": 1999343972352,
+                "needed": 2801,
+                "reserve": 1073741824,
+                "freeable": 0,
+                "freeableEarly": 0,
+                "after": 196504864015,
+                "fits": true,
+                "asOf": 1792575351985
+              },
+              "policy": {
+                "deletePolicy": "guarded",
+                "hashMode": "cached",
+                "verifyMode": null
+              }
+            },
+            "refusal": null,
+            "stale": true,
+            "updating": true,
+            "links": [],
+            "lastRun": null,
+            "gen": 5,
+            "selSeq": null,
+            "lastPlan": {
+              "runId": 3,
+              "status": "completed",
+              "auto": true,
+              "reason": null,
+              "at": 1792575352024
+            }
+          }
+        },
+        "prompt": null,
+        "prompts": [],
+        "pending": [],
+        "find": null,
+        "prewarm": {
+          "state": "idle",
+          "done": 0,
+          "total": 0,
+          "bytesDone": 0,
+          "bytesTotal": 0,
+          "at": null
+        },
+        "logDir": "D:\\Sync-fixture\\link-ud\\sync\\logs"
       }
     },
     "details": {
@@ -6555,7 +7520,7 @@
         ],
         "suggestions": [],
         "rebind": {
-          "shardId": "e0b08f3863b6854c",
+          "shardId": "8bb580e37797cd3e",
           "choices": [
             {
               "source": "previous",
@@ -6825,7 +7790,7 @@
           "key": "dev:Berserk",
           "name": "Berserk",
           "state": "orphaned",
-          "shardId": "5b0cf175429f5ae6",
+          "shardId": "55f595b2710b4a7b",
           "listed": true,
           "files": 5,
           "bytes": 15015,
@@ -6985,6 +7950,358 @@
         ],
         "suggestions": [],
         "anomalies": []
+      },
+      "pc:Hajime no Ippo": {
+        "ok": true,
+        "seriesKey": "pc:Hajime no Ippo",
+        "folder": "Hajime no Ippo",
+        "deviceFolder": "Hajime no Ippo",
+        "state": "new",
+        "heldReason": null,
+        "removing": false,
+        "tags": [],
+        "rows": [
+          {
+            "kind": "push",
+            "opId": "push:Hajime no Ippo/Ch.001 - Hajime.cbz",
+            "name": "Ch.001 - Hajime.cbz",
+            "pcName": "Ch.001 - Hajime.cbz",
+            "deviceName": null,
+            "unit": "chapter",
+            "label": "1",
+            "size": 3101,
+            "origin": null,
+            "reason": "new",
+            "preselected": false,
+            "selected": false,
+            "loss": false,
+            "lossIfSelected": false,
+            "settling": false,
+            "blockedBy": [
+              "link:pc:Hajime no Ippo=>Hajime no Ippo (old)"
+            ]
+          },
+          {
+            "kind": "push",
+            "opId": "push:Hajime no Ippo/Ch.002 - Hajime.cbz",
+            "name": "Ch.002 - Hajime.cbz",
+            "pcName": "Ch.002 - Hajime.cbz",
+            "deviceName": null,
+            "unit": "chapter",
+            "label": "2",
+            "size": 3102,
+            "origin": null,
+            "reason": "new",
+            "preselected": false,
+            "selected": false,
+            "loss": false,
+            "lossIfSelected": false,
+            "settling": false,
+            "blockedBy": [
+              "link:pc:Hajime no Ippo=>Hajime no Ippo (old)"
+            ]
+          }
+        ],
+        "anomalies": [
+          {
+            "id": "reader-compat:pc:Hajime no Ippo",
+            "kind": "reader-compat",
+            "severity": "warning",
+            "seriesKey": "pc:Hajime no Ippo",
+            "data": {
+              "issues": [
+                "no-cover"
+              ]
+            },
+            "acknowledged": false
+          }
+        ],
+        "suggestions": [
+          {
+            "id": "link:pc:Hajime no Ippo=>Hajime no Ippo (old)",
+            "kind": "link",
+            "tier": "content",
+            "strong": true,
+            "seriesKey": "pc:Hajime no Ippo",
+            "deviceFolder": "Hajime no Ippo (old)",
+            "ignored": false
+          }
+        ],
+        "rebind": null,
+        "strip": [
+          {
+            "state": "absent",
+            "count": 2,
+            "from": "1",
+            "to": "2"
+          }
+        ]
+      },
+      "pc:Kaiju No. 8": {
+        "ok": true,
+        "seriesKey": "pc:Kaiju No. 8",
+        "folder": "Kaiju No. 8",
+        "deviceFolder": "Kaiju No. 8",
+        "state": "new",
+        "heldReason": null,
+        "removing": false,
+        "tags": [],
+        "rows": [
+          {
+            "kind": "push",
+            "opId": "push:Kaiju No. 8/Ch.001 - Kaiju.cbz",
+            "name": "Ch.001 - Kaiju.cbz",
+            "pcName": "Ch.001 - Kaiju.cbz",
+            "deviceName": null,
+            "unit": "chapter",
+            "label": "1",
+            "size": 2801,
+            "origin": null,
+            "reason": "new",
+            "preselected": true,
+            "selected": true,
+            "loss": false,
+            "lossIfSelected": false,
+            "settling": false,
+            "blockedBy": []
+          }
+        ],
+        "anomalies": [
+          {
+            "id": "reader-compat:pc:Kaiju No. 8",
+            "kind": "reader-compat",
+            "severity": "warning",
+            "seriesKey": "pc:Kaiju No. 8",
+            "data": {
+              "issues": [
+                "no-cover"
+              ]
+            },
+            "acknowledged": false
+          }
+        ],
+        "suggestions": [],
+        "rebind": null,
+        "strip": [
+          {
+            "state": "push",
+            "count": 1,
+            "from": "1",
+            "to": "1"
+          }
+        ]
+      },
+      "pc:Mob Psycho 100": {
+        "ok": true,
+        "seriesKey": "pc:Mob Psycho 100",
+        "folder": "Mob Psycho 100",
+        "deviceFolder": "Mob Psycho 100",
+        "state": "new",
+        "heldReason": null,
+        "removing": false,
+        "tags": [],
+        "rows": [
+          {
+            "kind": "push",
+            "opId": "push:Mob Psycho 100/Ch.001 - Mob.cbz",
+            "name": "Ch.001 - Mob.cbz",
+            "pcName": "Ch.001 - Mob.cbz",
+            "deviceName": null,
+            "unit": "chapter",
+            "label": "1",
+            "size": 2901,
+            "origin": null,
+            "reason": "new",
+            "preselected": false,
+            "selected": false,
+            "loss": false,
+            "lossIfSelected": false,
+            "settling": false,
+            "blockedBy": [
+              "link:pc:Mob Psycho 100=>Mob Psycho (2019)"
+            ]
+          },
+          {
+            "kind": "push",
+            "opId": "push:Mob Psycho 100/Ch.002 - Mob.cbz",
+            "name": "Ch.002 - Mob.cbz",
+            "pcName": "Ch.002 - Mob.cbz",
+            "deviceName": null,
+            "unit": "chapter",
+            "label": "2",
+            "size": 2902,
+            "origin": null,
+            "reason": "new",
+            "preselected": false,
+            "selected": false,
+            "loss": false,
+            "lossIfSelected": false,
+            "settling": false,
+            "blockedBy": [
+              "link:pc:Mob Psycho 100=>Mob Psycho (2019)"
+            ]
+          },
+          {
+            "kind": "push",
+            "opId": "push:Mob Psycho 100/Ch.003 - Mob.cbz",
+            "name": "Ch.003 - Mob.cbz",
+            "pcName": "Ch.003 - Mob.cbz",
+            "deviceName": null,
+            "unit": "chapter",
+            "label": "3",
+            "size": 2903,
+            "origin": null,
+            "reason": "new",
+            "preselected": false,
+            "selected": false,
+            "loss": false,
+            "lossIfSelected": false,
+            "settling": false,
+            "blockedBy": [
+              "link:pc:Mob Psycho 100=>Mob Psycho (2019)"
+            ]
+          }
+        ],
+        "anomalies": [
+          {
+            "id": "reader-compat:pc:Mob Psycho 100",
+            "kind": "reader-compat",
+            "severity": "warning",
+            "seriesKey": "pc:Mob Psycho 100",
+            "data": {
+              "issues": [
+                "no-cover"
+              ]
+            },
+            "acknowledged": false
+          }
+        ],
+        "suggestions": [
+          {
+            "id": "link:pc:Mob Psycho 100=>Mob Psycho (2019)",
+            "kind": "link",
+            "tier": "content",
+            "strong": true,
+            "seriesKey": "pc:Mob Psycho 100",
+            "deviceFolder": "Mob Psycho (2019)",
+            "ignored": false
+          }
+        ],
+        "rebind": null,
+        "strip": [
+          {
+            "state": "absent",
+            "count": 3,
+            "from": "1",
+            "to": "3"
+          }
+        ]
+      },
+      "dev:Hajime no Ippo (old)": {
+        "ok": true,
+        "seriesKey": "dev:Hajime no Ippo (old)",
+        "deviceOnly": {
+          "key": "dev:Hajime no Ippo (old)",
+          "name": "Hajime no Ippo (old)",
+          "state": "preserved",
+          "shardId": null,
+          "listed": true,
+          "files": 2,
+          "bytes": 6203,
+          "chapterFiles": 2,
+          "ours": 0,
+          "suggestions": [
+            "link:pc:Hajime no Ippo=>Hajime no Ippo (old)"
+          ],
+          "query": "Hajime no Ippo (old)"
+        },
+        "rows": [
+          {
+            "kind": "device-only",
+            "name": "Ch.001 - Hajime.cbz",
+            "size": 3101,
+            "unit": "chapter",
+            "label": "1",
+            "origin": null
+          },
+          {
+            "kind": "device-only",
+            "name": "Ch.002 - Hajime.cbz",
+            "size": 3102,
+            "unit": "chapter",
+            "label": "2",
+            "origin": null
+          }
+        ],
+        "suggestions": [
+          {
+            "id": "link:pc:Hajime no Ippo=>Hajime no Ippo (old)",
+            "kind": "link",
+            "tier": "content",
+            "strong": true,
+            "seriesKey": "pc:Hajime no Ippo",
+            "deviceFolder": "Hajime no Ippo (old)",
+            "ignored": false
+          }
+        ],
+        "anomalies": []
+      },
+      "dev:Mob Psycho (2019)": {
+        "ok": true,
+        "seriesKey": "dev:Mob Psycho (2019)",
+        "deviceOnly": {
+          "key": "dev:Mob Psycho (2019)",
+          "name": "Mob Psycho (2019)",
+          "state": "preserved",
+          "shardId": null,
+          "listed": true,
+          "files": 3,
+          "bytes": 8706,
+          "chapterFiles": 3,
+          "ours": 0,
+          "suggestions": [
+            "link:pc:Mob Psycho 100=>Mob Psycho (2019)"
+          ],
+          "query": "Mob Psycho (2019)"
+        },
+        "rows": [
+          {
+            "kind": "device-only",
+            "name": "Ch.001 - Mob.cbz",
+            "size": 2901,
+            "unit": "chapter",
+            "label": "1",
+            "origin": null
+          },
+          {
+            "kind": "device-only",
+            "name": "Ch.002 - Mob.cbz",
+            "size": 2902,
+            "unit": "chapter",
+            "label": "2",
+            "origin": null
+          },
+          {
+            "kind": "device-only",
+            "name": "Ch.003 - Mob.cbz",
+            "size": 2903,
+            "unit": "chapter",
+            "label": "3",
+            "origin": null
+          }
+        ],
+        "suggestions": [
+          {
+            "id": "link:pc:Mob Psycho 100=>Mob Psycho (2019)",
+            "kind": "link",
+            "tier": "content",
+            "strong": true,
+            "seriesKey": "pc:Mob Psycho 100",
+            "deviceFolder": "Mob Psycho (2019)",
+            "ignored": false
+          }
+        ],
+        "anomalies": []
       }
     },
     "selection": [
@@ -7049,10 +8366,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "t36edc5d7bf",
+          "targetId": "t80c046cd13",
           "summary": {
-            "targetId": "t36edc5d7bf",
-            "asOf": 1792266562164,
+            "targetId": "t80c046cd13",
+            "asOf": 1792575342806,
             "firstSync": false,
             "totals": {
               "push": {
@@ -7090,7 +8407,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792266586948,
+            "settleAt": 1792575367691,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -7447,7 +8764,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "5b0cf175429f5ae6",
+                "shardId": "55f595b2710b4a7b",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -7512,15 +8829,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 226252673024,
+              "free": 196508090368,
               "total": 1999343972352,
               "needed": 57905,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 226252651197,
+              "after": 196508068541,
               "fits": true,
-              "asOf": 1792266562154
+              "asOf": 1792575342787
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -7530,12 +8847,14 @@
           },
           "refusal": null,
           "stale": false,
+          "updating": false,
+          "links": [],
           "lastRun": {
             "runId": 2,
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792266561831,
+            "at": 1792575342559,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -7560,11 +8879,11 @@
           "gen": 5,
           "selSeq": 1,
           "lastPlan": {
-            "runId": 6,
+            "runId": 4,
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792266562166
+            "at": 1792575342839
           }
         }
       },
@@ -7626,10 +8945,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "t36edc5d7bf",
+          "targetId": "t80c046cd13",
           "summary": {
-            "targetId": "t36edc5d7bf",
-            "asOf": 1792266562164,
+            "targetId": "t80c046cd13",
+            "asOf": 1792575342806,
             "firstSync": false,
             "totals": {
               "push": {
@@ -7667,7 +8986,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792266586948,
+            "settleAt": 1792575367691,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -8018,7 +9337,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "5b0cf175429f5ae6",
+                "shardId": "55f595b2710b4a7b",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -8083,15 +9402,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 226252673024,
+              "free": 196508090368,
               "total": 1999343972352,
               "needed": 48086,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 226252661016,
+              "after": 196508078360,
               "fits": true,
-              "asOf": 1792266562154
+              "asOf": 1792575342787
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -8101,12 +9420,14 @@
           },
           "refusal": null,
           "stale": false,
+          "updating": false,
+          "links": [],
           "lastRun": {
             "runId": 2,
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792266561831,
+            "at": 1792575342559,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -8131,11 +9452,11 @@
           "gen": 5,
           "selSeq": 2,
           "lastPlan": {
-            "runId": 6,
+            "runId": 4,
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792266562166
+            "at": 1792575342839
           }
         }
       },
@@ -8197,10 +9518,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "t36edc5d7bf",
+          "targetId": "t80c046cd13",
           "summary": {
-            "targetId": "t36edc5d7bf",
-            "asOf": 1792266562164,
+            "targetId": "t80c046cd13",
+            "asOf": 1792575342806,
             "firstSync": false,
             "totals": {
               "push": {
@@ -8238,7 +9559,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792266586948,
+            "settleAt": 1792575367691,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -8589,7 +9910,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "5b0cf175429f5ae6",
+                "shardId": "55f595b2710b4a7b",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -8654,15 +9975,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 226252673024,
+              "free": 196508090368,
               "total": 1999343972352,
               "needed": 60912,
               "reserve": 1073741824,
               "freeable": 36078,
               "freeableEarly": 36078,
-              "after": 226252648190,
+              "after": 196508065534,
               "fits": true,
-              "asOf": 1792266562154
+              "asOf": 1792575342787
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -8672,12 +9993,14 @@
           },
           "refusal": null,
           "stale": false,
+          "updating": false,
+          "links": [],
           "lastRun": {
             "runId": 2,
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792266561831,
+            "at": 1792575342559,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -8702,11 +10025,11 @@
           "gen": 5,
           "selSeq": 3,
           "lastPlan": {
-            "runId": 6,
+            "runId": 4,
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792266562166
+            "at": 1792575342839
           }
         }
       },
@@ -8792,10 +10115,10 @@
         },
         "view": {
           "kind": "plans",
-          "targetId": "t36edc5d7bf",
+          "targetId": "t80c046cd13",
           "summary": {
-            "targetId": "t36edc5d7bf",
-            "asOf": 1792266562164,
+            "targetId": "t80c046cd13",
+            "asOf": 1792575342806,
             "firstSync": false,
             "totals": {
               "push": {
@@ -8833,7 +10156,7 @@
               "count": 1
             },
             "needsVerify": 0,
-            "settleAt": 1792266586948,
+            "settleAt": 1792575367691,
             "series": [
               {
                 "seriesKey": "pc:Blue Lock",
@@ -9185,7 +10508,7 @@
                 "key": "dev:Berserk",
                 "name": "Berserk",
                 "state": "orphaned",
-                "shardId": "5b0cf175429f5ae6",
+                "shardId": "55f595b2710b4a7b",
                 "listed": true,
                 "files": 5,
                 "bytes": 15015,
@@ -9250,15 +10573,15 @@
             "gen": 5,
             "warnings": [],
             "capacity": {
-              "free": 226252673024,
+              "free": 196508090368,
               "total": 1999343972352,
               "needed": 60912,
               "reserve": 1073741824,
               "freeable": 39081,
               "freeableEarly": 39081,
-              "after": 226252651193,
+              "after": 196508068537,
               "fits": true,
-              "asOf": 1792266562154
+              "asOf": 1792575342787
             },
             "policy": {
               "deletePolicy": "guarded",
@@ -9268,12 +10591,14 @@
           },
           "refusal": null,
           "stale": false,
+          "updating": false,
+          "links": [],
           "lastRun": {
             "runId": 2,
             "phase": "apply",
             "status": "completed",
             "auto": false,
-            "at": 1792266561831,
+            "at": 1792575342559,
             "summary": {
               "skipped": [],
               "skippedReasons": {},
@@ -9298,11 +10623,11 @@
           "gen": 5,
           "selSeq": 5,
           "lastPlan": {
-            "runId": 6,
+            "runId": 4,
             "status": "completed",
             "auto": false,
             "reason": null,
-            "at": 1792266562166
+            "at": 1792575342839
           }
         }
       }
@@ -9322,13 +10647,13 @@
       },
       "busy": {
         "job": {
-          "runId": 7,
+          "runId": 5,
           "phase": "apply",
-          "targetId": "t36edc5d7bf",
+          "targetId": "t80c046cd13",
           "serial": null,
           "auto": false,
           "state": "running",
-          "startedAt": 1792266562586,
+          "startedAt": 1792575343239,
           "finishedAt": null,
           "progress": {
             "bytesDone": 3402,
@@ -9353,7 +10678,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266562654,
+            "at": 1792575343299,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 1,
@@ -9378,11 +10703,11 @@
         "message": "the folder isn't available"
       }
     },
-    "targetId": "t36edc5d7bf",
+    "targetId": "t80c046cd13",
     "review": {
       "ok": true,
-      "targetId": "t36edc5d7bf",
-      "asOf": 1792266562164,
+      "targetId": "t80c046cd13",
+      "asOf": 1792575342806,
       "firstSync": false,
       "deletePolicy": "guarded",
       "totals": {
@@ -10109,7 +11434,7 @@
           "seriesKey": "pc:Solo Leveling",
           "series": "Solo Leveling",
           "rebind": {
-            "shardId": "e0b08f3863b6854c",
+            "shardId": "8bb580e37797cd3e",
             "choices": [
               {
                 "source": "previous",
@@ -10132,15 +11457,15 @@
       "selSeq": null,
       "stale": false,
       "capacity": {
-        "free": 226252673024,
+        "free": 196508090368,
         "total": 1999343972352,
         "needed": 60912,
         "reserve": 1073741824,
         "freeable": 36078,
         "freeableEarly": 36078,
-        "after": 226252648190,
+        "after": 196508065534,
         "fits": true,
-        "asOf": 1792266562154
+        "asOf": 1792575342787
       },
       "policy": {
         "deletePolicy": "guarded",
@@ -10152,42 +11477,42 @@
     },
     "libraryStatus": {
       "ok": true,
-      "asOf": 1792266562183,
+      "asOf": 1792575342861,
       "bySeries": {
         "D:\\Sync-fixture\\tab-manga\\Dungeon Meshi": [
           {
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "state": "synced",
             "pending": 0
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Eleceed": [
           {
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "state": "pending",
             "pending": 4
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Frieren": [
           {
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "state": "pending",
             "pending": 2
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Kagurabachi": [
           {
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "state": "absent",
             "pending": 3
           }
         ],
         "D:\\Sync-fixture\\tab-manga\\Solo Leveling": [
           {
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "state": "removed",
             "pending": 12,
-            "asOf": 1792266562164
+            "asOf": 1792575342806
           }
         ]
       }
@@ -10195,7 +11520,7 @@
     "find": {
       "ok": true,
       "running": false,
-      "targetId": "t36edc5d7bf",
+      "targetId": "t80c046cd13",
       "waiting": null,
       "done": 0,
       "total": 0,
@@ -10211,7 +11536,7 @@
           "pinnedUrl": null,
           "skip": false,
           "error": "search exited with code 1",
-          "searchedAt": 1792266562289
+          "searchedAt": 1792575342973
         },
         {
           "folder": "Chainsaw Man",
@@ -10231,6 +11556,7 @@
                 "rating": 0.91,
                 "chapters": 181,
                 "qualityBasis": "chapter_probe",
+                "edition": null,
                 "titleMatch": 1
               },
               "sources": [
@@ -10242,6 +11568,7 @@
                   "rating": 0.91,
                   "chapters": 181,
                   "qualityBasis": "chapter_probe",
+                  "edition": null,
                   "titleMatch": 1
                 },
                 {
@@ -10252,6 +11579,7 @@
                   "rating": 0.84,
                   "chapters": 181,
                   "qualityBasis": "chapter_probe",
+                  "edition": null,
                   "titleMatch": 1
                 },
                 {
@@ -10262,6 +11590,7 @@
                   "rating": 0.82,
                   "chapters": 180,
                   "qualityBasis": "chapter_probe",
+                  "edition": null,
                   "titleMatch": 1
                 },
                 {
@@ -10272,6 +11601,7 @@
                   "rating": 0.78,
                   "chapters": 179,
                   "qualityBasis": "cover",
+                  "edition": null,
                   "titleMatch": 1
                 },
                 {
@@ -10282,6 +11612,7 @@
                   "rating": 0.74,
                   "chapters": 181,
                   "qualityBasis": "chapter_probe",
+                  "edition": null,
                   "titleMatch": 1
                 },
                 {
@@ -10292,6 +11623,7 @@
                   "rating": 0.7,
                   "chapters": 181,
                   "qualityBasis": "seed",
+                  "edition": null,
                   "titleMatch": 1
                 }
               ],
@@ -16411,6 +17743,7 @@
                 "rating": 0.62,
                 "chapters": 97,
                 "qualityBasis": "seed",
+                "edition": null,
                 "titleMatch": 0.82
               },
               "sources": [
@@ -16422,6 +17755,7 @@
                   "rating": 0.62,
                   "chapters": 97,
                   "qualityBasis": "seed",
+                  "edition": null,
                   "titleMatch": 0.82
                 }
               ]
@@ -16432,7 +17766,7 @@
           "pinnedUrl": null,
           "skip": false,
           "error": null,
-          "searchedAt": 1792266562336
+          "searchedAt": 1792575343021
         },
         {
           "folder": "Kagurabachi_",
@@ -16445,7 +17779,7 @@
           "pinnedUrl": null,
           "skip": false,
           "error": null,
-          "searchedAt": 1792266562382
+          "searchedAt": 1792575343066
         },
         {
           "folder": "Tis Time for Torture Princess",
@@ -16465,6 +17799,7 @@
                 "rating": 0.88,
                 "chapters": 212,
                 "qualityBasis": "chapter_probe",
+                "edition": null,
                 "titleMatch": 0.87
               },
               "sources": [
@@ -16476,6 +17811,7 @@
                   "rating": 0.88,
                   "chapters": 212,
                   "qualityBasis": "chapter_probe",
+                  "edition": null,
                   "titleMatch": 0.87
                 },
                 {
@@ -16486,6 +17822,7 @@
                   "rating": 0.83,
                   "chapters": 210,
                   "qualityBasis": "chapter_probe",
+                  "edition": null,
                   "titleMatch": 0.87
                 },
                 {
@@ -16496,6 +17833,7 @@
                   "rating": 0.8,
                   "chapters": 212,
                   "qualityBasis": "seed",
+                  "edition": null,
                   "titleMatch": 0.86
                 }
               ],
@@ -20600,6 +21938,7 @@
                 "rating": 0.66,
                 "chapters": 34,
                 "qualityBasis": "seed",
+                "edition": null,
                 "titleMatch": 0.8
               },
               "sources": [
@@ -20611,6 +21950,7 @@
                   "rating": 0.66,
                   "chapters": 34,
                   "qualityBasis": "seed",
+                  "edition": null,
                   "titleMatch": 0.8
                 }
               ]
@@ -20621,13 +21961,13 @@
           "pinnedUrl": null,
           "skip": false,
           "error": null,
-          "searchedAt": 1792266562430
+          "searchedAt": 1792575343114
         }
       ]
     },
     "findRunning": {
       "kind": "find",
-      "targetId": "t36edc5d7bf",
+      "targetId": "t80c046cd13",
       "state": "running",
       "done": 0,
       "total": 4,
@@ -20647,8 +21987,8 @@
     },
     "reviewWithLoss": {
       "ok": true,
-      "targetId": "t36edc5d7bf",
-      "asOf": 1792266562164,
+      "targetId": "t80c046cd13",
+      "asOf": 1792575342806,
       "firstSync": false,
       "deletePolicy": "guarded",
       "totals": {
@@ -21386,7 +22726,7 @@
           "seriesKey": "pc:Solo Leveling",
           "series": "Solo Leveling",
           "rebind": {
-            "shardId": "e0b08f3863b6854c",
+            "shardId": "8bb580e37797cd3e",
             "choices": [
               {
                 "source": "previous",
@@ -21409,15 +22749,15 @@
       "selSeq": 5,
       "stale": false,
       "capacity": {
-        "free": 226252673024,
+        "free": 196508090368,
         "total": 1999343972352,
         "needed": 60912,
         "reserve": 1073741824,
         "freeable": 39081,
         "freeableEarly": 39081,
-        "after": 226252651193,
+        "after": 196508068537,
         "fits": true,
-        "asOf": 1792266562154
+        "asOf": 1792575342787
       },
       "policy": {
         "deletePolicy": "guarded",
@@ -21432,16 +22772,16 @@
         "t": 0,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "job": {
-            "runId": 7,
+            "runId": 5,
             "phase": "apply",
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "serial": null,
             "auto": false,
             "state": "running",
-            "startedAt": 1792266562586,
+            "startedAt": 1792575343239,
             "finishedAt": null,
             "progress": {
               "bytesDone": 0,
@@ -21460,7 +22800,7 @@
         "t": 1,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 0,
@@ -21470,15 +22810,15 @@
             "current": null,
             "preflight": null,
             "step": "probe",
-            "at": 1792266562587
+            "at": 1792575343240
           }
         }
       },
       {
-        "t": 21,
+        "t": 17,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 0,
@@ -21500,7 +22840,7 @@
               "refusal": null
             },
             "step": "device-ready",
-            "at": 1792266562606
+            "at": 1792575343255
           }
         }
       },
@@ -21508,7 +22848,7 @@
         "t": 124,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 3402,
@@ -21533,7 +22873,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266562654,
+            "at": 1792575343299,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 1,
@@ -21546,7 +22886,7 @@
         "t": 233,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 6409,
@@ -21571,7 +22911,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266562797,
+            "at": 1792575343432,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 2,
@@ -21581,10 +22921,10 @@
         }
       },
       {
-        "t": 347,
+        "t": 333,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 6409,
@@ -21609,7 +22949,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266562933,
+            "at": 1792575343571,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 2,
@@ -21619,10 +22959,10 @@
         }
       },
       {
-        "t": 451,
+        "t": 436,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 9417,
@@ -21647,7 +22987,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266562937,
+            "at": 1792575343575,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 3,
@@ -21657,10 +22997,10 @@
         }
       },
       {
-        "t": 561,
+        "t": 545,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 12426,
@@ -21685,7 +23025,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266563078,
+            "at": 1792575343717,
             "lane": {
               "seriesKey": "pc:Eleceed",
               "landed": 4,
@@ -21695,10 +23035,10 @@
         }
       },
       {
-        "t": 670,
+        "t": 655,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 15428,
@@ -21723,7 +23063,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266563226,
+            "at": 1792575343864,
             "lane": {
               "seriesKey": "pc:Frieren",
               "landed": 1,
@@ -21733,10 +23073,10 @@
         }
       },
       {
-        "t": 769,
+        "t": 755,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 15428,
@@ -21761,7 +23101,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266563355,
+            "at": 1792575343993,
             "lane": {
               "seriesKey": "pc:Frieren",
               "landed": 1,
@@ -21771,10 +23111,10 @@
         }
       },
       {
-        "t": 872,
+        "t": 859,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 18431,
@@ -21799,7 +23139,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266563360,
+            "at": 1792575343997,
             "lane": {
               "seriesKey": "pc:Frieren",
               "landed": 2,
@@ -21809,10 +23149,10 @@
         }
       },
       {
-        "t": 981,
+        "t": 968,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 21432,
@@ -21837,7 +23177,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266563511,
+            "at": 1792575344150,
             "lane": {
               "seriesKey": "pc:Kagurabachi",
               "landed": 1,
@@ -21847,10 +23187,10 @@
         }
       },
       {
-        "t": 1091,
+        "t": 1076,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 24434,
@@ -21875,7 +23215,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266563655,
+            "at": 1792575344293,
             "lane": {
               "seriesKey": "pc:Kagurabachi",
               "landed": 2,
@@ -21885,10 +23225,10 @@
         }
       },
       {
-        "t": 1221,
+        "t": 1204,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 24434,
@@ -21913,7 +23253,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266563807,
+            "at": 1792575344443,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 0,
@@ -21923,10 +23263,10 @@
         }
       },
       {
-        "t": 1326,
+        "t": 1310,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 27435,
@@ -21951,7 +23291,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266563812,
+            "at": 1792575344447,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 1,
@@ -21961,10 +23301,10 @@
         }
       },
       {
-        "t": 1435,
+        "t": 1419,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 30437,
@@ -21989,7 +23329,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266563953,
+            "at": 1792575344589,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 2,
@@ -21999,10 +23339,10 @@
         }
       },
       {
-        "t": 1544,
+        "t": 1528,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 33440,
@@ -22027,7 +23367,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266564095,
+            "at": 1792575344732,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 3,
@@ -22037,13 +23377,13 @@
         }
       },
       {
-        "t": 1643,
+        "t": 1627,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
-            "bytesDone": 33440,
+            "bytesDone": 36444,
             "bytesTotal": 60512,
             "filesDone": 11,
             "filesTotal": 20,
@@ -22065,7 +23405,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266564229,
+            "at": 1792575344866,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 3,
@@ -22075,10 +23415,10 @@
         }
       },
       {
-        "t": 1746,
+        "t": 1731,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 36444,
@@ -22103,7 +23443,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266564233,
+            "at": 1792575344869,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 4,
@@ -22113,10 +23453,10 @@
         }
       },
       {
-        "t": 1855,
+        "t": 1839,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 39449,
@@ -22141,7 +23481,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266564373,
+            "at": 1792575345010,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 5,
@@ -22151,10 +23491,10 @@
         }
       },
       {
-        "t": 1963,
+        "t": 1948,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 42455,
@@ -22179,7 +23519,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266564513,
+            "at": 1792575345149,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 6,
@@ -22189,13 +23529,13 @@
         }
       },
       {
-        "t": 2063,
+        "t": 2048,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
-            "bytesDone": 45462,
+            "bytesDone": 42455,
             "bytesTotal": 60512,
             "filesDone": 14,
             "filesTotal": 20,
@@ -22217,7 +23557,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266564649,
+            "at": 1792575345286,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 6,
@@ -22227,10 +23567,10 @@
         }
       },
       {
-        "t": 2166,
+        "t": 2152,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 45462,
@@ -22255,7 +23595,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266564652,
+            "at": 1792575345291,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 7,
@@ -22265,10 +23605,10 @@
         }
       },
       {
-        "t": 2276,
+        "t": 2261,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 48470,
@@ -22293,7 +23633,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266564794,
+            "at": 1792575345430,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 8,
@@ -22303,10 +23643,10 @@
         }
       },
       {
-        "t": 2385,
+        "t": 2370,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 51479,
@@ -22331,7 +23671,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266564935,
+            "at": 1792575345572,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 9,
@@ -22341,10 +23681,10 @@
         }
       },
       {
-        "t": 2486,
+        "t": 2470,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 51479,
@@ -22369,7 +23709,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266565070,
+            "at": 1792575345709,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 9,
@@ -22379,10 +23719,10 @@
         }
       },
       {
-        "t": 2587,
+        "t": 2572,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 54489,
@@ -22407,7 +23747,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266565075,
+            "at": 1792575345713,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 10,
@@ -22417,10 +23757,10 @@
         }
       },
       {
-        "t": 2696,
+        "t": 2682,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 57500,
@@ -22445,7 +23785,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266565235,
+            "at": 1792575345852,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 11,
@@ -22455,10 +23795,10 @@
         }
       },
       {
-        "t": 2805,
+        "t": 2791,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "running",
           "progress": {
             "bytesDone": 60512,
@@ -22483,7 +23823,7 @@
               "refusal": null
             },
             "step": "apply",
-            "at": 1792266565371,
+            "at": 1792575345992,
             "lane": {
               "seriesKey": "pc:Solo Leveling",
               "landed": 12,
@@ -22493,10 +23833,10 @@
         }
       },
       {
-        "t": 2954,
+        "t": 2918,
         "ev": {
           "kind": "job",
-          "runId": 7,
+          "runId": 5,
           "state": "done",
           "status": "completed",
           "summary": {
@@ -22529,14 +23869,14 @@
             "dropped": []
           },
           "job": {
-            "runId": 7,
+            "runId": 5,
             "phase": "apply",
-            "targetId": "t36edc5d7bf",
+            "targetId": "t80c046cd13",
             "serial": null,
             "auto": false,
             "state": "done",
-            "startedAt": 1792266562586,
-            "finishedAt": 1792266565540,
+            "startedAt": 1792575343239,
+            "finishedAt": 1792575346157,
             "progress": {
               "bytesDone": 60512,
               "bytesTotal": 60512,
@@ -22560,7 +23900,7 @@
                 "refusal": null
               },
               "step": "apply",
-              "at": 1792266565371,
+              "at": 1792575345992,
               "lane": {
                 "seriesKey": "pc:Solo Leveling",
                 "landed": 12,
@@ -22606,7 +23946,7 @@
       "adbPath": null,
       "targets": [
         {
-          "id": "t36edc5d7bf",
+          "id": "t80c046cd13",
           "deletePolicy": "guarded",
           "excludes": [
             {

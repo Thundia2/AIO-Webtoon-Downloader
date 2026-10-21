@@ -16,9 +16,14 @@
 // event goes out per COALESCE_MS (≤10/s). begin and finish go out at once and
 // replace any progress still waiting, since their event carries the whole job.
 //
-// AUTO-PLAN QUEUE: a connect while busy queues one plan per target (FIFO,
+// AUTO QUEUE: a connect while busy queues one plan per target (FIFO,
 // one entry per target). A user-started job while busy is refused instead.
-// A queued plan is dropped when its device disconnects (dropDevice).
+// A queued entry is dropped when its device disconnects (dropDevice).
+// Entries carry a `kind`: "plan" (a full prepare) or "refresh" (top up a
+// plan derived from cached facts, service.js _startRefresh). A plan request
+// upgrades a queued refresh of the same target (the plan measures
+// everything the refresh would); a refresh request while a plan is queued is
+// a no-op.
 //
 // NOT PERSISTED: a job dies with the process; the record files under
 // userData/sync are what survives it.
@@ -161,13 +166,22 @@ function createJobRecord(deps) {
     },
 
     /**
-     * Queue an automatic plan for a target (deviation 5). One entry per
-     * target; a second connect for a queued target is a no-op.
-     * @returns {boolean} true when queued.
+     * Queue an automatic job for a target (deviation 5). One entry per
+     * target; a second request for a queued target is a no-op, except that
+     * a plan upgrades a queued refresh in place (keeping its FIFO slot).
+     * @param {{targetId:string, serial?:string, kind?:'plan'|'refresh'}} e
+     * @returns {boolean} true when queued or upgraded.
      */
-    enqueueAuto({ targetId, serial }) {
-      if (!targetId || queue.some((q) => q.targetId === targetId)) return false;
-      queue.push({ targetId, serial: serial || null, queuedAt: now() });
+    enqueueAuto({ targetId, serial, kind = "plan" }) {
+      if (!targetId) return false;
+      const k = kind === "refresh" ? "refresh" : "plan";
+      const have = queue.find((q) => q.targetId === targetId);
+      if (have) {
+        if (k !== "plan" || have.kind === "plan") return false;
+        have.kind = "plan";
+        return true;
+      }
+      queue.push({ targetId, serial: serial || null, queuedAt: now(), kind: k });
       return true;
     },
 
@@ -190,7 +204,7 @@ function createJobRecord(deps) {
       return true;
     },
 
-    /** The next queued plan, FIFO, or null while busy or empty. */
+    /** The next queued entry {targetId, serial, queuedAt, kind}, FIFO, or null while busy or empty. */
     takeNextAuto() {
       if (this.isBusy() || !queue.length) return null;
       return queue.shift();

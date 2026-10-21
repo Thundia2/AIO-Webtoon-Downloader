@@ -23,7 +23,7 @@
 // ============================================================
 
 import React, { useEffect, useState } from "react";
-import { AlertTriangle, ChevronDown, ChevronRight, EyeOff, Link, Pencil, Trash2 } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, EyeOff, Link, Loader2, Pencil, Trash2 } from "lucide-react";
 import { Badge, Button, Checkbox, Input } from "@/components/ui/primitives";
 import { Sheet } from "@/components/ui/overlay";
 import { cn, formatBytes } from "@/lib/utils";
@@ -31,7 +31,7 @@ import ChapterStrip, { SEG_CLASS } from "./ChapterStrip";
 import { Cover } from "./Ledger";
 import { useArm } from "./TargetEditor";
 import {
-  anomalyCopy, DEVICE_ONLY_COPY, heldReasonCopy, opReasonCopy, READER_ISSUE_COPY, seriesStateCopy, SUGGESTION_TIER_COPY, TAG_COPY,
+  anomalyCopy, DEVICE_ONLY_COPY, heldReasonCopy, liveStateCopy, opReasonCopy, READER_ISSUE_COPY, seriesStateCopy, SUGGESTION_TIER_COPY, TAG_COPY,
 } from "./copy";
 import { chLabel, detailGroups, groupChanges, seriesPathLine } from "./syncView";
 
@@ -129,11 +129,13 @@ function anomalyText(a, tn) {
 
 /**
  * @param {{open, onClose, targetId, seriesKey, row, tn, wide, sync, ops,
- *   cover, pcPath, root, locked, pendingOps, gen, selSeq, contained, onSelect(req), onError(reply)}} props
+ *   cover, pcPath, root, locked, live, linking, pendingOps, gen, selSeq, contained, onSelect(req), onError(reply)}} props
+ *   live = syncView.liveState of the row (its badge while a decision lands);
+ *   linking = device folders with a Link in flight (syncView.linkIndex).
  *   pcPath = the series' PC folder (library scan); root = the target's root.
  *   row = the summary row (pc:) or the deviceOnly entry (dev:).
  */
-export default function SeriesSheet({ open, onClose, targetId, seriesKey, row, tn, wide, contained, sync, ops, cover, pcPath, root, locked, pendingOps, gen, selSeq, onSelect, onError }) {
+export default function SeriesSheet({ open, onClose, targetId, seriesKey, row, tn, wide, contained, sync, ops, cover, pcPath, root, locked, live, linking, pendingOps, gen, selSeq, onSelect, onError }) {
   const [detail, setDetail] = useState(null);
   const [openGroups, setOpenGroups] = useState({});
   const [renaming, setRenaming] = useState(null);
@@ -200,9 +202,16 @@ export default function SeriesSheet({ open, onClose, targetId, seriesKey, row, t
       </span>
     </span>
   );
+  const liveText = !isDev && live ? liveStateCopy(live, tn) : null;
   const badges = (
     <div className="flex flex-wrap gap-1">
-      {!isDev && row && (row.state === "held" ? heldReasonCopy(row.heldReason, tn) : seriesStateCopy(row.state, tn)) && (
+      {liveText && (
+        <Badge variant="token-info">
+          {live !== "verify-offline" && <Loader2 className="animate-spin motion-reduce:animate-none" aria-hidden="true" />}
+          {liveText}
+        </Badge>
+      )}
+      {!liveText && !isDev && row && (row.state === "held" ? heldReasonCopy(row.heldReason, tn) : seriesStateCopy(row.state, tn)) && (
         <Badge variant="token-muted">{row.state === "held" ? heldReasonCopy(row.heldReason, tn) : seriesStateCopy(row.state, tn)}</Badge>
       )}
       {isDev && row && <Badge variant="token-muted">{DEVICE_ONLY_COPY[row.state] || row.state}</Badge>}
@@ -350,12 +359,21 @@ export default function SeriesSheet({ open, onClose, targetId, seriesKey, row, t
                 )}
                 <span className="text-muted-foreground"> · {SUGGESTION_TIER_COPY[g.tier] || g.tier}</span>
               </span>
-              <Button size="sm" variant="outline" className={XS} disabled={locked} onClick={async () => { const r = await sync.actions.link({ targetId, suggestionIds: [g.id] }); if (!r.ok) onError && onError(r); }}>
-                Link
-              </Button>
-              <Button size="sm" variant="ghost" className={XS} disabled={locked} onClick={() => run("ignore-suggestion", { suggestionId: g.id })}>
-                Ignore
-              </Button>
+              {linking && linking.has(g.deviceFolder) ? (
+                <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground" role="status">
+                  <Loader2 className="h-3 w-3 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                  Linking…
+                </span>
+              ) : (
+                <>
+                  <Button size="sm" variant="outline" className={XS} disabled={locked} onClick={async () => { const r = await sync.actions.link({ targetId, suggestionIds: [g.id] }); if (!r.ok) onError && onError(r); }}>
+                    Link
+                  </Button>
+                  <Button size="sm" variant="ghost" className={XS} disabled={locked} onClick={() => run("ignore-suggestion", { suggestionId: g.id })}>
+                    Ignore
+                  </Button>
+                </>
+              )}
             </div>
           ))}
         </div>

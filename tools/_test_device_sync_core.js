@@ -1508,6 +1508,20 @@ test("auto-plan queue: FIFO, one per target, dropped on device removal", () => {
   assert.strictEqual(jr.takeNextAuto(), null);
 });
 
+test("auto queue kinds: a plan upgrades a queued refresh in its slot; a refresh never downgrades a plan; refresh is a job phase", () => {
+  const jr = createJobRecord({ send: () => {} });
+  const { runId } = jr.begin({ phase: "refresh", targetId: "x" });
+  assert.ok(jr.enqueueAuto({ targetId: "t1", serial: "S1", kind: "refresh" }));
+  assert.ok(jr.enqueueAuto({ targetId: "t2", serial: "S2" }));
+  assert.ok(!jr.enqueueAuto({ targetId: "t1", serial: "S1", kind: "refresh" }), "one entry per target");
+  assert.ok(jr.enqueueAuto({ targetId: "t1", serial: "S1", kind: "plan" }), "upgraded");
+  assert.ok(!jr.enqueueAuto({ targetId: "t2", serial: "S2", kind: "refresh" }), "a queued plan covers a refresh");
+  assert.deepStrictEqual(jr.snapshot().queue.map((q) => [q.targetId, q.kind]), [["t1", "plan"], ["t2", "plan"]]);
+  jr.finish(runId, { status: "completed" });
+  assert.strictEqual(jr.takeNextAuto().kind, "plan");
+  assert.ok(!jr.needsQuitAsk());
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed) {
   for (const x of failures) console.error(`\n${x.name}\n`, x.err);

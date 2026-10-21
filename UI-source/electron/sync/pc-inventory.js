@@ -165,4 +165,32 @@ async function walkLibrary(root, { fsp = fs.promises } = {}) {
   return { ok: true, root, series, warnings };
 }
 
-module.exports = { walkLibrary, SERIES_META };
+/**
+ * Everything of a walk the planner reads, as one comparable string: two
+ * walks with equal signatures plan the same. service.js notifyLibraryChanged
+ * compares a fresh walk with the plan's own (prep.pc), so a library scan
+ * that changed nothing doesn't re-plan. Leaves out folderPath / path (the
+ * root and the names already say them), mtimeMs (mtimeNs says it more
+ * precisely) and sha256 (prepare.js fills it in from the size and mtime).
+ * A field the planner starts reading must be added here.
+ */
+function pcSignature(pc) {
+  if (!pc || !pc.ok) return null;
+  return JSON.stringify([
+    pc.root,
+    pc.series.map((s) => [
+      s.folder,
+      s.readError || null,
+      s.title,
+      s.identityKey,
+      s.url,
+      s.anilistId,
+      s.synonyms,
+      s.imageOnly,
+      s.malformedJson,
+      s.files.map((f) => [f.name, f.size, f.mtimeNs]),
+    ]),
+  ]);
+}
+
+module.exports = { walkLibrary, pcSignature, SERIES_META };

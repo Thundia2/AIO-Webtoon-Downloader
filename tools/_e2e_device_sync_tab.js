@@ -31,6 +31,9 @@
 //      restored → gone
 //   7. device-listing-suspect: the target folder suddenly empty → its card,
 //      nothing removed; restored → gone
+//   8. decisions without full re-plans: Acknowledge on an image-only series
+//      runs no job; Link on a content match runs one refresh (no plan job),
+//      binds the target's old folder and leaves the series in sync
 "use strict";
 const fs = require("fs");
 const os = require("os");
@@ -288,6 +291,50 @@ function findFile(root, name) {
       await box("Sync Alpha").waitFor({ timeout: 30_000 }).catch(() => {});
     });
     check("device-listing-suspect clears once restored", true);
+
+    // 8. decisions without full re-plans (plan device-sync-cheap-replans.md):
+    // Acknowledge lands with no job at all; Link runs one `refresh`, never a
+    // `plan`, binds the old folder (nothing copied to a new one) and leaves
+    // the series in sync. The last job's runId/phase come from get-state.
+    const lastJob = async () => {
+      const st = await win.evaluate(() => window.electronAPI.syncGetState());
+      const j = st && st.job && st.job.job;
+      return j ? { runId: j.runId, phase: j.phase, state: j.state } : null;
+    };
+    // Delta: images only → held image-only with an anomaly to acknowledge.
+    fs.mkdirSync(path.join(LIB, "Delta"), { recursive: true });
+    for (const n of ["001.jpg", "002.jpg"]) chapter(path.join(LIB, "Delta"), n, 3000);
+    // Gamma: also on the target as "Gamma (old)", same bytes → a content match.
+    const gamma = ["Ch.001.cbz", "Ch.002.cbz", "Ch.003.cbz", "Ch.004.cbz"];
+    series(LIB, "Gamma", gamma);
+    for (const c of gamma) chapter(path.join(DEV, "Gamma (old)"), c, 4000 + c.length);
+    await step("decision scene planned", async () => {
+      await recheck();
+      await text("Looks like", 30_000);
+      await win.getByRole("button", { name: "Open Delta" }).waitFor({ timeout: 30_000 });
+      await win.waitForFunction(async () => {
+        const st = await window.electronAPI.syncGetState();
+        return !(st.job && st.job.job && st.job.job.state === "running");
+      }, null, { timeout: 30_000, polling: 200 });
+    });
+    const j0 = await lastJob();
+    await step("acknowledge", async () => {
+      await win.getByRole("button", { name: "Open Delta" }).click();
+      await dialog().getByRole("button", { name: "Acknowledge" }).click();
+      await dialog().getByRole("button", { name: "Undo" }).waitFor({ timeout: 10_000 });
+      await win.keyboard.press("Escape");
+    });
+    const j1 = await lastJob();
+    check("acknowledge: no job ran (no full re-plan)", JSON.stringify(j1) === JSON.stringify(j0), `${JSON.stringify(j0)} → ${JSON.stringify(j1)}`);
+    await step("link", async () => {
+      await win.getByRole("button", { name: "Link", exact: true }).first().click();
+      await text(`${gamma.length} on ${TN}`, 30_000);
+      await gone("Looks like", 10_000);
+    });
+    const j2 = await lastJob();
+    check("link: one refresh job, no plan job", !!j2 && j2.phase === "refresh" && j2.runId === (j0 ? j0.runId : 0) + 1, `${JSON.stringify(j0)} → ${JSON.stringify(j2)}`);
+    check("link: bound to the old folder, nothing copied to a new one", !fs.existsSync(path.join(DEV, "Gamma")) && gamma.every((c) => fs.existsSync(path.join(DEV, "Gamma (old)", c))), fs.readdirSync(DEV).join(","));
+    check("link: the dock settles (no Updating line left)", (await win.getByText("Updating the plan").count()) === 0);
   } catch (e) {
     if (!failures) check("e2e", false, e && e.stack);
   } finally {

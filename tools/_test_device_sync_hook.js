@@ -322,7 +322,13 @@ function deferred(value) {
     eq("config applied at once", h.mounted.state.config.version, 4);
     const lastRun = { runId: 5, phase: "apply", status: "completed", summary: { files: { done: 3 } } };
     h.mounted.act(() => h.emit({ kind: "plans", targetId: "t1", summary: { ops: 7 }, refusal: null, stale: false, lastRun, gen: 12 }));
-    eq("plans overwrites the target's view", h.mounted.state.plans.t1, { summary: { ops: 7 }, refusal: null, stale: false, lastRun, gen: 12, selSeq: null, lastPlan: null });
+    eq("plans overwrites the target's view", h.mounted.state.plans.t1, { summary: { ops: 7 }, refusal: null, stale: false, updating: false, links: [], lastRun, gen: 12, selSeq: null, lastPlan: null });
+    // Cheap re-plans: a decision landing and a Link in flight ride the event.
+    const link = { suggestionId: "s1", seriesKey: "pc:Mu", deviceFolder: "Mu Old Name", bound: true };
+    h.mounted.act(() => h.emit({ kind: "plans", targetId: "t1", summary: { ops: 7 }, refusal: null, stale: true, updating: true, links: [link], lastRun, gen: 13 }));
+    eq("updating and links are carried", [h.mounted.state.plans.t1.updating, h.mounted.state.plans.t1.links], [true, [link]]);
+    h.mounted.act(() => h.emit({ kind: "plans", targetId: "t1", summary: { ops: 7 }, refusal: null, stale: false, links: "junk", lastRun, gen: 14 }));
+    eq("missing updating → false; non-array links → []", [h.mounted.state.plans.t1.updating, h.mounted.state.plans.t1.links], [false, []]);
     h.mounted.act(() => h.emit({ kind: "plans", targetId: "t2", summary: null, refusal: { ok: false, code: "needs-mode" }, stale: true, lastRun: null, gen: null }));
     eq("another target is added beside it", Object.keys(h.mounted.state.plans).sort(), ["t1", "t2"]);
     eq("a refusal rides the event", h.mounted.state.plans.t2.refusal.code, "needs-mode");

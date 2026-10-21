@@ -22,7 +22,10 @@
 // stale run's late event after the snapshot).
 //
 // PLANS ARE PUSHED (UI pass U0): a `plans` event carries one target's whole
-// view {summary, refusal, stale, lastRun, gen} whenever any of it changes,
+// view {summary, refusal, stale, updating, links, lastRun, gen, selSeq,
+// lastPlan} whenever any of it changes (field meanings: sync/contract.js
+// EVENT_KINDS; the reducer copies fields BY NAME, so a new field needs a line
+// in the "plans" case),
 // and `removed:true` once the target is gone. The hook only overwrites; it
 // never re-reads get-state to catch up (that re-read raced main's identity
 // clear and lost job results). `adb` and `settings` events likewise. The one
@@ -173,6 +176,8 @@ function applySyncEvent(s, ev) {
           summary: ev.summary || null,
           refusal: ev.refusal || null,
           stale: !!ev.stale,
+          updating: !!ev.updating,
+          links: Array.isArray(ev.links) ? ev.links : [],
           lastRun: ev.lastRun || null,
           gen: ev.gen == null ? null : ev.gen,
           selSeq: Number.isInteger(ev.selSeq) ? ev.selSeq : null,

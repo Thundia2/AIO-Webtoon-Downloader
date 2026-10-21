@@ -108,6 +108,14 @@ const TAB_CASES = [
   { id: "tab-suspect", title: "Tab: device listing suspect", spec: { tab: "listingSuspect" } },
   { id: "tab-disconnected", title: "Tab: disconnected", spec: { tab: "disconnected" } },
   { id: "tab-needs-mode", title: "Tab: needs a verify mode (adb)", spec: { tab: "needsMode" } },
+  { id: "tab-linking", title: "Tab: a Link queued behind a plan", note: "Hajime no Ippo linked while a plan job runs: Linking… on its row and on the folder only on the target (recorded).", spec: { tab: "linking" } },
+  { id: "tab-verifying", title: "Tab: a Link verifying its folder", note: "Mob Psycho 100 linked with no job running: the interim plan, needs-verify while its refresh is to come; the dock reads Updating the plan (recorded).", spec: { tab: "verifying" } },
+  {
+    id: "tab-verify-offline",
+    title: "Tab: a Link verifying, target away",
+    note: "The verifying snapshot with the folder marked absent (synthetic): Connect to verify.",
+    spec: { tab: "verifying", mutate: (s) => { for (const t of s.config.targets) s.folderPresence[t.id] = false; } },
+  },
   { id: "tab-none", title: "Tab: no targets", spec: { tab: "planned", mutate: (s) => { s.config.targets = []; } } },
   { id: "tab-find", title: "Tab: find sources", note: "Recorded rows (synthetic search results): an error, a Ready match on six sites, nothing found, and a close call that reads Check match. A source chip opens every site of the series; Search replays them; Queue links then queues (a no-op here).", spec: { tab: "planned" }, initial: { find: true } },
   {

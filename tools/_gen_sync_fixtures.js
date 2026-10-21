@@ -120,6 +120,7 @@ function scrub(v, tmp) {
 //     search hits the network): FAKE_SEARCH answers by query in the
 //     --search-json shape, and the real find-sources.js compacts them.
 // Snapshots are whole get-state answers, so the gallery feeds them as is.
+// recordLink adds the `linking` / `verifying` snapshots (its doc comment).
 
 function writeYoung(p, data, ageS) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -513,6 +514,154 @@ async function recordTab(tmp) {
   return out;
 }
 /**
+ * tab.json snapshots `linking` and `verifying` (plan sync-temp/plans/
+ * device-sync-cheap-replans.md §7): a Link landing without a full re-plan,
+ * in a world of its own so recordTab's plan (and everything recorded off it)
+ * stays as it was. A folder target with two series that are also on the
+ * target under older folder names, same bytes (two content-match
+ * suggestions), and one new series.
+ *   linking    a Link clicked while a plan job runs: queued, the plan view
+ *              carries it in `links` (bound:false) with updating
+ *   verifying  then the second suggestion's Link with no job running: bound
+ *              at once, the interim plan shows that series needs-verify
+ *              while its refresh is still to come (the first `plans` push
+ *              after the Link, taken from the events: the refresh lands
+ *              moments later)
+ * Each is a whole get-state answer; details for its rows are merged into the
+ * returned `details` (keys don't collide with recordTab's series).
+ */
+async function recordLink(tmp) {
+  const { FolderTransport } = require(path.join(SYNC, "transports.js"));
+  const lib = path.join(tmp, "link-manga");
+  const userData = path.join(tmp, "link-ud", "sync");
+  const root = path.join(tmp, "Tablet4", "Komikku");
+  fs.mkdirSync(root, { recursive: true });
+  const old = new Date(OLD_S * 1000);
+  const pair = (title, deviceFolder, files) => {
+    series(lib, title, files);
+    for (const [n, s] of Object.entries(files)) {
+      const p = path.join(root, deviceFolder, n);
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, bytes(n, s));
+      fs.utimesSync(p, old, old);
+    }
+  };
+  pair("Hajime no Ippo", "Hajime no Ippo (old)", { "Ch.001 - Hajime.cbz": 3101, "Ch.002 - Hajime.cbz": 3102 });
+  pair("Mob Psycho 100", "Mob Psycho (2019)", { "Ch.001 - Mob.cbz": 2901, "Ch.002 - Mob.cbz": 2902, "Ch.003 - Mob.cbz": 2903 });
+  series(lib, "Kaiju No. 8", { "Ch.001 - Kaiju.cbz": 2801 });
+  const events = [];
+  const handlers = new Map();
+  const settings = { syncEnabled: true, cpuLimit: "unlimited", syncPromptOnConnect: false };
+  const svc = service.initDeviceSync({
+    ipcMain: { handle: (c, fn) => handlers.set(c, fn) },
+    send: (c, p) => events.push(p),
+    userDataDir: userData,
+    getSettings: () => settings,
+    getLibraryRoot: () => lib,
+    getRunningDownloads: () => [],
+    isCheckAllRunning: () => false,
+    isSearchRunning: () => false,
+    resolveSpawnPaths: () => ({ pythonCmd: "python", scriptPath: "aio-dl.py", workingDir: tmp }),
+    extraEnv: {},
+    onFocus: () => {},
+    isFocused: () => true,
+    getWindow: () => null,
+    showSaveDialog: async () => ({ canceled: true }),
+    _test: {
+      clientOpts: { port: 1, recheckMs: 20, idleMs: 5000, connectTimeoutMs: 500 },
+      locateAdb: async () => ({ resolved: null, candidates: [] }),
+      ensureServer: async () => ({ ok: false, error: new Error("no adb in this recording"), started: false }),
+      prewarmDelayMs: 60 * 60 * 1000,
+      replanDebounceMs: 30,
+      busyPollMs: 40,
+      bootEpoch: 1,
+      connectWaitMs: 2000,
+    },
+  });
+  const raw = (name, payload) => handlers.get(`sync:${name}`)({}, payload || {});
+  const call = async (name, payload) => {
+    const r = await raw(name, payload);
+    assert.ok(r && r.ok !== false, `sync:${name} refused: ${JSON.stringify(r)}`);
+    return r;
+  };
+  const state = () => raw("get-state");
+  const idle = async () => {
+    await waitFor(() => !svc._debug().current, 30000, "idle lane");
+    await sleep(60);
+    await waitFor(() => !svc._debug().current, 30000, "idle lane (2)");
+  };
+  const out = { snapshots: {}, details: {} };
+  try {
+    const t = await call("config-op", { op: "add-target", target: { name: "Galaxy Tab", kind: "folder", root, profile: "komikku" } });
+    const id = t.targetId;
+    await waitFor(async () => (await raw("plan", { targetId: id, ifNeeded: true })).why === "fresh" || null, 30000, "first plan");
+    await idle();
+    const sum0 = (await state()).plans[id].summary;
+    const sugOf = (folder) => {
+      const r = sum0.series.find((x) => x.folder === folder);
+      return sum0.suggestionList.find((g) => g.seriesKey === r.seriesKey);
+    };
+    const sug = sugOf("Hajime no Ippo");
+    const sug2 = sugOf("Mob Psycho 100");
+    assert.ok(sug && sug2, "the world has two link suggestions");
+
+    // linking: hold the plan job at its probe, Link, read the state.
+    let open;
+    const wait = new Promise((r) => (open = r));
+    let reached;
+    const hit = new Promise((r) => (reached = r));
+    const probe = FolderTransport.prototype.probe;
+    FolderTransport.prototype.probe = async function (...args) {
+      FolderTransport.prototype.probe = probe;
+      reached();
+      await wait;
+      return probe.apply(this, args);
+    };
+    try {
+      await call("plan", { targetId: id });
+      await hit;
+      const lk = await call("link", { targetId: id, suggestionIds: [sug.id] });
+      assert.ok(lk.queued, JSON.stringify(lk));
+      out.snapshots.linking = await state();
+      const v = out.snapshots.linking.plans[id];
+      assert.deepStrictEqual([v.updating, v.links.map((l) => l.bound)], [true, [false]]);
+      for (const row of v.summary.series) out.details[row.seriesKey] = await call("series-detail", { targetId: id, seriesKey: row.seriesKey });
+      for (const d of v.summary.deviceOnly) out.details[d.key] = await call("series-detail", { targetId: id, seriesKey: d.key });
+    } finally {
+      FolderTransport.prototype.probe = probe;
+      open();
+    }
+    // The queued Link lands after that plan (a refresh verifies it).
+    await waitFor(async () => {
+      const p = (await state()).plans[id];
+      return !p.stale && !p.links.length && p.summary.series.some((r) => r.seriesKey === sug.seriesKey && r.state === "bound") ? p : null;
+    }, 30000, "the queued Link landed");
+    await idle();
+
+    // verifying: the second Link with the lane idle; the first push after
+    // it is the interim plan (needs-verify, refresh to come).
+    const from = events.length;
+    await call("link", { targetId: id, suggestionIds: [sug2.id] });
+    // Pushes are coalesced to the next tick (service.js _planChanged).
+    const interim = await waitFor(
+      () => events.slice(from).find((e) => e.kind === "plans" && e.targetId === id && e.summary && e.summary.series.some((r) => r.seriesKey === sug2.seriesKey && r.state === "needs-verify")),
+      5000,
+      "the interim needs-verify plan"
+    );
+    assert.ok(interim && interim.updating, "an interim needs-verify plan was pushed with updating");
+    await idle();
+    const after = await state();
+    const { kind, targetId, ...view } = interim; // eslint-disable-line no-unused-vars
+    out.snapshots.verifying = { ...after, plans: { ...after.plans, [id]: view } };
+    // Detail sheets answer from the linking snapshot's recordings (the
+    // interim plan's own details are gone once the refresh adopts).
+  } finally {
+    await svc.shutdown({ timeoutMs: 2000 });
+  }
+  return out;
+}
+
+/**
  * prompts.json (UI pass U3): the connect card's inputs as main sends them.
  *   ready     a folder target appearing with prompt-on-connect on: the
  *             `pending` event (Preparing card), the running connect plan's
@@ -718,6 +867,11 @@ async function main() {
     await srv.close();
   }
   out.tab = await recordTab(tmp);
+  {
+    const link = await recordLink(tmp);
+    Object.assign(out.tab.snapshots, link.snapshots);
+    Object.assign(out.tab.details, link.details);
+  }
   out.prompts = await recordPrompts(tmp);
 
   const adb = out.stateOn.adb;

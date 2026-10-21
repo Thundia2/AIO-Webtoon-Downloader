@@ -10,7 +10,9 @@
 //     file (or folder), throughput, ETA, files / series / folders and bytes
 //     done, Cancel. A plan job keeps the selection face and says
 //     "Planning…" in its status line: plans are short and frequent, and the
-//     user's place in the totals shouldn't jump.
+//     user's place in the totals shouldn't jump. A refresh (a review
+//     decision's top-up) likewise stays on the selection face, as "Updating
+//     the plan…" (syncView.dockStatus), so PHASE_VERB / UNIT have no entry.
 //
 // Throughput is computed by the caller from progress samples
 // (syncView.throughput); this file only draws.

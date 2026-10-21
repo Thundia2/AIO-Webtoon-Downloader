@@ -185,6 +185,7 @@ class Executor {
     this.reserveBytes = d.reserveBytes != null ? d.reserveBytes : RESERVE_BYTES;
     this.budgetLimit = Math.max(1, (this.settings.syncErrorBudget | 0) || DEFAULT_BUDGET);
     this.failStreak = 0;
+    this.verifyListings = new Map(); // folder → listing.files of each folder verify() listed
   }
 
   // ---------------------------------------------------------------- plumbing
@@ -994,6 +995,10 @@ class Executor {
       row.reason = `listing-${listing.error}`;
       return;
     }
+    // The listing the merge reads, for the caller's plan (prepare.js folds it
+    // into its device facts; grep verifyListings). Kept off `row`: rows go
+    // into the run log.
+    this.verifyListings.set(f.folder, listing.files);
     const files = listing.files.filter((x) => !x.name.startsWith("."));
     const largest = files.reduce((m, x) => Math.max(m, x.size || 0), 0);
     this._progress({ folder: f.folder });

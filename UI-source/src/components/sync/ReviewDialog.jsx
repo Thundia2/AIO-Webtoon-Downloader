@@ -119,6 +119,7 @@ function rebindLabel(c) {
 
 const WHY = {
   stale: "The plan is being rebuilt",
+  updating: "Updating the plan…",
   busy: "A sync job is writing to the target",
   saving: "Saving your last change…",
   changed: "The plan just changed; reloading",
@@ -203,7 +204,7 @@ export default function ReviewDialog({ open, onClose, targetId, tn, wide, contai
     seenSig.current = sig;
   }, [open, review, targetId]);
 
-  const gate = reviewGate(review, acks, { stale: view && view.stale, settled, busy: locked, viewGen: gen, viewSelSeq: selSeq, changedNotice });
+  const gate = reviewGate(review, acks, { stale: view && view.stale, updating: !!(view && view.updating), settled, busy: locked, viewGen: gen, viewSelSeq: selSeq, changedNotice });
   const ok = review && review.ok;
   const files = ok ? workCount(review.totals) : 0;
   const cap = ok ? review.capacity : null;

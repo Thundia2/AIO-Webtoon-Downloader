@@ -17,6 +17,11 @@
 // THE INTERFACE (every method is async unless marked):
 //   probe()            → {canonicalRoot, caseInsensitive, caseMeasured, caps,
 //                         volumeId?}; once per connection (cached)
+//   adoptProbe(probe)  (sync) seed this transport with an earlier probe() of
+//                         the same connection instead of probing again (the
+//                         case probe lists the root). prepare.js refreshPlan
+//                         only: a refresh trusts the cached facts, and any
+//                         stat that contradicts them escalates to a full plan
 //   statRoot()         → {ok, isDir, error}
 //   stat(rel)          → {exists, type, size, devMtime, error}
 //   listRoot()         → listing of the root (see _listing below)
@@ -264,6 +269,13 @@ class AdbTransport {
       throw new AdbError(kind, `${what} failed (rc ${r.rc}): ${text}`, { serial: this.serial, op: what, sent: true });
     }
     return r;
+  }
+
+  /** See the header (adoptProbe): later paths use the canonical root, listings pick their protocol off caps. */
+  adoptProbe(probe) {
+    this._probe = probe;
+    this.canonicalRoot = probe.canonicalRoot || this.root.replace(/\/+$/, "");
+    this._caps = probe.caps;
   }
 
   async probe({ force = false } = {}) {
@@ -734,6 +746,12 @@ class FolderTransport {
       if (why) throw new RangeError(`invalid folder path (${why}): ${JSON.stringify(rel)}`);
     }
     return path.join(root, ...segs);
+  }
+
+  /** See the header (adoptProbe). */
+  adoptProbe(probe) {
+    this._probe = probe;
+    this.canonicalRoot = probe.canonicalRoot || this.root;
   }
 
   async probe({ force = false } = {}) {

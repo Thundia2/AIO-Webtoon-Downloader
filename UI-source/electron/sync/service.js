@@ -20,7 +20,8 @@
 // Turning sync off mid-job cancels the job and the find-sources run first,
 // then stops the monitor (applySettings).
 //
-// JOBS. One lane (job-record.js): plan, verify, apply, prune, rename. A
+// JOBS. One lane (job-record.js): plan, verify, apply, prune, rename,
+// refresh. A
 // job-starting handler answers {ok, runId} at once, or a refusal it can
 // decide without device I/O (busy, disconnected, library-missing, blocked
 // against the reviewed plan, invalid). Refusals that need the device
@@ -45,10 +46,31 @@
 // every apply goes through Review's Start. The renderer draws the card's
 // numbers from the live plans, not the frozen card (U3-9).
 //
-// LINK (P4 decision): sync:link {targetId, suggestionIds} binds each
-// suggestion's device folder to its series (RecordStore.bindFolder), refused
-// `busy` while any job runs; the folder is then verified by the re-plan it
-// queues.
+// LIBRARY CHANGES (notifyLibraryChanged, debounced) re-plan in full only
+// the targets whose plan read a different library than a fresh walk finds
+// (grep _afterLibraryChange): a scan that changed nothing (the Sync tab's
+// cover scan on open, a Library refresh) leaves the plan and any decision
+// in flight alone.
+//
+// DECISIONS WITHOUT FULL RE-PLANS (plan sync-temp/plans/
+// device-sync-cheap-replans.md). A review decision (every config op but an
+// identity edit, forget-record and add-target; a Link; a rebind; the
+// planning settings but hash mode) re-derives the plan from the last
+// prepare's cached facts (prepare.js derivePlan, no I/O; grep _derive). A
+// fact the decision newly needs (a stat, a hash, a verify of a newly bound
+// folder) is topped up by an automatic `refresh` job (prepare.js
+// refreshPlan; grep _startRefresh), never a full prepare. While a job of the
+// target runs, the derive waits for its end (rt.rederive, _afterJob); while a
+// full plan is owed (rt.stale), nothing is derived: that plan reads the new
+// config itself. Apply is unaffected: it always prepares afresh and
+// reconciles (_startApply).
+//
+// LINK: sync:link {targetId, suggestionIds} QUEUES a bind (rt.links) and
+// answers {ok, queued:true}; refused `busy` only while an apply / prune /
+// rename of that target runs. Binds are record writes, so they run only when
+// no job of the target runs: in _derive, or at the start of every job before
+// its first store.load (_runJob → _bindLinks). The folder is then verified by
+// the refresh the derive asks for.
 //
 // PRE-WARM (P4 decision): hashes what the targets mirror PREWARM_DELAY_MS
 // after launch (or at once when sync is switched on), and pauses while a
@@ -71,8 +93,8 @@
 // UI-PASS CONTRACT (U0, plan sync-temp/plans/device-sync-ui-pass.md):
 //   * PUSHED, NOT RE-READ. Every change to a target's plan state calls
 //     _planChanged(id) → one coalesced `plans` event per target per tick
-//     {targetId, summary, refusal, stale, lastRun, gen, selSeq, lastPlan,
-//     removed?}. `adb`
+//     {targetId, summary, refusal, stale, updating, links, lastRun, gen,
+//     selSeq, lastPlan, removed?} (field meanings: contract.js EVENT_KINDS). `adb`
 //     and `settings` events cover the rest. get-state is the first read only.
 //   * GEN IS THE REVIEW CONTRACT. Every adopted plan gets a new gen
 //     (summary.gen). apply {gen} must name the gen the user looked at; a
@@ -136,8 +158,8 @@ const { labelPreview } = require("./chapter-labels");
 const { segmentProblem, spaceNeeded, AdbTransport, FolderTransport, shq } = require("./transports");
 const { WriteQueue, RecordStore, readJson, sweepTmp, newShardId } = require("./store");
 const { HashPool, workerCountFor } = require("./hash-pool");
-const { walkLibrary } = require("./pc-inventory");
-const { preparePlan } = require("./prepare");
+const { walkLibrary, pcSignature } = require("./pc-inventory");
+const { preparePlan, derivePlan, refreshPlan, loadView, verifyKeyOf } = require("./prepare");
 const { Executor, RunStop, policyFor, RESERVE_BYTES } = require("./executor");
 const { normalizeSeriesUrl } = require("../library");
 const mon = require("./monitor");
@@ -186,8 +208,8 @@ const TARGET_FIELDS = Object.freeze([
   "verifyMode", // the needs-mode answer (profiles.js STORED_VERIFY_MODES)
   "deletePolicy", // Removals (profiles.js DELETE_POLICIES; add-target stamps the global)
 ]);
-// Settings whose change alters what a plan offers: applySettings re-plans
-// every planned, connected target when one of them changes.
+// Settings whose change alters what a plan offers: applySettings re-derives
+// every planned target when one of them changes (syncHashMode: a full plan).
 const PLANNING_SETTINGS = Object.freeze(["syncDeletePolicy", "syncHashMode", "syncChapterPatterns", "syncSizeWarnPct"]);
 const DEPS = Object.freeze({
   ipcMain: "object",
@@ -315,6 +337,8 @@ function initDeviceSync(deps) {
   let busyTimer = null;
   let prewarmTimer = null;
   let replanTimer = null;
+  // notifyLibraryChanged reasons since the debounce began (service log only).
+  const libReasons = new Set();
   let discoverUntil = 0;
   let discoverTimer = null;
   let prewarm = { state: "idle", done: 0, total: 0, bytesDone: 0, bytesTotal: 0, at: null };
@@ -375,6 +399,19 @@ function initDeviceSync(deps) {
         lastPlan: null,
         autoHold: false,
         settleTimer: null,
+        // Cheap re-plans (grep _derive): Links not yet in the plan
+        // ({suggestionId, seriesKey, deviceFolder, binding, rebindShardId,
+        // dropShardId, bound}); a bind landed that rt.prep.view doesn't show; a derive
+        // owed when the running job ends; derives in flight, serialized.
+        links: [],
+        bindP: null,
+        recordChanged: false,
+        rederive: false,
+        deriving: 0,
+        deriveChain: Promise.resolve(),
+        // A needs-mode refusal's facts (_stripFacts): choosing a mode tops
+        // them up instead of preparing again.
+        needsModeFacts: null,
       };
       rts.set(id, r);
     }
@@ -383,11 +420,33 @@ function initDeviceSync(deps) {
 
   /** What `plans` events and get-state's plans[targetId] carry. */
   function _planView(id) {
-    const empty = { summary: null, refusal: null, stale: false, lastRun: null, gen: null, selSeq: null, lastPlan: null };
+    const empty = { summary: null, refusal: null, stale: false, updating: false, links: [], lastRun: null, gen: null, selSeq: null, lastPlan: null };
     if (!_target(id)) return { ...empty, removed: true };
     const rt = rts.get(id);
     if (!rt) return empty;
-    return { summary: rt.summary, refusal: rt.refusal, stale: rt.stale, lastRun: rt.lastRun, gen: rt.summary ? rt.gen : null, selSeq: rt.selSeq, lastPlan: rt.lastPlan };
+    const updating = _updating(rt);
+    return {
+      summary: rt.summary,
+      refusal: rt.refusal,
+      stale: rt.stale || updating,
+      updating: updating && !rt.stale,
+      links: rt.links.map((l) => ({ suggestionId: l.suggestionId, seriesKey: l.seriesKey, deviceFolder: l.deviceFolder, bound: !!l.bound })),
+      lastRun: rt.lastRun,
+      gen: rt.summary ? rt.gen : null,
+      selSeq: rt.selSeq,
+      lastPlan: rt.lastPlan,
+    };
+  }
+
+  /**
+   * A review decision is on its way into the plan: a derive owed or running,
+   * a Link not yet planned, a refresh queued or running. rt.stale (a full
+   * plan owed) is separate; the plan view's `stale` is either.
+   */
+  function _updating(rt) {
+    if (rt.rederive || rt.deriving > 0 || rt.links.length) return true;
+    if (current && current.targetId === rt.id && current.phase === "refresh") return true;
+    return jobs.snapshot().queue.some((q) => q.targetId === rt.id && q.kind === "refresh");
   }
 
   async function _loadConfig() {
@@ -632,7 +691,7 @@ function initDeviceSync(deps) {
       prompts.lostAdb();
       for (const k of connected.adb) autoBatches.delete(k);
       connected.adb.clear();
-      for (const d of devices) jobs.dropDevice(d.serial);
+      for (const d of devices) _dropQueued((q) => q.serial === d.serial, () => jobs.dropDevice(d.serial));
     }
     devices = rows || [];
     const live = new Map();
@@ -646,7 +705,8 @@ function initDeviceSync(deps) {
       connected.adb.delete(k);
       autoBatches.delete(k);
       prompts.disconnected(k);
-      jobs.dropDevice(k.slice(0, k.lastIndexOf("#")));
+      const serial = k.slice(0, k.lastIndexOf("#"));
+      _dropQueued((q) => q.serial === serial, () => jobs.dropDevice(serial));
     }
     for (const [k, v] of live) {
       if (connected.adb.has(k)) continue;
@@ -666,9 +726,25 @@ function initDeviceSync(deps) {
       connected.folder.delete(k);
       autoBatches.delete(k);
       prompts.disconnected(k);
-      jobs.dropTarget(id);
+      _dropQueued((q) => q.targetId === id, () => jobs.dropTarget(id));
     }
     emit("device", _devicePayload());
+  }
+
+  /**
+   * A disconnect drops queued jobs. A dropped refresh leaves a decision the
+   * plan doesn't show yet: the target is owed a full plan (rt.stale), which
+   * the reconnect's automatic plan delivers. Either way its `updating` changed.
+   */
+  function _dropQueued(pred, drop) {
+    const lost = jobs.snapshot().queue.filter(pred);
+    drop();
+    for (const q of lost) {
+      const rt = rts.get(q.targetId);
+      if (!rt) continue;
+      if (q.kind === "refresh") rt.stale = true;
+      _planChanged(q.targetId);
+    }
   }
 
   /**
@@ -990,6 +1066,11 @@ function initDeviceSync(deps) {
       let status = "completed";
       let summary = null;
       try {
+        // Every job binds the target's queued Links before its first
+        // store.load, so a bind never races the job's own record reads and
+        // writes (grep _bindLinks).
+        const brt = rts.get(spec.targetId);
+        if (brt) await _bindLinks(brt);
         const out = await fn(runId, ac.signal, transport, cfg);
         status = (out && out.status) || "completed";
         summary = (out && out.summary) || null;
@@ -1020,7 +1101,8 @@ function initDeviceSync(deps) {
 
   function _afterJob(job, status, summary) {
     const lrt = rts.get(job.targetId);
-    if (lrt && job.phase !== "plan") {
+    // A refresh tops up the current plan: the last apply/verify card stays.
+    if (lrt && job.phase !== "plan" && job.phase !== "refresh") {
       // The result outlives the re-plan this job queued (the job event's
       // summary is overwritten by the next begin). A verify's adopted plan
       // already went out as the summary; lastRun doesn't repeat it.
@@ -1033,6 +1115,22 @@ function initDeviceSync(deps) {
       // changes (_replanSoon / a connect / a manual plan): otherwise the
       // Sync tab re-asks forever after a Cancel or an internal failure.
       lrt.autoHold = status !== "completed";
+    }
+    if (lrt && job.phase === "refresh") {
+      if (status === "completed" && summary && summary.plan) {
+        // A plan is current again (a Link resolved, a needs-mode answered).
+        lrt.lastPlan = { runId: job.runId, status, auto: true, reason: null, at: now() };
+        lrt.autoHold = false;
+      } else if (status !== "completed" && !(summary && summary.refusal)) {
+        // The decision didn't land: a full plan is owed. A failure queues it
+        // (a failed plan then holds itself: autoHold, no loop); a cancel or
+        // a disconnect only marks it (Re-check, the reconnect's plan).
+        if (status === "failed") _replanSoon(job.targetId);
+        else {
+          lrt.stale = true;
+          if (status === "cancelled") lrt.autoHold = true;
+        }
+      }
     }
     _planChanged(job.targetId);
     // Prompt bookkeeping for automatic connect plans. Any plan of a waiting
@@ -1053,6 +1151,17 @@ function initDeviceSync(deps) {
       if (status === "completed" && prompts) _resolvePrompts(job.targetId);
       _refreshLibraryStatus();
     }
+    if (job.phase === "refresh" && status === "completed") {
+      if (prompts) _resolvePrompts(job.targetId);
+      _refreshLibraryStatus();
+    }
+    // A decision made while this job ran (config op, Link, setting) is
+    // derived now from whatever the job left; _deriveNow returns early when
+    // a full plan is owed (an apply/prune/rename queues one).
+    if (lrt && (lrt.rederive || lrt.links.some((l) => !l.bound))) {
+      lrt.rederive = false;
+      _derive(job.targetId);
+    }
     // A selection change made during this job on a header-less target.
     const srt = rts.get(job.targetId);
     if (srt && srt.selDeferred) _persistSelection(srt, job.targetId).catch((e) => _log("selection write", e && e.message));
@@ -1069,9 +1178,15 @@ function initDeviceSync(deps) {
       const t = _target(next.targetId);
       if (!t || !_isConnected(t)) {
         _batchDrop(next.targetId);
+        // Like _dropQueued: a decision that never got its refresh is owed a full plan.
+        const drt = next.kind === "refresh" ? rts.get(next.targetId) : null;
+        if (drt) {
+          drt.stale = true;
+          _planChanged(next.targetId);
+        }
         continue;
       }
-      const r = _startPlan(next.targetId, { auto: true });
+      const r = next.kind === "refresh" ? _startRefresh(next.targetId) : _startPlan(next.targetId, { auto: true });
       if (r.ok) return;
       _batchDrop(next.targetId);
     }
@@ -1163,7 +1278,20 @@ function initDeviceSync(deps) {
       executorDeps: T.executorDeps,
     });
     if (prep && prep.ok) prep.usedOpts = opts;
-    return prep;
+    return _stripFacts(rt, prep, opts);
+  }
+
+  /**
+   * A needs-mode refusal carries the prepare's facts (prepare.js, `prep`) so
+   * the chooser's answer can be a verify-only refresh. They stay here: a
+   * refusal goes to the renderer (rt.refusal, summary.refusal) and the facts
+   * hold Maps of every listing. grep needsModeFacts for the reader.
+   */
+  function _stripFacts(rt, r, opts) {
+    if (!r || r.ok !== false || !r.prep) return r;
+    const { prep: facts, ...refusal } = r;
+    rt.needsModeFacts = { ...facts, usedOpts: opts };
+    return refusal;
   }
 
   /**
@@ -1230,17 +1358,39 @@ function initDeviceSync(deps) {
     return s;
   }
 
-  /** Adopt a successful prepare as the target's current plan (a new gen). */
+  /** Adopt a full prepare as the target's current plan (a new gen). */
   function _adopt(rt, prep) {
+    return _adoptPlan(rt, prep, { full: true, freshView: true });
+  }
+
+  /**
+   * The one adopt path, full prepares and derived plans alike. Gen ALWAYS
+   * bumps: the series sheet and the review re-read only on a gen change
+   * (SeriesSheet.jsx seriesDetail effect, ReviewDialog.jsx), and the review
+   * hides its "plan changed" notice when the content is equal (reviewSig).
+   *   full       the plan measured everything: a full plan owed is paid
+   *              (rt.stale). A derived or refreshed plan never clears it.
+   *   freshView  prep.view was read from the store after the target's last
+   *              bind: the selection epoch rule applies, and the Links it
+   *              shows leave rt.links. A derived plan's view is the cached
+   *              one with the in-memory selection (_selView), so the
+   *              selection stays as it is.
+   */
+  function _adoptPlan(rt, prep, { full = false, freshView = false } = {}) {
     rt.prep = prep;
     rt.plan = prep.plan;
     rt.gen = ++genSeq;
     rt.refusal = null;
-    rt.stale = false;
-    const epoch = prep.view.epoch;
-    if (rt.selOps == null || rt.selEpoch !== epoch) rt.selOps = { ...(prep.view.selection.ops || {}) };
-    rt.selRebinds = { ...(prep.view.selection.rebinds || {}) };
-    rt.selEpoch = epoch;
+    rt.needsModeFacts = null;
+    if (full) rt.stale = false;
+    if (freshView) {
+      const epoch = prep.view.epoch;
+      if (rt.selOps == null || rt.selEpoch !== epoch) rt.selOps = { ...(prep.view.selection.ops || {}) };
+      rt.selRebinds = { ...(prep.view.selection.rebinds || {}) };
+      rt.selEpoch = epoch;
+      rt.recordChanged = false;
+      rt.links = rt.links.filter((l) => !l.bound);
+    }
     rt.summary = _summarize(rt);
     _armSettle(rt);
     _planChanged(rt.id);
@@ -1305,7 +1455,7 @@ function initDeviceSync(deps) {
         // needs-mode is a refusal the Sync tab answers (U2-1), not a failed run.
         if (v.status === "failed" && v.reason === "needs-mode") return _refused(rt, _needsMode(prep));
         if (v.status !== "completed") return { status: v.status, summary: { reason: v.reason } };
-        prep = await _prepare(rt, cfg, transport, signal, runId, opts);
+        prep = await _replanAfterVerify(rt, prep, v, { transport, signal, runId, cfg, verifyMode: opts.verifyMode });
         if (!prep.ok) return _refused(rt, prep);
       }
       return { status: "completed", summary: { plan: _adopt(rt, prep) } };
@@ -1384,7 +1534,40 @@ function initDeviceSync(deps) {
     }
     const m = transport.kind === "folder" || (prep.probe.caps && prep.probe.caps.sha256sum) ? "device-hash" : mode;
     if (!VERIFY_MODES.includes(m)) return { status: "failed", reason: "needs-mode" };
-    return _executor(rt, prep, transport, signal, runId).verify({ folders: list, mode: m, runId: String(runId) });
+    const ex = _executor(rt, prep, transport, signal, runId);
+    const v = await ex.verify({ folders: list, mode: m, runId: String(runId) });
+    // For _replanAfterVerify: the listings this verify merged against, and
+    // the folders it tried (prepare.js verifyAttempted keys).
+    v.listings = ex.verifyListings;
+    v.attempted = list.map((x) => verifyKeyOf(x));
+    return v;
+  }
+
+  /**
+   * The plan after an explicit Verify (the Verify job, a plan's
+   * verifyFirst): the first prepare's facts with the verified folders'
+   * fresh listings, topped up by refreshPlan in the same job (plan R11),
+   * instead of a second full prepare. A refresh that finds the cache wrong
+   * falls back to that full prepare. `verifyMode` is the job's one-shot
+   * mode. Returns a prep to adopt, or a refusal.
+   */
+  async function _replanAfterVerify(rt, prep, v, { transport, signal, runId, cfg, verifyMode }) {
+    const folders = new Map(prep.device.folders);
+    for (const [name, files] of v.listings || []) folders.set(name, { ok: true, files });
+    const after = { ...prep, device: { ...prep.device, folders }, verifyAttempted: new Set([...(prep.verifyAttempted || []), ...(v.attempted || [])]) };
+    const opts = _planOpts(cfg, { verifyMode });
+    const r = await refreshPlan({ ..._refreshDeps(rt, cfg, transport, signal, runId), prep: _withSel(rt, after), reloadView: true, opts });
+    if (r.ok) {
+      r.prep.usedOpts = { ...(prep.usedOpts || {}), verifyMode: opts.verifyMode };
+      return r.prep;
+    }
+    if (r.escalate) return _prepare(rt, cfg, transport, signal, runId, { verifyMode });
+    return _stripFacts(rt, r, opts);
+  }
+
+  /** refreshPlan's inputs every caller shares. */
+  function _refreshDeps(rt, cfg, transport, signal, runId) {
+    return { transport, store: rt.store, hashPool, target: cfg, settings, signal, onProgress: _progressOf(runId), runId, now, connectWaitMs: T.connectWaitMs, executorDeps: T.executorDeps };
   }
 
   // A run's result as jobs and lastRun carry it. `skipped` lists files and
@@ -1434,10 +1617,231 @@ function initDeviceSync(deps) {
     setImmediate(_pump);
   }
 
+  // ---------------------------------------------------------- cheap re-plans
+  //
+  // Plan sync-temp/plans/device-sync-cheap-replans.md; the service header's
+  // "DECISIONS WITHOUT FULL RE-PLANS" has the rules. prepare.js "cached
+  // facts" owns derivePlan / refreshPlan; this section decides WHEN.
+
+  /** `view` with the in-memory selection: buildPlan reads its rebinds. */
+  function _selView(rt, view) {
+    return { ...view, selection: { ops: rt.selOps || {}, rebinds: rt.selRebinds || {} } };
+  }
+
+  function _withSel(rt, prep) {
+    return { ...prep, view: _selView(rt, prep.view) };
+  }
+
+  /**
+   * Write the queued Links (rt.links, bound:false) into the record. Single
+   * flight per target: a job's start awaits a bind _deriveNow began, and a
+   * Link queued while one runs is taken by its next pass. Callers make sure
+   * no job of the target is past its start (the job start itself, or
+   * _deriveNow outside a job). A target never applied to gets its
+   * identity-only header first; a selection change deferred for want of one
+   * (selDeferred) is written under it, so the adopt keeps it.
+   */
+  function _bindLinks(rt) {
+    if (rt.bindP) return rt.bindP;
+    if (!rt.links.some((l) => !l.bound)) return Promise.resolve(false);
+    rt.bindP = (async () => {
+      let bound = false;
+      for (;;) {
+        const todo = rt.links.filter((l) => !l.bound);
+        if (!todo.length) return bound;
+        const t = _target(rt.id);
+        const prep = rt.prep;
+        if (!t || !prep) {
+          rt.links = [];
+          return bound;
+        }
+        // Against the record as it is: a click validated against the plan
+        // must not give a folder or a series a second shard.
+        const l0 = await rt.store.load();
+        const hadEpoch = rt.store.epoch;
+        const ex = new Executor({ transport: { kind: t.kind }, store: rt.store, target: prep.target, settings, probe: prep.probe, view: prep.view, now });
+        await ex.ensureHeader();
+        if (!hadEpoch && rt.store.epoch) {
+          rt.selEpoch = rt.store.epoch;
+          if (rt.selOps || rt.selDeferred) await rt.store.writeSelection({ ops: rt.selOps || {}, rebinds: rt.selRebinds || {} });
+          rt.selDeferred = false;
+        }
+        const ci = !l0.header || l0.header.caseInsensitive !== false;
+        const fold = (n) => (ci ? String(n).toLowerCase() : String(n));
+        for (const l of todo) {
+          // The shards this Link replaces (H.link: the orphaned folder's,
+          // the gone series') are no clash; any other is a bind that landed
+          // since the click.
+          const mine = (sh) => sh.shardId === l.rebindShardId || sh.shardId === l.dropShardId;
+          const clash = l0.shards.find((sh) => !mine(sh) && (fold(sh.name) === fold(l.deviceFolder) || (l.binding && l.binding.identityKey && sh.identityKey === l.binding.identityKey)));
+          if (clash) {
+            _log("link dropped: the record already binds", clash.shardId);
+            rt.links = rt.links.filter((x) => x !== l);
+            continue;
+          }
+          // Delete before the bind: a crash between the two leaves the
+          // series unlinked (the suggestion shows again), never holding two
+          // shards on one target.
+          if (l.dropShardId) await rt.store.deleteShard(l.dropShardId);
+          // The kept shard is rewritten in place (store.bindFolder), so the
+          // folder's name is never claimed by two shards.
+          l.shardId = await rt.store.bindFolder({ name: l.deviceFolder, binding: l.binding, shardId: l.rebindShardId || newShardId() });
+          l.bound = true;
+          rt.recordChanged = true;
+          bound = true;
+        }
+      }
+    })().finally(() => {
+      rt.bindP = null;
+    });
+    return rt.bindP;
+  }
+
+  /**
+   * A review decision changed this target's derivation inputs (config, a
+   * Link, a rebind, a planning setting): re-derive its plan. Serialized per
+   * target; resolves when this derive is done (a refresh it asks for runs
+   * later, as a job). Never throws.
+   */
+  function _derive(targetId) {
+    const rt = rts.get(targetId);
+    if (!rt) {
+      if (_target(targetId)) _replanSoon(targetId);
+      return Promise.resolve();
+    }
+    rt.deriving += 1;
+    _planChanged(targetId);
+    const run = rt.deriveChain
+      .then(() => _deriveNow(rt))
+      .catch((e) => _log("derive", e && e.stack))
+      .finally(() => {
+        rt.deriving -= 1;
+        _planChanged(targetId);
+      });
+    rt.deriveChain = run;
+    return run;
+  }
+
+  async function _deriveNow(rt) {
+    const id = rt.id;
+    const live = () => started && rts.get(id) === rt && !!_target(id);
+    // A running job of the target holds the record and owns the adopt: the
+    // derive runs when it ends (_afterJob).
+    const deferred = () => {
+      if (!_jobOn(id)) return false;
+      rt.rederive = true;
+      return true;
+    };
+    if (!live() || deferred()) return;
+    if (rt.links.some((l) => !l.bound)) {
+      try {
+        await _bindLinks(rt);
+      } catch (e) {
+        // A record write that failed: those Links are dropped, not retried
+        // forever; the row shows its suggestion again.
+        _log("link bind", e && e.message);
+        rt.links = rt.links.filter((l) => l.bound);
+      }
+      if (!live() || deferred()) return;
+    }
+    if (!rt.prep) return _replanSoon(id);
+    // R8: a full plan is owed (library change, settle, an apply); it reads
+    // the new config itself, and a derived adopt must not look current.
+    // _replanSoon queues it if nothing has (a cancelled refresh, a drop on
+    // disconnect), so the decision is never left waiting on a Re-check.
+    if (rt.stale) return _replanSoon(id);
+    const t = _target(id);
+    const cfg = _cfg(t);
+    let source = rt.prep;
+    if (rt.refusal) {
+      // Only a needs-mode refusal has facts to derive from; any other
+      // refusal is about the device or the record, which a full plan re-reads.
+      if (rt.refusal.code !== "needs-mode" || !rt.needsModeFacts) return _replanSoon(id);
+      source = rt.needsModeFacts;
+    } else if (!rt.summary) return _replanSoon(id);
+    let view = source.view;
+    let freshView = false;
+    if (rt.recordChanged) {
+      // A bind the cached view doesn't show: read the record here (disk
+      // only; no job of the target runs, `deferred` re-checks after the
+      // await). The Link then shows as needs-verify at once, and a device
+      // that can't hash refuses needs-mode before any job (plan §1).
+      view = await loadView(rt.store, source, cfg);
+      if (!live() || deferred()) return;
+      freshView = true;
+    }
+    const opts = _planOpts(cfg, {});
+    const d = derivePlan({ prep: source, view: _selView(rt, view), target: cfg, settings, verifyMode: opts.verifyMode, now });
+    if (d.ok === false) {
+      if (d.code !== "needs-mode") return _replanSoon(id);
+      _refused(rt, _stripFacts(rt, d, opts));
+      return;
+    }
+    d.prep.usedOpts = { ...(source.usedOpts || {}), verifyMode: opts.verifyMode };
+    if (d.pending) {
+      // A stat or a hash is missing: the plan isn't shown until it lands. A
+      // target that is away is owed a full plan; its reconnect plans anyway.
+      if (_isConnected(t)) return _requestRefresh(id);
+      rt.stale = true;
+      _planChanged(id);
+      return;
+    }
+    // Only verifies missing: an honest interim plan (needs-verify rows, no
+    // pre-selected deletes, planner.js header) while the refresh runs.
+    _adoptPlan(rt, d.prep, { freshView });
+    if (d.obligations.verify.length && _isConnected(t)) _requestRefresh(id);
+  }
+
+  /** Queue a refresh of this target behind the current job. */
+  function _requestRefresh(targetId) {
+    const t = _target(targetId);
+    if (!t) return;
+    if (_jobOn(targetId)) {
+      _rt(targetId).rederive = true;
+    } else if (_isConnected(t)) {
+      jobs.enqueueAuto({ targetId, serial: t.serial || null, kind: "refresh" });
+      setImmediate(_pump);
+    }
+    _planChanged(targetId);
+  }
+
+  /**
+   * The refresh job: bind (the job start), then only the facts the
+   * derivation is missing (prepare.js refreshPlan), then adopt. A refresh
+   * never queues another refresh: what it couldn't settle becomes a full
+   * plan (escalate) or a warning. With no facts to start from (or a full
+   * plan owed) it prepares in full instead.
+   */
+  function _startRefresh(targetId) {
+    const t = _target(targetId);
+    return _runJob({ phase: "refresh", targetId, serial: t.serial, auto: true }, async (runId, signal, transport, cfg) => {
+      const rt = _rt(targetId);
+      const nm = rt.refusal && rt.refusal.code === "needs-mode" ? rt.needsModeFacts : null;
+      const source = nm || (rt.summary ? rt.prep : null);
+      if (!source || rt.stale) {
+        const prep = await _prepare(rt, cfg, transport, signal, runId, {});
+        if (!prep.ok) return _refused(rt, prep);
+        return { status: "completed", summary: { plan: _adopt(rt, prep) } };
+      }
+      const opts = _planOpts(cfg, {});
+      const r = await refreshPlan({ ..._refreshDeps(rt, cfg, transport, signal, runId), prep: _withSel(rt, source), reloadView: rt.recordChanged, opts });
+      if (r.ok === false && r.escalate) {
+        // The cache is what's wrong (a folder the cached root listing left
+        // out): plan in full, next in the lane.
+        _replanSoon(targetId);
+        return { status: "completed", summary: { escalated: r.escalate, folder: r.folder || null } };
+      }
+      if (r.ok === false) return _refused(rt, _stripFacts(rt, r, opts));
+      r.prep.usedOpts = { ...(source.usedOpts || {}), verifyMode: opts.verifyMode };
+      return { status: "completed", summary: { plan: _adoptPlan(rt, r.prep, { freshView: !!r.viewReloaded }), warnings: (r.warnings || []).slice(0, 50) } };
+    });
+  }
+
   // ---------------------------------------------------------- library status
 
-  async function _computeLibraryStatus() {
-    const pc = await walkLibrary(deps.getLibraryRoot());
+  /** `walk`: a library walk already made (_afterLibraryChange shares its own). */
+  async function _computeLibraryStatus(walk) {
+    const pc = walk || (await walkLibrary(deps.getLibraryRoot()));
     const bySeries = {};
     if (!pc.ok) return { asOf: now(), bySeries, error: pc.error };
     for (const s of pc.series) for (const f of s.files) f.sha256 = hashPool ? hashPool.lookup(f.path, f.size, f.mtimeNs) : null;
@@ -1452,9 +1856,37 @@ function initDeviceSync(deps) {
     return { asOf: now(), bySeries };
   }
 
-  function _refreshLibraryStatus() {
+  /**
+   * A library change was announced (notifyLibraryChanged: a download, a
+   * scan, a delete, a merge, a metadata edit). Walks the library once and
+   * re-plans in full only the targets whose plan was built from a different
+   * library (pc-inventory.js pcSignature against prep.pc): a scan that only
+   * read the library, such as the Sync tab's cover scan on open, changes
+   * nothing and must not re-plan. A plan with no library snapshot to compare
+   * (a refusal other than needs-mode, a walk that failed) re-plans as before.
+   * The walk also feeds the library status.
+   */
+  async function _afterLibraryChange(reasons) {
+    const walk = await walkLibrary(deps.getLibraryRoot());
     if (!started) return;
-    _computeLibraryStatus().then(
+    const sig = pcSignature(walk);
+    const replanned = [];
+    for (const t of _targets()) {
+      const rt = rts.get(t.id);
+      if (!_isConnected(t) || !rt || !rt.plan) continue;
+      const facts = rt.refusal ? (rt.refusal.code === "needs-mode" ? rt.needsModeFacts : null) : rt.prep;
+      if (sig != null && facts && pcSignature(facts.pc) === sig) continue;
+      _replanSoon(t.id);
+      replanned.push(t.id);
+    }
+    slog.event("library-change", { reasons, replanned });
+    _refreshLibraryStatus(walk);
+    _schedulePrewarm(0);
+  }
+
+  function _refreshLibraryStatus(walk) {
+    if (!started) return;
+    _computeLibraryStatus(walk).then(
       (s) => {
         // A walk that outlived a stop describes a library sync no longer watches.
         if (!started) return;
@@ -1586,6 +2018,11 @@ function initDeviceSync(deps) {
     rt.prep = rt.plan = rt.summary = rt.refusal = rt.gen = null;
     rt.selOps = null;
     rt.selRebinds = {};
+    // Links and cached facts belong to the old identity's record.
+    rt.links = [];
+    rt.recordChanged = false;
+    rt.rederive = false;
+    rt.needsModeFacts = null;
     // A new identity owes nothing to the old one's failed plan or settle
     // countdown; config-op's _replanSoon then plans it if it is reachable.
     rt.autoHold = false;
@@ -1633,10 +2070,10 @@ function initDeviceSync(deps) {
     if (errors.length) return refuse("invalid", errors[0].message, { errors });
     const identity = profiles.recordIdentityChanged(_cfg(t), _cfg(next));
     if (identity && _jobOn(t.id)) return refuse("busy", "that target's job is running");
-    // replan either way: an identity edit clears the record, and a target
-    // re-pointed at a root it can reach must plan again (review R10: with
-    // replan:false a target whose last plan failed stayed autoHold forever).
-    return { next: { ...config, targets: _targets().map((x) => (x.id === t.id ? next : x)) }, after: identity ? () => _identityClear(t.id, _cfg(next)) : null, targetId: t.id, replan: true };
+    // An identity edit clears the record and must plan in full (review R10:
+    // with no re-plan a target whose last plan failed stayed autoHold
+    // forever); any other field only changes the derivation (_derive).
+    return { next: { ...config, targets: _targets().map((x) => (x.id === t.id ? next : x)) }, after: identity ? () => _identityClear(t.id, _cfg(next)) : null, targetId: t.id, replan: identity ? "full" : "derive" };
   };
 
   OPS["remove-target"] = async (p) => {
@@ -1661,7 +2098,7 @@ function initDeviceSync(deps) {
     const t = _target(p.targetId);
     if (!t) return refuse("invalid", "unknown target");
     if (_jobOn(t.id)) return refuse("busy", "that target's job is running");
-    return { next: null, after: () => _identityClear(t.id, _cfg(t)), targetId: t.id, replan: true };
+    return { next: null, after: () => _identityClear(t.id, _cfg(t)), targetId: t.id, replan: "full" };
   };
 
   OPS["set-adb-path"] = async (p) => {
@@ -1826,12 +2263,16 @@ function initDeviceSync(deps) {
     if (r.patch) {
       const t = _target(p.targetId);
       const next = { ...t, ...r.patch };
-      r = { next: { ...config, targets: _targets().map((x) => (x.id === t.id ? next : x)) }, targetId: t.id, replan: true };
+      r = { next: { ...config, targets: _targets().map((x) => (x.id === t.id ? next : x)) }, targetId: t.id, replan: "derive" };
     }
     if (r.next) await _saveConfig(r.next);
     if (r.after) await r.after();
     if (r.next) emit("config", { config: _publicConfig() });
-    if (r.targetId && r.replan) _replanSoon(r.targetId);
+    // `replan`: "full" (the cache is invalid: identity, forget-record) or
+    // "derive" (a review decision; plan device-sync-cheap-replans.md).
+    // Not awaited: the reply is the config, and a derive is never refused.
+    if (r.targetId && r.replan === "derive") _derive(r.targetId);
+    else if (r.targetId && r.replan) _replanSoon(r.targetId);
     return { ok: true, config: _publicConfig(), ...(r.targetId && p.op === "add-target" ? { targetId: r.targetId } : {}) };
   }
 
@@ -2018,11 +2459,12 @@ function initDeviceSync(deps) {
       // name it, so a toggle that lands after the review was read can't
       // ride on its Start (review R6).
       selSeq: rt.selSeq,
-      stale: rt.stale,
+      stale: rt.stale || _updating(rt),
       capacity: _capacity(rt, sel),
       policy: _policyOf(rt),
       warnings: rt.summary.warnings,
-      busy: !!current && current.targetId === p.targetId && QUIT_ASK_PHASES.has(current.phase),
+      // A refresh is about to replace this plan: Start is gated, not refused (R18).
+      busy: !!current && current.targetId === p.targetId && (QUIT_ASK_PHASES.has(current.phase) || current.phase === "refresh"),
     };
   };
 
@@ -2047,20 +2489,9 @@ function initDeviceSync(deps) {
       if (!r.ok) return r;
       rt.selRebinds = r.rebinds;
       await _persistSelection(rt, p.targetId);
-      // Re-plan from the cached input: the folder name is part of every op id.
-      const prep = rt.prep;
-      const view = { ...prep.view, selection: { ops: rt.selOps || {}, rebinds: rt.selRebinds } };
-      const plan = planner.buildPlan({ target: prep.target, settings, pc: prep.pc, device: prep.device, view, opts: { ...prep.planOpts, now: now() } });
-      if (plan.ok === false) return plan;
-      if (plan.needsProbe.some((n) => !prep.planOpts.nameProbe.has(n))) {
-        _replanSoon(p.targetId);
-      } else {
-        // A new plan (the folder name is in every op id): a new gen.
-        rt.plan = plan;
-        rt.prep = { ...prep, plan, view };
-        rt.gen = ++genSeq;
-        rt.summary = _summarize(rt);
-      }
+      // The folder name is part of every op id: a derived plan, a new gen.
+      // A name never probed tops up as a stat-only refresh.
+      await _derive(p.targetId);
     } else {
       const r = planner.changeSelection(rt.plan, rt.selOps, p);
       if (!r.ok) return r;
@@ -2082,7 +2513,7 @@ function initDeviceSync(deps) {
       massDelete: ev.massDelete,
       massRepush: ev.massRepush,
       changedSeries,
-      stale: rt.stale,
+      stale: rt.stale || _updating(rt),
     };
   };
 
@@ -2108,7 +2539,7 @@ function initDeviceSync(deps) {
       const v = await _verifyFolders(rt, prep, transport, signal, runId, mode, folders);
       if (v.status === "failed" && v.reason === "needs-mode") return _refused(rt, _needsMode(prep));
       if (v.status !== "completed") return { status: v.status, summary: _runSummary(v) };
-      prep = await _prepare(rt, cfg, transport, signal, runId, { verifyMode: vopts.verifyMode });
+      prep = await _replanAfterVerify(rt, prep, v, { transport, signal, runId, cfg, verifyMode: vopts.verifyMode });
       if (!prep.ok) return _refused(rt, prep);
       return { status: "completed", summary: { ..._runSummary(v), plan: _adopt(rt, prep) } };
     });
@@ -2133,6 +2564,8 @@ function initDeviceSync(deps) {
     // After the await: a rebind may have swapped the plan meanwhile.
     const changed = _genMismatch(rt, p.gen);
     if (changed) return changed;
+    // A Link or a decision not in this plan yet: the review is about to change.
+    if (_updating(rt)) return refuse("blocked", "the plan is being updated", { blocking: [{ kind: "plan-changed", gen: rt.gen }] });
     // Optional so in-process callers needn't track it; the renderer always sends it.
     if (p.selSeq !== undefined && p.selSeq !== rt.selSeq) {
       return refuse("blocked", "the selection changed since the review", { blocking: [{ kind: "plan-changed", gen: rt.gen }] });
@@ -2239,17 +2672,22 @@ function initDeviceSync(deps) {
     });
   };
 
+  // A queued bind (service header, LINK): validated now against the plan
+  // AND the Links it doesn't show yet, so two clicks during a job can't give
+  // a folder or a series two shards (R2). Bound by _bindLinks, planned by
+  // the refresh _derive asks for.
   H.link = async (p) => {
     const t = _target(p.targetId);
     if (!t) return refuse("invalid", "unknown target");
-    if (current) return refuse("busy", "another sync job is running", { job: jobs.snapshot().job });
+    // An apply/prune/rename holds its op list (the selection-lock rule).
+    if (current && current.targetId === t.id && QUIT_ASK_PHASES.has(current.phase)) return refuse("busy", "that target's sync is running", { job: jobs.snapshot().job });
     const rt = rts.get(t.id);
     if (!rt || !rt.plan) return refuse("invalid", "plan this target first");
     const ids = Array.isArray(p.suggestionIds) ? p.suggestionIds.map(String) : [];
     if (!ids.length) return refuse("invalid", "suggestionIds required");
     const picks = [];
-    const folders = new Set();
-    const series = new Set();
+    const folders = new Set(rt.links.map((l) => l.deviceFolder));
+    const series = new Set(rt.links.map((l) => l.seriesKey));
     for (const id of ids) {
       const g = rt.plan.suggestions.find((x) => x.id === id);
       if (!g) return refuse("invalid", `unknown suggestion ${id}`);
@@ -2260,17 +2698,29 @@ function initDeviceSync(deps) {
       series.add(g.seriesKey);
       picks.push({ g, sp });
     }
-    const ex = new Executor({ transport: { kind: t.kind }, store: rt.store, target: rt.prep.target, settings, probe: rt.prep.probe, view: rt.prep.view, now });
-    await ex.ensureHeader();
-    const linked = [];
     for (const { g, sp } of picks) {
-      // A gone series' shard is rebound in place (store.bindFolder), so a
-      // series never holds two shards on one target.
-      const shardId = await rt.store.bindFolder({ name: g.deviceFolder, binding: sp.binding, shardId: sp.state === "gone" ? sp.shardId : newShardId() });
-      linked.push({ suggestionId: g.id, seriesKey: g.seriesKey, deviceFolder: g.deviceFolder, shardId });
+      // A folder the record already names (orphaned: its series left the
+      // library) keeps its shard, rebound to this series; a gone series'
+      // own shard is then dropped, so one folder has one shard and one
+      // series has one shard. Otherwise a gone series' shard is rebound, or
+      // a new one made. (planner.js deviceOnly state "orphaned"; grep
+      // dropShardId)
+      const du = rt.plan.deviceOnly.find((d) => d.name === g.deviceFolder);
+      const orphan = du && du.state === "orphaned" && du.shardId ? du.shardId : null;
+      const gone = sp.state === "gone" ? sp.shardId : null;
+      rt.links.push({
+        suggestionId: g.id,
+        seriesKey: g.seriesKey,
+        deviceFolder: g.deviceFolder,
+        binding: sp.binding,
+        rebindShardId: orphan || gone,
+        dropShardId: orphan && gone && gone !== orphan ? gone : null,
+        bound: false,
+      });
     }
-    _replanSoon(t.id);
-    return { ok: true, linked };
+    // Binds now unless a job of the target runs; never touches the device.
+    await _derive(t.id);
+    return { ok: true, queued: true, linked: picks.map(({ g }) => ({ suggestionId: g.id, seriesKey: g.seriesKey, deviceFolder: g.deviceFolder })) };
   };
 
   // Review opens the Sync tab on the prompt's targets (renderer side);
@@ -2430,7 +2880,10 @@ function initDeviceSync(deps) {
         if (was && enabled && started) {
           const same = (k) => JSON.stringify(prev[k]) === JSON.stringify(next[k]);
           if (!PLANNING_SETTINGS.every(same)) {
-            for (const t of _targets()) if (rts.get(t.id) && rts.get(t.id).plan) _replanSoon(t.id);
+            // Hash mode changes what the cached hashes mean: plan in full.
+            // The others only change the derivation (R14).
+            const full = !same("syncHashMode");
+            for (const t of _targets()) if (rts.get(t.id) && rts.get(t.id).plan) (full ? _replanSoon(t.id) : _derive(t.id));
           }
         }
         if (was && !enabled) {
@@ -2457,11 +2910,12 @@ function initDeviceSync(deps) {
         if (!started) return;
         libStatus = null;
         clearTimeout(replanTimer);
+        libReasons.add(String(reason || "unknown"));
         replanTimer = setTimeout(() => {
           replanTimer = null;
-          for (const t of _targets()) if (_isConnected(t) && rts.get(t.id) && rts.get(t.id).plan) _replanSoon(t.id);
-          _refreshLibraryStatus();
-          _schedulePrewarm(0);
+          const reasons = [...libReasons];
+          libReasons.clear();
+          _afterLibraryChange(reasons).catch((e) => _log("library change", e && e.stack));
         }, T.replanDebounceMs != null ? T.replanDebounceMs : REPLAN_DEBOUNCE_MS);
         if (replanTimer.unref) replanTimer.unref();
       } catch (e) {

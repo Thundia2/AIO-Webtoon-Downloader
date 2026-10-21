@@ -231,10 +231,73 @@ export function etaMs(progress, rate) {
   return left > 0 ? (left / rate) * 1000 : 0;
 }
 
-/** The running job on this target, by kind, or null. */
+/**
+ * The running job on this target, by kind, or null. `planning` is a full
+ * plan (or a Verify job, which prepares too); `refreshing` is the automatic
+ * top-up after a review decision (service.js _startRefresh), which leaves
+ * the shown plan in place.
+ */
 export function jobOn(job, targetId) {
   if (!job || job.state !== "running" || job.targetId !== targetId) return null;
-  return { job, writing: WRITING_PHASES.has(job.phase), planning: job.phase === "plan" || job.phase === "verify" };
+  return { job, writing: WRITING_PHASES.has(job.phase), planning: job.phase === "plan" || job.phase === "verify", refreshing: job.phase === "refresh" };
+}
+
+// ── Decisions without full re-plans (plan sync-temp/plans/device-sync-cheap-replans.md §7) ──
+// The plan view (service.js _planView) carries `links`: Links the shown plan
+// doesn't reflect yet, bound to the record or still queued behind a job.
+// `updating` is a decision on its way in (a derive or a refresh), as opposed
+// to `stale` alone, a full plan owed (`stale` is true for either).
+
+/** {folders, series}: Sets of the device folders and series keys with a Link in flight. */
+export function linkIndex(pv) {
+  const folders = new Set();
+  const series = new Set();
+  for (const l of (pv && Array.isArray(pv.links) && pv.links) || []) {
+    if (l && typeof l.deviceFolder === "string") folders.add(l.deviceFolder);
+    if (l && typeof l.seriesKey === "string") series.add(l.seriesKey);
+  }
+  return { folders, series };
+}
+
+/**
+ * The transient state a series row shows in place of its planner badge, or
+ * null (copy.js LIVE_STATE_COPY words it):
+ *   linking         a Link of this series isn't in the plan yet
+ *   verifying       needs-verify while a decision is landing (the refresh
+ *                   that Link asked for checks the folder)
+ *   verify-offline  needs-verify with the target away; the reconnect's plan
+ *                   checks it
+ * needs-verify with neither is a check that failed or wasn't asked for: the
+ * planner's own "Needs a check" stays.
+ */
+export function liveState(row, { links, updating, refreshing, connected } = {}) {
+  if (!row) return null;
+  if (links && links.series.has(row.seriesKey)) return "linking";
+  if (row.state !== "needs-verify") return null;
+  if (!connected) return "verify-offline";
+  return updating || refreshing ? "verifying" : null;
+}
+
+/**
+ * The selection dock's status line {kind: busy|settle|ok, text} or null.
+ * A full plan (a plan or Verify job running, or one owed) outranks a
+ * decision landing: the full plan carries the decision too.
+ */
+export function dockStatus({ run, pv, settle, otherRunning, summary, tn }) {
+  if (run && run.planning) return { kind: "busy", text: `Planning ${tn}…` };
+  if (pv && pv.stale && !pv.updating) return { kind: "busy", text: "Something changed; re-planning…" };
+  if (run && run.refreshing) {
+    const p = run.job.progress || {};
+    const folder = p.current && p.current.folder;
+    if (p.step === "verify" && folder) return { kind: "busy", text: `Updating the plan: checking ${folder} on ${tn}…` };
+    if (p.step === "hashing") return { kind: "busy", text: "Updating the plan: fingerprinting PC files…" };
+    return { kind: "busy", text: "Updating the plan…" };
+  }
+  if (pv && pv.updating) return { kind: "busy", text: "Updating the plan…" };
+  if (settle) return { kind: "settle", text: settleLine(settle) };
+  if (otherRunning) return { kind: "busy", text: "Another target's sync is running; Start waits for it." };
+  if (summary) return { kind: "ok", text: `Plan ${pv.gen} · built ${clock(summary.asOf)}` };
+  return null;
 }
 
 /**
@@ -398,9 +461,10 @@ export function lossAcked(acks, l) {
  * viewSelSeq: the pushed plan view's selSeq; a review answered before the
  * latest selection change landed (review.selSeq behind it) can't start
  * (U2-11, review R6). changedNotice: an undismissed "the plan changed"
- * notice (R7).
+ * notice (R7). updating: the plan view's `updating` (a decision landing, no
+ * full plan owed), which words a stale gate "updating" instead.
  */
-export function reviewGate(review, acks, { stale, settled, busy, viewGen, viewSelSeq, changedNotice } = {}) {
+export function reviewGate(review, acks, { stale, updating, settled, busy, viewGen, viewSelSeq, changedNotice } = {}) {
   if (!review || !review.ok) return { left: 0, canStart: false, why: "loading" };
   const a = acks || {};
   let left = 0;
@@ -410,7 +474,9 @@ export function reviewGate(review, acks, { stale, settled, busy, viewGen, viewSe
   const files = workCount(review.totals);
   const selBehind = viewSelSeq != null && review.selSeq !== viewSelSeq;
   const why = stale || review.stale
-    ? "stale"
+    ? updating
+      ? "updating"
+      : "stale"
     : busy || review.busy
       ? "busy"
       : !settled

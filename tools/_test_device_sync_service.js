@@ -1131,13 +1131,20 @@ test("adb: attached device → automatic plan → prompt; list/browse; Link a co
     assert.strictEqual(sug.tier, "content");
     assert.ok(det.rows.filter((x) => x.opId && x.opId.startsWith("push:")).every((x) => !x.preselected), "a strong match unticks the pushes");
     assert.ok((await a.call("prompt-response", { promptId: shown.prompt.promptId, action: "not-now" })).ok);
-    // Link: binds, then the queued re-plan verifies the folder and finds it in sync.
+    // Link: binds, then a refresh (not a full plan) verifies that one folder
+    // and finds it in sync (plan device-sync-cheap-replans.md).
     const from = a.since();
+    const log0 = a.srv.log.length;
     const lk = await a.call("link", { targetId: id, suggestionIds: [sug.id] });
-    assert.ok(lk.ok, JSON.stringify(lk));
+    assert.ok(lk.ok && lk.queued, JSON.stringify(lk));
     assert.strictEqual(lk.linked[0].deviceFolder, "Mu Old Name");
-    await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, from, "re-plan after link");
+    const rf = await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "refresh", 15000, from, "refresh after link");
+    assert.strictEqual(rf.status, "completed", JSON.stringify(rf.summary));
     await a.idle();
+    assert.ok(!a.events.slice(from).some((e) => e.kind === "job" && e.job && e.job.phase === "plan"), "no full plan after a Link");
+    const syncReqs = a.srv.log.slice(log0).filter((e) => e.kind === "sync" && e.id !== "QUIT");
+    assert.ok(!syncReqs.some((e) => e.path === CANON || e.path === `${CANON}/`), `the root is never listed again: ${JSON.stringify(syncReqs.map((e) => [e.id, e.path]))}`);
+    assert.ok(syncReqs.every((e) => e.path.startsWith(`${CANON}/Mu Old Name`)), `only the linked folder is read: ${JSON.stringify(syncReqs.map((e) => [e.id, e.path]))}`);
     const after = (await a.summary(id)).series.find((s) => s.folder === "Mu");
     assert.strictEqual(after.deviceFolder, "Mu Old Name");
     assert.strictEqual(after.counts.push || 0, 0, JSON.stringify(after.counts));
@@ -1578,6 +1585,8 @@ test("U0b removals are a target field: add-target stamps the global, a later glo
     const p = await a.plan(id);
     assert.strictEqual(p.summary.plan.totals.delete.count, 0);
     const gen0 = p.summary.plan.gen;
+    // A real change: a scan that finds nothing new doesn't re-plan.
+    series(a.lib, "Zz Lib Change", { "Ch.001.cbz": 700 });
     a.svc.notifyLibraryChanged("scan");
     await waitFor(() => a.events.some((e) => e.kind === "plans" && e.targetId === id && e.gen > gen0), 15000, "auto re-plan");
     await a.idle();
@@ -1622,9 +1631,13 @@ test("U0b remove from target: a saved mark survives re-plans, goes through Revie
     await a.idle();
     // An automatic re-plan (a library change) keeps the pending removal.
     const gen0 = (await a.state()).plans[id].gen;
+    // A real change: a scan that finds nothing new doesn't re-plan.
+    series(a.lib, "Zz Lib Change", { "Ch.001.cbz": 700 });
     a.svc.notifyLibraryChanged("scan");
     await waitFor(() => a.events.some((e) => e.kind === "plans" && e.targetId === id && e.gen > gen0), 15000, "auto re-plan");
     await a.idle();
+    // Gone again before the apply, so the record keeps only this test's shards.
+    fs.rmSync(path.join(a.lib, "Zz Lib Change"), { recursive: true });
     const sum = await a.summary(id);
     const rho = sum.series.find((s) => s.seriesKey === rhoKey);
     assert.deepStrictEqual([rho.state, rho.heldReason, rho.removing], ["held", "excluded", true]);
@@ -1674,6 +1687,7 @@ test("U0 needs-mode: a stored verifyMode lets automatic plans of a non-hashing d
     const id = t.targetId;
     const auto = await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, 0, "auto plan");
     assert.strictEqual(auto.summary.refusal && auto.summary.refusal.code, "needs-mode", JSON.stringify(auto.summary));
+    assert.ok(!("prep" in auto.summary.refusal), "prepare's facts never reach the renderer (service.js _stripFacts)");
     await a.idle();
     assertRefusal(await a.call("config-op", { op: "update-target", targetId: id, patch: { verifyMode: "bogus" } }), "invalid");
     const from = a.since();
@@ -2343,6 +2357,616 @@ test("R3/R11 apply refuses a stale selSeq; cancel ignores another job's runId; s
     const v = await lastPlans(a, id, from);
     assert.ok(v && !v.summary, `expected no summary once the root is gone: ${JSON.stringify(v && v.refusal)}`);
     assertRefusal(await a.call("set-selection", { targetId: id, gen: s0.gen, seq: 6, changes: [] }), "invalid");
+  } finally {
+    await a.close();
+  }
+});
+
+
+// ---------------------------------------------------------------- cheap re-plans (P2)
+//
+// Plan sync-temp/plans/device-sync-cheap-replans.md: a review decision
+// re-derives the plan from cached facts; only missing facts reach the device,
+// in an automatic `refresh` job. The engine-level equivalence (derived =
+// fresh prepare) is tools/_test_device_sync_exec.js; these drive the service.
+
+const { FolderTransport, AdbTransport } = require(path.join(SYNC, "transports.js"));
+const { RecordStore } = require(path.join(SYNC, "store.js"));
+const { HashPool } = require(path.join(SYNC, "hash-pool.js"));
+const DEVICE_METHODS = ["probe", "stat", "listRoot", "listFolder", "listRootDirsAlt", "readSmall", "hashFolder", "storage", "freeSpace"];
+
+/**
+ * Count device calls (both transports' prototypes) and record loads while
+ * active. `calls` keeps [method, firstArg]. restore() before asserting.
+ */
+function spy() {
+  const counts = {};
+  const calls = [];
+  const undo = [];
+  const wrap = (proto, name, key) => {
+    const orig = proto[name];
+    if (typeof orig !== "function") return;
+    proto[name] = function (...args) {
+      counts[key] = (counts[key] || 0) + 1;
+      // A record load keeps its caller, so an unexpected one names itself.
+      calls.push([key, key === "store.load" ? new Error().stack.split(/\r?\n/).slice(2, 5).join(" <- ") : args[0]]);
+      return orig.apply(this, args);
+    };
+    undo.push(() => (proto[name] = orig));
+  };
+  for (const m of DEVICE_METHODS) {
+    wrap(FolderTransport.prototype, m, m);
+    wrap(AdbTransport.prototype, m, m);
+  }
+  wrap(RecordStore.prototype, "load", "store.load");
+  wrap(HashPool.prototype, "hashFiles", "hashFiles");
+  return { counts, calls, restore: () => undo.reverse().forEach((f) => f()) };
+}
+
+/** Hold the next call of proto[name] until the gate opens. */
+function holdNext(proto, name) {
+  const g = gate();
+  const orig = proto[name];
+  proto[name] = async function (...args) {
+    proto[name] = orig;
+    g._hit();
+    await g.wait;
+    return orig.apply(this, args);
+  };
+  g.restore = () => (proto[name] = orig);
+  return g;
+}
+
+const jobsSince = (a, from) => a.events.slice(from).filter((e) => e.kind === "job" && e.state === "done").map((e) => e.job.phase);
+const rtOf = (a, id) => a.svc._debug().rts.get(id);
+const shardFiles = (a, id) => {
+  try {
+    return fs.readdirSync(path.join(a.userData, "targets", id, "folders")).filter((n) => n.endsWith(".json")).length;
+  } catch (_) {
+    return 0;
+  }
+};
+const settled = (a, id) => waitFor(() => rtOf(a, id).deriving === 0, 5000, "derive settled");
+
+/**
+ * A folder target with series Mu (also on the device as "Mu Old Name", same
+ * bytes: a content-match suggestion), Nu (new) and a loose root file (an
+ * anomaly), planned. Returns {id, sug, anomaly}.
+ */
+async function linkWorld(a) {
+  series(a.lib, "Mu", { "Ch.001.cbz": 1500, "Ch.002.cbz": 1500 });
+  series(a.lib, "Nu", { "Ch.001.cbz": 1200 });
+  const dev = path.join(a.dir, "device");
+  for (const n of ["Ch.001.cbz", "Ch.002.cbz"]) writeOld(path.join(dev, "Mu Old Name", n), bytes(n, 1500));
+  writeOld(path.join(dev, "loose.cbz"), Buffer.from("x"));
+  const id = await a.addFolderTarget();
+  await a.idle();
+  // The plan's library-status walk (service _refreshLibraryStatus) loads
+  // every record; let it land so a spy started next counts only the test's.
+  const lastDone = a.events.map((e) => e.kind === "job" && e.state === "done").lastIndexOf(true);
+  await a.waitEvent((e) => e.kind === "library-status", 8000, lastDone + 1, "library status");
+  const rt = rtOf(a, id);
+  assert.ok(rt && rt.plan, "the connect plan landed");
+  const mu = rt.plan.series.find((s) => s.folder === "Mu");
+  const sug = rt.plan.suggestions.find((g) => g.seriesKey === mu.seriesKey);
+  const anomaly = rt.plan.anomalies.find((x) => x.kind === "loose-root-files");
+  assert.ok(sug && anomaly, "the scenario has a suggestion and an anomaly");
+  return { id, sug, anomaly };
+}
+
+test("P2 ack: derived at once: no job, no device call, no record read; a new gen shows it", async () => {
+  const a = await app();
+  try {
+    const { id, anomaly } = await linkWorld(a);
+    const gen0 = (await a.state()).plans[id].gen;
+    const from = a.since();
+    const sp = spy();
+    try {
+      for (const op of ["ack-anomaly", "unack-anomaly", "ack-anomaly", "ignore-suggestion", "unignore-suggestion"]) {
+        const r = await a.call("config-op", { op, targetId: id, anomalyId: anomaly.id, suggestionId: "x" });
+        assert.ok(r.ok, JSON.stringify(r));
+      }
+      await settled(a, id);
+      await sleep(30);
+    } finally {
+      sp.restore();
+    }
+    assert.deepStrictEqual(sp.counts, {}, `no device call and no record load: ${JSON.stringify(sp.calls)}`);
+    assert.deepStrictEqual(jobsSince(a, from), [], "no job ran");
+    assert.ok(rtOf(a, id).plan.anomalies.find((x) => x.id === anomaly.id).acknowledged);
+    const v = (await a.state()).plans[id];
+    assert.ok(v.gen > gen0, "every derived adopt is a new gen");
+    assert.deepStrictEqual([v.stale, v.updating], [false, false]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 Link (folder target): one refresh reads only the linked folder, never the root; the series is in sync", async () => {
+  const a = await app();
+  try {
+    const { id, sug } = await linkWorld(a);
+    const from = a.since();
+    const sp = spy();
+    let lk;
+    try {
+      lk = await a.call("link", { targetId: id, suggestionIds: [sug.id] });
+      assert.ok(lk.ok && lk.queued, JSON.stringify(lk));
+      // Bound and derived before the reply: an interim plan waits on the verify.
+      const interim = (await a.state()).plans[id];
+      const m0 = interim.summary.series.find((s) => s.folder === "Mu");
+      assert.deepStrictEqual([m0.deviceFolder, m0.state, interim.updating], ["Mu Old Name", "needs-verify", true], JSON.stringify(m0));
+      await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "refresh", 15000, from, "refresh");
+      await a.idle();
+    } finally {
+      sp.restore();
+    }
+    assert.deepStrictEqual(jobsSince(a, from), ["refresh"]);
+    assert.ok(!sp.counts.listRoot && !sp.counts.listRootDirsAlt, `root never listed: ${JSON.stringify(sp.counts)}`);
+    const devCalls = sp.calls.filter(([m]) => !["store.load", "probe", "hashFiles"].includes(m));
+    assert.ok(devCalls.length && devCalls.every(([, arg]) => String(arg).startsWith("Mu Old Name")), JSON.stringify(devCalls));
+    const v = (await a.state()).plans[id];
+    const mu = v.summary.series.find((s) => s.folder === "Mu");
+    assert.strictEqual(mu.deviceFolder, "Mu Old Name");
+    assert.deepStrictEqual([mu.counts.inSync, mu.counts.push || 0], [2, 0], JSON.stringify(mu.counts));
+    assert.deepStrictEqual([v.stale, v.updating, v.links.length], [false, false, 0]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 Link to an orphaned folder (its series left the library) rebinds its shard; a gone series' own shard is dropped", async () => {
+  const a = await app();
+  try {
+    const { id, sug } = await linkWorld(a);
+    const shardIds = () => {
+      try {
+        return fs.readdirSync(path.join(a.userData, "targets", id, "folders")).filter((n) => n.endsWith(".json")).map((n) => n.slice(0, -5)).sort();
+      } catch (_) {
+        return [];
+      }
+    };
+    const linkAndSettle = async (suggestionId) => {
+      const from = a.since();
+      const lk = await a.call("link", { targetId: id, suggestionIds: [suggestionId] });
+      assert.ok(lk.ok && lk.queued, JSON.stringify(lk));
+      await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "refresh", 15000, from, "refresh");
+      await a.idle();
+      await settled(a, id);
+      assert.deepStrictEqual(jobsSince(a, from), ["refresh"]);
+      const v = (await a.state()).plans[id];
+      assert.deepStrictEqual([v.stale, v.updating, v.links.length], [false, false, 0]);
+      return v;
+    };
+    const suggestionFor = (folder) => {
+      const rt = rtOf(a, id);
+      const sp = rt.plan.series.find((s) => s.folder === folder);
+      return { sp, g: rt.plan.suggestions.find((x) => x.seriesKey === sp.seriesKey) };
+    };
+    await linkAndSettle(sug.id);
+    const [s1] = shardIds();
+    assert.ok(s1, "Mu is bound");
+
+    // The user's case: Mu leaves the library and comes back under another
+    // name and source, so "Mu Old Name" is orphaned and Mu Reborn is new.
+    fs.rmSync(path.join(a.lib, "Mu"), { recursive: true });
+    series(a.lib, "Mu Reborn", { "Ch.001.cbz": 1500, "Ch.002.cbz": 1500 }, "https://example.org/manga/mu-reborn");
+    await a.plan(id);
+    const p1 = suggestionFor("Mu Reborn");
+    assert.strictEqual(rtOf(a, id).plan.deviceOnly.find((d) => d.name === "Mu Old Name").state, "orphaned");
+    assert.ok(p1.g && p1.g.deviceFolder === "Mu Old Name", "Mu Reborn is offered the orphaned folder");
+    const v1 = await linkAndSettle(p1.g.id);
+    const mr = v1.summary.series.find((s) => s.folder === "Mu Reborn");
+    assert.deepStrictEqual([mr.deviceFolder, mr.counts.inSync, mr.counts.push || 0], ["Mu Old Name", 2, 0], JSON.stringify(mr));
+    assert.deepStrictEqual(shardIds(), [s1], "the orphan's shard is rebound in place, no second shard names the folder");
+    assert.ok(!v1.summary.deviceOnly.some((d) => d.name === "Mu Old Name"), "the folder left Only on");
+
+    // Gone + orphaned: Nu is bound to "Nu (old)", which then disappears
+    // (Nu gone); Mu Reborn leaves (its folder orphaned) and the folder now
+    // holds Nu's chapter. Linking Nu there keeps the folder's shard and
+    // drops Nu's own, so each still has exactly one.
+    writeOld(path.join(a.target, "Nu (old)", "Ch.001.cbz"), bytes("Ch.001.cbz", 1200));
+    await a.plan(id);
+    await linkAndSettle(suggestionFor("Nu").g.id);
+    const s2 = shardIds().find((x) => x !== s1);
+    assert.ok(s2, "Nu is bound");
+    fs.rmSync(path.join(a.target, "Nu (old)"), { recursive: true });
+    fs.rmSync(path.join(a.lib, "Mu Reborn"), { recursive: true });
+    fs.rmSync(path.join(a.target, "Mu Old Name", "Ch.002.cbz"));
+    writeOld(path.join(a.target, "Mu Old Name", "Ch.001.cbz"), bytes("Ch.001.cbz", 1200));
+    await a.plan(id);
+    const p2 = suggestionFor("Nu");
+    assert.deepStrictEqual([p2.sp.state, p2.g && p2.g.deviceFolder], ["gone", "Mu Old Name"]);
+    const v2 = await linkAndSettle(p2.g.id);
+    const nu = v2.summary.series.find((s) => s.folder === "Nu");
+    assert.deepStrictEqual([nu.deviceFolder, nu.counts.inSync], ["Mu Old Name", 1], JSON.stringify(nu));
+    assert.deepStrictEqual(shardIds(), [s1], "the folder's shard kept, the gone series' own dropped");
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 a second Link while the first one's refresh runs: a second refresh, never a full plan", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Ka", { "Ch.001.cbz": 1300, "Ch.002.cbz": 1300 });
+    for (const n of ["Ch.001.cbz", "Ch.002.cbz"]) writeOld(path.join(a.dir, "device", "Ka Old Name", n), bytes(n, 1300));
+    const { id, sug } = await linkWorld(a);
+    const rt = rtOf(a, id);
+    const ka = rt.plan.series.find((s) => s.folder === "Ka");
+    const sug2 = rt.plan.suggestions.find((g) => g.seriesKey === ka.seriesKey);
+    assert.ok(sug2, "Ka is offered its old folder");
+    const from = a.since();
+    const g = holdNext(FolderTransport.prototype, "hashFolder");
+    try {
+      assert.ok((await a.call("link", { targetId: id, suggestionIds: [sug.id] })).ok);
+      await g.reached;
+      const lk2 = await a.call("link", { targetId: id, suggestionIds: [sug2.id] });
+      assert.ok(lk2.ok && lk2.queued, JSON.stringify(lk2));
+      g.open();
+      await waitFor(() => jobsSince(a, from).length >= 2, 15000, "two jobs");
+      await a.idle();
+      await settled(a, id);
+      await a.idle();
+    } finally {
+      g.restore();
+    }
+    assert.deepStrictEqual(jobsSince(a, from), ["refresh", "refresh"]);
+    const v = (await a.state()).plans[id];
+    const rows = v.summary.series.filter((s) => s.folder === "Mu" || s.folder === "Ka").map((s) => [s.folder, s.deviceFolder, s.counts.inSync]);
+    assert.deepStrictEqual(rows.sort(), [["Ka", "Ka Old Name", 2], ["Mu", "Mu Old Name", 2]]);
+    assert.deepStrictEqual([v.stale, v.updating, v.links.length], [false, false, 0]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 two orphaned-folder Links in a row (the second during the first's refresh): two refreshes, never a full plan", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Ka", { "Ch.001.cbz": 1300, "Ch.002.cbz": 1300 });
+    for (const n of ["Ch.001.cbz", "Ch.002.cbz"]) writeOld(path.join(a.dir, "device", "Ka Old Name", n), bytes(n, 1300));
+    const { id, sug } = await linkWorld(a);
+    const sugOf = (folder) => {
+      const rt = rtOf(a, id);
+      const sp = rt.plan.series.find((s) => s.folder === folder);
+      return rt.plan.suggestions.find((x) => x.seriesKey === sp.seriesKey);
+    };
+    const sugKa = sugOf("Ka");
+    assert.ok((await a.call("link", { targetId: id, suggestionIds: [sug.id, sugKa.id] })).ok);
+    await a.idle();
+    await settled(a, id);
+    await a.idle();
+    // Both leave the library and come back under new names and sources.
+    for (const [f, n, sz] of [["Mu", "Mu Reborn", 1500], ["Ka", "Ka Reborn", 1300]]) {
+      fs.rmSync(path.join(a.lib, f), { recursive: true });
+      series(a.lib, n, { "Ch.001.cbz": sz, "Ch.002.cbz": sz }, `https://example.org/manga/${f}-reborn`);
+    }
+    await a.plan(id);
+    await a.idle();
+    const s1 = sugOf("Mu Reborn");
+    const s2 = sugOf("Ka Reborn");
+    assert.ok(s1 && s2, "both reborn series are offered their orphaned folders");
+    const from = a.since();
+    const g = holdNext(FolderTransport.prototype, "hashFolder");
+    try {
+      assert.ok((await a.call("link", { targetId: id, suggestionIds: [s1.id] })).ok);
+      await g.reached;
+      const lk2 = await a.call("link", { targetId: id, suggestionIds: [s2.id] });
+      assert.ok(lk2.ok && lk2.queued, JSON.stringify(lk2));
+      g.open();
+      await waitFor(() => jobsSince(a, from).length >= 2, 15000, "two jobs");
+      await a.idle();
+      await settled(a, id);
+      await a.idle();
+    } finally {
+      g.restore();
+    }
+    assert.deepStrictEqual(jobsSince(a, from), ["refresh", "refresh"]);
+    const v = (await a.state()).plans[id];
+    const rows = v.summary.series.filter((s) => /Reborn/.test(s.folder)).map((s) => [s.folder, s.deviceFolder, s.counts.inSync]);
+    assert.deepStrictEqual(rows.sort(), [["Ka Reborn", "Ka Old Name", 2], ["Mu Reborn", "Mu Old Name", 2]]);
+    assert.deepStrictEqual([v.stale, v.updating, v.links.length], [false, false, 0]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("a library scan that changed nothing doesn't re-plan, even with a Link's refresh running; a real change does", async () => {
+  const a = await app();
+  try {
+    const { id, sug } = await linkWorld(a);
+    const libEvents = (from) => slogLines(a).filter((l) => l.ev === "library-change").slice(from);
+    const quiet = async () => {
+      await sleep(150);
+      await a.idle();
+      await settled(a, id);
+    };
+
+    // A scan alone (the Sync tab's cover scan on open): no job.
+    let from = a.since();
+    let l0 = libEvents(0).length;
+    a.svc.notifyLibraryChanged("scan");
+    await waitFor(() => libEvents(l0).length, 8000, "library-change logged");
+    await quiet();
+    assert.deepStrictEqual(jobsSince(a, from), []);
+    assert.deepStrictEqual(libEvents(l0).map((l) => [l.reasons, l.replanned]), [[["scan"], []]]);
+    assert.strictEqual((await a.state()).plans[id].stale, false);
+
+    // The user's case: a Link, and the scan's debounce ends during its refresh.
+    from = a.since();
+    l0 = libEvents(0).length;
+    const g = holdNext(FolderTransport.prototype, "hashFolder");
+    try {
+      assert.ok((await a.call("link", { targetId: id, suggestionIds: [sug.id] })).ok);
+      await g.reached;
+      a.svc.notifyLibraryChanged("scan");
+      await waitFor(() => libEvents(l0).length, 8000, "library-change logged");
+      g.open();
+      await waitFor(() => jobsSince(a, from).length >= 1, 15000, "the refresh");
+      await quiet();
+    } finally {
+      g.restore();
+    }
+    assert.deepStrictEqual(jobsSince(a, from), ["refresh"], "the Link's refresh, no full plan");
+    const mu = (await a.summary(id)).series.find((s) => s.folder === "Mu");
+    assert.deepStrictEqual([mu.deviceFolder, mu.counts.inSync], ["Mu Old Name", 2]);
+
+    // A real change (a new chapter): one full plan.
+    from = a.since();
+    l0 = libEvents(0).length;
+    writeOld(path.join(a.lib, "Nu", "Ch.002.cbz"), bytes("Ch.002.cbz", 1200));
+    a.svc.notifyLibraryChanged("download");
+    await waitFor(() => jobsSince(a, from).length >= 1, 15000, "a plan");
+    await quiet();
+    assert.deepStrictEqual(jobsSince(a, from), ["plan"]);
+    assert.deepStrictEqual(libEvents(l0).map((l) => l.replanned), [[id]]);
+    const nu = (await a.summary(id)).series.find((s) => s.folder === "Nu");
+    assert.strictEqual(nu.counts.push, 2, JSON.stringify(nu.counts));
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 decisions during a running plan: Link and Ack wait for it, bind after it, one Link per folder; then one refresh", async () => {
+  const a = await app();
+  try {
+    const { id, sug, anomaly } = await linkWorld(a);
+    const shards0 = shardFiles(a, id);
+    const g = holdNext(FolderTransport.prototype, "probe");
+    const from = a.since();
+    try {
+      const pl = await a.call("plan", { targetId: id });
+      assert.ok(pl.ok, JSON.stringify(pl));
+      await g.reached;
+      assert.ok((await a.call("config-op", { op: "ack-anomaly", targetId: id, anomalyId: anomaly.id })).ok);
+      const lk = await a.call("link", { targetId: id, suggestionIds: [sug.id] });
+      assert.ok(lk.ok && lk.queued, JSON.stringify(lk));
+      assertRefusal(await a.call("link", { targetId: id, suggestionIds: [sug.id] }), "invalid");
+      assert.strictEqual(shardFiles(a, id), shards0, "nothing is bound while the plan job runs");
+      const v = (await a.state()).plans[id];
+      assert.deepStrictEqual([v.stale, v.updating], [true, true]);
+      assert.deepStrictEqual(v.links.map((l) => [l.deviceFolder, l.bound]), [["Mu Old Name", false]]);
+      g.open();
+      await a.job(pl.runId);
+      await a.idle();
+      await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "refresh", 15000, from, "refresh");
+      await a.idle();
+    } finally {
+      g.restore();
+    }
+    assert.deepStrictEqual(jobsSince(a, from), ["plan", "refresh"]);
+    const rt = rtOf(a, id);
+    assert.ok(rt.plan.anomalies.find((x) => x.id === anomaly.id).acknowledged, "the ack landed after the plan");
+    assert.strictEqual(shardFiles(a, id), shards0 + 1, "one shard for the one Link");
+    const mu = (await a.summary(id)).series.find((s) => s.folder === "Mu");
+    assert.deepStrictEqual([mu.deviceFolder, mu.counts.inSync], ["Mu Old Name", 2]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 a full plan owed beats a refresh: a library change during a running plan carries the Link into the next full plan", async () => {
+  const a = await app();
+  try {
+    const { id, sug } = await linkWorld(a);
+    const g = holdNext(FolderTransport.prototype, "probe");
+    const from = a.since();
+    try {
+      const pl = await a.call("plan", { targetId: id });
+      await g.reached;
+      // A real change: a scan that finds nothing new doesn't re-plan.
+      series(a.lib, "Zz Lib Change", { "Ch.001.cbz": 700 });
+      a.svc.notifyLibraryChanged("test");
+      await waitFor(() => a.svc._debug().current && rtOf(a, id).stale, 3000, "a full plan owed");
+      assert.ok((await a.call("link", { targetId: id, suggestionIds: [sug.id] })).ok);
+      g.open();
+      await a.job(pl.runId);
+      await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan" && e.runId !== pl.runId, 15000, from, "the owed plan");
+      await a.idle();
+    } finally {
+      g.restore();
+    }
+    assert.deepStrictEqual(jobsSince(a, from), ["plan", "plan"], "no refresh: the owed full plan bound and verified the Link");
+    const mu = (await a.summary(id)).series.find((s) => s.folder === "Mu");
+    assert.deepStrictEqual([mu.deviceFolder, mu.counts.inSync], ["Mu Old Name", 2]);
+    assert.strictEqual((await a.state()).plans[id].links.length, 0);
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 include after exclude: a hash-only refresh, no device call; the series' pushes come back", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Nu", { "Ch.001.cbz": 1200, "Ch.002.cbz": 1300 });
+    series(a.lib, "Xi", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    assert.ok((await a.call("config-op", { op: "add-exclude", targetId: id, entry: { pcFolder: "Nu" } })).ok);
+    await settled(a, id);
+    // A full plan with Nu excluded: Nu's files are never hashed.
+    await a.plan(id);
+    await a.idle();
+    const from = a.since();
+    const sp = spy();
+    try {
+      assert.ok((await a.call("config-op", { op: "remove-exclude", targetId: id, entry: { pcFolder: "Nu" } })).ok);
+      await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "refresh", 15000, from, "refresh");
+      await a.idle();
+    } finally {
+      sp.restore();
+    }
+    assert.deepStrictEqual(jobsSince(a, from), ["refresh"]);
+    const dev = Object.fromEntries(Object.entries(sp.counts).filter(([k]) => !["store.load", "probe", "hashFiles"].includes(k)));
+    assert.deepStrictEqual(dev, {}, "hashes only");
+    assert.strictEqual(sp.counts.hashFiles, 1, "one hash pass, for Nu's files");
+    const nu = (await a.summary(id)).series.find((s) => s.folder === "Nu");
+    assert.strictEqual(nu.counts.push, 2, JSON.stringify(nu.counts));
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 a folder the cached root listing missed: the refresh escalates to a full plan", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Nu", { "Ch.001.cbz": 1200 });
+    series(a.lib, "Xi", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    assert.strictEqual((await a.job((await a.apply({ targetId: id })).runId)).status, "completed");
+    await a.idle();
+    // Nu is excluded and its folder goes: the next plan's root listing lacks
+    // it, and an excluded series is no gone candidate, so it is never stat'd.
+    assert.ok((await a.call("config-op", { op: "add-exclude", targetId: id, entry: { pcFolder: "Nu" } })).ok);
+    fs.rmSync(path.join(a.target, "Nu"), { recursive: true, force: true });
+    await a.plan(id);
+    await a.idle();
+    // Back behind the cache's back: including Nu stats its name and finds a folder.
+    fs.mkdirSync(path.join(a.target, "Nu"), { recursive: true });
+    const from = a.since();
+    assert.ok((await a.call("config-op", { op: "remove-exclude", targetId: id, entry: { pcFolder: "Nu" } })).ok);
+    const rf = await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "refresh", 15000, from, "refresh");
+    assert.strictEqual(rf.status, "completed");
+    assert.strictEqual(rf.summary.escalated, "missed-folder", JSON.stringify(rf.summary));
+    await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, from, "the full plan");
+    await a.idle();
+    assert.deepStrictEqual(jobsSince(a, from), ["refresh", "plan"]);
+    const v = (await a.state()).plans[id];
+    assert.ok(v.summary && !v.stale && !v.updating, JSON.stringify([v.stale, v.updating, v.refusal]));
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 a decision during an apply: refused only where the apply holds the selection; it lands through the plan the apply owes", async () => {
+  const g = gate();
+  let held = false;
+  const a = await app({ executorDeps: { hooks: (pt) => (pt === "before-send" && !held ? ((held = true), g._hit(), g.wait) : undefined) } });
+  try {
+    const { id, sug, anomaly } = await linkWorld(a);
+    const from = a.since();
+    const ap = await a.apply({ targetId: id });
+    assert.ok(ap.ok, JSON.stringify(ap));
+    await g.reached;
+    assertRefusal(await a.call("link", { targetId: id, suggestionIds: [sug.id] }), "busy");
+    assert.ok((await a.call("config-op", { op: "ack-anomaly", targetId: id, anomalyId: anomaly.id })).ok);
+    g.open();
+    assert.strictEqual((await a.job(ap.runId)).status, "completed");
+    await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, from, "re-plan after apply");
+    await a.idle();
+    assert.deepStrictEqual(jobsSince(a, from), ["apply", "plan"], "no derive from the pre-apply facts, no refresh");
+    assert.ok(rtOf(a, id).plan.anomalies.find((x) => x.id === anomaly.id).acknowledged);
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 needs-mode from a Link (device can't hash): refused at once with no job; choosing a mode is a verify-only refresh", async () => {
+  const a = await app({ adb: true });
+  try {
+    a.dev = a.srv.addDevice({ serial: SERIAL, inject: { symlinks: { "/sdcard": "/storage/emulated/0" }, tools: { sha256sum: false } } });
+    a.dev.fs.mkdirs(CANON);
+    a.dev.fs.mkdirs(`${CANON}/Mu Old Name`);
+    for (const n of ["Ch.001.cbz", "Ch.002.cbz"]) a.dev.fs.writeFile(`${CANON}/Mu Old Name/${n}`, bytes(n, 1500), { mtime: OLD_S });
+    series(a.lib, "Mu", { "Ch.001.cbz": 1500, "Ch.002.cbz": 1500 });
+    const t = await a.call("config-op", { op: "add-target", target: { name: "Tab", kind: "adb", serial: SERIAL, root: "/sdcard/Komikku/local", profile: "komikku" } });
+    const id = t.targetId;
+    await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, 0, "auto plan");
+    await a.idle();
+    const rt = rtOf(a, id);
+    const mu = rt.plan.series.find((s) => s.folder === "Mu");
+    const sug = rt.plan.suggestions.find((g) => g.seriesKey === mu.seriesKey);
+    assert.ok(sug, "a content match");
+    const from = a.since();
+    const log0 = a.srv.log.length;
+    assert.ok((await a.call("link", { targetId: id, suggestionIds: [sug.id] })).ok);
+    await settled(a, id);
+    const v = (await a.state()).plans[id];
+    assert.strictEqual(v.refusal && v.refusal.code, "needs-mode", JSON.stringify(v.refusal));
+    assert.deepStrictEqual(v.refusal.folders, ["Mu Old Name"]);
+    assert.ok(!("prep" in v.refusal), "the facts stay in main");
+    assert.deepStrictEqual(jobsSince(a, from), [], "decided without a job");
+    assert.ok((await a.call("config-op", { op: "update-target", targetId: id, patch: { verifyMode: "read-back" } })).ok);
+    const rf = await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "refresh", 30000, from, "refresh");
+    assert.strictEqual(rf.status, "completed", JSON.stringify(rf.summary));
+    await a.idle();
+    assert.deepStrictEqual(jobsSince(a, from), ["refresh"]);
+    const reqs = a.srv.log.slice(log0).filter((e) => e.kind === "sync" && e.id !== "QUIT");
+    assert.ok(reqs.every((e) => e.path.startsWith(`${CANON}/Mu Old Name`)), JSON.stringify(reqs.map((e) => [e.id, e.path])));
+    const after = (await a.state()).plans[id];
+    assert.strictEqual(after.refusal, null);
+    const m2 = after.summary.series.find((s) => s.folder === "Mu");
+    assert.deepStrictEqual([m2.deviceFolder, m2.counts.inSync], ["Mu Old Name", 2], JSON.stringify(m2.counts));
+    assert.strictEqual(after.summary.policy.verifyMode, "read-back");
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 planning settings re-derive (no job); hash mode plans in full", async () => {
+  const a = await app();
+  try {
+    series(a.lib, "Phi", { "Ch.001.cbz": 1000 });
+    const id = await a.addFolderTarget();
+    await a.idle();
+    const gen0 = (await a.summary(id)).gen;
+    const from = a.since();
+    a.settings = { ...a.settings, syncSizeWarnPct: 15 };
+    await a.svc.applySettings(a.settings);
+    await settled(a, id);
+    await sleep(30);
+    assert.deepStrictEqual(jobsSince(a, from), []);
+    assert.ok((await a.summary(id)).gen > gen0);
+    a.settings = { ...a.settings, syncHashMode: "rehash" };
+    await a.svc.applySettings(a.settings);
+    await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, from, "full plan");
+    await a.idle();
+    assert.deepStrictEqual(jobsSince(a, from), ["plan"]);
+  } finally {
+    await a.close();
+  }
+});
+
+test("P2 a disconnected target: a Link binds and shows waiting for a verify; the reconnect's plan verifies it", async () => {
+  const a = await app();
+  try {
+    const { id, sug } = await linkWorld(a);
+    const hidden = `${a.target}.away`;
+    fs.renameSync(a.target, hidden);
+    await a.waitEvent((e) => e.kind === "device" && e.folderPresence && e.folderPresence[id] === false, 8000, 0, "folder gone");
+    const from = a.since();
+    assert.ok((await a.call("link", { targetId: id, suggestionIds: [sug.id] })).ok);
+    await settled(a, id);
+    assert.deepStrictEqual(jobsSince(a, from), []);
+    const mu = (await a.summary(id)).series.find((s) => s.folder === "Mu");
+    assert.deepStrictEqual([mu.deviceFolder, mu.state], ["Mu Old Name", "needs-verify"], JSON.stringify(mu));
+    fs.renameSync(hidden, a.target);
+    await a.waitEvent((e) => e.kind === "job" && e.state === "done" && e.job.phase === "plan", 15000, from, "reconnect plan");
+    await a.idle();
+    const m2 = (await a.summary(id)).series.find((s) => s.folder === "Mu");
+    assert.deepStrictEqual([m2.deviceFolder, m2.counts.inSync], ["Mu Old Name", 2]);
   } finally {
     await a.close();
   }

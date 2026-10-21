@@ -175,6 +175,18 @@ export const SERIES_STATE_COPY = Object.freeze({
   gone: (tn) => `Removed on ${tn}`,
   held: null,
 });
+// A series row's transient state while a decision lands (syncView.liveState;
+// plan sync-temp/plans/device-sync-cheap-replans.md §7). Not planner states,
+// so the drift test leaves this map alone.
+export const LIVE_STATE_COPY = Object.freeze({
+  linking: () => "Linking…",
+  verifying: () => "Verifying…",
+  "verify-offline": () => "Connect to verify",
+});
+export function liveStateCopy(state, tn) {
+  const f = LIVE_STATE_COPY[state];
+  return typeof f === "function" ? f(tn) : null;
+}
 export function seriesStateCopy(state, tn) {
   const f = SERIES_STATE_COPY[state];
   return typeof f === "function" ? f(tn) : f;
@@ -536,7 +548,10 @@ export function refusalCardCopy(r, tn) {
 }
 
 // ── Last-run cards (spec §5; mockup LAST_RUNS). The numbers are formatted by
-// the caller; this only picks words and tone. ──
+// the caller; this only picks words and tone.
+// No `plan` or `refresh` entry: neither writes a last run (service.js
+// _afterJob: grep "the last apply/verify card stays").
+// ──
 export const LAST_RUN_PHASE_COPY = Object.freeze({
   apply: { done: (tn) => `Synced to ${tn}`, verb: "copied" },
   prune: { done: (tn) => `Removed folders from ${tn}`, verb: "removed" },

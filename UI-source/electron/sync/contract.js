@@ -66,9 +66,13 @@ const EVENT_CHANNEL = "sync-event";
 // UI shows is pushed when it changes, so the renderer never re-reads
 // get-state to catch up (the re-read raced the identity clear and lost job
 // results). `plans` {targetId, summary, refusal, stale, lastRun, gen,
-// selSeq, lastPlan, removed?} is per target and coalesced to one event per
+// selSeq, lastPlan, updating, links, removed?} is per target and coalesced to one event per
 // tick (selSeq: the last set-selection seq applied; lastPlan: the last plan
-// job's {runId, status, reason, at} — UI-pass U2-1/U2-3); `adb`
+// job's {runId, status, reason, at} — UI-pass U2-1/U2-3; `stale` is true
+// while the plan is out of date, `updating` while that is only a review
+// decision being re-derived or topped up, not a full re-plan; `links` the
+// Links not yet in the plan, {suggestionId, seriesKey, deviceFolder, bound});
+// `adb`
 // {adb} carries the binary, server and tracking state; `settings`
 // {enabled, settings} follows every applySettings.
 const EVENT_KINDS = Object.freeze([
@@ -97,7 +101,10 @@ const ORIGINS = Object.freeze([
   "pending",
 ]);
 
-const JOB_PHASES = Object.freeze(["plan", "verify", "apply", "prune", "rename"]);
+// `refresh` (plan sync-temp/plans/device-sync-cheap-replans.md): an automatic
+// job that tops up a plan derived from cached facts after a review decision
+// (a Link, a newly mirrored file); service.js grep _startRefresh.
+const JOB_PHASES = Object.freeze(["plan", "verify", "apply", "prune", "rename", "refresh"]);
 
 // The close listener asks before quitting only while one of these runs; a
 // plan or verify is simply cancelled (main.js, grep deviceSync).

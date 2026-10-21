@@ -18,6 +18,8 @@
 //   - lane fills across series, the Review gate's every reason, the apply
 //     payload (loss op ids, mass acks only when required)
 //   - detail grouping + group changes, cover/path indexes, chapter labels
+//   - cheap re-plans: refresh jobs, Link/verify row states, the dock line,
+//     the review gate's updating reason
 //   - U4: the Library chip / Sync line / Open in Sync target (libraryView.js)
 //     and the find-sources rows, Linked, queue args and status (findView.js)
 
@@ -584,6 +586,46 @@ function eq(label, actual, expected) {
       }
     }
     eq(`Search-tab builder == shared builder == sync path, ${cases.length} picks`, mismatch, []);
+  }
+
+  // ── Decisions without full re-plans (plan device-sync-cheap-replans.md §7) ──
+  {
+    const rj = (progress, phase = "refresh") => ({ runId: 9, state: "running", phase, targetId: "t1", auto: true, progress: progress || {} });
+    eq("a refresh is neither a full plan nor a write", (({ writing, planning, refreshing }) => [writing, planning, refreshing])(V.jobOn(rj(), "t1")), [false, false, true]);
+    eq("a plan job isn't a refresh", V.jobOn(rj({}, "plan"), "t1").refreshing, false);
+
+    const links = V.linkIndex({ links: [{ suggestionId: "s1", seriesKey: "pc:Mu", deviceFolder: "Mu Old Name", bound: false }, { suggestionId: "s2", seriesKey: "pc:Other", deviceFolder: "Old", bound: true }] });
+    eq("link index: folders and series", [[...links.folders], [...links.series]], [["Mu Old Name", "Old"], ["pc:Mu", "pc:Other"]]);
+    eq("link index: no plan view / no links", [V.linkIndex(null).folders.size, V.linkIndex({}).series.size], [0, 0]);
+
+    const nv = { seriesKey: "pc:Nv", state: "needs-verify" };
+    const ctx = (o) => ({ links, updating: false, refreshing: false, connected: true, ...o });
+    eq("a series with a Link in flight → linking (outranks its state)", V.liveState({ seriesKey: "pc:Mu", state: "new" }, ctx()), "linking");
+    eq("needs-verify while a decision lands → verifying", V.liveState(nv, ctx({ updating: true })), "verifying");
+    eq("needs-verify while the refresh runs → verifying", V.liveState(nv, ctx({ refreshing: true })), "verifying");
+    eq("needs-verify, target away → verify-offline", V.liveState(nv, ctx({ connected: false, updating: true })), "verify-offline");
+    eq("needs-verify, nothing landing → the planner's own badge", V.liveState(nv, ctx()), null);
+    eq("other states show no live badge", V.liveState({ seriesKey: "pc:B", state: "bound" }, ctx({ updating: true })), null);
+
+    const base = { pv: { gen: 4, stale: false, updating: false }, summary: { asOf: Date.UTC(2026, 9, 21, 12, 0) }, tn: "Tab" };
+    const ds = (o) => V.dockStatus({ ...base, ...o });
+    eq("dock: a full plan running", ds({ run: V.jobOn(rj({}, "plan"), "t1") }).text, "Planning Tab…");
+    eq("dock: a full plan owed", ds({ pv: { gen: 4, stale: true, updating: false } }).text, "Something changed; re-planning…");
+    eq("dock: a decision landing", ds({ pv: { gen: 4, stale: true, updating: true } }).text, "Updating the plan…");
+    eq("dock: a refresh verifying one folder", ds({ pv: { gen: 4, stale: true, updating: true }, run: V.jobOn(rj({ step: "verify", current: { folder: "Mu Old Name" } }), "t1") }).text, "Updating the plan: checking Mu Old Name on Tab…");
+    eq("dock: a refresh hashing", ds({ run: V.jobOn(rj({ step: "hashing" }), "t1") }).text, "Updating the plan: fingerprinting PC files…");
+    eq("dock: a full plan owed outranks a running refresh", ds({ pv: { gen: 4, stale: true, updating: false }, run: V.jobOn(rj(), "t1") }).text, "Something changed; re-planning…");
+    eq("dock: settled plan", ds({}).kind, "ok");
+    eq("dock: another target's job", ds({ otherRunning: true }).text, "Another target's sync is running; Start waits for it.");
+
+    const rv0 = TAB.review;
+    const g0 = (o) => V.reviewGate(rv0, { massDelete: rv0.massDelete.count }, { settled: true, viewGen: rv0.gen, ...o }).why;
+    eq("review gate: a decision landing reads updating", g0({ stale: true, updating: true }), "updating");
+    eq("review gate: a full plan owed reads stale", g0({ stale: true, updating: false }), "stale");
+
+    eq("work line: a refresh's read-back shows (no plan on screen after a needs-mode pick)", C.workLine({ ...rj({ step: "verify", filesDone: 0, filesTotal: 1 }), targetId: "a" }, "a").text, "Reading back what's already there (0 of 1 series, 0%)");
+    const conn2 = { targets: [{ id: "f", kind: "folder", root: "X:/" }], devices: [], folderPresence: { f: true }, plans: {} };
+    eq("rail: a refresh doesn't pulse", C.railBadge({ ...conn2, job: rj() }).dot, null);
   }
 
   if (failures) {

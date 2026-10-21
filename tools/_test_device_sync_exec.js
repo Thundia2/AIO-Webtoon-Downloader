@@ -148,7 +148,8 @@ async function world(o = {}) {
     fs.mkdirSync(targetRoot, { recursive: true });
     w.targetRoot = targetRoot;
   }
-  w.target = profiles.resolveTargetConfig({
+  // targetRaw: the stored config, for tests that resolve a changed one.
+  w.targetRaw = {
     id: "t1",
     name: "Tab",
     kind,
@@ -156,7 +157,8 @@ async function world(o = {}) {
     root: targetRoot,
     profile: "komikku",
     ...(o.target || {}),
-  });
+  };
+  w.target = profiles.resolveTargetConfig(w.targetRaw);
   w.settings = resolveSyncSettings(o.settings || {});
   w.fresh = () => {
     if (w.transport) w.transport.destroy();
@@ -1235,6 +1237,351 @@ test("Link on a gone series rewrites its shard onto the linked folder; it is ver
     assert.deepStrictEqual(shards.map((s) => [s.shardId, s.name]), [[beta.shardId, "Beta (tablet)"]]);
     assert.strictEqual(entry(shards[0], "Ch.001.cbz").origin, "adopted");
     assertSettled(q, "after Link");
+  } finally {
+    await w.close();
+  }
+});
+
+// ---------------------------------------------------------------------
+// Cached facts: derivePlan / refreshPlan (plan sync-temp/plans/
+// device-sync-cheap-replans.md, P1). The contract under test: a plan
+// derived from a prepare's facts, with its obligations fulfilled, is the
+// plan a fresh prepare would build, and the device sees only the calls the
+// obligations name.
+// ---------------------------------------------------------------------
+
+/** What a review shows of a plan; asOf and other clocks left out. */
+function planShape(plan) {
+  return {
+    series: plan.series.map((sp) => [sp.seriesKey, sp.state, sp.deviceFolder || null, sp.heldReason || null]).sort(),
+    ops: [...plan.ops.values()].map((o) => [o.id, !!o.preselected, o.sha || null]).sort(),
+    suggestions: plan.suggestions.map((g) => [g.id, !!g.ignored, !!g.strong]).sort(),
+    anomalies: plan.anomalies.map((a) => [a.id, !!a.acknowledged]).sort(),
+    needsVerify: plan.needsVerify.map((v) => v.folder).sort(),
+    gone: plan.gone.map((g) => [g.previous, g.chosen]).sort(),
+    firstSync: plan.firstSync,
+  };
+}
+
+/**
+ * Count the device calls a transport answers (wraps the instance's methods).
+ * probe() counts only when it would really probe (nothing cached or adopted):
+ * the transports call it internally for their caps.
+ */
+function countCalls(t) {
+  const n = {};
+  const realProbe = t.probe.bind(t);
+  t.probe = (...a) => {
+    if (!t._probe) n.probe = (n.probe || 0) + 1;
+    return realProbe(...a);
+  };
+  for (const m of ["listRoot", "listFolder", "stat", "listRootDirsAlt", "hashFolder", "readBack", "readSmall", "storage", "freeSpace", "sweepLeftovers"]) {
+    if (typeof t[m] !== "function") continue;
+    const orig = t[m].bind(t);
+    t[m] = (...a) => {
+      n[m] = (n[m] || 0) + 1;
+      return orig(...a);
+    };
+  }
+  return n;
+}
+
+function resolved(w, over) {
+  return profiles.resolveTargetConfig({ ...w.targetRaw, ...over });
+}
+
+const derive = (w, p, target, extra = {}) => prep.derivePlan({ prep: p, target, settings: w.settings, ...extra });
+const refresh = (w, p, target, extra = {}) =>
+  prep.refreshPlan({ prep: p, transport: w.transport, store: w.store, hashPool: w.pool, target, settings: w.settings, connectWaitMs: 2000, ...extra });
+
+for (const kind of ["adb", "folder"]) {
+  test(`${kind}: a derive right after a prepare is that prepare (no obligations, no fixes)`, async () => {
+    const w = await world({ kind, lib: LIB });
+    try {
+      await w.sync();
+      w.devWrite("loose.cbz", Buffer.from("x"));
+      const p = await w.prepare();
+      assert.ok(p.ok, p.code);
+      const d = derive(w, p, w.target);
+      assert.ok(d.ok, d.code);
+      assert.deepStrictEqual(planShape(d.prep.plan), planShape(p.plan));
+      assert.deepStrictEqual(d.obligations, { gone: [], names: [], hashes: [], verify: [] });
+      assert.strictEqual(d.pending, false);
+      assert.deepStrictEqual([d.prep.plan.entryFixes.length, d.prep.plan.shardNameFixes.length], [0, 0]);
+    } finally {
+      await w.close();
+    }
+  });
+}
+
+test("config-only decisions (ack, ignore, delete policy, rename-to-match): derived = fresh prepare, zero device calls", async () => {
+  const w = await world({ lib: LIB });
+  try {
+    await w.sync();
+    w.devWrite("loose.cbz", Buffer.from("x"));
+    w.dev.fs.rename(`${CANON}/Beta`, `${CANON}/Beta (tablet)`);
+    await w.restart();
+    const p = await w.prepare();
+    assert.ok(p.ok, p.code);
+    const anomaly = p.plan.anomalies.find((a) => a.kind === "loose-root-files");
+    const sug = p.plan.suggestions.find((g) => g.deviceFolder === "Beta (tablet)");
+    assert.ok(anomaly && sug, "the scenario has an anomaly and a suggestion");
+    const decisions = [
+      { acknowledged: [anomaly.id] },
+      { ignoredSuggestions: [sug.id] },
+      { deletePolicy: "never" },
+      { renameToMatch: true },
+    ];
+    for (const over of decisions) {
+      const t = resolved(w, over);
+      await w.restart();
+      const calls = countCalls(w.transport);
+      const d = derive(w, p, t);
+      assert.ok(d.ok && !d.pending, JSON.stringify(over));
+      assert.deepStrictEqual(d.obligations, { gone: [], names: [], hashes: [], verify: [] }, JSON.stringify(over));
+      assert.deepStrictEqual(calls, {}, `${JSON.stringify(over)}: no device call`);
+      const fresh = await w.prepare({ target: t });
+      assert.ok(fresh.ok, fresh.code);
+      assert.deepStrictEqual(planShape(d.prep.plan), planShape(fresh.plan), JSON.stringify(over));
+    }
+    const acked = derive(w, p, resolved(w, { acknowledged: [anomaly.id] }));
+    assert.ok(acked.prep.plan.anomalies.find((a) => a.id === anomaly.id).acknowledged);
+  } finally {
+    await w.close();
+  }
+});
+
+for (const kind of ["adb", "folder"]) {
+  test(`${kind}: Link of a new series → refresh verifies that one folder, no root listing; = a fresh prepare`, async () => {
+    const lib = { ...LIB, Gamma: { files: { "Ch.001.cbz": 1500, "Ch.002.cbz": 1600 } } };
+    const w = await world({ kind, lib });
+    try {
+      await w.sync({ select: ["push:Gamma/Ch.001.cbz", "push:Gamma/Ch.002.cbz"].map((id) => ({ opId: id, selected: false })) });
+      for (const n of ["Ch.001.cbz", "Ch.002.cbz"]) w.devWrite(`Gamma stuff/${n}`, fs.readFileSync(pcPath(w, "Gamma", n)));
+      await w.restart();
+      const p = await w.prepare();
+      assert.ok(p.ok, p.code);
+      const sug = p.plan.suggestions.find((g) => g.deviceFolder === "Gamma stuff");
+      assert.ok(sug, "a content suggestion");
+      const sp = p.plan.bySeriesKey.get("pc:Gamma");
+      assert.strictEqual(sp.state, "new");
+      await w.store.bindFolder({ name: "Gamma stuff", binding: sp.binding, shardId: "0123456789abcdef" });
+
+      const d = derive(w, p, w.target, { view: null });
+      assert.deepStrictEqual(d.obligations.verify, [], "the cached view doesn't know the Link yet");
+      await w.restart();
+      const calls = countCalls(w.transport);
+      const r = await refresh(w, p, w.target, { reloadView: true });
+      assert.ok(r.ok, `${r.code || r.escalate}`);
+      assert.deepStrictEqual(
+        Object.fromEntries(Object.entries(calls).filter(([m]) => m !== "readSmall")),
+        // FolderTransport.hashFolder lists the folder itself.
+        kind === "adb" ? { listFolder: 1, hashFolder: 1 } : { listFolder: 2, hashFolder: 1 },
+        `only the linked folder: ${JSON.stringify(calls)}`,
+      );
+      assert.deepStrictEqual(r.verify.folders.map((x) => [x.folder, x.outcome]), [["Gamma stuff", "verified"]]);
+      assert.strictEqual(r.prep.plan.bySeriesKey.get("pc:Gamma").state, "bound");
+      await w.restart();
+      const fresh = await w.prepare();
+      assert.ok(fresh.ok, fresh.code);
+      assert.deepStrictEqual(planShape(r.prep.plan), planShape(fresh.plan));
+      assertSettled(r.prep, "after Link");
+    } finally {
+      await w.close();
+    }
+  });
+}
+
+test("Link of a gone series (shard rebound in place) → one folder verified; = a fresh prepare", async () => {
+  const w = await world({ lib: LIB });
+  try {
+    await w.sync();
+    const beta = await w.shard("Beta");
+    w.dev.fs.rename(`${CANON}/Beta`, `${CANON}/Beta (tablet)`);
+    await w.restart();
+    const p = await w.prepare();
+    const sp = p.plan.bySeriesKey.get("pc:Beta");
+    assert.strictEqual(sp.state, "gone");
+    await w.store.bindFolder({ name: "Beta (tablet)", binding: sp.binding, shardId: beta.shardId });
+    await w.restart();
+    const calls = countCalls(w.transport);
+    const r = await refresh(w, p, w.target, { reloadView: true });
+    assert.ok(r.ok, `${r.code || r.escalate}`);
+    assert.strictEqual(calls.listRoot || 0, 0);
+    assert.strictEqual(calls.listFolder, 1);
+    await w.restart();
+    const fresh = await w.prepare();
+    assert.deepStrictEqual(planShape(r.prep.plan), planShape(fresh.plan));
+    assertSettled(r.prep, "after Link");
+  } finally {
+    await w.close();
+  }
+});
+
+test("including a gone series: stat-only refresh (plus the rc-checked listing on adb); a stale cache escalates", async () => {
+  const w = await world({ lib: LIB });
+  try {
+    await w.sync();
+    const betaUrl = JSON.parse(fs.readFileSync(path.join(w.libRoot, "Beta", ".aio_series.json"), "utf8")).url;
+    const excluded = resolved(w, { excludes: [{ url: betaUrl }] });
+    w.devRmTree("Beta");
+    await w.restart();
+    const p = await w.prepare({ target: excluded });
+    assert.ok(p.ok, p.code);
+    assert.strictEqual(p.plan.bySeriesKey.get("pc:Beta").state, "held", "excluded: not a gone candidate");
+
+    const d = derive(w, p, w.target);
+    assert.ok(d.ok && d.pending, "the include needs a stat");
+    assert.deepStrictEqual(d.obligations.gone.map((c) => c.names), [["Beta"]]);
+    await w.restart();
+    const calls = countCalls(w.transport);
+    const r = await refresh(w, p, w.target);
+    assert.ok(r.ok, `${r.code || r.escalate}`);
+    // The gone stat, then the gone series' name probe of "Beta" (a fresh
+    // prepare asks both too), and the rc-checked listing.
+    assert.deepStrictEqual(calls, { stat: 2, listRootDirsAlt: 1 });
+    await w.restart();
+    const fresh = await w.prepare();
+    assert.deepStrictEqual(planShape(r.prep.plan), planShape(fresh.plan));
+    assert.strictEqual(r.prep.plan.bySeriesKey.get("pc:Beta").state, "gone");
+
+    // The folder came back after the cached listing: the stat contradicts the cache.
+    w.dev.fs.mkdirs(`${CANON}/Beta`);
+    await w.restart();
+    const e = await refresh(w, p, w.target);
+    assert.deepStrictEqual([e.ok, e.escalate, e.folder], [false, "missed-folder", "Beta"]);
+  } finally {
+    await w.close();
+  }
+});
+
+test("a newly mirrored sidecar: hash-only refresh, no device call; = a fresh prepare", async () => {
+  const w = await world({ lib: LIB, target: { profile: "custom", formats: ["cbz"], sidecars: [] } });
+  try {
+    await w.sync();
+    const p = await w.prepare();
+    assert.ok(p.ok, p.code);
+    const wider = resolved(w, { sidecars: ["cover.jpg"] });
+    const d = derive(w, p, wider);
+    assert.deepStrictEqual(d.obligations.hashes.map((f) => path.basename(f.path)), ["cover.jpg"]);
+    assert.ok(d.pending);
+    await w.restart();
+    const calls = countCalls(w.transport);
+    const r = await refresh(w, p, wider);
+    assert.ok(r.ok, `${r.code || r.escalate}`);
+    assert.deepStrictEqual(calls, {}, "PC hashing only");
+    await w.restart();
+    const fresh = await w.prepare({ target: wider });
+    assert.deepStrictEqual(planShape(r.prep.plan), planShape(fresh.plan));
+    assert.ok(r.prep.plan.ops.get("push:Alpha/cover.jpg"), "the sidecar is planned");
+  } finally {
+    await w.close();
+  }
+});
+
+test("aliases: a gone series' alias name is probed (stat only); a new series aliased onto a folder verifies it", async () => {
+  const lib = { ...LIB, Gamma: { files: { "Ch.001.cbz": 1500 } } };
+  const w = await world({ lib });
+  try {
+    await w.sync({ select: [{ opId: "push:Gamma/Ch.001.cbz", selected: false }] });
+    w.devRmTree("Beta");
+    w.devWrite("Old Gamma/Ch.001.cbz", fs.readFileSync(pcPath(w, "Gamma", "Ch.001.cbz")));
+    await w.restart();
+    const p = await w.prepare();
+    assert.ok(p.ok, p.code);
+    const urlOf = (f) => JSON.parse(fs.readFileSync(path.join(w.libRoot, f, ".aio_series.json"), "utf8")).url;
+    const aliased = resolved(w, { aliases: [{ url: urlOf("Beta"), deviceFolder: "Beta Renamed" }, { url: urlOf("Gamma"), deviceFolder: "Old Gamma" }] });
+    const d = derive(w, p, aliased);
+    assert.deepStrictEqual(d.obligations.names, ["Beta Renamed"]);
+    await w.restart();
+    const calls = countCalls(w.transport);
+    const r = await refresh(w, p, aliased);
+    assert.ok(r.ok, `${r.code || r.escalate}`);
+    assert.strictEqual(calls.stat, 1, "the alias name");
+    assert.strictEqual(calls.listRoot || 0, 0);
+    assert.deepStrictEqual(r.verify.folders.map((x) => [x.folder, x.outcome]), [["Old Gamma", "verified"]]);
+    await w.restart();
+    const fresh = await w.prepare({ target: aliased });
+    assert.ok(fresh.ok, fresh.code);
+    assert.deepStrictEqual(planShape(r.prep.plan), planShape(fresh.plan));
+    // The previous name still wins (decision 10's order); the alias was asked
+    // because a fresh prepare asks it too.
+    assert.deepStrictEqual(r.prep.plan.gone.map((g) => g.chosen), ["Beta"]);
+  } finally {
+    await w.close();
+  }
+});
+
+test("derivePlan cost on a large library (400 series x 12 files, folder target)", async () => {
+  const lib = {};
+  for (let i = 0; i < 400; i += 1) {
+    const files = {};
+    for (let c = 1; c <= 12; c += 1) files[`Ch.${String(c).padStart(3, "0")}.cbz`] = 64 + c;
+    lib[`Series ${String(i).padStart(3, "0")}`] = { files };
+  }
+  const w = await world({ kind: "folder", lib });
+  try {
+    // A first sync: every series plans its pushes, the planner's widest case.
+    const p = await w.prepare();
+    assert.ok(p.ok, p.code);
+    const t = resolved(w, { acknowledged: ["x"] });
+    derive(w, p, t);
+    const runs = [];
+    for (let i = 0; i < 5; i += 1) {
+      const t0 = process.hrtime.bigint();
+      const d = derive(w, p, t);
+      runs.push(Number(process.hrtime.bigint() - t0) / 1e6);
+      assert.ok(d.ok && !d.pending);
+    }
+    runs.sort((a, b) => a - b);
+    console.log(`       derivePlan median ${runs[2].toFixed(1)} ms (min ${runs[0].toFixed(1)}, max ${runs[4].toFixed(1)})`);
+  } finally {
+    await w.close();
+  }
+});
+
+test("a verify already attempted is not asked again (a failed folder never loops)", async () => {
+  const w = await world({ lib: { ...LIB, Gamma: { files: { "Ch.001.cbz": 1500 } } } });
+  try {
+    for (const n of ["Ch.001.cbz"]) w.devWrite(`Gamma stuff/${n}`, fs.readFileSync(pcPath(w, "Gamma", n)));
+    const p = await w.prepare();
+    const sp = p.plan.bySeriesKey.get("pc:Gamma");
+    await w.executor(p).ensureHeader();
+    await w.store.bindFolder({ name: "Gamma stuff", binding: sp.binding, shardId: "0123456789abcdef" });
+    const view = prov.loadRecordView({ ...(await w.store.load()), target: p.target, measured: p.measured });
+    const d = derive(w, p, w.target, { view });
+    assert.deepStrictEqual(d.obligations.verify.map((v) => v.folder), ["Gamma stuff"]);
+    assert.ok(!d.pending, "verify alone: an interim plan");
+    assert.strictEqual(d.prep.plan.bySeriesKey.get("pc:Gamma").state, "needs-verify");
+    const tried = { ...p, verifyAttempted: new Set([...p.verifyAttempted, `Gamma stuff\u00000123456789abcdef`]) };
+    assert.deepStrictEqual(derive(w, tried, w.target, { view }).obligations.verify, []);
+  } finally {
+    await w.close();
+  }
+});
+
+test("needs-mode: prepare's refusal carries its facts; derive refuses a Link on a can't-hash device at once", async () => {
+  const w = await world({ lib: LIB, inject: { tools: { sha256sum: false } } });
+  try {
+    for (const n of ["Ch.001.cbz", "Ch.002.cbz"]) w.devWrite(`Alpha/${n}`, fs.readFileSync(pcPath(w, "Alpha", n)));
+    const p = await w.prepare();
+    assert.strictEqual(p.code, "needs-mode");
+    assert.ok(p.prep && p.prep.plan && p.prep.goneAnswers instanceof Map, "facts ride along");
+    const d = derive(w, p.prep, w.target);
+    assert.strictEqual(d.code, "needs-mode");
+    assert.deepStrictEqual(d.folders, ["Alpha"]);
+    // The chooser's answer: a verify-only refresh, no second full prepare.
+    await w.restart();
+    const calls = countCalls(w.transport);
+    const r = await refresh(w, p.prep, resolved(w, { verifyMode: "read-back" }), { opts: { verifyMode: "read-back" } });
+    assert.ok(r.ok, `${r.code || r.escalate}`);
+    assert.strictEqual(calls.listRoot || 0, 0);
+    assert.strictEqual(calls.listFolder, 1);
+    assert.strictEqual(calls.readBack, 2);
+    await w.restart();
+    const fresh = await w.prepare({ opts: { verifyMode: "read-back" } });
+    assert.ok(fresh.ok, fresh.code);
+    assert.deepStrictEqual(planShape(r.prep.plan), planShape(fresh.plan));
   } finally {
     await w.close();
   }

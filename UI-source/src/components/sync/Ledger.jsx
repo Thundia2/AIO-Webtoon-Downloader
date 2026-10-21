@@ -24,7 +24,7 @@ import { Badge, Button, Checkbox, Input, Select } from "@/components/ui/primitiv
 import { Popover } from "@/components/ui/overlay";
 import { cn, formatBytes } from "@/lib/utils";
 import ChapterStrip, { SEG_CLASS, StripLegend } from "./ChapterStrip";
-import { attentionCopy, DEVICE_ONLY_COPY, heldReasonCopy, SUGGESTION_TIER_COPY, seriesStateCopy, TAG_COPY } from "./copy";
+import { attentionCopy, DEVICE_ONLY_COPY, heldReasonCopy, liveStateCopy, SUGGESTION_TIER_COPY, seriesStateCopy, TAG_COPY } from "./copy";
 import { rowView, SORTS } from "./syncView";
 
 const XS = "h-[26px] gap-1 px-2 text-[11.5px] [&_svg]:h-[13px] [&_svg]:w-[13px]";
@@ -131,7 +131,17 @@ export function Cover({ path, title, className }) {
 
 const STATE_BADGE = { new: "default", gone: "token-warning", "needs-verify": "token-info", held: "token-muted" };
 
-function RowLabel({ row, v, wide, tn }) {
+/** `live` (syncView.liveState) outranks the planner state while a decision lands. */
+function RowLabel({ row, v, wide, tn, live }) {
+  const liveText = live ? liveStateCopy(live, tn) : null;
+  if (liveText) {
+    return (
+      <Badge variant="token-info">
+        {live !== "verify-offline" && <Loader2 className="animate-spin motion-reduce:animate-none" aria-hidden="true" />}
+        {liveText}
+      </Badge>
+    );
+  }
   const stateText = row.state === "held" ? heldReasonCopy(row.heldReason, tn) : seriesStateCopy(row.state, tn);
   if (stateText) return <Badge variant={STATE_BADGE[row.state] || "token-muted"}>{stateText}</Badge>;
   const tags = (row.tags || []).slice(0, wide ? 2 : 1).filter((t) => TAG_COPY[t]);
@@ -160,12 +170,12 @@ function rowSig(p) {
   const r = p.row;
   return [
     r.seriesKey, r.title, r.state, r.heldReason, r.removing, r.hasLoss, JSON.stringify(r.counts), JSON.stringify(r.strip), (r.tags || []).join(),
-    (r.attention || []).join(), p.wide, p.tn, p.cover, p.pending, p.locked, p.lane, p.active, p.animate, p.index,
+    (r.attention || []).join(), p.wide, p.tn, p.cover, p.pending, p.locked, p.lane, p.active, p.animate, p.index, p.live,
   ].join("\u0001");
 }
 
 export const LedgerRow = memo(
-  function LedgerRow({ row, index, wide, tn, cover, pending, locked, lane, active, animate, onToggle, onOpen, onInclude }) {
+  function LedgerRow({ row, index, wide, tn, cover, pending, locked, live, lane, active, animate, onToggle, onOpen, onInclude }) {
     const v = rowView(row);
     const attnText = v.attention.filter((a) => a !== "loss").map((a) => attentionCopy(a, tn)).filter(Boolean);
     const d = `${Math.min(index, 12) * 28}ms`;
@@ -209,7 +219,7 @@ export const LedgerRow = memo(
             )}
           </div>
           <div className="mt-0.5 flex min-w-0 items-center gap-1 overflow-hidden">
-            <RowLabel row={row} v={v} wide={wide} tn={tn} />
+            <RowLabel row={row} v={v} wide={wide} tn={tn} live={live} />
             {pending && (
               <span className="flex items-center gap-[3px] text-[11px] text-muted-foreground">
                 <Loader2 className="h-3 w-3 animate-spin motion-reduce:animate-none" aria-hidden="true" />
@@ -266,8 +276,15 @@ export const LedgerRow = memo(
  * download was queued for it), so it shows that instead of Find source; a
  * second find would add a second alias to the same folder (add-alias
  * accepts duplicates; the planner then warns alias-conflict).
+ *
+ * Two locks (plan sync-temp/plans/device-sync-cheap-replans.md §7):
+ * linkLocked is the selection lock (an apply / prune / rename of this target,
+ * the only jobs service.js H.link refuses during); pruneLocked is any job
+ * running, since a prune is a job of its own. linking = device folders with a
+ * Link in flight (syncView.linkIndex): they show "Linking…" instead of the
+ * buttons, so a second click can't send the same Link twice.
  */
-export function DeviceOnlySection({ items, suggestions, titleOf, tn, locked, active, onOpen, onLink, onIgnore, onPrune, onFindAll, onFindOne, isLinked }) {
+export function DeviceOnlySection({ items, suggestions, titleOf, tn, linkLocked, pruneLocked, linking, active, onOpen, onLink, onIgnore, onPrune, onFindAll, onFindOne, isLinked }) {
   if (!items || !items.length) return null;
   const orphaned = items.filter((d) => d.state === "orphaned");
   const byFolder = new Map();
@@ -286,7 +303,7 @@ export function DeviceOnlySection({ items, suggestions, titleOf, tn, locked, act
           </Button>
         )}
         {orphaned.length > 0 && (
-          <Button size="sm" variant="outline" disabled={locked} onClick={onPrune} className={cn(XS, "border-destructive/45 text-destructive hover:bg-destructive/[.08] hover:text-destructive")}>
+          <Button size="sm" variant="outline" disabled={pruneLocked} onClick={onPrune} className={cn(XS, "border-destructive/45 text-destructive hover:bg-destructive/[.08] hover:text-destructive")}>
             <Trash2 aria-hidden="true" />
             Remove folders…
           </Button>
@@ -294,6 +311,7 @@ export function DeviceOnlySection({ items, suggestions, titleOf, tn, locked, act
       </div>
       {items.map((d) => {
         const g = byFolder.get(d.name);
+        const isLinking = !!(linking && linking.has(d.name));
         return (
           <div
             key={d.key}
@@ -308,13 +326,19 @@ export function DeviceOnlySection({ items, suggestions, titleOf, tn, locked, act
                 {d.listed === false ? `Couldn't list it on ${tn}` : `${d.files} file${d.files === 1 ? "" : "s"} · ${formatBytes(d.bytes)}`} · {DEVICE_ONLY_COPY[d.state] || d.state}
               </span>
             </div>
-            {!g && isLinked && isLinked(d.name) && (
+            {isLinking && (
+              <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground" role="status">
+                <Loader2 className="h-3 w-3 animate-spin motion-reduce:animate-none" aria-hidden="true" />
+                Linking…
+              </span>
+            )}
+            {!isLinking && !g && isLinked && isLinked(d.name) && (
               <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground" title="It syncs into this folder once its download lands">
                 <Link className="h-3 w-3 text-primary" aria-hidden="true" />
                 Linked, waiting for its download
               </span>
             )}
-            {!g && onFindOne && !(isLinked && isLinked(d.name)) && (
+            {!isLinking && !g && onFindOne && !(isLinked && isLinked(d.name)) && (
               <Button
                 size="sm"
                 variant="ghost"
@@ -328,16 +352,16 @@ export function DeviceOnlySection({ items, suggestions, titleOf, tn, locked, act
                 Find source
               </Button>
             )}
-            {g && (
+            {!isLinking && g && (
               <span onClick={(e) => e.stopPropagation()} className="flex shrink-0 items-center gap-1.5">
                 <span className="flex items-center gap-1 text-xs" title={SUGGESTION_TIER_COPY[g.tier]}>
                   <Link className="h-3 w-3 text-primary" aria-hidden="true" />
                   Looks like <b className="font-semibold">{titleOf(g.seriesKey)}</b>
                 </span>
-                <Button size="sm" variant="outline" className={XS} disabled={locked} onClick={() => onLink(g)}>
+                <Button size="sm" variant="outline" className={XS} disabled={linkLocked} onClick={() => onLink(g)}>
                   Link
                 </Button>
-                <Button size="sm" variant="ghost" className={XS} disabled={locked} onClick={() => onIgnore(g)}>
+                <Button size="sm" variant="ghost" className={XS} disabled={linkLocked} onClick={() => onIgnore(g)}>
                   Ignore
                 </Button>
               </span>

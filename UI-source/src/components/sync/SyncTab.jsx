@@ -16,7 +16,12 @@
 // WHO OWNS WHAT
 //   * main owns every plan, selection and job; this renders the hook's
 //     mirror (useDeviceSync: plans[targetId] = {summary, refusal, stale,
-//     lastRun, gen, selSeq, lastPlan}) and sends intents.
+//     updating, links, lastRun, gen, selSeq, lastPlan}) and sends intents.
+//   * a review decision (Link, Ignore, Acknowledge, an exclude…) re-derives
+//     the plan in main without a full re-plan (plan sync-temp/plans/
+//     device-sync-cheap-replans.md): rows say "Linking…" / "Verifying…" /
+//     "Connect to verify" while it lands (syncView.liveState), and the dock
+//     says "Updating the plan…" (syncView.dockStatus).
 //   * the selection client (queue, pending marks) lives in the hook
 //     (actions.select), because App unmounts this tab on every tab switch.
 //   * per-visit view state (picked target, tile filter, query, sort,
@@ -54,8 +59,8 @@ import { workLine } from "./connectView";
 import { LastRunCard, RefusalCard, WarningCallouts } from "./SyncCards";
 import { useConfigOps } from "./useConfigOps";
 import {
-  averageEta, clock, coverIndex, dockTotals, etaMs, jobOn, laneFills, lastRunView, ledgerRows, pcPathIndex, pickTargets, rowToggle, settleInfo, settleLine,
-  throughput, tileCounts,
+  averageEta, coverIndex, dockStatus, dockTotals, etaMs, jobOn, laneFills, lastRunView, ledgerRows, linkIndex, liveState, pcPathIndex, pickTargets, rowToggle,
+  settleInfo, throughput, tileCounts,
 } from "./syncView";
 
 const WIDE_PX = 1000;
@@ -242,6 +247,8 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
   const pcPaths = useMemo(() => pcPathIndex(libraryEntries), [libraryEntries]);
   const pendingRows = useMemo(() => SQ.pendingRows(sel), [sel]);
   const counts = useMemo(() => tileCounts(summary), [summary]);
+  const links = useMemo(() => linkIndex(pv), [pv]);
+  const liveCtx = { links, updating: !!(pv && pv.updating), refreshing: !!(run && run.refreshing), connected: !!status.connected };
   const { active, held } = useMemo(() => ledgerRows(summary, view), [summary, view]);
   const totals = useMemo(() => dockTotals(summary), [summary]);
   const titleOf = useCallback((k) => {
@@ -340,12 +347,7 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
       : summary && summary.series.find((r) => r.seriesKey === detailKey)
     : null;
 
-  let dockStatus = null;
-  if (run && run.planning) dockStatus = { kind: "busy", text: `Planning ${tn}…` };
-  else if (pv && pv.stale) dockStatus = { kind: "busy", text: "Something changed; re-planning…" };
-  else if (settleNow) dockStatus = { kind: "settle", text: settleLine(settleNow) };
-  else if (sync.job && sync.job.state === "running" && sync.job.targetId !== tid) dockStatus = { kind: "busy", text: "Another target's sync is running; Start waits for it." };
-  else if (summary) dockStatus = { kind: "ok", text: `Plan ${pv.gen} · built ${clock(summary.asOf)}` };
+  const dockLine = dockStatus({ run, pv, settle: settleNow, otherRunning: !!(sync.job && sync.job.state === "running" && sync.job.targetId !== tid), summary, tn });
   const anything = totals.files + totals.removals + totals.renames > 0 || !!(summary && summary.massRepush && summary.massRepush.required);
   const canReview = !!summary && status.connected && !(run && run.writing) && anything;
 
@@ -403,6 +405,7 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
               cover={covers.get(r.folder) || null}
               pending={pendingRows.has(r.seriesKey)}
               locked={locked}
+              live={liveState(r, liveCtx)}
               lane={fills[r.seriesKey]}
               active={detailKey === r.seriesKey}
               animate={animating}
@@ -423,6 +426,7 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
               cover={covers.get(r.folder) || null}
               pending={pendingRows.has(r.seriesKey)}
               locked={locked}
+              live={liveState(r, liveCtx)}
               lane={fills[r.seriesKey]}
               active={detailKey === r.seriesKey}
               animate={animating}
@@ -437,7 +441,9 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
             suggestions={summary.suggestionList}
             titleOf={titleOf}
             tn={tn}
-            locked={locked || !!(sync.job && sync.job.state === "running")}
+            linkLocked={locked}
+            pruneLocked={locked || !!(sync.job && sync.job.state === "running")}
+            linking={links.folders}
             active={detailKey}
             onOpen={onOpen}
             onLink={(g) => sync.actions.link({ targetId: tid, suggestionIds: [g.id] }).then(reply)}
@@ -496,7 +502,7 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
           }}
         />
       ) : summary ? (
-        <SelectionDock totals={totals} status={dockStatus} canReview={canReview} onReview={() => setReviewOpen(true)} />
+        <SelectionDock totals={totals} status={dockLine} canReview={canReview} onReview={() => setReviewOpen(true)} />
       ) : null}
 
       <SeriesSheet
@@ -514,6 +520,8 @@ export default function SyncTab({ sync, onOpenSettings, libraryEntries, loadLibr
         pcPath={detailRow && detailRow.folder ? pcPaths.get(detailRow.folder) : null}
         root={target.root || null}
         locked={locked}
+        live={detailRow && !detailKey.startsWith("dev:") ? liveState(detailRow, liveCtx) : null}
+        linking={links.folders}
         pendingOps={sel.ops}
         gen={gen}
         selSeq={pv ? pv.selSeq : null}
