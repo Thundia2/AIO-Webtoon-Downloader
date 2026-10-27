@@ -31,7 +31,7 @@ import TargetEditor, { Field, PersistNote } from "./TargetEditor";
 import RemoteBrowser from "./RemoteBrowser";
 import { useConfigOps, refusalField } from "./useConfigOps";
 import {
-  ADB_SOURCE_COPY, DELETE_POLICY_COPY, DEVICE_STATE_COPY, HASH_MODE_COPY, KIND_COPY, PROFILE_COPY, PROFILE_ORDER,
+  ADB_SOURCE_COPY, DELETE_POLICY_COPY, DELETE_POLICY_ORDER, DEVICE_STATE_COPY, HASH_MODE_COPY, KIND_COPY, PROFILE_COPY, PROFILE_ORDER,
   adbTrackingCopy, configRefusalCopy, deviceLabel,
 } from "./copy";
 
@@ -228,9 +228,12 @@ function AdbSection({ sync, ops, host }) {
 function DefaultsSection({ local, set }) {
   return (
     <>
-      <SRow title="Removals for new targets" sub="Each target keeps its own setting after it's added.">
+      <SRow
+        title="Removals for new targets"
+        sub={`${(DELETE_POLICY_COPY[local.syncDeletePolicy] || DELETE_POLICY_COPY.guarded).hint} Each target keeps its own setting after it's added.`}
+      >
         <Select value={local.syncDeletePolicy} onChange={(e) => set("syncDeletePolicy", e.target.value)} className="h-8 w-[150px] text-[13px]">
-          {SYNC_PRESETS.syncDeletePolicy.map((k) => (
+          {DELETE_POLICY_ORDER.filter((k) => SYNC_PRESETS.syncDeletePolicy.includes(k)).map((k) => (
             <option key={k} value={k}>
               {DELETE_POLICY_COPY[k].label}
             </option>

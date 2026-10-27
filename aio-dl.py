@@ -43,7 +43,7 @@ import textwrap
 import xml.sax.saxutils
 import zipfile
 import zlib
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse, unquote_to_bytes
 
 from aio_config import (
@@ -95,7 +95,8 @@ class ChapterSkippedError(Exception):
         image URLs all return the same 5051-byte 403 template body)
 
     Caught by _process_chapter_strict, which performs an inline retry pass
-    (long wait + redo the chapter from scratch). After inline retries are
+    (wait, then redo the chapter keeping the pages already downloaded — grep
+    resume_pages). After inline retries are
     exhausted, _process_chapter_strict converts this into ChapterAbortedError
     which the main loop treats as a fatal stop — EXCEPT for ghost_chapter,
     which short-circuits inline-retry (a structural failure won't fix itself
@@ -133,14 +134,18 @@ class ChapterAbortedError(Exception):
         chap, reason, host, pages_ok, pages_total: forwarded from the last
             ChapterSkippedError that triggered the abort.
         attempts: total number of attempts made (1 initial + N inline retries).
+        detail: what the multi-source rescue tried and why each candidate was
+            rejected (grep _rescue_search); printed under the FATAL line so an
+            abort names the nearest candidate instead of just "failed".
     """
-    def __init__(self, chap, reason: str, host: str = "", pages_ok: int = 0, pages_total: int = 0, attempts: int = 0):
+    def __init__(self, chap, reason: str, host: str = "", pages_ok: int = 0, pages_total: int = 0, attempts: int = 0, detail: str = ""):
         self.chap = chap
         self.reason = reason
         self.host = host
         self.pages_ok = pages_ok
         self.pages_total = pages_total
         self.attempts = attempts
+        self.detail = detail
         super().__init__(
             f"chapter {chap} aborted after {attempts} attempt(s): "
             f"reason={reason} host={host or '-'} pages={pages_ok}/{pages_total}"
@@ -292,6 +297,107 @@ def _replayable_missed(entries: List[Dict[str, Any]]) -> Tuple[List[Dict[str, An
 # is not a decision worth another knob, and the useful override is really just
 # 0 for tests.
 _NEAR_MISS_RETRY_BACKOFF = float(os.getenv("AIO_NEAR_MISS_RETRY_BACKOFF", "5"))
+
+# Seconds before the ONE retry a chapter whose page LIST failed gets (the
+# handler raised before any page URL existed: get_chapter_images_failed:*, a
+# handler's own "no_images_found"). A list that fails twice is not a CDN blip
+# the 30s/60s ladder waits out; the chapter goes to the alternatives instead
+# (user decision 2026-10-25, plan sync-temp/plans/multisource-offset.md D1).
+# Env-only for the same reason as the near-miss wait above.
+_LIST_RETRY_BACKOFF = float(os.getenv("AIO_LIST_RETRY_BACKOFF", "5"))
+
+# Chapters in a row the primary could not serve after every retry (page list
+# loaded but pages kept failing, or the list itself failed twice) before the
+# run stops as a host outage instead of filling chapter after chapter from
+# other sites. Locked / gated / ghost chapters neither count nor reset it.
+# Grep _outage_streak in _process_chapter_strict.
+_OUTAGE_BREAKER = 3
+
+# A failed PRIMARY attempt keeps its downloaded pages in the chapter's temp dir
+# with this manifest beside them, and the next inline retry fetches only what
+# is missing (plan multisource-offset.md D2). Written by _process_chapter_impl's
+# failure branch, read through _resumable_pages.
+_PAGES_MANIFEST = ".pages.json"
+
+
+def _resumable_pages(manifest: Any, site: str, count: int,
+                     tasks: Sequence[Tuple[int, str, str, str]],
+                     files: Iterable[str], n: Any) -> Dict[int, str]:
+    """Which pages a retry may reuse from the previous attempt -> {page index:
+    file name in the chapter dir}.
+
+    A kept page is reused only when the previous attempt was the SAME site (an
+    alt rescue writes into the same `ch_{n}` dir under the primary's number)
+    with the SAME page count, its recorded URL at that index equals the new
+    one, and the file is a finished `{n}_{idx:04d}.<ext>` (dl_image writes
+    `.pending_*` first, which never matches). URLs compare in full, or by path
+    alone when every path in the new list is distinct and non-trivial: signed
+    CDN query tokens rotate between attempts, while a proxy list (`/?url=...`)
+    has one path for every page and must not match by path. Data URIs keep
+    nothing (they cost no download anyway)."""
+    if not isinstance(manifest, dict) or manifest.get("site") != site \
+            or manifest.get("count") != count:
+        return {}
+    rec = manifest.get("urls") or {}
+
+    def path_of(u: str) -> str:
+        try:
+            return urlparse(u).path
+        except Exception:
+            return ""
+
+    paths = [path_of(u) for _, u, _, _ in tasks]
+    by_path = all(p not in ("", "/") for p in paths) and len(set(paths)) == len(paths)
+    names = sorted(files)
+    out: Dict[int, str] = {}
+    for idx, url, _folder, _fn in tasks:
+        old = rec.get(str(idx))
+        if not old or url.startswith("data:") or old.startswith("data:"):
+            continue
+        if old != url and not (by_path and path_of(old) == path_of(url)):
+            continue
+        prefix = f"{n}_{idx:04d}."
+        hit = next((f for f in names if f.startswith(prefix)), None)
+        if hit:
+            out[idx] = hit
+    return out
+
+
+def _rescue_provenance(rescue: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The part of a multi-source rescue record that is written down: which site,
+    which of ITS chapters, its url, and the proof tier. Feeds <AioRescue> in the
+    per-chapter ComicInfo and the fingerprint meta (grep _rescue_search)."""
+    if not rescue:
+        return None
+    return {k: rescue.get(k) for k in ("site", "chap", "url", "tier")}
+
+
+# Alt sites whose pages come through a driven browser: probed after the HTTP
+# ones, because a head probe there costs seconds of rendering, not one request.
+_BROWSER_DRIVEN_SITES = frozenset({"comix", "mangafire"})
+
+
+def _build_ms_catalog(records: List[Dict[str, Any]]) -> List[Any]:
+    """Ordered alt lists (sites/rescue_pairing.AltList) from the alternatives
+    builders' `catalog` records. Scanlation groups come from each alt handler's
+    own get_group_name, numbers from the same extractor the aligner uses."""
+    from sites import rescue_pairing as _rp
+
+    def _group_of(rec: Dict[str, Any], c: Dict[str, Any]) -> str:
+        try:
+            return str(rec["handler"].get_group_name(c) or "")
+        except Exception:
+            return ""
+
+    try:
+        return _rp.build_catalog(
+            records, group_of=_group_of, num_of=_extract_chapter_num,
+            browser_sites=_BROWSER_DRIVEN_SITES,
+        )
+    except Exception as exc:
+        print(f"[!] Multi-source: alt catalog unusable ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+        return []
 
 
 # -----------------------------------------------------------
@@ -5008,8 +5114,13 @@ def build_per_chapter_comic_info_xml(
     page_count: int,
     aux_records: Optional[Dict[str, Any]] = None,
     missing_pages: Optional[List[int]] = None,
+    rescue: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Per-chapter ComicInfo.xml string for Komikku-mode CBZs.
+
+    `rescue` (site/chap/url/tier) marks a chapter whose pages came from another
+    site by multi-source rescue; it becomes <AioRescue .../> (grep
+    _rescue_provenance). Number/Title/Web stay the primary's.
 
     Spec §6.2: Komikku v1.13.5+ reads <Number>/<Title>/<Translator>/<Series>
     from a ComicInfo.xml at the archive root and these OVERRIDE filename-
@@ -5153,6 +5264,19 @@ def build_per_chapter_comic_info_xml(
     if missing_pages:
         joined = ",".join(str(int(p)) for p in sorted(missing_pages))
         lines.append(f'  <AioMissingPages>{escape(joined)}</AioMissingPages>')
+
+    # Where a multi-source rescue's pages really came from. The chapter is
+    # stored under the primary's number/title (the pages were content-proven to
+    # be that chapter), so this is the only record of the other site. Attributes
+    # only; --refresh-rewrite-cbz carries it across (grep 'AioRescue').
+    if rescue:
+        attrs = "".join(
+            f' {k}="{xml.sax.saxutils.escape(str(rescue[k]), {chr(34): "&quot;"})}"'
+            for k in ("site", "chap", "url", "tier")
+            if rescue.get(k) not in (None, "")
+        )
+        if attrs:
+            lines.append(f'  <AioRescue{attrs} />')
 
     # Auxiliary assets (audio / motion-toon) that ride INSIDE this CBZ under the
     # _aio/ prefix. Aio-prefixed custom elements — dropped silently by Komga/
@@ -8159,6 +8283,7 @@ def _rewrite_cbz_comicinfo(
         # still inside this CBZ (grep _materialize_chapter_aux). ET .text is
         # already entity-unescaped, so the blob parses straight as JSON.
         aux_records: Optional[Dict[str, Any]] = None
+        rescue_attrs: Optional[Dict[str, str]] = None
         if ci_name and blobs.get(ci_name):
             root = None
             try:
@@ -8194,6 +8319,9 @@ def _rewrite_cbz_comicinfo(
                         )
                     except (ValueError, OverflowError):
                         uploaded_epoch = None
+                _resc = root.find("AioRescue")
+                if _resc is not None and _resc.attrib:
+                    rescue_attrs = dict(_resc.attrib)
                 acr = _gx("AioChapterResources")
                 if acr:
                     try:
@@ -8227,6 +8355,7 @@ def _rewrite_cbz_comicinfo(
             lang=lang or lang_default or "",
             page_count=page_count,
             aux_records=aux_records,
+            rescue=rescue_attrs,
         )
         target = ci_name or "ComicInfo.xml"
         had_ci = target in blobs
@@ -10014,17 +10143,23 @@ def main():
     # one URL — multi-URL/--prompt-urls modes are blocked at validation above.
     # Closure-scope multi-source state. Dict mapping chapter_num_float → list
     # of alternative source dicts (each with handler/scraper/context/chapter).
-    # Three writers: --search --multi-source --auto-pick (right below), the
-    # direct-URL discovery (grep _discover_multi_source_alternatives — eager
-    # by default, deferred to first chapter failure under
-    # --multi-source-lazy), and the prefetched-JSON path inside that same
-    # closure. Consumed by _process_chapter_strict for per-chapter fallback.
-    # Empty/None means single-source mode (existing behavior unchanged).
+    # One writer: _discover_multi_source_alternatives (eager by default,
+    # deferred to the first chapter failure under --multi-source-lazy), fed by
+    # the --search records, the prefetched JSON, the resume cache or a fresh
+    # search. Read by the ghost classifier (primary-only signal); the rescue
+    # itself searches _ms_catalog. Empty means single-source mode.
     _multi_source_alternatives: Dict[float, List[Dict[str, Any]]] = {}
+    # Every alt site's FULL chapter list (sites/rescue_pairing.AltList), for the
+    # content-proven rescue: the per-number dict above holds only what the
+    # aligner paired by label, and the sites that number differently are
+    # exactly the ones a rescue has to search. Set by the direct-URL discovery
+    # (eager / lazy / resume / prefetched), from the builders' `catalog`
+    # (aio_search_cli._catalog_from_records), --search --auto-pick included.
+    # Read by _rescue_search and _place.
+    _ms_catalog: List[Any] = []
     # consensus_set for the refined collapse-splits Rule 2 / 3b / 6 drops at
     # group_chapters_for_download (2026-05-27). Populated alongside
-    # _multi_source_alternatives from the same three carriers (auto-pick,
-    # prefetched JSON, direct-URL discovery). None = no peer signal; the
+    # _multi_source_alternatives by the same discovery. None = no peer signal; the
     # group helper falls through to original in-source-only heuristics.
     _multi_source_consensus_set: Optional[Set[float]] = None
 
@@ -10044,6 +10179,13 @@ def main():
     # alternative has chapters the primary lacks.
     _ms_discovery_result: Optional[Dict[str, Any]] = None
 
+    # --search --multi-source --auto-pick: the chapter lists the search already
+    # fetched, with live handler/scraper/context refs
+    # (aio_search_cli.take_latest_multi_source_state). Turned into alternatives
+    # by _discover_multi_source_alternatives once the primary is resolved and
+    # its own list fetched, so they are aligned with the list this run walks.
+    _ms_search_state: Optional[Dict[str, Any]] = None
+
     if getattr(args, "search", None):
         from aio_search_cli import run_search_mode, take_latest_multi_source_state
         winner_url = run_search_mode(
@@ -10056,18 +10198,7 @@ def main():
             return
         # --auto-pick: continue with the chosen URL.
         args.comic_url = [winner_url]
-        # Pick up the multi-source state, if any, before main() proceeds.
-        _ms_state = take_latest_multi_source_state()
-        if _ms_state and _ms_state.get("alternatives_by_chap_num"):
-            _multi_source_alternatives = _ms_state["alternatives_by_chap_num"]
-            _multi_source_consensus_set = _ms_state.get("consensus_set")
-            n_alts = sum(len(v) for v in _multi_source_alternatives.values())
-            n_chapters_with_alts = len(_multi_source_alternatives)
-            print(
-                f"[*] Multi-source ON: {n_chapters_with_alts} chapters have "
-                f"alternative sources ({n_alts} total fallback paths)",
-                file=sys.stderr,
-            )
+        _ms_search_state = take_latest_multi_source_state()
 
     # ------------------------------------------------------------------
     # Multi-URL / multi-job runner
@@ -10650,12 +10781,11 @@ def main():
         args, "download_volumes", False
     )
 
-    # ── Direct-URL multi-source: find alternatives for fallback ──
-    # When --multi-source is set and we got here via a direct URL (not via
-    # --search --auto-pick which already populated _multi_source_alternatives),
-    # search for the series title across other handlers and pre-fetch their
-    # chapter lists so per-chapter fallback in _process_chapter_strict has
-    # alternatives to try. Skipped when --list-chapters is set (read-only
+    # ── Multi-source: find alternatives for fallback ──
+    # When --multi-source is set, find the series on other handlers and
+    # pre-fetch their chapter lists (or take the lists --search already
+    # fetched) so the rescue in _process_chapter_strict has alternatives to
+    # try. Skipped when --list-chapters is set (read-only
     # mode, no downloads happening, alternatives discovery would just waste
     # time).
     #
@@ -10676,8 +10806,12 @@ def main():
         for a direct-URL --multi-source run. Never raises: any discovery
         failure degrades to standard single-source behavior."""
         nonlocal _multi_source_alternatives, _multi_source_consensus_set
-        nonlocal _ms_resume_cache_payload, _ms_discovery_result
+        nonlocal _ms_resume_cache_payload, _ms_discovery_result, _ms_catalog
+        nonlocal _ms_search_state
         # Source of alternatives, in priority order:
+        #   0. --search --auto-pick: the lists the search fetched moments ago
+        #      (no network here). Persisted like a fresh search, so a resume
+        #      of this run (a direct-URL run) skips the search.
         #   1. UI-supplied --multi-source-prefetched file (authoritative for
         #      THIS spawn; the search-tab writes it just before launch, saving
         #      the redundant ~80s search).
@@ -10696,7 +10830,16 @@ def main():
         )
         _cache_hit = False
         try:
-            if prefetched_path:
+            if _ms_search_state is not None:
+                from aio_search_cli import alternatives_from_search_state
+                _ms_result = alternatives_from_search_state(
+                    _ms_search_state, primary_handler=handler,
+                    primary_chapters=pool, args=args,
+                )
+                # One-shot: if building from them raised, the primary switch's
+                # later discovery falls through to a fresh search instead.
+                _ms_search_state = None
+            elif prefetched_path:
                 from aio_search_cli import build_alternatives_from_prefetched
                 _ms_result = build_alternatives_from_prefetched(
                     prefetched_path=prefetched_path,
@@ -10780,6 +10923,17 @@ def main():
                     ],
                     "readable_sites": list(_ms_result.get("readable_sites") or []),
                 }
+                _ms_catalog = _build_ms_catalog(
+                    [_r for _r in (_ms_result.get("catalog") or [])
+                     if (_r.get("site", "") or "").lower() not in _disable_set]
+                )
+                if _ms_catalog:
+                    print(
+                        f"[*] Multi-source: {len(_ms_catalog)} alternative chapter "
+                        f"list(s) kept for content-proven rescue "
+                        f"({sum(len(_a) for _a in _ms_catalog)} entries)",
+                        file=sys.stderr,
+                    )
             if _ms_alts:
                 _multi_source_alternatives = _ms_alts
                 _multi_source_consensus_set = _ms_consensus
@@ -10790,6 +10944,10 @@ def main():
                     f"alternative sources ({n_alts} total fallback paths)",
                     file=sys.stderr,
                 )
+            # Not nested in `if _ms_alts`: sites that number differently pair
+            # nothing by label yet fill the catalog, and the rescue only needs
+            # the catalog.
+            if _ms_alts or _ms_catalog:
                 # Persist the discovered sources so a future resume of this
                 # series skips the search. On a cache HIT the payload is already
                 # on disk and unchanged — just retain it for the write block /
@@ -10829,17 +10987,20 @@ def main():
     # the UI's JSON skips the expensive search, and its temp file lifetime is
     # tied to this spawn (downloader.js unlinks on close), so defer-reading
     # it buys nothing.
+    # --search lists are already in hand, so their discovery is always eager
+    # (it costs no network). --search without them (the search found no
+    # sources) gets no discovery here.
     _ms_lazy_pending = False
     if (
         getattr(args, "multi_source", False)
-        and not getattr(args, "search", None)
+        and (not getattr(args, "search", None) or _ms_search_state is not None)
         and not getattr(args, "list_chapters", False)
         and not getattr(args, "download_volumes", False)
-        and not _multi_source_alternatives  # not already populated
     ):
         if (
             getattr(args, "multi_source_lazy", False)
             and not getattr(args, "multi_source_prefetched", None)
+            and _ms_search_state is None
         ):
             _ms_lazy_pending = True
             print(
@@ -11030,10 +11191,9 @@ def main():
             and not _sw_existing
         ):
             # Discovery has not run when it was deferred (--multi-source-lazy)
-            # or when --search --auto-pick supplied the alternatives (those are
-            # keyed on this site's numbers and carry no readable_sites). Run it
-            # now, once — the decision needs it, and no chapter will fail to
-            # trigger it later.
+            # or when --search found no sources to hand over. Run it now, once
+            # — the decision needs it, and no chapter will fail to trigger it
+            # later.
             if _ms_discovery_result is None and (
                 _ms_lazy_pending or getattr(args, "search", None)
             ):
@@ -11406,6 +11566,12 @@ def main():
             )
     # ──────────────────────────────────────────────────────────────────
 
+    # The primary's whole list, before --no-partials / --chapters narrow it: the
+    # multi-source rescue measures distances and finds neighbours on the SERIES,
+    # not on this run's selection (a 1-chapter update's neighbours are the
+    # fingerprints earlier runs left in .aio_fp/). grep _primary_full.
+    _primary_full: List[Dict[str, Any]] = list(chapters)
+
     if args.no_partials:
         original_count = len(chapters)
         # Guard float(c["chap"]) against a non-numeric group.label (collapse-
@@ -11763,7 +11929,11 @@ def main():
             ]
         return out
 
-    def _record_missed(ch: Dict[str, Any], grp_name: str, reason: str, err: str, *, insert_list_index: int, insert_chapter_index: int, insert_marker_index: int, insert_page_index: int, host: str = "", pages_ok: int = 0, pages_total: int = 0) -> None:
+    def _record_missed(ch: Dict[str, Any], grp_name: str, reason: str, err: str, *, slot: Optional[str] = None, host: str = "", pages_ok: int = 0, pages_total: int = 0) -> Dict[str, Any]:
+        """Append a missed-chapter entry (and save the log). `slot` is the
+        chapter's key in the book buffer (grep _book =): the end-of-run pass
+        fills that slot in place if the chapter is recovered. Returns the
+        entry, which later passes update in place."""
         entry = {
             'key': _chapter_key(ch),
             'ch': _strip_aux_for_log(ch),
@@ -11780,13 +11950,11 @@ def main():
             'host': str(host or ''),
             'pages_ok': int(pages_ok or 0),
             'pages_total': int(pages_total or 0),
-            'insert_list_index': int(insert_list_index),
-            'insert_chapter_index': int(insert_chapter_index),
-            'insert_marker_index': int(insert_marker_index),
-            'insert_page_index': int(insert_page_index),
+            'slot': slot,
         }
         missed_entries.append(entry)
         _save_missed(missed_entries)
+        return entry
 
     # Run-level flags: did ANY chapter this run carry audio / motion aux? Read
     # at end-of-run to OR the has_audio/has_motion booleans into details.json AND
@@ -11796,7 +11964,89 @@ def main():
     # accumulate a per-chapter map here. All-False for every normal site.
     aux_seen: Dict[str, bool] = {"audio": False, "motion": False}
 
-    def _process_chapter_impl(ch: Dict[str, Any], *, force_redownload: bool = False, next_chapter: Optional[Dict[str, Any]] = None, is_alt_source: bool = False, upcoming_chapters: Optional[List[Dict[str, Any]]] = None):
+    # Chapter fingerprints (sites/chapter_fingerprint.py; plan
+    # sync-temp/plans/multisource-offset.md). Every chapter that downloads in
+    # full leaves `<series>/.aio_fp/<primary site>/<chap>.npz` (page smalls,
+    # ~200-300 KB): later rescues need the NEIGHBOURS' content to place and veto
+    # a fill. Failed primary attempts leave their delivered pages under
+    # `<tmp>/.rescue_partial/` — the own-pages proof `_rescue_search` runs. The
+    # writer decodes off the chapter thread and is drained before the timing
+    # summary (grep _fp_writer.close). Imported here, not at module top: numpy +
+    # the decode budget are only needed once a download runs.
+    from sites import chapter_fingerprint as _cfp
+    _fp_writer = _cfp.FingerprintWriter()
+
+    def _partial_path(n: Any) -> str:
+        return os.path.join(main_tmp_dir, ".rescue_partial", _cfp.chap_key(n) + ".npz")
+
+    def _capture_partial_pages(n: Any, build: Callable[[], Any]) -> None:
+        """Union this failed attempt's delivered pages into the chapter's partial
+        record. `build` returns the ChapterPages (`_cfp.pages_from_files` over the
+        attempt's page files, or `_cfp.pages_from_blobs` over a handler's
+        IncompleteChapterError.pages); it runs inside the guard, so a decode
+        failure never fails the chapter."""
+        try:
+            got = build()
+            if not got.pages:
+                return
+            path = _partial_path(n)
+            old = _cfp.load_pages(path)
+            if old is not None:
+                old.merge(got)
+                got = old
+            _cfp.save_pages(path, got)
+            log_verbose(
+                f"  [Multi-source] kept {len(got.pages)}/{got.pages_total} page(s) of "
+                f"Ch {n} as rescue evidence"
+            )
+        except Exception as exc:
+            log_verbose(f"  [Multi-source] could not keep Ch {n}'s pages: {type(exc).__name__}: {exc}")
+
+    def _fingerprint_chapter(n: Any, ident: Dict[str, Any], ch: Dict[str, Any],
+                             pages: List[Tuple[int, str]], pages_total: int,
+                             rescue: Optional[Dict[str, Any]]) -> bool:
+        """Fingerprint a fully downloaded chapter. For a rescue (`rescue` set) the
+        pages are decoded here, `rescue["verify"]` must prove them to be the
+        primary's chapter n, and the answer is returned (False = do not store this
+        chapter); the proof lands in rescue["proof"] for the caller's log. For an
+        ordinary chapter the bytes go to the background writer and the answer is
+        always True: a fingerprint never fails a download."""
+        site = (rescue or {}).get("primary_site") or handler.name
+        meta: Dict[str, Any] = {
+            "site": site, "chap": n, "title": ident.get("title"), "url": ident.get("url"),
+            "source_site": handler.name, "source_chap": ch.get("chap"), "source_url": ch.get("url"),
+        }
+        path = _cfp.fp_path(out_dir, site, n)
+        if rescue is not None:
+            try:
+                got = _cfp.pages_from_files(pages, pages_total, meta)
+                proof = rescue["verify"](got)
+            except Exception as exc:
+                got, proof = None, _cfp.Proof(False, f"proof failed: {type(exc).__name__}: {exc}")
+            rescue["proof"] = proof
+            if not proof.ok:
+                print(
+                    f"    [Multi-source] {handler.name} chapter {ch.get('chap')} is not "
+                    f"Chapter {n}: {proof.why}"
+                )
+                return False
+            got.meta["rescue"] = _rescue_provenance(rescue)
+            try:
+                _cfp.save_pages(path, got)
+            except Exception:
+                pass
+            return True
+        try:
+            blobs = []
+            for idx, p in pages:
+                with open(p, "rb") as fh:
+                    blobs.append((idx, fh.read()))
+            _fp_writer.submit(path, blobs, pages_total, meta)
+        except Exception as exc:
+            log_verbose(f"  [fingerprint] Ch {n} skipped: {type(exc).__name__}: {exc}")
+        return True
+
+    def _process_chapter_impl(ch: Dict[str, Any], *, force_redownload: bool = False, next_chapter: Optional[Dict[str, Any]] = None, is_alt_source: bool = False, upcoming_chapters: Optional[List[Dict[str, Any]]] = None, store_as: Optional[Dict[str, Any]] = None, rescue: Optional[Dict[str, Any]] = None, resume_pages: bool = False):
         # Implementation body. _process_chapter() (defined below) wraps this with
         # the per-chapter watchdog timer + host-failure reset so we can fast-fail
         # a chapter if the source CDN goes flaky. ChapterSkippedError raised in
@@ -11811,7 +12061,25 @@ def main():
         # would silently fail and waste a worker pool. The prefetch only
         # makes sense on the primary path; subsequent chapters resume on
         # the primary (strict wrapper restores it via finally).
-        n = ch["chap"]
+        #
+        # store_as / rescue (multi-source rescue, grep _rescue_search): `ch` is
+        # the ALT site's chapter dict and is used only to FETCH (images,
+        # _merged_parts, group name, aux). Everything stored or reported takes
+        # the primary's identity from `store_as` (`ident` below): the number n
+        # (tmp dir, marker, processed/{n}, filename, events, prefetch key) and
+        # ComicInfo Title/Volume/Web/date. Before this split a rescue was saved
+        # under the ALT's number, so an alt "Chapter 399" holding the primary's
+        # Ch.404 landed as Ch.399 and the real 399 was never fetched.
+        # `rescue` carries the content proof (`verify`, run on the downloaded
+        # pages before anything is processed) and the provenance written to
+        # <AioRescue> and the fingerprint.
+        #
+        # resume_pages (the strict wrapper's inline retries): a failed primary
+        # attempt left its finished pages in tdir with a _PAGES_MANIFEST; reuse
+        # the ones _resumable_pages accepts and fetch only the rest. Any other
+        # caller starts clean as before.
+        ident = store_as if store_as is not None else ch
+        n = ident["chap"]
         grp_name = handler.get_group_name(ch)
         tdir = os.path.join(main_tmp_dir, f"ch_{n}")
         processed_tdir = os.path.join(tdir, "processed")
@@ -11967,12 +12235,26 @@ def main():
             # no-op backstop for any future direct-impl caller.
             _consume_image_prefetch(n)
             prefetch_marker_path = os.path.join(tdir, ".download_prefetched")
+            kept_manifest: Optional[Dict[str, Any]] = None
             if force_redownload:
-                # Inline retry / explicit redo: discard whatever was there,
-                # including any prefetched bytes (the same sources may have
-                # been the failure root cause).
+                # Explicit redo: discard whatever was there, including any
+                # prefetched bytes (the same sources may have been the failure
+                # root cause).
                 prefetch_hit = False
                 if os.path.isdir(tdir):
+                    rm_tree(tdir)
+            elif resume_pages and os.path.isfile(os.path.join(tdir, _PAGES_MANIFEST)):
+                # Inline retry after a failed primary attempt: keep its pages;
+                # which ones are reused is decided once the new page list is in
+                # (grep _resumable_pages below).
+                prefetch_hit = False
+                try:
+                    with open(os.path.join(tdir, _PAGES_MANIFEST), encoding="utf-8") as fh:
+                        kept_manifest = json.load(fh)
+                except (OSError, ValueError):
+                    kept_manifest = None
+                if not isinstance(kept_manifest, dict):
+                    kept_manifest = None
                     rm_tree(tdir)
             else:
                 prefetch_hit = os.path.exists(prefetch_marker_path)
@@ -12017,6 +12299,27 @@ def main():
             # stale count from the previous attempt would mislabel a fresh
             # miss. Grep decode_dropped_pages.
             ch.pop("_decode_dropped", None)
+
+            def _drop_tdir_unless_kept() -> None:
+                """The page list failed. A primary dir holding a previous
+                attempt's pages + manifest stays for the next retry (the
+                manifest re-validates every page against the new list); anything
+                else is wiped as before."""
+                if not os.path.isdir(tdir):
+                    return
+                if is_alt_source or not os.path.isfile(os.path.join(tdir, _PAGES_MANIFEST)):
+                    rm_tree(tdir)
+
+            def _handler_incomplete(ice: IncompleteChapterError) -> None:
+                """A handler gave up mid-chapter: keep the bytes it did get as
+                rescue evidence (primary attempts only — an alt's pages are not
+                this chapter's evidence), then tidy tdir."""
+                if not is_alt_source and ice.pages:
+                    _capture_partial_pages(
+                        n, lambda: _cfp.pages_from_blobs(ice.pages, ice.pages_total)
+                    )
+                _drop_tdir_unless_kept()
+
             merged_parts = ch.get("_merged_parts")
             if merged_parts:
                 media_entries = []
@@ -12034,8 +12337,7 @@ def main():
                         # pages — convert to ChapterSkippedError so the strict
                         # wrapper's alt-source fallback / inline retry path
                         # picks it up the same as a Phase-2 download failure.
-                        if os.path.isdir(tdir):
-                            rm_tree(tdir)
+                        _handler_incomplete(ice)
                         raise ChapterSkippedError(
                             reason=ice.reason,
                             host=ice.host,
@@ -12070,10 +12372,8 @@ def main():
                 except IncompleteChapterError as ice:
                     # Handler exhausted its own retry policy without getting
                     # all pages — same conversion as the merged-parts branch
-                    # above. Wipes tdir so any partial state doesn't get
-                    # picked up by the next attempt's resume check.
-                    if os.path.isdir(tdir):
-                        rm_tree(tdir)
+                    # above.
+                    _handler_incomplete(ice)
                     raise ChapterSkippedError(
                         reason=ice.reason,
                         host=ice.host,
@@ -12098,8 +12398,7 @@ def main():
                     # this branch was the asymmetry letting the silent skip
                     # through. Symptom that drove this fix: Shuumatsu no
                     # Valkyrie Ch 5 on MangaDex 2026-05-16, /at-home/server 500.
-                    if os.path.isdir(tdir):
-                        rm_tree(tdir)
+                    _drop_tdir_unless_kept()
                     raise ChapterSkippedError(
                         reason=f"get_chapter_images_failed:{type(exc).__name__}",
                         host="",
@@ -12133,7 +12432,7 @@ def main():
                     entry_type = entry.get("type")
                     if entry_type == "text":
                         paragraphs = entry.get("paragraphs", [])
-                        title_text = entry.get("title") or ch.get("title")
+                        title_text = entry.get("title") or ident.get("title")
                         if paragraphs or title_text:
                             text_blocks.append(
                                 {
@@ -12178,21 +12477,60 @@ def main():
             downloaded_images: List[Tuple[int, Optional[str]]] = []
             image_workers = max(1, getattr(args, "image_workers", 3))
 
+            # Page-keeping resume (resume_pages): the pages the previous failed
+            # attempt finished, still valid for THIS page list, count as
+            # downloaded; only the rest are fetched. Every other file in tdir
+            # (a rejected page, a stale `.pending_*`) is removed first so the
+            # re-download can't pick up an old extension variant.
+            # `fetch_tasks` is what Phase 2 downloads; `download_tasks` stays the
+            # whole list (pages_total, the manifest, host blame read it).
+            fetch_tasks = download_tasks
+            if kept_manifest is not None:
+                try:
+                    present = [f for f in os.listdir(tdir)
+                               if os.path.isfile(os.path.join(tdir, f))
+                               and os.path.getsize(os.path.join(tdir, f)) > 0]
+                except OSError:
+                    present = []
+                reuse = _resumable_pages(
+                    kept_manifest, handler.name,
+                    len(download_tasks) + len(immediate_images),
+                    download_tasks, present, n,
+                )
+                keep_names = set(reuse.values())
+                binary_names = {os.path.basename(p) for _, p in immediate_images}
+                for f in os.listdir(tdir):
+                    pth = os.path.join(tdir, f)
+                    if f in keep_names or f in binary_names or not os.path.isfile(pth):
+                        continue
+                    try:
+                        os.remove(pth)
+                    except OSError:
+                        pass
+                downloaded_images.extend(
+                    (idx, os.path.join(tdir, f)) for idx, f in reuse.items()
+                )
+                fetch_tasks = [t for t in download_tasks if t[0] not in reuse]
+                print(
+                    f"  [i] Chapter {n}: kept {len(reuse)}/{len(download_tasks)} "
+                    f"page(s) from the previous attempt, fetching {len(fetch_tasks)}."
+                )
+
             _t0_dl = time.monotonic()
-            if download_tasks:
+            if fetch_tasks:
                 if prefetch_hit:
                     # Files already on disk from the inter-chapter prefetch;
                     # resolve actual filenames since dl_image's Phase A sniff
                     # may have rewritten the extension (e.g. placeholder
                     # "{n}_0001.jpg" → "{n}_0001.webp" after the bytes landed).
                     log_verbose(
-                        f"  Using prefetched files for {len(download_tasks)} image(s)..."
+                        f"  Using prefetched files for {len(fetch_tasks)} image(s)..."
                     )
                     try:
-                        existing = os.listdir(download_tasks[0][2])
+                        existing = os.listdir(fetch_tasks[0][2])
                     except OSError:
                         existing = []
-                    for task_page_idx, task_url, task_folder, task_filename in download_tasks:
+                    for task_page_idx, task_url, task_folder, task_filename in fetch_tasks:
                         base, _ = os.path.splitext(task_filename)
                         prefix = base + "."
                         # Pick the matching real file (skip hidden markers
@@ -12226,7 +12564,7 @@ def main():
                     # for this CDN, _effective_concurrency clamps to the
                     # cap. Healthy CDNs see the user-configured value.
                     fast_conc = _effective_concurrency(
-                        urlparse(download_tasks[0][1]).netloc if download_tasks else "",
+                        urlparse(fetch_tasks[0][1]).netloc if fetch_tasks else "",
                         fast_conc,
                     )
                     fast_timeout = float(globals().get("_HTTP_TIMEOUT", 30.0))
@@ -12241,11 +12579,11 @@ def main():
                     # cancels every in-flight attempt via is_cancelled.
                     fast_attempts = int(globals().get("_HTTP_MAX_RETRIES", 6))
                     log_verbose(
-                        f"  Downloading {len(download_tasks)} image(s) via "
+                        f"  Downloading {len(fetch_tasks)} image(s) via "
                         f"{handler.name} fast path (curl_cffi async, conc={fast_conc})..."
                     )
                     fast_results = handler.fast_download_images(
-                        download_tasks,
+                        fetch_tasks,
                         concurrency=fast_conc,
                         timeout=fast_timeout,
                         attempts=fast_attempts,
@@ -12273,17 +12611,17 @@ def main():
                         scraper=scraper,
                     )
                     downloaded_images.extend(fast_results)
-                elif image_workers > 1 and len(download_tasks) > 1:
+                elif image_workers > 1 and len(fetch_tasks) > 1:
                     # Phase D: apply per-host concurrency cap. ThreadPool
                     # max_workers can't be changed after creation, so we
                     # compute the effective worker count up front.
-                    pool_workers = min(image_workers, len(download_tasks))
+                    pool_workers = min(image_workers, len(fetch_tasks))
                     pool_workers = max(1, _effective_concurrency(
-                        urlparse(download_tasks[0][1]).netloc if download_tasks else "",
+                        urlparse(fetch_tasks[0][1]).netloc if fetch_tasks else "",
                         pool_workers,
                     ))
                     log_verbose(
-                        f"  Downloading {len(download_tasks)} image(s) with {pool_workers} parallel workers..."
+                        f"  Downloading {len(fetch_tasks)} image(s) with {pool_workers} parallel workers..."
                     )
                     with ThreadPoolExecutor(max_workers=pool_workers) as img_pool:
                         future_to_page = {
@@ -12295,7 +12633,7 @@ def main():
                                 scraper,
                                 not args.no_cleanup,
                             ): task_page_idx
-                            for task_page_idx, task_url, task_folder, task_filename in download_tasks
+                            for task_page_idx, task_url, task_folder, task_filename in fetch_tasks
                         }
                         for future in as_completed(future_to_page):
                             pg_idx = future_to_page[future]
@@ -12307,7 +12645,7 @@ def main():
                             downloaded_images.append((pg_idx, result_path))
                 else:
                     # Sequential fallback (image_workers=1 or only 1 image)
-                    for task_page_idx, task_url, task_folder, task_filename in download_tasks:
+                    for task_page_idx, task_url, task_folder, task_filename in fetch_tasks:
                         result_path = dl_image(
                             task_url,
                             task_folder,
@@ -12444,8 +12782,7 @@ def main():
                 # the pages_total floor from 5 to 3 (independent corroboration
                 # the chapter is fake). Grep anchors:
                 # _is_ghost_chapter_signature (this file), and the alignment
-                # dict writers under _discover_multi_source_alternatives /
-                # take_latest_multi_source_state. Under --multi-source-lazy
+                # dict writer _discover_multi_source_alternatives. Under --multi-source-lazy
                 # the dict is empty until the first failure fires discovery,
                 # so this classification runs with primary_only=None (same
                 # as multi-source off) for that first chapter; the strict
@@ -12518,8 +12855,41 @@ def main():
                         f"  [!] Chapter {n} incomplete: {pages_ok}/{pages_total} pages "
                         f"(reason={reason}, host={host_blame or '-'}). Will inline-retry."
                     )
-                # Wipe partial chapter dir so the inline retry starts fresh.
-                rm_tree(tdir)
+                # Keep what this attempt DID deliver, as page smalls: they are
+                # the multi-source rescue's own-pages proof (grep
+                # _rescue_search) and accumulate across the retries. Decoded
+                # now because the files themselves don't outlive the rescue's
+                # own attempts (an alt download wipes ch_{n}). Primary attempts
+                # only: an alt attempt's pages are not this chapter's evidence.
+                if not is_alt_source and all_images:
+                    _capture_partial_pages(
+                        n, lambda: _cfp.pages_from_files(all_images, pages_total)
+                    )
+                if is_alt_source:
+                    # An alt attempt writes into the primary's ch_{n} dir; its
+                    # pages must never be resumed by the primary (or by the next
+                    # candidate, which may be another chapter entirely).
+                    rm_tree(tdir)
+                else:
+                    # Keep the finished pages for the inline retry (grep
+                    # resume_pages / _resumable_pages). The prefetch marker goes:
+                    # it would make the retry adopt the dir as a complete
+                    # prefetch. A dir nobody retries is wiped by the next clean
+                    # attempt or the end-of-run temp cleanup.
+                    try:
+                        os.remove(prefetch_marker_path)
+                    except OSError:
+                        pass
+                    try:
+                        with open(os.path.join(tdir, _PAGES_MANIFEST), "w", encoding="utf-8") as fh:
+                            json.dump({
+                                "site": handler.name,
+                                "count": pages_total,
+                                "urls": {str(idx): url for idx, url, _f, _fn in download_tasks
+                                         if not url.startswith("data:")},
+                            }, fh)
+                    except OSError:
+                        rm_tree(tdir)
                 raise ChapterSkippedError(
                     reason=reason,
                     host=host_blame,
@@ -12532,6 +12902,22 @@ def main():
                     f"  Warning: No media downloaded for Chapter {n}. Skipping."
                 )
                 return None, grp_name, n, 0
+
+            # Every page is in: fingerprint the source bytes (before any
+            # recompress/modernize rewrites them) into .aio_fp/, and for a
+            # multi-source rescue run the content proof FIRST. An unproven
+            # rescue is wiped and reported as reason "rescue_unproven"; the
+            # strict wrapper then tries the next candidate (grep _rescue_search).
+            if raw_image_paths and not _fingerprint_chapter(
+                n, ident, ch, all_images, pages_total, rescue
+            ):
+                rm_tree(tdir)
+                raise ChapterSkippedError(
+                    reason="rescue_unproven",
+                    host="",
+                    pages_ok=pages_ok,
+                    pages_total=pages_total,
+                )
 
             if args.keep_images and raw_image_paths:
                 # When --keep-images is enabled, keep raw downloads inside the manga's
@@ -13117,7 +13503,7 @@ def main():
                         block["paragraphs"],
                         processed_tdir,
                         f"{n}_text_{idx:02d}",
-                        title=block.get("title") or ch.get("title"),
+                        title=block.get("title") or ident.get("title"),
                         start_index=len(processed_page_images) + 1,
                     )
                     processed_page_images.extend(text_paths)
@@ -13159,18 +13545,19 @@ def main():
                         if getattr(args, "komikku", False):
                             per_chap_xml = build_per_chapter_comic_info_xml(
                                 series_title=title,
-                                chapter_title=ch.get("title") or "",
+                                chapter_title=ident.get("title") or "",
                                 chapter_num=n,
-                                volume=ch.get("vol"),
+                                volume=ident.get("vol"),
                                 scanlator=grp_name,
-                                web_url=ch.get("url") or args.comic_url,
-                                uploaded_epoch=ch.get("uploaded"),
+                                web_url=ident.get("url") or args.comic_url,
+                                uploaded_epoch=ident.get("uploaded"),
                                 comic_info=comic_data,
                                 publishers=[grp_name] if grp_name else [],
                                 lang=args.language,
                                 page_count=len(processed_page_images),
                                 aux_records=ch.get("_aux_records"),
                                 missing_pages=ch.get("_missing_pages"),
+                                rescue=_rescue_provenance(rescue),
                             )
                             zf.writestr(
                                 "ComicInfo.xml",
@@ -13193,7 +13580,7 @@ def main():
                     render_text_to_xhtml(
                         block["paragraphs"],
                         xhtml_path,
-                        block.get("title") or ch.get("title"),
+                        block.get("title") or ident.get("title"),
                         args.language,
                     )
                     chapter_content.append(
@@ -13222,7 +13609,7 @@ def main():
                     render_text_to_pdf(
                         block["paragraphs"],
                         pdf_path,
-                        block.get("title") or ch.get("title"),
+                        block.get("title") or ident.get("title"),
                     )
                     pdf_parts.append(pdf_path)
 
@@ -13298,7 +13685,7 @@ def main():
             # See _komikku_chapter_filename for padding/decimal rules.
             if getattr(args, "komikku", False):
                 ch_filename = _komikku_chapter_filename(
-                    n, ch.get("vol"), ch.get("title")
+                    n, ident.get("vol"), ident.get("title")
                 )
                 ch_suffix = f"Ch {format_chap_for_filename(n)}"  # logging only
                 active_out_dir = None  # Komikku always uses out_dir
@@ -13313,7 +13700,7 @@ def main():
             log_verbose(f"  Saving individual chapter file...")
 
             if args.format == "epub":
-                chapter_marker = [{"ch": ch, "page_index": 0}]
+                chapter_marker = [{"ch": ident, "page_index": 0}]
                 with _cpu_guard('build_epub'):
                     build_epub(
                     chapter_content,
@@ -13365,18 +13752,19 @@ def main():
                     if getattr(args, "komikku", False):
                         chapter_xml = build_per_chapter_comic_info_xml(
                             series_title=title,
-                            chapter_title=ch.get("title") or "",
+                            chapter_title=ident.get("title") or "",
                             chapter_num=n,
-                            volume=ch.get("vol"),
+                            volume=ident.get("vol"),
                             scanlator=grp_name,
-                            web_url=ch.get("url") or args.comic_url,
-                            uploaded_epoch=ch.get("uploaded"),
+                            web_url=ident.get("url") or args.comic_url,
+                            uploaded_epoch=ident.get("uploaded"),
                             comic_info=comic_data,
                             publishers=[grp_name] if grp_name else [],
                             lang=args.language,
                             page_count=len(cbz_images),
                             aux_records=ch.get("_aux_records"),
                             missing_pages=ch.get("_missing_pages"),
+                            rescue=_rescue_provenance(rescue),
                         )
                     with _cpu_guard('build_cbz'):
                         build_cbz(
@@ -13404,7 +13792,7 @@ def main():
         return chapter_content, grp_name, n, chapter_content_size
 
 
-    def _process_chapter(ch: Dict[str, Any], *, force_redownload: bool = False, next_chapter: Optional[Dict[str, Any]] = None, is_alt_source: bool = False, upcoming_chapters: Optional[List[Dict[str, Any]]] = None):
+    def _process_chapter(ch: Dict[str, Any], *, force_redownload: bool = False, next_chapter: Optional[Dict[str, Any]] = None, is_alt_source: bool = False, upcoming_chapters: Optional[List[Dict[str, Any]]] = None, store_as: Optional[Dict[str, Any]] = None, rescue: Optional[Dict[str, Any]] = None, resume_pages: bool = False):
         """Wrapper around _process_chapter_impl that arms the per-chapter
         watchdog (deadline timer + host-failure reset) and tears it down on
         exit, even if _process_chapter_impl raises (ChapterSkippedError or any
@@ -13432,16 +13820,19 @@ def main():
         # prefetched 124/124 pages were wiped at the completeness gate. The
         # impl's own _consume_image_prefetch call stays as a no-op backstop
         # (this join pops the done-event).
-        _consume_image_prefetch(ch.get("chap"))
+        # Keyed by the STORED chapter: a rescue fetches an alt dict whose own
+        # number may be another primary chapter's (grep store_as).
+        _consume_image_prefetch((store_as or ch).get("chap"))
         # Reset per-chapter host-failure tally so the poison threshold is
         # scoped per chapter, not per run.
         _reset_host_failures_for_chapter()
         _CHAPTER_CANCEL = threading.Event()
 
         deadline_s = float(globals().get("_CHAPTER_DEADLINE", 90.0))
-        if force_redownload and deadline_s > 0:
-            # End-of-run retry pass: give the chapter more headroom on its
-            # second chance. Origin is often less flaky a few minutes later.
+        if (force_redownload or resume_pages) and deadline_s > 0:
+            # A retry (the strict wrapper's inline retries resume; the end-of-
+            # run pass redoes): give the chapter more headroom on its second
+            # chance. Origin is often less flaky a few minutes later.
             deadline_s *= 2.0
 
         timer: Optional[threading.Timer] = None
@@ -13450,7 +13841,7 @@ def main():
             timer.daemon = True
             timer.start()
         try:
-            return _process_chapter_impl(ch, force_redownload=force_redownload, next_chapter=next_chapter, is_alt_source=is_alt_source, upcoming_chapters=upcoming_chapters)
+            return _process_chapter_impl(ch, force_redownload=force_redownload, next_chapter=next_chapter, is_alt_source=is_alt_source, upcoming_chapters=upcoming_chapters, store_as=store_as, rescue=rescue, resume_pages=resume_pages)
         finally:
             if timer is not None:
                 timer.cancel()
@@ -13459,6 +13850,587 @@ def main():
             # see a stale set Event that would make them fast-fail.
             _CHAPTER_CANCEL = None
 
+
+    # ------------------------------------------------------------------
+    # Multi-source rescue (plan sync-temp/plans/multisource-offset.md rev 3).
+    # Two tiers, both searching the alt catalog (`_ms_catalog`, one ordered list
+    # per alt site or scanlation group) and both storing the alt chapter AS the
+    # primary's (store_as), run by the strict wrapper after the primary's own
+    # retries:
+    #   own-pages (`_rescue_search`): the pages the primary's failed attempts
+    #     delivered are found, in order, inside the alt chapter. Proof.
+    #   placement (`_place`): the alt entry the count from the chapter's
+    #     neighbours' copies points at, the far neighbour confirmed where the
+    #     count puts it, then downloaded and checked (labels, ±15 veto, length,
+    #     own pages). Not proof; the user accepted the residual risk for chapters
+    #     the primary delivers no pages for. Neighbours not on disk yet are
+    #     probed on the primary (4 middle pages), so placement finishes at the
+    #     point of failure. A locked run at either end of the list has one
+    #     neighbour only and is CHAINED from it instead (both sides' numbers
+    #     stepping one for one, rescue_pairing.lockstep).
+    # Pairs (primary entry <-> alt entry) are kept in memory and in
+    # `.aio_fp/<primary>/pairings.json`; they predict where to look, and the
+    # content-located ones (own-pages / probe) are anchors that cost no probe.
+    # ------------------------------------------------------------------
+    from sites import rescue_pairing as _rp
+    _rescue_primary = handler.name
+    _pair_store = _rp.PairStore(
+        os.path.join(out_dir, ".aio_fp", _cfp.chap_key(_rescue_primary), "pairings.json")
+    )
+    _run_pairs: Dict[str, List[Any]] = {}
+    _primary_idx_by_id = {id(c): i for i, c in enumerate(_primary_full)}
+    _primary_idx_by_url = {c.get("url"): i for i, c in enumerate(_primary_full) if c.get("url")}
+    _primary_idx_by_label: Dict[str, int] = {}
+    for _i, _c in enumerate(_primary_full):
+        _primary_idx_by_label.setdefault(_chap_label_str(_c.get("chap")), _i)
+
+    def _primary_index(ch: Dict[str, Any]) -> Optional[int]:
+        """`ch`'s index in the primary's FULL list (grep _primary_full)."""
+        i = _primary_idx_by_id.get(id(ch))
+        if i is None:
+            i = _primary_idx_by_url.get(ch.get("url"))
+        if i is None:
+            i = _primary_idx_by_label.get(_chap_label_str(ch.get("chap")))
+        return i
+
+    def _pairs(alt: Any) -> List[Any]:
+        return _rp.resolve_pairs(alt, _pair_store, _primary_idx_by_url,
+                                 _run_pairs.get(alt.key, ()))
+
+    def _remember_pair(alt: Any, i: int, pos: int, tier: str) -> None:
+        _run_pairs.setdefault(alt.key, []).append(_rp.Pair(i, pos, tier))
+        pch, ent = _primary_full[i], alt.entries[pos]
+        _pair_store.put(alt.key, pch.get("url"), pch.get("chap"), ent.url, ent.chap,
+                        tier, len(alt))
+
+    @_contextlib.contextmanager
+    def _as_alt(alt: Any):
+        """Swap the alt list's handler/scraper/context in for the block; the
+        primary's are restored however it exits."""
+        nonlocal handler, scraper, context, comic_data
+        saved = (handler, scraper, context, comic_data)
+        rec = alt.record
+        handler, scraper, context = rec["handler"], rec["scraper"], rec["context"]
+        comic_data = rec["context"].comic if rec["context"] is not None else saved[3]
+        try:
+            yield
+        finally:
+            handler, scraper, context, comic_data = saved
+
+    # Own-page count each chapter's last own-pages search ran with; a repeat
+    # search with no new evidence would only repeat the same probes.
+    _rescue_evidence_seen: Dict[str, int] = {}
+    # Per list: candidates looked at (cheap pre-check included), and of those
+    # how many may be downloaded IN FULL without a pre-check answer. P0 replay:
+    # median 1 probe, p90 3, max 14 (bench/ms-offset/data/replay_w15.jsonl).
+    _RESCUE_PROBES_PER_SITE = 10
+    _RESCUE_FULL_PER_SITE = 3
+    # Placement's veto: no primary chapter this far either side whose content we
+    # hold may be found in the candidate.
+    _VETO_RADIUS = 15
+
+    def _fetch_pages(chapter: Dict[str, Any], probe_dir: str, which: Any) -> Optional[Any]:
+        """Pages of one chapter as ChapterPages (decoded to smalls, the files
+        deleted), with the CURRENT handler/scraper: the primary's, or an alt's
+        inside _as_alt. Not the chapter routine: nothing is stored, and probes are
+        outside the per-site chapter budget. `which`: None = every page; an int k
+        = the first k (T1's head pre-check); "middle" = an identifying probe
+        (chapter_fingerprint.middle_pages, widened when the first pages carry too
+        little). None when the page list failed or was empty; otherwise the
+        pages that downloaded (maybe none), with pages_total = the list's length."""
+        try:
+            parts = chapter.get("_merged_parts") or [chapter]
+            entries: List[Any] = []
+            for part in (parts[:1] if isinstance(which, int) else parts):
+                entries += handler.get_chapter_images(part, scraper, make_request) or []
+            entries = [e for e in entries if not (isinstance(e, dict) and e.get("type") == "text")]
+        except Exception:
+            return None
+        if not entries:
+            return None
+        n_pages = len(entries)
+        got = _cfp.ChapterPages(pages_total=n_pages)
+
+        def one(i: int):
+            if run_cancelled():
+                return None
+            try:
+                e = entries[i - 1]
+                if isinstance(e, dict) and e.get("type") == "binary_image":
+                    blob = e.get("data")
+                else:
+                    url = e if isinstance(e, str) else (e.get("url") if isinstance(e, dict) else None)
+                    if not url:
+                        return None
+                    pth = dl_image(url, probe_dir, f"p_{i:04d}.jpg", scraper)
+                    if not pth:
+                        return None
+                    with open(pth, "rb") as fh:
+                        blob = fh.read()
+                return (i, _cfp.page_small(blob)) if blob else None
+            except Exception:
+                return None
+
+        def fetch(idxs: List[int]) -> None:
+            todo = [i for i in idxs if i not in got.pages]
+            if len(todo) > 1:
+                # dl_image is called from a thread pool by the chapter routine
+                # too (grep img_pool); 4 workers keep one host polite.
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    results = list(pool.map(one, todo))
+            else:
+                results = [one(i) for i in todo]
+            for r in results:
+                if r:
+                    got.pages[r[0]] = r[1]
+
+        try:
+            os.makedirs(probe_dir, exist_ok=True)
+            if which is None:
+                fetch(list(range(1, n_pages + 1)))
+            elif which == "middle":
+                fetch(_cfp.middle_pages(n_pages, _cfp.PROBE_PAGES))
+                if got.pages and not got.fingerprint().informative:
+                    fetch(_cfp.middle_pages(n_pages, _cfp.PROBE_PAGES_WIDE))
+            else:
+                fetch(list(range(1, min(n_pages, int(which)) + 1)))
+            return got
+        finally:
+            rm_tree(probe_dir)
+
+    # Fetches per run, by (alt url, kind). A failure is retried once on a later
+    # ask (a transient error must not blind a list for the whole run), then
+    # remembered.
+    _fetch_cache: Dict[Tuple[str, str], Any] = {}
+    _fetch_fails: Dict[Tuple[str, str], int] = {}
+
+    def _cached_fetch(key: Tuple[str, str], fetch: Callable[[], Any]) -> Any:
+        if key in _fetch_cache:
+            return _fetch_cache[key]
+        got = fetch()
+        if (got is not None and got.pages) or _fetch_fails.get(key, 0) >= 1:
+            _fetch_cache[key] = got
+        else:
+            _fetch_fails[key] = 1
+        return got
+
+    def _alt_head(alt: Any, ent: Any) -> Optional[Any]:
+        """The first HEAD_PAGES pages of an alt entry (T1's pre-check), or None."""
+        def fetch():
+            with _as_alt(alt):
+                return _fetch_pages(ent.chapter, os.path.join(main_tmp_dir, ".rescue_probe"),
+                                    _cfp.HEAD_PAGES)
+        got = _cached_fetch((ent.url or f"{alt.key}#{ent.pos}", "head"), fetch)
+        return got if got is not None and got.pages else None
+
+    _alt_probe_fp: Dict[Tuple[str, int], Any] = {}
+
+    def _alt_probe(alt: Any, ent: Any) -> Any:
+        """An alt entry's identifying probe -> its Fingerprint, None (its images
+        failed or carry too little picture content), or rescue_pairing.NOIMG (it
+        has no page list: costs a list request, not probe budget)."""
+        def fetch():
+            with _as_alt(alt):
+                return _fetch_pages(ent.chapter, os.path.join(main_tmp_dir, ".rescue_probe"),
+                                    "middle")
+        got = _cached_fetch((ent.url or f"{alt.key}#{ent.pos}", "middle"), fetch)
+        if got is None:
+            return _rp.NOIMG
+        if not got.pages:
+            return None
+        key = (alt.key, ent.pos)
+        if key not in _alt_probe_fp:
+            _alt_probe_fp[key] = got.fingerprint()
+        fp = _alt_probe_fp[key]
+        return fp if fp.informative else None
+
+    def _rescue_search(ch: Dict[str, Any], primary_err: "ChapterSkippedError",
+                       primary_state: Tuple[Any, Any, Any, Any],
+                       next_chapter: Optional[Dict[str, Any]]):
+        """Tier own-pages: find, among the alt lists' chapters, one whose content
+        is PROVEN to be the primary's chapter `ch`, download it and store it AS
+        `ch` (store_as). Returns (result_tuple, notes) on success, (None, notes)
+        otherwise; notes say what each candidate was and why it was rejected (the
+        abort message).
+
+        Proof: the pages the primary's failed attempts did deliver
+        (`_capture_partial_pages`) must be found, in order, inside the candidate,
+        both ways (chapter_fingerprint.prove_partial). A chapter the primary
+        delivered NO pages for cannot be proven here; placement may fill it
+        (grep _place).
+
+        Search: per list, outward from the predicted position (grep
+        rescue_pairing.predict). Each candidate first gets a cheap check of its
+        first pages; only candidates that pass, or that the check cannot judge,
+        are downloaded in full. The full download runs through the normal chapter
+        routine with the proof as a gate before anything is processed or saved.
+        """
+        n = ch.get("chap")
+        notes: List[str] = []
+        partial = _cfp.load_pages(_partial_path(n))
+        if partial is None or not partial.pages:
+            notes.append(f"no pages from {primary_state[0].name} to prove a fill with")
+            print(
+                f"  [Multi-source] Chapter {n}: {primary_state[0].name} delivered no "
+                f"pages, so no alternative can be proven to be this chapter by its "
+                f"own pages."
+            )
+            return None, notes
+        key = _cfp.chap_key(n)
+        if _rescue_evidence_seen.get(key) == len(partial.pages):
+            return None, notes
+        _rescue_evidence_seen[key] = len(partial.pages)
+        i = _primary_index(ch)
+        if i is None:
+            notes.append(f"chapter {n!r} is not in {primary_state[0].name}'s list")
+            return None, notes
+        print(
+            f"  [Multi-source] Chapter {n} failed on {primary_state[0].name} "
+            f"({primary_err.reason}); searching {len(_ms_catalog)} alternative list(s) for "
+            f"the chapter holding its {len(partial.pages)}/{partial.pages_total} "
+            f"delivered page(s)..."
+        )
+        for alt in _ms_catalog:
+            if run_cancelled():
+                break
+            if not len(alt):
+                continue
+            start = _rp.predict(alt, i, _primary_full, _pairs(alt), _extract_chapter_num)
+            probes = full = 0
+            for pos in _rp.outward(start, len(alt)):
+                if probes >= _RESCUE_PROBES_PER_SITE or run_cancelled():
+                    break
+                probes += 1
+                ent = alt.entries[pos]
+                alt_chapter = ent.chapter
+                label = f"{alt.key} chapter {ent.chap}"
+                with _as_alt(alt):
+                    head = _alt_head(alt, ent)
+                    verdict = _cfp.head_matches(partial, head) if head else None
+                    if verdict is False:
+                        notes.append(f"{label}: opening pages differ")
+                        log_verbose(f"    [Multi-source] {label}: opening pages differ")
+                        continue
+                    if verdict is None:
+                        if full >= _RESCUE_FULL_PER_SITE:
+                            notes.append(f"{label}: not downloaded (probe budget)")
+                            continue
+                        full += 1
+                    print(f"    [Multi-source] -> {label}")
+                    rescue = {
+                        "site": handler.name,
+                        "chap": ent.chap,
+                        "url": ent.url,
+                        "tier": "own-pages",
+                        "primary_site": primary_state[0].name,
+                        "verify": lambda got: _cfp.prove_partial(partial, got.fingerprint()),
+                    }
+                    try:
+                        result = _process_chapter(
+                            alt_chapter, force_redownload=True, next_chapter=next_chapter,
+                            is_alt_source=True, store_as=ch, rescue=rescue,
+                        )
+                    except ChapterSkippedError as cse_alt:
+                        proof = rescue.get("proof")
+                        why = proof.why if (cse_alt.reason == "rescue_unproven" and proof) else f"download failed ({cse_alt.reason})"
+                        notes.append(f"{label}: {why}")
+                        continue
+                _remember_pair(alt, i, pos, "own-pages")
+                multi_source_rescues.append({
+                    "chap": n,
+                    "alt_site": alt.site,
+                    "alt_chap": ent.chap,
+                    "primary_site": primary_state[0].name,
+                    "primary_reason": primary_err.reason,
+                    "tier": "own-pages",
+                })
+                print(
+                    f"    [Multi-source] ✓ Chapter {n} filled from {label} "
+                    f"(content-proven: {rescue['proof'].why})"
+                )
+                return result, notes
+        return None, notes
+
+    # Primary fingerprints by full-list index, loaded once each. A miss is not
+    # cached: this run's chapters land in .aio_fp/ while it runs.
+    _primary_fp_cache: Dict[int, Any] = {}
+
+    def _primary_pages(j: int) -> Optional[Any]:
+        """Complete smalls of primary entry j from .aio_fp/, or None. A file whose
+        recorded url is not entry j's is stale (tapas renumbers `scene` numbers
+        when the publisher inserts an episode) and is ignored."""
+        if j in _primary_fp_cache:
+            return _primary_fp_cache[j]
+        pch = _primary_full[j]
+        cp = _cfp.load_pages(_cfp.fp_path(out_dir, _rescue_primary, pch.get("chap")))
+        if cp is None or not cp.complete:
+            return None
+        rec_url = (cp.meta or {}).get("url")
+        if rec_url and pch.get("url") and rec_url != pch.get("url"):
+            return None
+        _primary_fp_cache[j] = cp
+        return cp
+
+    # Placement's our-side evidence (plan D3): per primary entry, its full
+    # fingerprint from .aio_fp/ (the chapter as stored, a filled one included:
+    # a block fills left to right, each fill anchoring the next), else its probe
+    # (4 middle pages, `.aio_fp/<primary>/<chap>.probe.npz`). Probes fetched or
+    # loaded this run are cached, a failed fetch too; a full fingerprint is
+    # looked up every time, since this run's chapters land in .aio_fp/ as it runs.
+    _probe_pages: Dict[int, Optional[Any]] = {}
+    _ev_fp: Dict[Tuple[int, str], Any] = {}
+    _names_memo: Dict[Tuple[str, int, int, str], bool] = {}
+
+    def _evidence(k: int, fetch: bool = False) -> Optional[Tuple[Any, str]]:
+        """(Fingerprint, "full" | "probe") for primary entry k, or None. With
+        fetch=True a chapter we hold nothing for is probed on the PRIMARY now (a
+        neighbour the run has not reached, or a library from before
+        fingerprints, plan D6); locked / publisher-hosted entries never are."""
+        if not (0 <= k < len(_primary_full)):
+            return None
+        cp, kind = _primary_pages(k), "full"
+        if cp is None:
+            kind = "probe"
+            pch = _primary_full[k]
+            if k not in _probe_pages:
+                path = _cfp.probe_path(out_dir, _rescue_primary, pch.get("chap"))
+                cp = _cfp.load_pages(path)
+                if cp is not None and (cp.meta or {}).get("url") not in (None, pch.get("url")):
+                    cp = None                  # a renumbered entry (tapas scenes)
+                if cp is None:
+                    if not fetch or pch.get("_locked"):
+                        return None
+                    print(f"    [Multi-source] probing Ch {pch.get('chap')} on {_rescue_primary} "
+                          f"({_cfp.PROBE_PAGES} middle pages)...")
+                    cp = _fetch_pages(pch, os.path.join(main_tmp_dir, ".rescue_probe"), "middle")
+                    if cp is not None and cp.pages:
+                        cp.meta = {"site": _rescue_primary, "chap": pch.get("chap"),
+                                   "url": pch.get("url"), "probe": True}
+                        try:
+                            _cfp.save_pages(path, cp)
+                        except Exception:
+                            pass
+                    else:
+                        cp = None
+                _probe_pages[k] = cp
+            cp = _probe_pages[k]
+            if cp is None:
+                return None
+        if (k, kind) not in _ev_fp:
+            _ev_fp[(k, kind)] = cp.fingerprint()
+        fp = _ev_fp[(k, kind)]
+        return (fp, kind) if fp.informative else None
+
+    def _placed(k: int) -> bool:
+        """Is primary entry k's stored copy a placement fill (or a P2
+        elimination one)? Its content is an alt entry put there by position, so
+        a probe that names it proves nothing new: a pair it makes is saved as
+        placement grade (rescue_pairing: placement pairs never anchor), and it
+        never serves as the far neighbour R. It may still be the left neighbour
+        of the next chapter of a block (user decision 2026-10-25: a block fills
+        left to right, each fill anchoring the next)."""
+        cp = _primary_pages(k)
+        r = (cp.meta or {}).get("rescue") if cp is not None else None
+        return bool(r) and _rp.tier_of(r.get("tier")) == "placement"
+
+    def _content_pair(alt: Any, k: int, pos: int) -> None:
+        """Save a pair a probe found, at the grade its evidence earns."""
+        _remember_pair(alt, k, pos, "placement" if _placed(k) else "probe")
+
+    def _identify(alt: Any, q: int, centre: int, hide: Set[int]) -> Any:
+        """Which of our chapters within IDENTIFY_WINDOW of `centre` is alt entry
+        q? -> primary index (exactly one named), None, or NOIMG. Only evidence we
+        already hold counts: a search never probes the primary."""
+        ent = alt.entries[q]
+        pf = _alt_probe(alt, ent)
+        if pf is _rp.NOIMG or pf is None:
+            return pf
+        ids = []
+        for k in range(max(0, centre - _rp.IDENTIFY_WINDOW),
+                       min(len(_primary_full), centre + _rp.IDENTIFY_WINDOW + 1)):
+            if k in hide:
+                continue
+            e = _evidence(k)
+            if e is None:
+                continue
+            key = (alt.key, q, k, e[1])
+            if key not in _names_memo:
+                _names_memo[key] = _cfp.probe_names(pf, e[0], e[1] == "probe")
+            if _names_memo[key]:
+                ids.append(k)
+        return ids[0] if len(ids) == 1 else None
+
+    def _place(ch: Dict[str, Any], i: int, partial: Optional[Any], pages_total: int,
+               reason: str):
+        """Tier placement for primary entry i (`ch`), plan rev 3 D3 / D4. Returns
+        (result_tuple, notes) or (None, notes).
+        1. The block: i plus the locked / publisher-hosted entries right after it
+           (they hold no evidence). L = nearest entry before i with evidence, R =
+           nearest after the block whose copy is not a placement fill (grep
+           _placed), each at most REACH out; a neighbour we hold nothing for is
+           probed on the primary.
+        2. One list at a time (rescue_pairing.order_lists): locate L's copy (a
+           free content / label anchor, else identifying probes); R's copy must
+           sit at L's + (R - L) (free anchor or ONE probe); the entry at L's +
+           (i - L) is the candidate.
+           Chains (D4), for a locked / publisher-hosted chapter only: a block
+           that runs to the newest entry has no R (tail), one with nothing but
+           locked entries before it has no L (head). The one neighbour's copy is
+           located as above, and instead of R's check every step from it across
+           the whole block must advance both our number and the alt's by exactly
+           one (rescue_pairing.lockstep). Any other missing side is no chain:
+           an outage on the newest chapters, or a neighbour with no picture
+           content, gives up.
+        3. The candidate is downloaded through the chapter routine with a gate:
+           labels agree where both carry one, no chapter within ±_VETO_RADIUS
+           whose content we hold is in it, its length fits its neighbours', and
+           it does not contradict pages the primary did deliver.
+        Content pairs met on the way are saved; the fill only as placement grade
+        (predicts, never anchors). Nothing waits: fill or give up here."""
+        n = ch.get("chap")
+        notes: List[str] = []
+        _fp_writer.drain()             # this run's fingerprints, before reading them
+        N = len(_primary_full)
+        chap_of = lambda k: _primary_full[k].get("chap")
+        j = i
+        while j + 1 < N and _primary_full[j + 1].get("_locked"):
+            j += 1
+        hide = set(range(i, j + 1))
+
+        def ev(k: int, fetch: bool = False) -> Optional[Tuple[Any, str]]:
+            return None if k in hide else _evidence(k, fetch)
+
+        def skip(note: str) -> None:
+            """A list that cannot place the chapter: said now (the next list may
+            still fill it) and kept for the abort message."""
+            notes.append(note)
+            print(f"    [Multi-source] {note}")
+
+        # Chains only where the primary will never serve the missing side: a
+        # locked run reaching the newest entry, or one with only locked entries
+        # before it. The primary's list is complete, so "no R" there is final.
+        locked = bool(ch.get("_locked")) or reason in ("locked", "external_link")
+        tail_ok = locked and j == N - 1
+        head_ok = locked and all(_primary_full[k].get("_locked") for k in range(i))
+        L = next((k for k in range(i - 1, max(-1, i - 1 - _rp.REACH), -1) if ev(k, True)), None)
+        if L is None and not head_ok:
+            notes.append(f"no readable chapter within {_rp.REACH} entries before it to place it by")
+            return None, notes
+        R = next((k for k in range(j + 1, min(N, j + 1 + _rp.REACH))
+                  if not _placed(k) and ev(k, True)), None)
+        if R is None and not (tail_ok and L is not None):
+            notes.append(f"no readable chapter within {_rp.REACH} entries after it to place it by")
+            return None, notes
+        # chain: None = bracket by L and R; +1 = tail, from L forwards; -1 =
+        # head, from R backwards. A = the neighbour whose copy is located.
+        chain = None if (L is not None and R is not None) else (+1 if R is None else -1)
+        A = R if chain == -1 else L
+        if chain is None:
+            print(f"  [Multi-source] Chapter {n}: placing it by its neighbours Ch {chap_of(L)} "
+                  f"and Ch {chap_of(R)} on the alternative lists...")
+        else:
+            print(f"  [Multi-source] Chapter {n}: no readable chapter "
+                  f"{'after' if chain > 0 else 'before'} it; chaining it one-for-one from "
+                  f"Ch {chap_of(A)} on the alternative lists...")
+        if chain == -1:
+            # A head run starts with nothing on disk. Probes of the next two
+            # chapters let a probe of an alt entry near R's copy name one of them
+            # and the search jump, as the M1 harness did (replay_m1.chain).
+            for k in range(R + 1, min(N, R + 3)):
+                ev(k, True)
+        lab = _rp.episode_label(ch.get("title"))
+        for alt in _rp.order_lists(_ms_catalog, _pairs):
+            if run_cancelled():
+                break
+            identify = lambda q, c, _alt=alt: _identify(_alt, q, c, hide)
+            loc = _rp.locate(alt, A, _primary_full, _pairs(alt), identify,
+                             num_of=_extract_chapter_num)
+            for p in loc.found:
+                _content_pair(alt, p.primary_idx, p.alt_pos)
+            if loc.pos is None:
+                skip(f"{alt.key}: Ch {chap_of(A)} {loc.note}")
+                continue
+            if loc.tier == "probe":
+                _content_pair(alt, A, loc.pos)
+            if chain is None:
+                ok, why, found = _rp.confirm(alt, R, loc.pos + (R - L), _primary_full, _pairs(alt),
+                                             identify, lambda: ev(R + 1, True) is not None)
+                for p in found:
+                    _content_pair(alt, p.primary_idx, p.alt_pos)
+                if not ok:
+                    skip(f"{alt.key}: Ch {chap_of(R)} is not {R - L} entries after "
+                         f"Ch {chap_of(L)} ({why})")
+                    continue
+                where = f"between Ch {chap_of(L)} and Ch {chap_of(R)} ({loc.tier} / {why})"
+            else:
+                # The whole block at once (tail: to the newest entry; head: back
+                # to i), so one list carries the run or none does.
+                ok, why = _rp.lockstep(alt, _primary_full, A, loc.pos, j if chain > 0 else i,
+                                       _extract_chapter_num)
+                if not ok:
+                    skip(f"{alt.key}: the chain from Ch {chap_of(A)} stops, {why}")
+                    continue
+                where = f"chained from Ch {chap_of(A)} ({loc.tier}), {why}"
+            ent = alt.entries[loc.pos + (i - A)]
+            label = f"{alt.key} chapter {ent.chap}"
+            if lab is not None and ent.label is not None and ent.label != lab:
+                skip(f"{label}: labelled episode {ent.label}, not {lab}")
+                continue
+            veto = [(k, e[0]) for k in range(max(0, i - _VETO_RADIUS), min(N, i + _VETO_RADIUS + 1))
+                    for e in (ev(k),) if e is not None]
+            nbrs = [(e[0].length_widths, _primary_pages(k).pages_total)
+                    for k in (i - 2, i - 1, i + 1, i + 2) for e in (ev(k),)
+                    if e is not None and e[1] == "full"]
+
+            def verify(got: Any) -> Any:
+                fp = got.fingerprint()
+                if not fp.informative:
+                    return _cfp.Proof(False, "too little picture content to check")
+                for k, ofp in veto:
+                    if _cfp.holds_other(fp, ofp):
+                        return _cfp.Proof(False, f"holds Ch {chap_of(k)}'s content")
+                ok_len, why_len = _rp.length_check(fp.length_widths, pages_total, nbrs)
+                if ok_len is False:
+                    return _cfp.Proof(False, why_len)
+                if partial is not None and partial.pages:
+                    head = _cfp.ChapterPages(pages_total=got.pages_total, pages={
+                        k: got.pages[k] for k in sorted(got.pages)[:_cfp.HEAD_PAGES]})
+                    if _cfp.head_matches(partial, head) is False:
+                        return _cfp.Proof(False, f"opens unlike the pages {_rescue_primary} delivered")
+                return _cfp.Proof(True, f"{where}; {why_len}; no match within "
+                                        f"{_VETO_RADIUS} chapters")
+
+            # "chain" reads as placement grade everywhere (rescue_pairing.tier_of)
+            # but stays visible in <AioRescue tier=> and the run summary.
+            tier = "placement" if chain is None else "chain"
+            print(f"    [Multi-source] -> {label} ({'placed' if chain is None else 'chained'})")
+            rescue = {
+                "site": alt.site, "chap": ent.chap, "url": ent.url, "tier": tier,
+                "primary_site": _rescue_primary, "verify": verify,
+            }
+            with _as_alt(alt):
+                try:
+                    result = _process_chapter(ent.chapter, force_redownload=True,
+                                              is_alt_source=True, store_as=ch, rescue=rescue)
+                except ChapterSkippedError as cse_alt:
+                    proof = rescue.get("proof")
+                    why = proof.why if (cse_alt.reason == "rescue_unproven" and proof) else f"download failed ({cse_alt.reason})"
+                    notes.append(f"{label}: {why}")
+                    continue
+            _remember_pair(alt, i, ent.pos, "placement")
+            multi_source_rescues.append({
+                "chap": n, "alt_site": alt.site, "alt_chap": ent.chap,
+                "primary_site": _rescue_primary, "primary_reason": reason,
+                "tier": tier,
+            })
+            print(f"    [Multi-source] ✓ Chapter {n} filled from {label} by "
+                  f"{'placement' if chain is None else 'chain'} ({rescue['proof'].why})")
+            return result, notes
+        return None, notes
+
+    # Chapters in a row whose primary retries were all exhausted (grep
+    # _OUTAGE_BREAKER). Reset by any chapter the primary serves.
+    _outage_streak = 0
 
     def _process_chapter_strict(ch: Dict[str, Any], *, force_redownload: bool = False, next_chapter: Optional[Dict[str, Any]] = None, upcoming_chapters: Optional[List[Dict[str, Any]]] = None):
         """Outer wrapper: zero-tolerance + per-chapter source fallback + inline
@@ -13471,20 +14443,30 @@ def main():
         restored. Avoids waiting 30-60s on inline-retry when an alternative
         source has the chapter and would succeed in seconds.
 
-        Behavior the user explicitly asked for after seeing partial PDFs:
-          1. Never accept a partial chapter (any missing page → fallback or retry).
-          2. NEAR-MISS FIRST (2026-08-20): a reason=="incomplete" failure means
-             the primary served nearly the whole chapter, so give it ONE quick
-             retry (_NEAR_MISS_RETRY_BACKOFF) before looking at other sources —
-             otherwise a 2-page transient miss trades the publisher's own
-             120-page chapter for a shorter third-party re-host. Grep NEAR-MISS.
-          3. Then try alternative sources (cheap — no long sleep) — EXCEPT
-             aux-bearing chapters (webtoons BGM/motion, tapas BGM): those are
-             never alt-rescued because alt sites lack the audio/motion content
-             (2026-07-03 directive; grep _chapter_carries_aux). They go
-             straight to the inline retry on the primary.
-          4. If all sources fail: long inline retry on primary (CDN recovery).
-          5. If inline retries don't recover: stop the run with a clear error.
+        Order (plan sync-temp/plans/multisource-offset.md D1, user decisions
+        2026-10-25):
+          1. Primary attempt. Never accept a partial chapter.
+          2. Inline retries on the primary FIRST, each resuming (pages the last
+             attempt finished are kept, grep resume_pages):
+             - page list loaded (pages_total > 0): a 5s retry when the failure
+               was a near-miss "incomplete" (grep NEAR-MISS), then the long
+               ladder below;
+             - page list failed: ONE short retry (_LIST_RETRY_BACKOFF); a list
+               that loads then continues on the long ladder;
+             - locked / external_link / the permanent gates
+               (_PERMANENT_SKIP_REASONS) / ghost_chapter: no retries.
+          3. Breaker: _OUTAGE_BREAKER chapters in a row exhausting step 2 stop
+             the run as a host outage (nothing filled from other sites).
+          4. Own-pages rescue (grep _rescue_search) with every page all attempts
+             delivered — EXCEPT aux-bearing chapters (webtoons BGM/motion, tapas
+             BGM, grep _chapter_carries_aux), which alt sites can't serve.
+          5. Ghosts skip (ChapterGhostError) as before.
+          6. Under --multi-source with an alt catalog, placement (grep _place):
+             the alt entry its neighbours' copies bracket, checked before it is
+             stored. Nothing waits for later chapters: a neighbour not
+             downloaded yet is probed on the primary. A locked run at the
+             newest or oldest end, with one neighbour only, is chained from it.
+          7. Nothing filled: stop the run (permanent gates skip as before).
 
         Backoff schedule: --inline-chapter-backoff seconds, doubling each
         retry. With defaults (base=30s, retries=2): waits 30s, then 60s.
@@ -13496,88 +14478,123 @@ def main():
         discovery, or — under --multi-source-lazy — by the first-failure
         hook right below (grep _ms_lazy_pending).
         """
-        nonlocal handler, scraper, context, comic_data, _ms_lazy_pending
+        # handler/scraper/context/comic_data are swapped to an alt only inside
+        # _rescue_search / _place (grep _as_alt), which restore them; read here,
+        # never assigned.
+        nonlocal _ms_lazy_pending
         primary_state = (handler, scraper, context, comic_data)
         n_for_log = ch.get("chap")
         max_retries = int(globals().get("_INLINE_CHAPTER_RETRIES", 2))
         base_backoff = float(globals().get("_INLINE_CHAPTER_BACKOFF", 30.0))
 
+        nonlocal _outage_streak
         # Try primary source first.
         try:
-            redo_primary = bool(force_redownload)
-            return _process_chapter(ch, force_redownload=redo_primary, next_chapter=next_chapter, upcoming_chapters=upcoming_chapters)
+            result = _process_chapter(ch, force_redownload=bool(force_redownload), next_chapter=next_chapter, upcoming_chapters=upcoming_chapters)
+            _outage_streak = 0
+            return result
         except ChapterSkippedError as cse_primary:
             primary_err: ChapterSkippedError = cse_primary
 
-        # NEAR-MISS quick retry on the primary, ahead of alternatives
-        # (2026-08-20, bench/linewebtoonlogs.md).
-        #
-        # reason=="incomplete" structurally means FEWER than
-        # --chapter-host-poison distinct URLs fully failed — 5+ would have
-        # classified as host_poison, and a uniform-signature failure would have
-        # classified as ghost_chapter. So the host just proved it is alive by
-        # serving nearly the whole chapter, and the one thing it has NOT been
-        # given is a second try.
-        #
-        # WHY this outranks the alternatives-first ordering documented above:
-        # that ordering was designed for chapters BROKEN on the primary, where
-        # an alt is strictly better. A near-miss is the opposite shape. In the
-        # log, LINE Webtoon (OFFICIAL_PUBLISHER — the canonical bytes) lost 2 of
-        # 120 pages to a transient CDN stall and was "rescued" by a 103-page
-        # comix re-host; the same run swapped a 109-page chapter for a 91-page
-        # one. Trading the publisher's own pages for a shorter third-party
-        # re-host is a downgrade the old ordering had no way to see.
-        #
-        # Deliberately narrow: ONE attempt, short wait, and only for
-        # "incomplete" — ghost_chapter/host_poison/time_budget/locked all
-        # describe something a 5s pause will not change, and they keep going
-        # straight to alternatives. The full long-backoff retry loop still runs
-        # after alternatives, unchanged.
-        #
-        # Placed BEFORE the lazy-discovery trigger so a chapter that recovers
-        # here never pays for the cross-site search, and before the aux veto so
-        # aux-bearing chapters (which can never be alt-rescued at all) get the
-        # fast retry too instead of waiting out the full 30s backoff.
-        #
-        # primary_err is deliberately NOT reassigned from this attempt: the
-        # downstream ghost/permanent-skip classification reasons about the
-        # FIRST failure, and the long-retry loop below tracks its own last_err.
-        near_miss_attempts = 0
-        if primary_err.reason == "incomplete" and not run_cancelled():
-            print(
-                f"  [!] Chapter {n_for_log} near-miss on {primary_state[0].name} "
-                f"({primary_err.pages_ok}/{primary_err.pages_total} pages) — "
-                f"retrying the primary in {_NEAR_MISS_RETRY_BACKOFF:.0f}s before "
-                f"considering other sources..."
-            )
-            # Chunked so Cancel actually cancels, same reason as the long-retry
-            # wait below (verified on-device 2026-08-08).
+        def _no_retry(err: ChapterSkippedError) -> bool:
+            # A retry cannot clear these: the primary never serves a locked /
+            # publisher-hosted chapter, a permanent gate fails identically, and a
+            # ghost's uniform error comes from a server-side rule.
+            return (err.reason in ("locked", "external_link", "ghost_chapter")
+                    or err.reason in _PERMANENT_SKIP_REASONS)
+
+        def _wait(seconds: float) -> bool:
+            """Sleep in 2s chunks so Cancel actually cancels (verified
+            on-device 2026-08-08). False = the run was cancelled."""
             waited = 0.0
-            while waited < _NEAR_MISS_RETRY_BACKOFF:
+            while waited < seconds:
                 if run_cancelled():
-                    break
-                chunk = min(2.0, _NEAR_MISS_RETRY_BACKOFF - waited)
+                    return False
+                chunk = min(2.0, seconds - waited)
                 time.sleep(chunk)
                 waited += chunk
-            if not run_cancelled():
-                near_miss_attempts = 1
-                try:
-                    return _process_chapter(
-                        ch, force_redownload=True, next_chapter=next_chapter
-                    )
-                except ChapterSkippedError as cse_near:
-                    print(
-                        f"  [!] Chapter {n_for_log} still incomplete after the "
-                        f"quick retry ({cse_near.pages_ok}/{cse_near.pages_total} "
-                        f"pages) — falling through to alternative sources."
-                    )
+            return not run_cancelled()
+
+        # Inline retries on the primary come FIRST (user decision 2026-10-25),
+        # ahead of any other site. The primary is the canonical copy: before
+        # this order, LINE Webtoon lost 2 of 120 pages to a CDN stall and was
+        # "rescued" by a 103-page re-host (bench/linewebtoonlogs.md), and the
+        # rescue's number pairing filled 21 of 23 unOrdinary chapters with the
+        # wrong chapter. Each retry RESUMES: the pages already downloaded are
+        # kept and only the missing ones fetched (grep resume_pages).
+        #
+        # NEAR-MISS: reason=="incomplete" means fewer than
+        # --chapter-host-poison distinct URLs failed (5+ is host_poison, a
+        # uniform signature is ghost_chapter), so the host is alive and gets
+        # one 5s retry before the 30s/60s ladder. A failed page LIST gets one
+        # short retry only; if the list loads on it, the page ladder takes
+        # over. primary_err keeps the FIRST failure (the ghost / locked
+        # classification reasons about it); last_err tracks the latest.
+        last_err: ChapterSkippedError = primary_err
+        attempts = 1
+        list_retry_used = near_miss_used = False
+        long_idx = 0
+        while not _no_retry(last_err) and not run_cancelled():
+            if last_err.pages_total <= 0:
+                if list_retry_used:
+                    break
+                list_retry_used = True
+                wait = _LIST_RETRY_BACKOFF
+                what = (f"page list failed ({last_err.reason}) — retrying it "
+                        f"in {wait:.0f}s")
+            elif last_err.reason == "incomplete" and not near_miss_used and long_idx == 0:
+                near_miss_used = True
+                wait = _NEAR_MISS_RETRY_BACKOFF
+                what = (f"near-miss ({last_err.pages_ok}/{last_err.pages_total} pages) — "
+                        f"retrying in {wait:.0f}s")
+            else:
+                if long_idx >= max_retries:
+                    break
+                wait = base_backoff * (2 ** long_idx)
+                long_idx += 1
+                what = (f"long retry {long_idx}/{max_retries}: waiting {wait:.0f}s for "
+                        f"{last_err.host or 'upstream'} to recover")
+            print(f"  [!] Chapter {n_for_log} {what} on {primary_state[0].name}, "
+                  f"keeping the pages already downloaded...")
+            if not _wait(wait):
+                # Report the chapter as skipped; the caller records it and the
+                # main loop breaks, so everything on disk stays resumable.
+                raise last_err
+            attempts += 1
+            try:
+                result = _process_chapter(ch, resume_pages=True, next_chapter=next_chapter)
+                _outage_streak = 0
+                return result
+            except ChapterSkippedError as cse_retry:
+                last_err = cse_retry
+        if run_cancelled():
+            raise last_err
+
+        # The primary could not serve a chapter it was able to retry: a host
+        # outage looks like this chapter after chapter. Stop the run rather
+        # than build the series from other sites one chapter at a time.
+        # Locked / gated / ghost chapters say nothing about the host.
+        if not _no_retry(primary_err):
+            _outage_streak += 1
+            if _outage_streak >= _OUTAGE_BREAKER:
+                raise ChapterAbortedError(
+                    chap=n_for_log,
+                    reason=last_err.reason,
+                    host=last_err.host,
+                    pages_ok=last_err.pages_ok,
+                    pages_total=last_err.pages_total,
+                    attempts=attempts,
+                    detail=(f"chapter {_outage_streak} in a row that "
+                            f"{primary_state[0].name} could not serve after retries: a "
+                            f"host outage, not chapters to fill from other sites"),
+                ) from last_err
 
         # Faithful-archival veto (2026-07-03): a chapter that carries sidecar
         # aux content on the primary (webtoons BGM / motion-toon, tapas BGM —
         # grep _chapter_carries_aux) is NEVER rescued from an alternative
         # source. Alt sites only mirror the flattened pages, so a rescue
-        # silently drops the audio/motion. Recovery for these chapters is
-        # inline-retry on the primary only (below). The veto also skips the
+        # silently drops the audio/motion; such a chapter gets the primary's
+        # retries above and nothing else. The veto also skips the
         # lazy-discovery trigger: no point paying the one-time cross-site
         # search for a chapter that won't consult the result —
         # _ms_lazy_pending stays armed for the next aux-free failure.
@@ -13590,22 +14607,23 @@ def main():
             and not getattr(args, "no_sidecar_assets", False)
             and _chapter_carries_aux(ch)
         )
-        if aux_veto and (_ms_lazy_pending or _multi_source_alternatives):
+        if aux_veto and (_ms_lazy_pending or _multi_source_alternatives or _ms_catalog):
             print(
                 f"  [Multi-source] Chapter {n_for_log} carries sidecar assets "
-                f"(BGM/motion) that alt sources can't provide; skipping "
-                f"alt-source rescue, will inline-retry on "
-                f"{primary_state[0].name}."
+                f"(BGM/motion) that alt sources can't provide; not looking on "
+                f"other sites."
             )
 
         # --multi-source-lazy: the upfront cross-site discovery was deferred
-        # at startup; the first failed chapter pays for it here, once, so the
-        # alts lookup below (and every later chapter, including the missed-
-        # retry pass which also routes through this wrapper) sees the result.
-        # Disarm BEFORE running so a discovery that fails or finds nothing
-        # isn't re-attempted on every subsequent failure. Runs outside the
-        # per-attempt watchdog (_process_chapter cancelled its timer before
-        # this except arm), so the chapter deadline can't kill the discovery.
+        # at startup; the first chapter the primary's retries could not save
+        # pays for it here, once, so the rescue below (and every later chapter,
+        # including the missed-retry pass which also routes through this
+        # wrapper) sees the result. After the retries, so a chapter that
+        # recovers on them never pays for the search. Disarm BEFORE running so
+        # a discovery that fails or finds nothing isn't re-attempted on every
+        # subsequent failure. Runs outside the per-attempt watchdog
+        # (_process_chapter cancelled its timer before raising), so the
+        # chapter deadline can't kill the discovery.
         if _ms_lazy_pending and not aux_veto:
             _ms_lazy_pending = False
             print(
@@ -13615,117 +14633,33 @@ def main():
             )
             _discover_multi_source_alternatives()
 
-        # Phase 4b: try alternative sources before the inline-retry sleep.
-        # Look up alternatives by chapter number (float). Numeric extraction
-        # mirrors chapter_merger._extract_chapter_num.
-        alts: List[Dict[str, Any]] = []
-        if not aux_veto:
-            # CL-1: canonical extractor (matches the aligner's dict keys) — grep
-            # _extract_chapter_num.
-            _cf = _extract_chapter_num(ch.get("chap"))
-            if _cf is not None:
-                alts = list(_multi_source_alternatives.get(_cf, []))
+        # Multi-source rescue: find, on the alternative sites, the chapter whose
+        # CONTENT is this one, and store it as this chapter (grep
+        # _rescue_search), with every page all the attempts above delivered.
+        # Pairing by number alone filled 21 of 23 unOrdinary chapters with a
+        # chapter 2-5 ahead (plan sync-temp/plans/multisource-offset.md), so
+        # nothing is filled here unless the primary's own pages are found in
+        # the candidate; a chapter without such proof may still be placed below.
+        rescue_notes: List[str] = []
+        if not aux_veto and _ms_catalog:
+            rescued, rescue_notes = _rescue_search(ch, last_err, primary_state, next_chapter)
+            if rescued is not None:
+                return rescued
 
-        if alts:
-            print(
-                f"  [Multi-source] Chapter {n_for_log} failed on {primary_state[0].name}; "
-                f"trying {len(alts)} alternative source(s) before inline-retry..."
-            )
-            for alt in alts:
-                alt_handler = alt.get("handler") or get_handler_by_name(alt.get("site", ""))
-                alt_scraper = alt.get("scraper")
-                alt_context = alt.get("context")
-                alt_chapter = alt.get("chapter")
-                if not (alt_handler and alt_scraper and alt_context and alt_chapter):
-                    continue
-                # Swap the closure-scope state so _process_chapter_impl
-                # (which reads handler/scraper/context from outer scope) uses
-                # the alternative source. Restore in finally so subsequent
-                # chapters see the primary by default.
-                handler = alt_handler
-                scraper = alt_scraper
-                context = alt_context
-                comic_data = context.comic if context is not None else primary_state[3]
-                try:
-                    print(f"    [Multi-source] -> {alt_handler.name}")
-                    # force_redownload=True on alternatives so the primary's
-                    # failed tdir is wiped; otherwise the marker check would
-                    # see the partial state from the failed primary attempt.
-                    # is_alt_source=True suppresses the Phase G7 inter-chapter
-                    # prefetch — next_chapter is from the PRIMARY chapter list,
-                    # so alt_handler.get_chapter_images(next_chapter) would
-                    # silently fail and waste a worker pool. Subsequent
-                    # chapters resume on the primary anyway (strict wrapper's
-                    # finally restores primary state).
-                    alt_result = _process_chapter(
-                        alt_chapter, force_redownload=True, next_chapter=next_chapter, is_alt_source=True
-                    )
-                    # Alt rescue succeeded. Record the rescue in the
-                    # cross-chapter tally so the timing summary can
-                    # surface multi-source value. Also print an explicit
-                    # "filled/rescued" line for the two reasons where the
-                    # in-chapter log didn't already make the rescue obvious:
-                    #   - locked: a premium tapas placeholder the primary can
-                    #     NEVER serve — this fill IS the feature the user asked
-                    #     for ("paid chapter → next highest rated site"), so
-                    #     name it plainly.
-                    #   - ghost: the in-chapter log claimed "every failure had
-                    #     identical signature"; close the loop visually.
-                    # For other reasons (host_poison / time_budget / incomplete)
-                    # the existing "[Multi-source] -> X" line + the per-chapter
-                    # "CBZ saved" already make the rescue obvious.
-                    multi_source_rescues.append({
-                        "chap": n_for_log,
-                        "alt_site": alt_handler.name,
-                        "primary_site": primary_state[0].name,
-                        "primary_reason": primary_err.reason,
-                    })
-                    if primary_err.reason == "locked":
-                        print(
-                            f"    [Multi-source] ✓ Chapter {n_for_log} "
-                            f"(premium/locked on {primary_state[0].name}) "
-                            f"filled from {alt_handler.name}"
-                        )
-                    elif primary_err.reason == "external_link":
-                        # host = the publisher (sites/mangadex.py puts
-                        # _external_host there), not the primary site.
-                        print(
-                            f"    [Multi-source] ✓ Chapter {n_for_log} "
-                            f"(publisher-hosted ({primary_err.host or 'unknown host'}) "
-                            f"on {primary_state[0].name}) filled from {alt_handler.name}"
-                        )
-                    elif primary_err.reason == "ghost_chapter":
-                        print(
-                            f"    [Multi-source] ✓ Chapter {n_for_log} rescued "
-                            f"from {primary_state[0].name} ({primary_err.reason}) "
-                            f"via {alt_handler.name}"
-                        )
-                    return alt_result
-                except ChapterSkippedError as cse_alt:
-                    print(
-                        f"    [Multi-source] {alt_handler.name} also failed "
-                        f"({cse_alt.reason}); trying next..."
-                    )
-                    continue
-                finally:
-                    # Always restore primary state so the next chapter starts
-                    # on the primary source (the alignment anchor).
-                    handler, scraper, context, comic_data = primary_state
-
-        # All alternatives failed (or none available).
-        #
         # Ghost-chapter short-circuit: when the PRIMARY failed with the ghost
-        # signature (every page returned an identical structural error), the
-        # inline-retry sleep + redo is pointless — the response template that
-        # produced the signature is generated by a server-side rule that won't
-        # change in 30s or 60s. mangafire's 5051-byte CF 403 for chapter-0
-        # placeholders is the canonical case. Hand off to ChapterGhostError
-        # (caught by the main loop as skip-and-continue) so the run isn't
-        # aborted on a structurally-fake chapter. Cross-source diagnostic:
-        # carry the primary_only flag through from the alignment lookup so
-        # the log line tells the user whether the chapter was primary-only
-        # (strongest fake signal) or just unavailable everywhere (alts
-        # listed it but couldn't deliver — could be coincident outage).
+        # signature (every page returned an identical structural error), it
+        # got no retries above — the response template that produced the
+        # signature is generated by a server-side rule that won't change in
+        # 30s or 60s. mangafire's 5051-byte CF 403 for chapter-0 placeholders
+        # is the canonical case. Hand off to ChapterGhostError (caught by the
+        # main loop as skip-and-continue) so the run isn't aborted on a
+        # structurally-fake chapter. Cross-source diagnostic: carry the
+        # primary_only flag through from the alignment lookup so the log line
+        # tells the user whether the chapter was primary-only (strongest fake
+        # signal) or just unavailable everywhere (alts listed it but couldn't
+        # deliver — could be coincident outage). Not placed: a primary-only
+        # placeholder has no copy anywhere, and position would pick a
+        # neighbour's.
         if primary_err.reason == "ghost_chapter":
             primary_only_for_ghost: Optional[bool] = None
             if _multi_source_alternatives:
@@ -13743,6 +14677,44 @@ def main():
                 primary_only=primary_only_for_ghost,
             ) from primary_err
 
+        # Placement (grep _place): the chapter the primary delivered no proof
+        # for, located by its neighbours' copies on one alt list at a time (or,
+        # for a locked run at either end of the list, chained from its one
+        # neighbour).
+        # Runs for every reason left here, locked / publisher-hosted and the
+        # permanent gates included (an alt site may well serve those).
+        if not aux_veto and _ms_catalog and getattr(args, "multi_source", False):
+            full_idx = _primary_index(ch)
+            if full_idx is None:
+                rescue_notes.append(f"chapter {n_for_log!r} is not in {_rescue_primary}'s list")
+            else:
+                placed, more = _place(
+                    ch, full_idx, _cfp.load_pages(_partial_path(n_for_log)),
+                    last_err.pages_total or primary_err.pages_total, last_err.reason,
+                )
+                rescue_notes += more
+                if placed is not None:
+                    return placed
+
+        # Locked / publisher-hosted chapters under --multi-source: the user asked
+        # for these to be filled from another site, and the primary can never
+        # serve them, so a chapter no alt could fill stops the run instead of
+        # leaving a silent gap (user decision 2026-10-21; plan
+        # multisource-offset.md decision 5). Without --multi-source nobody asked
+        # for a fill, so the skip-with-gap below stays.
+        if (
+            primary_err.reason in ("locked", "external_link")
+            and getattr(args, "multi_source", False)
+        ):
+            raise ChapterAbortedError(
+                chap=n_for_log,
+                reason=primary_err.reason,
+                host=primary_err.host,
+                pages_ok=0,
+                pages_total=primary_err.pages_total,
+                attempts=1 + len(rescue_notes),
+                detail="; ".join(rescue_notes) or "no alternative source could prove a fill",
+            ) from primary_err
         # Deterministic per-chapter gate (mature/age/login interstitial): no
         # inline retry or alt source clears it, and for an aux chapter the veto
         # above already skipped alt-rescue — so the OLD path exhausted retries
@@ -13750,67 +14722,68 @@ def main():
         # episode. Skip + continue instead (the main loop records it missed),
         # WITHOUT the ghost path's consecutive-host-block escalation (a mature
         # series legitimately has many consecutive gated episodes). Grep
-        # _PERMANENT_SKIP_REASONS / ChapterPermanentSkipError.
-        if primary_err.reason in _PERMANENT_SKIP_REASONS:
+        # _PERMANENT_SKIP_REASONS / ChapterPermanentSkipError. last_err, not
+        # primary_err: a list that only loads on its retry and then hits the
+        # login wall is gated too.
+        if last_err.reason in _PERMANENT_SKIP_REASONS:
+            if rescue_notes:
+                print(f"  [Multi-source] Chapter {n_for_log}: no alternative could fill it: "
+                      f"{'; '.join(rescue_notes)}")
             raise ChapterPermanentSkipError(
                 chap=n_for_log,
-                reason=primary_err.reason,
-                host=primary_err.host,
-                pages_total=primary_err.pages_total,
-            ) from primary_err
+                reason=last_err.reason,
+                host=last_err.host,
+                pages_total=last_err.pages_total,
+            ) from last_err
 
-        # Other reasons (incomplete / time_budget / host_poison): fall back
-        # to inline-retry on the primary source — these CAN be transient.
-        last_err: ChapterSkippedError = primary_err
-        for retry_attempt in range(max_retries):
-            wait = base_backoff * (2 ** retry_attempt)
-            print(
-                f"  [!] Chapter {n_for_log} long retry {retry_attempt + 1}/{max_retries}: "
-                f"waiting {wait:.0f}s for {last_err.host or 'upstream'} to recover, "
-                f"then redownloading chapter inline..."
-            )
-            waited = 0.0
-            cancelled_during_wait = False
-            while waited < wait:
-                # The 2s chunking exists so this wait CAN be interrupted; a run
-                # cancel has to actually do so. Without this check a user who
-                # hits Cancel while a CDN is being retried waits out the full
-                # backoff (up to 60s on the last attempt, and the retry then
-                # redownloads the whole chapter anyway) — on Android that reads
-                # as "Cancel is broken". Verified on-device 2026-08-08.
-                if run_cancelled():
-                    cancelled_during_wait = True
-                    break
-                chunk = min(2.0, wait - waited)
-                time.sleep(chunk)
-                waited += chunk
-            if cancelled_during_wait:
-                # Give up retrying and report the chapter as skipped. The caller
-                # records it and the main loop breaks, so everything already on
-                # disk stays resumable.
-                raise last_err
-            try:
-                return _process_chapter(ch, force_redownload=True, next_chapter=next_chapter)
-            except ChapterSkippedError as cse_retry:
-                last_err = cse_retry
-                continue
-        # Out of inline retries — hard abort.
+        # Retryable reasons (incomplete / time_budget / host_poison / a failed
+        # page list) that the retries above could not clear.
         raise ChapterAbortedError(
             chap=n_for_log,
             reason=last_err.reason,
             host=last_err.host,
             pages_ok=last_err.pages_ok,
             pages_total=last_err.pages_total,
-            attempts=max_retries + 1 + len(alts) + near_miss_attempts,
+            attempts=attempts + len(rescue_notes),
+            detail="; ".join(rescue_notes),
         ) from last_err
-
 
     # --- Timing accumulators (monotonic clock – essentially zero overhead) ---
     _timing = {"imageurls": 0.0, "download": 0.0, "processing": 0.0}
     _timing_total_start = time.monotonic()
-    # Running counter for EPUB page indices – avoids re-scanning
-    # the ever-growing current_book_content list every chapter.
-    _running_page_count = 0
+    # The book's chapter order (sites/book_buffer.py): one slot per selected
+    # chapter, keyed by its position in this run's list. Split parts are cut
+    # only from the filled prefix before the first hole, so a chapter that
+    # arrives late (a replayed miss) lands in its own place.
+    # The old flat lists shifted insert indices, which cannot reach a part
+    # already written; that is why --split is switched off while the replay is
+    # on (grep "split is disabled while"). The CBZ cover appended above opens
+    # the first part. The final-file gate below still reads current_book_*,
+    # set from the last part (grep _book.finish).
+    from sites.book_buffer import BookBuffer
+    _book = BookBuffer(split_size_bytes, split_chapter_count,
+                       preamble=current_book_content, preamble_size=current_book_size)
+
+    def _chapter_pages(content: List[Any]) -> int:
+        return _epub_page_count(content) if args.format == 'epub' else 0
+
+    def _book_miss(slot: str, ch: Dict[str, Any], reason: str) -> None:
+        """A missed chapter's slot: a HOLE when the end-of-run replay will retry
+        it (it then lands in place), DROPPED when nothing will (a permanent
+        per-chapter gate; grep _replayable_missed)."""
+        if reason in _PERMANENT_SKIP_REASONS:
+            _book.drop_new(slot, ch)
+        else:
+            _book.hole(slot, ch)
+
+    def _write_closed_parts() -> None:
+        """Split mode: write every part the filled prefix has closed."""
+        for part in _book.cut_parts():
+            build_book_part(
+                args, base_filename, comic_data, part.content, part.chapters,
+                part.groups, original_cover_path, epub_markers=part.markers,
+            )
+
     # When a chapter can't be recovered after inline retries, _process_chapter_strict
     # raises ChapterAbortedError. We set this flag so the end-of-run retry pass
     # (which is for *resumable* missed entries) is skipped — we already gave up
@@ -13902,10 +14875,7 @@ def main():
         # subtraction instead — the two mechanisms stay disjoint.
         attempted_chapter_labels.add(_chap_label_str(ch.get("chap")))
         grp_name = handler.get_group_name(ch)
-        insert_list_index = len(current_book_content)
-        insert_chapter_index = len(current_book_chapters)
-        insert_marker_index = len(current_epub_markers)
-        insert_page_index = _running_page_count if args.format == 'epub' else 0
+        slot = str(ch_idx)
         # Look ahead so _process_chapter_impl can image-prefetch upcoming
         # chapters while downloading images for this one. next_ch retained
         # for the inter-chapter image prefetch (Phase G7) which is
@@ -13980,10 +14950,6 @@ def main():
                 _record_missed(
                     ch, grp_name, "aborted:ghost_chapter",
                     f"escalated after {consecutive_ghosts} consecutive ghosts on primary",
-                    insert_list_index=insert_list_index,
-                    insert_chapter_index=insert_chapter_index,
-                    insert_marker_index=insert_marker_index,
-                    insert_page_index=insert_page_index,
                     host=cge.host,
                     pages_ok=0,
                     pages_total=cge.pages_total,
@@ -13997,10 +14963,6 @@ def main():
                         handler.get_group_name(skipped_ch),
                         "not_attempted_after_abort",
                         f"main pass aborted after {GHOST_ABORT_THRESHOLD} consecutive ghosts",
-                        insert_list_index=len(current_book_content),
-                        insert_chapter_index=len(current_book_chapters),
-                        insert_marker_index=len(current_epub_markers),
-                        insert_page_index=_running_page_count if args.format == 'epub' else 0,
                         host=cge.host,
                         pages_ok=0,
                         pages_total=0,
@@ -14019,13 +14981,11 @@ def main():
                 f"{cge.host or '?'} ({cge.pages_total} pages, 0 succeeded). "
                 f"Recorded as missed; the run continues.{counter_hint}"
             )
+            _book_miss(slot, ch, "ghost_chapter")
             _record_missed(
                 ch, grp_name, "ghost_chapter",
                 f"uniform error signature on primary; primary_only={cge.primary_only}",
-                insert_list_index=insert_list_index,
-                insert_chapter_index=insert_chapter_index,
-                insert_marker_index=insert_marker_index,
-                insert_page_index=insert_page_index,
+                slot=slot,
                 host=cge.host,
                 pages_ok=0,
                 pages_total=cge.pages_total,
@@ -14088,13 +15048,11 @@ def main():
                 f"{f' on {cpse.host}' if _show_host else ''} — {_gate_note}. "
                 f"Recorded as missed; the run continues."
             )
+            _book_miss(slot, ch, cpse.reason)
             _record_missed(
                 ch, grp_name, cpse.reason,
                 _gate_detail,
-                insert_list_index=insert_list_index,
-                insert_chapter_index=insert_chapter_index,
-                insert_marker_index=insert_marker_index,
-                insert_page_index=insert_page_index,
+                slot=slot,
                 host=cpse.host,
                 pages_ok=0,
                 pages_total=cpse.pages_total,
@@ -14112,16 +15070,14 @@ def main():
                 f"    {cae.pages_ok}/{cae.pages_total} pages succeeded, "
                 f"reason={cae.reason}, host={cae.host or '-'}."
             )
+            if cae.detail:
+                print(f"    Multi-source: {cae.detail}")
             print(
                 f"    Aborting run. Chapters successfully saved before this point "
                 f"are kept (per-chapter files via --keep-chapters)."
             )
             _record_missed(
                 ch, grp_name, f"aborted:{cae.reason}", str(cae),
-                insert_list_index=insert_list_index,
-                insert_chapter_index=insert_chapter_index,
-                insert_marker_index=insert_marker_index,
-                insert_page_index=insert_page_index,
                 host=cae.host,
                 pages_ok=cae.pages_ok,
                 pages_total=cae.pages_total,
@@ -14138,10 +15094,6 @@ def main():
                     handler.get_group_name(skipped_ch),
                     'not_attempted_after_abort',
                     f"main pass aborted at chapter {cae.chap}",
-                    insert_list_index=len(current_book_content),
-                    insert_chapter_index=len(current_book_chapters),
-                    insert_marker_index=len(current_epub_markers),
-                    insert_page_index=_running_page_count if args.format == 'epub' else 0,
                     host=cae.host,
                     pages_ok=0,
                     pages_total=0,
@@ -14167,7 +15119,8 @@ def main():
                 f"{type(e).__name__}: {str(e)[:200]}. "
                 f"Recorded as missed; the run will continue."
             )
-            _record_missed(ch, grp_name, 'exception', repr(e), insert_list_index=insert_list_index, insert_chapter_index=insert_chapter_index, insert_marker_index=insert_marker_index, insert_page_index=insert_page_index)
+            _book_miss(slot, ch, 'exception')
+            _record_missed(ch, grp_name, 'exception', repr(e), slot=slot)
             continue
 
         if not chapter_content:
@@ -14186,6 +15139,7 @@ def main():
             # carry the primary's flag in. Kept because mislabelling a decode
             # failure as "No downloadable content" is exactly the diagnosis this
             # detector exists to prevent, and the cost is four lines.
+            _dropped_pages = ch.get("_decode_dropped") or 0
             if _dropped_pages:
                 _miss_reason = 'decode_dropped_pages'
                 _miss_error = (
@@ -14195,53 +15149,17 @@ def main():
             else:
                 _miss_reason = 'empty_content'
                 _miss_error = 'No downloadable content'
-            _record_missed(ch, grp_name, _miss_reason, _miss_error, insert_list_index=insert_list_index, insert_chapter_index=insert_chapter_index, insert_marker_index=insert_marker_index, insert_page_index=insert_page_index)
+            _book_miss(slot, ch, _miss_reason)
+            _record_missed(ch, grp_name, _miss_reason, _miss_error, slot=slot)
             continue
 
         # Successful chapter — reset the consecutive-ghost counter. The
         # canonical "chapter 0 fake" pattern produces 1 ghost then real
         # downloads; this reset is what keeps that working.
         consecutive_ghosts = 0
-
-        should_split_by_size = (
-            split_size_bytes > 0
-            and current_book_content
-            and current_book_size + chapter_content_size > split_size_bytes
-        )
-        should_split_by_chapters = (
-            split_chapter_count > 0
-            and len(current_book_chapters) >= split_chapter_count
-        )
-
-        if should_split_by_size or should_split_by_chapters:
-            build_book_part(
-                args,
-                base_filename,
-                comic_data,
-                current_book_content,
-                current_book_chapters,
-                current_book_scan_groups,
-                original_cover_path,
-                epub_markers=current_epub_markers,
-            )
-            current_book_content = []
-            current_book_chapters = []
-            current_book_scan_groups = set()
-            current_book_size = 0
-            current_epub_markers = []
-            _running_page_count = 0
-
-        if args.format == 'epub':
-            start_page_index = _running_page_count
-        current_book_content.extend(chapter_content)
-        current_book_chapters.append(ch)
-        if grp_name:
-            current_book_scan_groups.add(grp_name)
-        current_book_size += chapter_content_size
-        chapter_page_count = _epub_page_count(chapter_content) if args.format == 'epub' else 0
-        if chapter_page_count > 0:
-            current_epub_markers.append({'ch': ch, 'page_index': start_page_index})
-        _running_page_count += chapter_page_count
+        _book.add(slot, ch, chapter_content, chapter_content_size, grp_name or "",
+                  _chapter_pages(chapter_content))
+        _write_closed_parts()
 
     # Retry missed chapters at the end. Skip if the run was aborted by
     # ChapterAbortedError — the strict-mode inline retry already gave up,
@@ -14255,15 +15173,9 @@ def main():
     if retry_missed and _replay_entries and missed_retries > 0 and not aborted_remaining:
         print(f"\n[*] Missed {len(_replay_entries)} chapter(s). Retrying at the end...")
         _emit("missed", count=len(_replay_entries))
-        _replay_entries.sort(key=lambda e: (int(e.get('insert_chapter_index', 0)), int(e.get('insert_list_index', 0))))
-        # Permanent skips stay in the missed log unchanged. Their insert
-        # indices are not touched by the shifts below, which is fine: they are
-        # never inserted.
+        _replay_entries.sort(key=lambda e: int(e.get('slot') or 0))
+        # Permanent skips stay in the missed log unchanged.
         remaining: List[Dict[str, Any]] = list(_permanent_missed)
-        content_shift_items = 0
-        chapter_shift = 0
-        marker_shift = 0
-        page_shift = 0
 
         for entry in _replay_entries:
             ch_retry = entry.get('ch') or {}
@@ -14294,34 +15206,14 @@ def main():
                 log_verbose(f"  Retry backoff: sleeping {sleep_s:.1f}s (attempt {attempt}/{missed_retries})")
                 time.sleep(sleep_s)
 
-            if not ok:
+            if not ok or entry.get('slot') is None:
                 entry['error'] = (last_err or entry.get('error') or '')[:500]
                 remaining.append(entry)
                 continue
 
-            insert_at = int(entry.get('insert_list_index', 0)) + content_shift_items
-            chap_insert_at = int(entry.get('insert_chapter_index', 0)) + chapter_shift
-            marker_insert_at = int(entry.get('insert_marker_index', 0)) + marker_shift
-            page_insert_at = int(entry.get('insert_page_index', 0)) + page_shift
-
-            delta_pages = _epub_page_count(chapter_content) if args.format == 'epub' else 0
-            if args.format == 'epub' and delta_pages > 0:
-                for m in current_epub_markers:
-                    if int(m.get('page_index', 0) or 0) >= page_insert_at:
-                        m['page_index'] = int(m.get('page_index', 0) or 0) + delta_pages
-
-            current_book_content[insert_at:insert_at] = chapter_content
-            current_book_chapters.insert(chap_insert_at, ch_retry)
-            if grp_name_retry:
-                current_book_scan_groups.add(grp_name_retry)
-            current_book_size += chapter_content_size
-            if args.format == 'epub' and delta_pages > 0:
-                current_epub_markers.insert(marker_insert_at, {'ch': ch_retry, 'page_index': page_insert_at})
-
-            content_shift_items += len(chapter_content)
-            chapter_shift += 1
-            marker_shift += 1
-            page_shift += delta_pages
+            _book.fill(entry['slot'], ch_retry, chapter_content, chapter_content_size,
+                       grp_name_retry or "", _chapter_pages(chapter_content))
+            _write_closed_parts()
             print(f"  [+] Recovered chapter {n}")
             _emit("recovered", chapter=n)
 
@@ -14351,6 +15243,22 @@ def main():
             shutil.copy(missed_log_path, out_log)
         except Exception:
             pass
+
+    # Close the book: holes still open (chapters still missed) are dropped, the
+    # split parts they held back are written now, and the last part goes to the
+    # final-file gate below through the same current_book_* names as before.
+    _parts = _book.finish()
+    if not aborted_remaining and not run_cancelled():
+        for _part in _parts[:-1]:
+            build_book_part(
+                args, base_filename, comic_data, _part.content, _part.chapters,
+                _part.groups, original_cover_path, epub_markers=_part.markers,
+            )
+    current_book_content = _parts[-1].content
+    current_book_chapters = _parts[-1].chapters
+    current_book_scan_groups = _parts[-1].groups
+    current_book_size = _parts[-1].size
+    current_epub_markers = _parts[-1].markers
 
     # Read the on-disk series metadata ONCE, here, before anything below can
     # rewrite it: the combined-archive overwrite guard needs to know what the
@@ -14776,6 +15684,9 @@ def main():
                 except Exception:
                     pass
 
+    # Finish writing queued chapter fingerprints before the run reports done.
+    _fp_writer.close()
+
     # --- Timing summary ---
     _timing_total = time.monotonic() - _timing_total_start
     def _fmt_time(s: float) -> str:
@@ -14812,11 +15723,13 @@ def main():
             f"failures via alternative sources:"
         )
         # Stable ordering: insertion order matches chapter-loop order which
-        # is already chap-ascending after collapse-splits + filter.
+        # is already chap-ascending after collapse-splits + filter. The tier
+        # says how sure the fill is: own-pages (proven) > placement > chain.
         for r in multi_source_rescues:
             print(
                 f"    Ch {r['chap']:<8} <- {r['alt_site']:<14} "
-                f"(primary {r['primary_site']} failed: {r['primary_reason']})"
+                f"(primary {r['primary_site']} failed: {r['primary_reason']}; "
+                f"{r.get('tier')})"
             )
 
     # --- Skipped chapters report ---

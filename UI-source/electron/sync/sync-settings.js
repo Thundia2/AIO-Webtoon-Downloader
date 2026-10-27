@@ -28,7 +28,7 @@ const { parseChapterPatterns } = require("./chapter-labels");
 const SYNC_SETTING_SPECS = Object.freeze({
   syncEnabled: { type: "boolean", default: false },
   syncPromptOnConnect: { type: "boolean", default: true },
-  syncDeletePolicy: { type: "enum", default: "guarded", presets: Object.freeze(["guarded", "add-only"]) },
+  syncDeletePolicy: { type: "enum", default: "guarded", presets: Object.freeze(["guarded", "add-only", "auto-replace"]) },
   syncHashMode: { type: "enum", default: "cached", presets: Object.freeze(["cached", "rehash"]) },
   // Consecutive failures before a run aborts (CompareManga transfer_runner's 3).
   syncErrorBudget: { type: "enum", default: 3, presets: Object.freeze([1, 3, 5, 10]) },

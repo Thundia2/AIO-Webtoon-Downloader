@@ -12,6 +12,11 @@ Owns:
   - delegating to sites.search_orchestrator.search_all().
   - emitting JSON when --search is the only mode, OR returning the winner
     URL when --auto-pick is set.
+  - the multi-source discovery result aio-dl.py consumes (alternatives dict,
+    catalog, resume-cache sources), built in ONE place
+    (build_alternatives_from_records) for all four entry points: direct-URL
+    search, prefetched JSON, resume cache, and --search --auto-pick's own
+    fetched lists (alternatives_from_search_state).
 
 Cross-file:
   - sites/search_orchestrator.py — the actual ranking logic.
@@ -489,6 +494,109 @@ def _readable_sites(source_records: list) -> list:
     ]
 
 
+def _catalog_from_records(source_records: list, primary_site: str) -> list:
+    """The full readable chapter list of every usable alt site, for the
+    multi-source rescue's alt catalog (aio-dl.py grep `_ms_catalog`;
+    sites/rescue_pairing.py builds the ordered lists). The per-number
+    alternatives dict keeps only the entries the aligner could pair by label,
+    which is exactly what sites that number differently break; content-proven
+    rescue needs every entry. Same records the dict is built from, so the live
+    handler/scraper/context refs are shared, not copied. The primary's own site
+    is left out, as in the dict."""
+    return [
+        {"site": r["site"], "url": r.get("url"), "chapters": list(r["chapters"]),
+         "handler": r["handler"], "scraper": r.get("scraper"), "context": r["context"]}
+        for r in source_records
+        if r.get("site") != primary_site and r.get("chapters")
+        and r.get("context") is not None and r.get("handler") is not None
+        and r.get("scraper") is not None
+    ]
+
+
+def build_alternatives_from_records(
+    source_records: list, alt_sources: list, primary_handler, primary_chapters, args,
+) -> dict:
+    """The discovery result every multi-source entry point returns, built from
+    alt chapter lists already in hand: the per-number alternatives dict
+    (aligned with the primary's REAL list as anchor), the consensus, the ranked
+    sources for the resume cache and the primary switch, and the full catalog.
+
+    `source_records` are _fetch_chapters_for_winner records; any for the
+    primary's own site are left out. `alt_sources` are the ranked sources the
+    records were fetched from (objects with .site / .url / .title / .cover),
+    echoed as `resolved_sources`. Callers: find_alternatives_for_direct_url,
+    build_alternatives_from_payload, alternatives_from_search_state.
+    """
+    primary_site = primary_handler.name
+    records = [r for r in source_records if r.get("site") != primary_site]
+    sources_with_chapters: list = [(primary_site, primary_chapters or [])]
+    for rec in records:
+        sources_with_chapters.append((rec["site"], rec["chapters"]))
+    alignment = align_chapter_lists(
+        sources_with_chapters,
+        collapse_splits=bool(getattr(args, "collapse_splits", False)),
+    )
+
+    records_by_site = {rec["site"]: rec for rec in records}
+    alternatives_by_chap_num: dict = {}
+    for entry in alignment.chapter_map:
+        alts = []
+        for site, ch_dict in entry.sources:
+            if site == primary_site:
+                continue
+            rec = records_by_site.get(site)
+            if not rec or not rec.get("context") or not rec.get("handler"):
+                continue
+            alts.append({
+                "site": site,
+                "url": rec["url"],
+                "chapter": ch_dict,
+                "scraper": rec["scraper"],
+                "handler": rec["handler"],
+                "context": rec["context"],
+            })
+        if alts:
+            alternatives_by_chap_num[entry.chapter_num] = alts
+
+    return {
+        "alternatives_by_chap_num": alternatives_by_chap_num,
+        # Consumed by aio-dl.py at the group_chapters_for_download call site
+        # (refined collapse-splits rules). None = no peer overlap.
+        "consensus_set": (
+            alignment.consensus_set if alignment.consensus_set else None
+        ),
+        "consensus_max": alignment.consensus_max,
+        # (site, url, title, cover) of the ranked alternatives. aio-dl.py
+        # persists these into run_params.json's `multi_source_cache` so a
+        # resume rebuilds the alternatives via build_alternatives_from_payload
+        # without a cross-site search (grep _build_multi_source_cache_payload).
+        "resolved_sources": [
+            {"site": s.site, "url": s.url,
+             "title": getattr(s, "title", "") or "",
+             "cover": getattr(s, "cover", None)}
+            for s in alt_sources if s.site != primary_site
+        ],
+        # Sites whose fetched list had readable chapters, in fetch order. The
+        # primary switch in aio-dl.py reads it (grep _pick_primary_switch).
+        "readable_sites": _readable_sites(records),
+        # Every alt site's full list, for the content-proven rescue.
+        "catalog": _catalog_from_records(records, primary_site),
+    }
+
+
+def alternatives_from_search_state(state: dict, primary_handler, primary_chapters, args) -> dict:
+    """The discovery result for a --search --multi-source --auto-pick run, from
+    the chapter lists the search already fetched (take_latest_multi_source_state),
+    so aio-dl.py gets the same alternatives, catalog and resume cache as a
+    direct-URL run without a second search or a second round of list fetches.
+    The primary is the handler main() actually resolved, not the search's
+    alignment anchor; its site is dropped from the alternatives."""
+    return build_alternatives_from_records(
+        state.get("source_records") or [], state.get("sources") or [],
+        primary_handler, primary_chapters, args,
+    )
+
+
 def run_search_mode(
     args: Any,
     make_request: Callable,
@@ -602,11 +710,11 @@ def run_search_mode(
 
     multi_source = bool(getattr(args, "multi_source", False))
 
-    # Phase 4a/b — multi-source: fetch chapter lists for the winner's sources,
-    # align them, and (Phase 4b) build a per-chapter alternatives dict that
-    # aio-dl.py's _process_chapter_strict consumes for automatic fallback.
+    # Multi-source: fetch chapter lists for the winner's sources and align
+    # them, for the JSON chapter map and (--auto-pick) the primary choice; the
+    # fetched lists are handed to aio-dl.py for the rescue (search_ms_state).
     winner_chapter_map = None
-    multi_source_alternatives_payload = None  # exposed to aio-dl.py main() via the search-mode return
+    search_ms_state = None  # handed to aio-dl.py main() via take_latest_multi_source_state
     if multi_source and candidates:
         winner = candidates[0]
         # Apply quality threshold to the WHOLE candidate's sources before
@@ -703,53 +811,24 @@ def run_search_mode(
                 ],
                 "total_chapters_aligned": len(alignment.chapter_map),
             }
-            # Phase 4b: build per-chapter alternatives indexed by chapter number.
-            # Each entry includes the alternative source's handler+scraper+context
-            # so _process_chapter_strict can swap them in via nonlocal and call
-            # _process_chapter without re-running fetch_comic_context.
-            # The site picked as anchor in alignment is what aio-dl.py will use
-            # as primary; everything else becomes a fallback.
-            anchor_site = next(
-                (s for s, d in alignment.merge_diagnostics.items() if d.get("role") == "anchor"),
-                None,
-            )
-            records_by_site = {rec["site"]: rec for rec in source_records}
-            alternatives_by_chap_num: dict = {}
-            for entry in alignment.chapter_map:
-                alts = []
-                for site, ch_dict in entry.sources:
-                    if site == anchor_site:
-                        continue
-                    rec = records_by_site.get(site)
-                    if not rec or rec["context"] is None or rec["handler"] is None:
-                        continue
-                    alts.append({
-                        "site": site,
-                        "url": rec["url"],
-                        "chapter": ch_dict,
-                        # scraper/handler/context aren't JSON-serializable; the
-                        # search-mode runner stashes them on a side channel so
-                        # aio-dl.py main() can pick them up. See _MULTI_SOURCE_STATE
-                        # below.
-                        "_scraper_token": id(rec["scraper"]),
-                        "_handler_token": id(rec["handler"]),
-                        "_context_token": id(rec["context"]),
-                    })
-                if alts:
-                    alternatives_by_chap_num[entry.chapter_num] = alts
-            multi_source_alternatives_payload = {
-                "anchor_site": anchor_site,
-                "alternatives_by_chap_num": alternatives_by_chap_num,
-                "source_records": source_records,  # holds live scraper/handler/context refs
-                # consensus_set passed in-memory (real set, not list) so
-                # aio-dl.py's group_chapters_for_download call can refine
-                # Rule 2 / 3b / 6 with peer-source confirmation. None when
-                # alignment.consensus_set is empty (single source / no peer
-                # overlap), to keep downstream's "no peer data" check simple.
-                "consensus_set": (
-                    alignment.consensus_set if alignment.consensus_set else None
+            # The alignment anchor (most chapters) becomes the download
+            # primary below. The fetched records ride to aio-dl.py as they are
+            # (live scraper/handler/context refs): main() builds the
+            # alternatives, catalog and resume cache from them once it has
+            # resolved the primary and fetched ITS list (grep
+            # alternatives_from_search_state), the same as a direct-URL run.
+            # Alternatives keyed here would be keyed on the anchor's list as
+            # the search saw it, not on the list the download walks.
+            search_ms_state = {
+                "anchor_site": next(
+                    (s for s, d in alignment.merge_diagnostics.items()
+                     if d.get("role") == "anchor"),
+                    None,
                 ),
-                "consensus_max": alignment.consensus_max,
+                "source_records": source_records,
+                # Ranked as the search ranked them (top source first); the
+                # resume cache and the primary switch keep this order.
+                "sources": list(winner.sources),
             }
 
     if json_output and not auto_pick:
@@ -819,11 +898,11 @@ def run_search_mode(
     # remain available for per-chapter fallback.
     primary_url = top.url
     primary_site = top.site
-    if multi_source_alternatives_payload is not None:
-        anchor_site = multi_source_alternatives_payload.get("anchor_site")
+    if search_ms_state is not None:
+        anchor_site = search_ms_state.get("anchor_site")
         if anchor_site:
             anchor_record = next(
-                (r for r in multi_source_alternatives_payload["source_records"]
+                (r for r in search_ms_state["source_records"]
                  if r["site"] == anchor_site),
                 None,
             )
@@ -843,28 +922,25 @@ def run_search_mode(
         file=sys.stderr,
     )
 
-    # Phase 4b: stash the multi-source state on a module attribute so
-    # aio-dl.py main() can pick it up after run_search_mode returns. We can't
-    # JSON-serialize live scrapers/handlers/contexts, so a side-channel is
-    # the cleanest pass-through. main() consumes _LATEST_MULTI_SOURCE_STATE
-    # immediately after the call.
+    # Stash the fetched records on a module attribute so aio-dl.py main() can
+    # pick them up after run_search_mode returns: live scrapers/handlers/
+    # contexts can't ride the str return value.
     global _LATEST_MULTI_SOURCE_STATE
-    _LATEST_MULTI_SOURCE_STATE = multi_source_alternatives_payload
+    _LATEST_MULTI_SOURCE_STATE = search_ms_state
     return primary_url
 
 
-# Side-channel for passing multi-source state from run_search_mode to
-# aio-dl.py main() without JSON-serializing live scrapers/handlers/contexts.
-# Set inside run_search_mode (--auto-pick path with --multi-source); consumed
-# by main() right after the call. None when multi-source is off.
+# Side-channel from run_search_mode to aio-dl.py main(): {"anchor_site",
+# "source_records" (live refs), "sources" (ranked)}. Set on the --auto-pick
+# path with --multi-source; main() takes it right after the call and turns it
+# into alternatives once the primary is resolved (alternatives_from_search_state,
+# aio-dl.py grep _ms_search_state). None when multi-source is off.
 _LATEST_MULTI_SOURCE_STATE = None
 
 
 def take_latest_multi_source_state():
-    """One-shot getter: returns the multi-source state payload from the most
-    recent run_search_mode call and clears it. Side-channel for aio-dl.py
-    main() to retrieve scrapers/handlers/contexts that can't ride through
-    the str return value of run_search_mode."""
+    """One-shot getter: returns the multi-source state from the most recent
+    run_search_mode call and clears it."""
     global _LATEST_MULTI_SOURCE_STATE
     val = _LATEST_MULTI_SOURCE_STATE
     _LATEST_MULTI_SOURCE_STATE = None
@@ -1108,67 +1184,11 @@ def find_alternatives_for_direct_url(
     if on_status:
         on_status(fetch_memo.stats_line())
 
-    # Step 5: align primary chapters with alt chapters. Primary is the anchor
-    # (the user picked this URL, so its chapter set is canonical for the
-    # download; alts are fallbacks for chapters the primary also has).
-    primary_site = primary_handler.name
-    sources_with_chapters: list = [(primary_site, primary_chapters or [])]
-    for rec in source_records:
-        sources_with_chapters.append((rec["site"], rec["chapters"]))
-
-    alignment = align_chapter_lists(
-        sources_with_chapters,
-        collapse_splits=bool(getattr(args, "collapse_splits", False)),
+    # Steps 5-6: align with the primary as anchor (the user picked this URL, so
+    # its chapter set is canonical for the download) and build the result.
+    return build_alternatives_from_records(
+        source_records, alt_sources, primary_handler, primary_chapters, args,
     )
-
-    # Step 6: build alternatives_by_chap_num.
-    records_by_site = {rec["site"]: rec for rec in source_records}
-    alternatives_by_chap_num: dict = {}
-    for entry in alignment.chapter_map:
-        alts = []
-        for site, ch_dict in entry.sources:
-            if site == primary_site:
-                continue
-            rec = records_by_site.get(site)
-            if not rec or not rec.get("context") or not rec.get("handler"):
-                continue
-            alts.append({
-                "site": site,
-                "url": rec["url"],
-                "chapter": ch_dict,
-                "scraper": rec["scraper"],
-                "handler": rec["handler"],
-                "context": rec["context"],
-            })
-        if alts:
-            alternatives_by_chap_num[entry.chapter_num] = alts
-
-    # consensus_set surfaced so the download path (group_chapters_for_download
-    # at aio-dl.py:6541) can refine Rule 2 / 3b / 6 with peer confirmation.
-    # None when alignment found no peer overlap (single eligible alt or all
-    # alts diverged via compatibility threshold) — downstream falls through
-    # to in-source-only heuristics.
-    return {
-        "alternatives_by_chap_num": alternatives_by_chap_num,
-        "consensus_set": (
-            alignment.consensus_set if alignment.consensus_set else None
-        ),
-        "consensus_max": alignment.consensus_max,
-        # The (site, url, title, cover) of the alternatives that survived
-        # host/quality filtering. aio-dl.py persists these into
-        # run_params.json's `multi_source_cache` so a later resume can rebuild
-        # the alternatives via build_alternatives_from_payload without re-running
-        # this cross-site search. grep _build_multi_source_cache_payload.
-        "resolved_sources": [
-            {"site": s.site, "url": s.url,
-             "title": getattr(s, "title", "") or "",
-             "cover": getattr(s, "cover", None)}
-            for s in alt_sources
-        ],
-        # Sites whose fetched list had readable chapters, in fetch order. The
-        # primary switch in aio-dl.py reads it (grep _pick_primary_switch).
-        "readable_sites": _readable_sites(source_records),
-    }
 
 
 def build_alternatives_from_prefetched(
@@ -1398,61 +1418,13 @@ def build_alternatives_from_payload(
         fetch_memo=fetch_memo,
     )
 
-    # Same alignment + alts-dict construction as find_alternatives_for_direct_url
-    # — primary is the anchor (user picked this URL).
-    primary_site = primary_handler.name
-    sources_with_chapters: list = [(primary_site, primary_chapters or [])]
-    for rec in source_records:
-        sources_with_chapters.append((rec["site"], rec["chapters"]))
-
-    alignment = align_chapter_lists(
-        sources_with_chapters,
-        collapse_splits=bool(getattr(args, "collapse_splits", False)),
+    # Same result as find_alternatives_for_direct_url — primary is the anchor
+    # (user picked this URL). resolved_sources echoes the sources that survived
+    # the SKIP_MULTI_SOURCE / validity filter, so aio-dl.py re-persists a
+    # cleaned resume cache.
+    return build_alternatives_from_records(
+        source_records, alt_sources, primary_handler, primary_chapters, args,
     )
-
-    records_by_site = {rec["site"]: rec for rec in source_records}
-    alternatives_by_chap_num: dict = {}
-    for entry in alignment.chapter_map:
-        alts = []
-        for site, ch_dict in entry.sources:
-            if site == primary_site:
-                continue
-            rec = records_by_site.get(site)
-            if not rec or not rec.get("context") or not rec.get("handler"):
-                continue
-            alts.append({
-                "site": site,
-                "url": rec["url"],
-                "chapter": ch_dict,
-                "scraper": rec["scraper"],
-                "handler": rec["handler"],
-                "context": rec["context"],
-            })
-        if alts:
-            alternatives_by_chap_num[entry.chapter_num] = alts
-
-    # Same consensus surfacing as find_alternatives_for_direct_url; consumed
-    # by aio-dl.py at the group_chapters_for_download call site.
-    return {
-        "alternatives_by_chap_num": alternatives_by_chap_num,
-        "consensus_set": (
-            alignment.consensus_set if alignment.consensus_set else None
-        ),
-        "consensus_max": alignment.consensus_max,
-        # Echo the sources that survived the SKIP_MULTI_SOURCE / validity
-        # filter so aio-dl.py can re-persist a cleaned resume cache. Same
-        # (site, url, title, cover) shape find_alternatives_for_direct_url
-        # returns. grep _build_multi_source_cache_payload.
-        "resolved_sources": [
-            {"site": s.site, "url": s.url,
-             "title": getattr(s, "title", "") or "",
-             "cover": getattr(s, "cover", None)}
-            for s in alt_sources
-        ],
-        # Sites whose fetched list had readable chapters, in fetch order. The
-        # primary switch in aio-dl.py reads it (grep _pick_primary_switch).
-        "readable_sites": _readable_sites(source_records),
-    }
 
 
 __all__ = [
@@ -1461,4 +1433,6 @@ __all__ = [
     "find_alternatives_for_direct_url",
     "build_alternatives_from_prefetched",
     "build_alternatives_from_payload",
+    "build_alternatives_from_records",
+    "alternatives_from_search_state",
 ]

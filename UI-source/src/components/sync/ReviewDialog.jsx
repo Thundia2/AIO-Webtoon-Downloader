@@ -40,7 +40,7 @@ import { Dialog } from "@/components/ui/overlay";
 import { cn, formatBytes } from "@/lib/utils";
 import { RefusalCard, TONE } from "./SyncCards";
 import { SEG_CLASS } from "./ChapterStrip";
-import { opReasonCopy, reviewGroupTitle } from "./copy";
+import { massDeleteCopy, opReasonCopy, reviewGroupTitle, seriesKeyName } from "./copy";
 import { applyPayload, chLabel, clock, lossAcked, lossSig, plannedWithLine, reviewGate, reviewSig, workCount } from "./syncView";
 
 const PAGE = 150;
@@ -341,11 +341,9 @@ export default function ReviewDialog({ open, onClose, targetId, tn, wide, contai
                   onCheckedChange={(v) => setAcks((a) => ({ ...a, massDelete: v ? review.massDelete.count : null }))}
                   aria-label="Confirm the mass removal"
                 />
-                <b className="font-semibold">
-                  Remove {review.massDelete.count} file{review.massDelete.count === 1 ? "" : "s"} from {tn} in one sync
-                </b>
+                <b className="font-semibold">{massDeleteCopy(review.massDelete, tn).title}</b>
               </div>
-              <div className="ml-[26px] mt-0.5 text-xs text-muted-foreground">More than a quarter of what this app synced to {tn}.</div>
+              <div className="ml-[26px] mt-0.5 text-xs text-muted-foreground">{massDeleteCopy(review.massDelete, tn).sub}</div>
             </div>
           )}
           {cap && cap.free != null && (
@@ -354,8 +352,8 @@ export default function ReviewDialog({ open, onClose, targetId, tn, wide, contai
               <span className={cn("flex-1", cap.fits === false && "text-destructive")}>
                 {cap.fits === false ? "Doesn't fit" : "Fits"}: needs <span className="font-mono">{formatBytes(Math.max(0, cap.needed || 0))}</span>,{" "}
                 <span className="font-mono">{formatBytes(cap.free)}</span> free, <span className="font-mono">{formatBytes(cap.reserve)}</span> kept in reserve
-                {/* service.js _capacity: fits = needed <= free − reserve + freeableEarly */}
-                {cap.fits === false ? ` (short by ${formatBytes((cap.needed || 0) - (cap.free - cap.reserve + (cap.freeableEarly || 0)))})` : ""}
+                {/* service.js _capacity (space.js simulateRun): needed = the run's deepest dip, shortBy = what it lacks above the reserve */}
+                {cap.fits === false ? ` (short by ${formatBytes(cap.shortBy || 0)}${cap.shortAt ? `, runs out at ${seriesKeyName(cap.shortAt)}` : ""})` : ""}
               </span>
             </div>
           )}

@@ -43,6 +43,19 @@ export const PROFILE_ORDER = Object.freeze(["everything", "komikku", "pdf", "cus
 export const DELETE_POLICY_COPY = Object.freeze({
   guarded: { label: "Guarded", hint: "Removes chapters only after you confirm each series in Review." },
   "add-only": { label: "Add only", hint: "Never removes anything from the target." },
+  "auto-replace": {
+    label: "Auto-replace",
+    hint: "Like Guarded, and also ticks swapping the target's other copies of a chapter for the PC's.",
+  },
+});
+// The order every Removals control lists them (TargetBar, TargetEditor,
+// Settings → Sync); the copy test checks it covers profiles.js DELETE_POLICIES.
+export const DELETE_POLICY_ORDER = Object.freeze(["guarded", "auto-replace", "add-only"]);
+// Review's "Planned with…" phrase per policy (syncView plannedWithLine).
+export const DELETE_POLICY_PLANNED = Object.freeze({
+  guarded: "guarded removals",
+  "auto-replace": "auto-replace removals",
+  "add-only": "removals off (add only)",
 });
 export const HASH_MODE_COPY = Object.freeze({
   cached: { label: "Cached", hint: "Reuses fingerprints from the last scan." },
@@ -214,6 +227,58 @@ export const TAG_COPY = Object.freeze({
   "volumes-not-comparable": "Volumes",
   mixed: "Mixed numbering",
 });
+
+/**
+ * The series detail's note when auto-replace left this series' swaps
+ * unticked (planner.js sp.autoHeld: the delete-blocking tags, or mixed).
+ */
+export function autoHeldCopy(tags, tn) {
+  const names = (tags || []).map((t) => TAG_COPY[t] || t);
+  if (!names.length) return null;
+  return `Auto-replace didn't tick this series' swaps (${names.join(", ")}). Tick the copies on ${tn || "the target"} yourself to replace them.`;
+}
+
+/**
+ * A series key as words: planner.js pcSeriesKey is `pc:<PC folder>`; the
+ * library root's loose files are analysis.js ROOT_SERIES_KEY "(root)".
+ */
+export function seriesKeyName(key) {
+  if (!key) return "";
+  if (key === "(root)") return "the library's loose files";
+  return key.startsWith("pc:") ? key.slice(3) : key;
+}
+
+/**
+ * Review's mass-removal confirmation (planner.js evaluateSelection
+ * massDelete). It separates what the PC's copy REPLACES from what is simply
+ * removed, since "remove 18,000 files" read as a loss when nearly all were
+ * swaps (user, 2026-10-27):
+ *   overwrites  a same-name copy the PC's file is written over;
+ *   swaps       a gated delete: the old copy under another name, removed
+ *               only once the PC's copy of that chapter is on the target;
+ *   deletes − swaps  removals nothing replaces (extras, extra files, losses).
+ * The line ends with the limit crossed: half the chapter files of a series
+ * (MASS_RATIO, MASS_MIN) or MASS_TOTAL_DELETES files in one sync.
+ */
+export function massDeleteCopy(md, tn) {
+  const num = (n) => n.toLocaleString("en-US");
+  const over = md.overwrites || 0;
+  const swaps = md.swaps || 0;
+  const replaced = over + swaps;
+  const other = Math.max(0, (md.deletes || 0) - swaps);
+  const copies = `${num(replaced)} ${replaced === 1 ? "copy" : "copies"}`;
+  const files = (n, w = "") => `${num(n)} ${w}${n === 1 ? "file" : "files"}`;
+  let title;
+  if (replaced && other) title = `Replace ${copies} on ${tn} with the PC's and remove ${files(other, "other ")} in one sync`;
+  else if (replaced) title = `Replace ${copies} on ${tn} with the PC's in one sync`;
+  else title = `Remove ${files(other)} from ${tn} in one sync`;
+  const parts = [];
+  if (over) parts.push(`${num(over)} overwritten in place`);
+  if (swaps) parts.push(`${num(swaps)} under another name, removed only once the PC's copy is on ${tn}`);
+  const split = replaced ? `${parts.join("; ")}. ` : "";
+  const why = md.series ? `Half or more of the chapter files in ${num(md.series)} series.` : "200 or more files in one sync.";
+  return { title, sub: split + why };
+}
 // Strip states (planner.js chapterStrip; colours in spec §2), for tooltips.
 export const STRIP_STATE_COPY = Object.freeze({
   synced: "on the target",
@@ -396,7 +461,8 @@ export function blockingCopy(b, tn) {
     case "plan-changed":
       return "The plan changed since you reviewed it. Review again.";
     case "free-space":
-      return `${tn} doesn't have enough free space`;
+      // b.at: the first series the run can't fit (executor.js apply, space.js shortAt).
+      return b.at ? `${tn} doesn't have enough free space (runs out at ${seriesKeyName(b.at)})` : `${tn} doesn't have enough free space`;
     default:
       return "Something needs your attention";
   }
@@ -407,7 +473,7 @@ export function blockingCopy(b, tn) {
 export const JOB_REASONS = Object.freeze([
   "cancelled", "device-lost", "offline", "still-connecting", "unauthorized", "server-unavailable", "no-space",
   "read-only", "record-write-failed", "error-budget", "internal", "pc-file-unreadable", "unknown-shard",
-  "not-a-bound-folder", "needs-mode", "same-name",
+  "not-a-bound-folder", "needs-mode", "same-name", "out-of-room",
 ]);
 export function jobReasonCopy(reason, tn) {
   const r = String(reason || "");
@@ -429,6 +495,10 @@ export function jobReasonCopy(reason, tn) {
     "needs-mode": `${tn} needs a check mode first`,
     "same-name": "the folder already has that name",
     "folder-reappeared": "its folder came back on the target meanwhile",
+    // A completed apply that skipped writes for space (executor.js _roomFor),
+    // and a whole new series it never started (_skipSeriesNoRoom).
+    "out-of-room": `not everything fit on ${tn}`,
+    "no-room": `it didn't fit on ${tn}`,
   };
   if (fixed[r]) return fixed[r];
   if (r.startsWith("rename-refused-destination-exists")) return "a folder with the new name already exists";
@@ -465,6 +535,8 @@ export const SKIP_REASON_COPY = Object.freeze({
   "changed-since-plan": "changed after the plan",
   "already-gone": "already gone",
   "slot-guard": "your PC has a file with that name",
+  // executor.js _roomFor: the space ledger turned the write away.
+  "no-room": "didn't fit; left for the next sync",
 });
 
 // ── Warnings (prepare / planner / executor / pc-inventory `kind`) ──
@@ -486,7 +558,8 @@ export function warningCopy(w, tn) {
     "alias-conflict": "Two series link to the same folder",
     "duplicate-op": "A change was planned twice (ignored)",
     "pc-name-collision": "Two PC files map to one name",
-    "deletes-first": `Removals run first to make room on ${there}`,
+    // executor.js apply: writes skipped or refused for space (plan A1b).
+    "out-of-room": `${(w && w.files) || "Some"} ${w && w.files === 1 ? "file" : "files"} didn't fit on ${there}${w && w.emptied && w.emptied.length ? `; ${w.emptied.length} old ${w.emptied.length === 1 ? "copy was" : "copies were"} removed before the copy failed` : ""}`,
     "nomedia-failed": `Couldn't write .nomedia on ${there}`,
     "post-listing-failed": `Couldn't list ${f || "a folder"} after copying`,
     "cleanup-failed": `Couldn't remove bookkeeping files in ${f || "a folder"}`,
@@ -560,6 +633,7 @@ export const LAST_RUN_PHASE_COPY = Object.freeze({
 });
 export function lastRunTitle(phase, status, tn, reason) {
   const p = LAST_RUN_PHASE_COPY[phase] || LAST_RUN_PHASE_COPY.apply;
+  if (status === "completed" && reason === "out-of-room") return `Synced what fit on ${tn}`;
   if (status === "completed") return p.done(tn);
   if (status === "cancelled") return "Sync cancelled";
   if (status === "disconnected") return `${tn} disconnected mid-sync`;

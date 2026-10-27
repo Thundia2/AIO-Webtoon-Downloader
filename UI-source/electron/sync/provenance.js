@@ -59,6 +59,25 @@ function isOurs(entry, devFile) {
 }
 
 /**
+ * A `foreign` entry still describes the file in its slot: same size and
+ * devMtime as when Verify hashed it. classifyDeviceFile calls any foreign
+ * entry foreign; only an unchanged one may pre-select its own replacement
+ * (planner.js auto-replace, grep foreignCurrent), since a file rewritten
+ * after its Verify is as unknown as an unverified one.
+ */
+function isForeignCurrent(entry, devFile) {
+  return (
+    !!entry &&
+    !!devFile &&
+    entry.origin === "foreign" &&
+    !!entry.sha256 &&
+    entry.devMtime != null &&
+    devFile.size === entry.size &&
+    devFile.devMtime === entry.devMtime
+  );
+}
+
+/**
  * @param {object|undefined} entry   The recorded entry for this slot.
  * @param {{size:number, devMtime:number}} devFile  The listing's file.
  * @returns {'ours'|'pending'|'changed'|'foreign'|'unverified'}
@@ -327,6 +346,7 @@ module.exports = {
   ORIGINS_OURS,
   normalizeDevMtime,
   isOurs,
+  isForeignCurrent,
   classifyDeviceFile,
   adoptMissingDevMtime,
   resolvePending,

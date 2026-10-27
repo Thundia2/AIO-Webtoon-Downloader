@@ -94,12 +94,15 @@ const SELECTION_MODES = Object.freeze(["all-except", "only"]);
 // device can hash. Consumers: service.js _planOpts, contract.js VERIFY_MODES.
 const STORED_VERIFY_MODES = Object.freeze(["read-back", "adopt-size"]);
 // A target's removal policy (approved design D5): guarded offers and
-// pre-selects proven removals, add-only never pre-selects one. A permanent
+// pre-selects proven removals, add-only never pre-selects one, auto-replace
+// is guarded plus pre-selecting the swap of a hash-verified foreign copy for
+// the PC's (plan sync-temp/plans/device-sync-auto-replace.md; the rule lives
+// in planner.js _planExisting, grep autoReplace). A permanent
 // per-target field; the global syncDeletePolicy is only the value a NEW
 // target starts with (service.js add-target stamps it). A target saved before
 // the field existed resolves null here and the planner falls back to the
 // global (planner.js buildPlan, grep `cfg.deletePolicy`).
-const DELETE_POLICIES = Object.freeze(["guarded", "add-only"]);
+const DELETE_POLICIES = Object.freeze(["guarded", "add-only", "auto-replace"]);
 
 function _arr(v) {
   return Array.isArray(v) ? v.slice() : [];
@@ -250,7 +253,7 @@ function validateTarget(target, ctx) {
     errors.push({ field: "verifyMode", message: "verify mode must be read-back or adopt-size" });
   }
   if (t.deletePolicy != null && !DELETE_POLICIES.includes(t.deletePolicy)) {
-    errors.push({ field: "deletePolicy", message: "removals must be guarded or add-only" });
+    errors.push({ field: "deletePolicy", message: "removals must be guarded, add-only or auto-replace" });
   }
   if (Array.isArray(t.excludes) && t.excludes.some((e) => e && e.removeFiles != null && typeof e.removeFiles !== "boolean")) {
     errors.push({ field: "excludes", message: "removeFiles must be true or false" });

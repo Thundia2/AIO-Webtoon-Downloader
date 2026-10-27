@@ -1027,6 +1027,9 @@ class MangaDexSiteHandler(BaseSiteHandler):
                 pages_total=n_pages,
                 host=host,
                 reason="mdah_persistent_failure_after_swaps",
+                # 1-based like the chapter loop's page_counter; the pages
+                # already fetched become rescue evidence (grep pages_from_blobs).
+                pages={i + 1: b for i, b in blobs.items()},
             )
 
         # Assemble binary_image entries in original page order. The blob's

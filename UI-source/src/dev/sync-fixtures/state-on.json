@@ -29,7 +29,8 @@
         "default": "guarded",
         "presets": [
           "guarded",
-          "add-only"
+          "add-only",
+          "auto-replace"
         ]
       },
       "syncHashMode": {
@@ -74,7 +75,7 @@
       "adbPath": null,
       "targets": [
         {
-          "id": "t90ac5d6733",
+          "id": "tf50fe92999",
           "deletePolicy": "guarded",
           "excludes": [
             {
@@ -96,7 +97,7 @@
           "profile": "komikku"
         },
         {
-          "id": "te13002d4eb",
+          "id": "t8e8c81b2a2",
           "deletePolicy": "guarded",
           "excludes": [],
           "aliases": [],
@@ -108,7 +109,7 @@
           "profile": "everything"
         },
         {
-          "id": "t98b54e844a",
+          "id": "t5e03b218ae",
           "deletePolicy": "guarded",
           "excludes": [],
           "aliases": [],
@@ -153,7 +154,7 @@
       ],
       "tracking": "tracking",
       "trackingError": null,
-      "at": 1792575341517
+      "at": 1793121385232
     },
     "devices": [
       {
@@ -176,17 +177,17 @@
       }
     ],
     "folderPresence": {
-      "te13002d4eb": true
+      "t8e8c81b2a2": true
     },
     "job": {
       "job": {
         "runId": 1,
         "phase": "plan",
-        "targetId": "t90ac5d6733",
+        "targetId": "tf50fe92999",
         "serial": "R5CW71ABCDE",
         "auto": true,
         "state": "running",
-        "startedAt": 1792575341532,
+        "startedAt": 1793121385248,
         "finishedAt": null,
         "progress": {
           "bytesDone": 0,
@@ -196,22 +197,22 @@
           "current": null,
           "preflight": null,
           "step": "probe",
-          "at": 1792575341534
+          "at": 1793121385250
         },
         "status": null,
         "summary": null
       },
       "queue": [
         {
-          "targetId": "te13002d4eb",
+          "targetId": "t8e8c81b2a2",
           "serial": null,
-          "queuedAt": 1792575341540,
+          "queuedAt": 1793121385260,
           "kind": "plan"
         }
       ]
     },
     "plans": {
-      "t90ac5d6733": {
+      "tf50fe92999": {
         "summary": null,
         "refusal": null,
         "stale": true,
@@ -222,7 +223,7 @@
         "selSeq": null,
         "lastPlan": null
       },
-      "te13002d4eb": {
+      "t8e8c81b2a2": {
         "summary": null,
         "refusal": null,
         "stale": false,
@@ -233,7 +234,7 @@
         "selSeq": null,
         "lastPlan": null
       },
-      "t98b54e844a": {
+      "t5e03b218ae": {
         "summary": null,
         "refusal": null,
         "stale": false,
@@ -249,22 +250,22 @@
     "prompts": [],
     "pending": [
       {
-        "promptId": "p1-1792575341532",
+        "promptId": "p1-1793121385248",
         "connKey": "R5CW71ABCDE#1",
         "serial": "R5CW71ABCDE",
         "targetIds": [
-          "t90ac5d6733"
+          "tf50fe92999"
         ],
-        "since": 1792575341532
+        "since": 1793121385248
       },
       {
-        "promptId": "p2-1792575341540",
-        "connKey": "folder:te13002d4eb",
+        "promptId": "p2-1793121385260",
+        "connKey": "folder:t8e8c81b2a2",
         "serial": null,
         "targetIds": [
-          "te13002d4eb"
+          "t8e8c81b2a2"
         ],
-        "since": 1792575341540
+        "since": 1793121385260
       }
     ],
     "find": null,

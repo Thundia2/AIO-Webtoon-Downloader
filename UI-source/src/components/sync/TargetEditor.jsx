@@ -33,7 +33,7 @@ import { cn } from "@/lib/utils";
 import RemoteBrowser from "./RemoteBrowser";
 import { refusalField } from "./useConfigOps";
 import {
-  PROFILE_COPY, PROFILE_ORDER, DELETE_POLICY_COPY, NAMING_POLICY_COPY, SELECTION_MODE_COPY,
+  PROFILE_COPY, PROFILE_ORDER, DELETE_POLICY_COPY, DELETE_POLICY_ORDER, NAMING_POLICY_COPY, SELECTION_MODE_COPY,
   CHAPTER_FORMATS, SIDECAR_NAMES, CUSTOM_DEFAULTS, KIND_COPY, configRefusalCopy, deviceLabel,
 } from "./copy";
 
@@ -423,7 +423,7 @@ export default function TargetEditor({ target: t, sync, ops, library, host }) {
           aria-label="Removals"
           value={deletePolicy}
           onChange={(v) => patch({ deletePolicy: v }, "deletePolicy")}
-          options={["guarded", "add-only"].map((k) => ({ value: k, label: DELETE_POLICY_COPY[k].label }))}
+          options={DELETE_POLICY_ORDER.map((k) => ({ value: k, label: DELETE_POLICY_COPY[k].label }))}
         />
       </Field>
 

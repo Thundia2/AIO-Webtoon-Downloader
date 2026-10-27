@@ -75,11 +75,15 @@ except Exception:  # ImportError or any sub-dep failure
 # TIMEOUT_MS survives as a ceiling so nothing can hang indefinitely on a
 # trickle that stays just above the low-speed floor.
 #
-# Deliberately NOT done: HTTP Range resume on retry. Neither observed
-# pathology needs it (a progressing transfer now completes on the first
-# attempt; a hard-stalled one needs a different CONNECTION, not a byte
-# offset), and partial-body resume would have to be validated against CDNs
-# that silently ignore Range and re-serve from 0.
+# A retry RESUMES the bytes the failed attempt delivered (HTTP Range, see
+# _PartialImage below). It was first left out on the theory that a stalled page
+# needs a different connection, not a byte offset; the 2026-10-20 library
+# refresh disproved that: swebtoon-phinf served ONE Tower of God image at
+# ~3-5 KB/s for 8+ minutes on fresh connections and HTTP/1.1 alike (a cold
+# edge cache, by every sign), and two attempts moved 551 KB + 820 KB of a
+# 995 KB page, more than the page, while each restart from byte 0 under the
+# ceiling could never finish it. The chapter fell to --multi-source
+# (bench/library-refresh/logs/tower-of-god/download-1.log, ch 284 and 453).
 
 # A transfer below this many bytes/sec for the caller's whole `timeout` window
 # is dead rather than slow. Well under the ~20 KB/s a starved HTTP/2 stream on
@@ -137,6 +141,129 @@ def _fast_dl_retry_options(timeout: float) -> Dict[Any, Any]:
     return opts
 
 
+# Bytes a resumed request re-fetches from BEFORE the end of what is held, and
+# that must come back identical. This is the proof that the response continues
+# the same object: swebtoon-phinf sends no ETag, and its Last-Modified is the
+# edge's cache-fill time (it changed between two requests ten minutes apart),
+# so neither validator identifies the bytes. 4 KB of compressed image data
+# matching by chance is not a real possibility.
+_FAST_DL_RESUME_OVERLAP = 4096
+
+_CONTENT_RANGE_RE = re.compile(r"^\s*bytes\s+(\d+)-(\d+)/(\d+)\s*$", re.I)
+
+
+class _PartialImage:
+    """The bytes of ONE page that failed attempts delivered, kept so the next
+    attempt asks only for the rest (fast_download_images, grep _PartialImage).
+
+    Contract: `complete()` only ever returns bytes that are byte-for-byte one
+    object. Every way that could break resets the held bytes and the next
+    attempt starts from 0, exactly the pre-resume behaviour:
+      - a 206 must start at the offset asked for, carry the same total the
+        first response declared, and repeat the held overlap window exactly
+        (_FAST_DL_RESUME_OVERLAP); anything else is a different object or a
+        broken range implementation;
+      - a 200 to a Range request (CDNs that ignore Range, or serve a cold
+        object whole) is a fresh full body and replaces the held bytes;
+      - a compressed body (Content-Encoding other than identity) is never held:
+        curl hands back DECODED bytes, whose offsets mean nothing to Range;
+      - the assembled body must be exactly the declared total long.
+    Page identity is not this class's concern: it is keyed by one page's URL
+    inside one call, so it cannot move bytes between pages. A page that never
+    assembles stays a miss for the chapter completeness gate in aio-dl.py.
+    Held in memory for the duration of one fast_download_images call; a later
+    call (the prefetch handing over to the foreground, an inline chapter
+    retry) starts the page from 0.
+    """
+
+    __slots__ = ("data", "total")
+
+    def __init__(self) -> None:
+        self.data = b""
+        self.total: Optional[int] = None
+
+    def reset(self) -> None:
+        self.data = b""
+        self.total = None
+
+    def resume_from(self) -> Optional[int]:
+        """Byte offset for the next request's Range header, None = whole."""
+        if not self.data or not self.total or len(self.data) >= self.total:
+            return None
+        return max(0, len(self.data) - _FAST_DL_RESUME_OVERLAP)
+
+    @staticmethod
+    def _encoded(resp: Any) -> bool:
+        enc = (resp.headers.get("Content-Encoding") or "").strip().lower()
+        return enc not in ("", "identity")
+
+    def _absorb_206(self, resp: Any, asked_from: Optional[int]) -> bool:
+        """Splice a 206 body onto the held bytes. False = not the same object
+        (the held bytes are then reset)."""
+        m = _CONTENT_RANGE_RE.match(resp.headers.get("Content-Range") or "")
+        content = resp.content or b""
+        if (
+            asked_from is None
+            or m is None
+            or self._encoded(resp)
+            or int(m.group(1)) != asked_from
+            or int(m.group(3)) != self.total
+        ):
+            self.reset()
+            return False
+        overlap = self.data[asked_from:]
+        # A transfer that died inside the overlap window can only be checked
+        # on what it delivered; it adds nothing, so the held bytes stand.
+        if len(content) <= len(overlap):
+            if overlap[:len(content)] != content:
+                self.reset()
+                return False
+            return True
+        if content[:len(overlap)] != overlap:
+            self.reset()
+            return False
+        self.data = self.data[:asked_from] + content
+        if len(self.data) > self.total:
+            self.reset()
+            return False
+        return True
+
+    def absorb_failure(self, resp: Any, asked_from: Optional[int]) -> None:
+        """Keep what a failed attempt (the request raised) delivered.
+        `resp` is curl_cffi's `exc.response`: on a transfer error it still
+        holds the status, headers and every body byte received."""
+        if resp is None or not (resp.content or b""):
+            return
+        if resp.status_code == 206:
+            self._absorb_206(resp, asked_from)
+            return
+        if resp.status_code != 200 or self._encoded(resp):
+            return
+        try:
+            total = int(resp.headers.get("Content-Length") or 0)
+        except ValueError:
+            total = 0
+        if total <= 0 or len(resp.content) >= total:
+            # No declared length = nothing to prove the assembled body
+            # against; a body at full length did not fail on its bytes.
+            self.reset()
+            return
+        self.data = bytes(resp.content)
+        self.total = total
+
+    def complete(self, resp: Any, asked_from: Optional[int]) -> Optional[bytes]:
+        """The whole object from a successful 206, or None when the response
+        does not continue the held bytes (they are reset; the next attempt
+        starts from 0)."""
+        if not self._absorb_206(resp, asked_from):
+            return None
+        if len(self.data) != self.total:
+            self.reset()
+            return None
+        body, self.data, self.total = self.data, b"", None
+        return body
+
+
 # Exceptions from a probe fetch that mean "we couldn't MEASURE this page in time"
 # (slowness), NOT "the page/CDN is definitively broken". The matched-page probe
 # (sites/match_session.py) counts these as timeouts, never as failures, so a
@@ -189,6 +316,12 @@ class IncompleteChapterError(Exception):
     Cross-file: see aio-dl.py's existing ChapterSkippedError for the full
     retry contract; this exception only carries the diagnostic fields the
     wrapper needs to re-raise as ChapterSkippedError.
+
+    `pages` ({1-based page index: image bytes}) is what the handler DID get. A
+    handler that downloads in-process (MangaDex MD@H) passes it so the bytes
+    become multi-source rescue evidence (aio-dl.py grep
+    `_capture_partial_pages(n, _cfp.pages_from_blobs`) instead of vanishing with
+    the exception. Optional: URL-listing handlers have no bytes to give.
     """
 
     def __init__(
@@ -197,11 +330,13 @@ class IncompleteChapterError(Exception):
         pages_total: int,
         host: str = "",
         reason: str = "",
+        pages: Optional[Dict[int, bytes]] = None,
     ) -> None:
         self.pages_ok = int(pages_ok)
         self.pages_total = int(pages_total)
         self.host = host or ""
         self.reason = reason or "handler_incomplete"
+        self.pages = dict(pages or {})
         super().__init__(
             f"chapter incomplete: {self.pages_ok}/{self.pages_total} from "
             f"{self.host or '?'} ({self.reason})"
@@ -1041,13 +1176,23 @@ class BaseSiteHandler:
             # The inter-attempt backoff is deliberately taken OUTSIDE the
             # semaphore: a page that is only sleeping must not occupy one of
             # the `concurrency` slots that its still-healthy siblings need.
+            #
+            # Each failed attempt's bytes are kept and the next attempt asks
+            # for the rest (grep _PartialImage for the guards that keep a
+            # spliced body one object).
             retry_delay = 0.0
+            partial = _PartialImage()
             for attempt in range(n_attempts):
                 if is_cancelled is not None and is_cancelled():
                     return page_idx, None
                 if retry_delay:
                     await asyncio.sleep(retry_delay)
                     retry_delay = 0.0
+                asked_from = partial.resume_from()
+                req_headers = headers
+                if asked_from is not None:
+                    req_headers = dict(headers)
+                    req_headers["Range"] = f"bytes={asked_from}-"
                 async with sema:
                     # Re-check after sema acquire — coroutines that were
                     # queued before cancel was set should still bail here
@@ -1058,8 +1203,11 @@ class BaseSiteHandler:
                         return page_idx, None
                     try:
                         session = await get_session(attempt)
-                        r = await session.get(url, headers=headers, timeout=ceiling)
+                        r = await session.get(url, headers=req_headers, timeout=ceiling)
                     except Exception as exc:
+                        # On a transfer error curl_cffi still attaches the
+                        # response with every byte received (exc.response).
+                        partial.absorb_failure(getattr(exc, "response", None), asked_from)
                         # Per-attempt visibility: shows up in aio-dl's stderr
                         # which the UI's LogPanel surfaces. Ported from the
                         # 2026-05-13-deleted mangafire-specific
@@ -1067,7 +1215,9 @@ class BaseSiteHandler:
                         # Subclasses that don't want this can override
                         # fast_download_images and skip the print.
                         import sys
-                        print(f"[-] curl_cffi exception: {exc} for URL: {url}", file=sys.stderr)
+                        held = (f" (holding {len(partial.data)}/{partial.total} bytes "
+                                f"to resume)" if partial.resume_from() is not None else "")
+                        print(f"[-] curl_cffi exception: {exc} for URL: {url}{held}", file=sys.stderr)
                         if attempt < n_attempts - 1:
                             retry_delay = min(4.0, 1.0 * (attempt + 1))
                             continue
@@ -1090,12 +1240,28 @@ class BaseSiteHandler:
                 # (HTML/JSON stubs, 1x1 tracking pixels, truncated bodies); the
                 # old blanket len<256 gate false-positived on real dividers and
                 # aborted whole runs (bench/webtoonCanvasShelterLogs.md).
-                if r.status_code != 200 or not looks_like_real_image(r.content):
+                body = r.content
+                resume_rejected = False
+                if r.status_code == 206:
+                    # Only a resumed request gets a 206; complete() returns
+                    # None unless the response provably continues the held
+                    # bytes, which it then resets.
+                    body = partial.complete(r, asked_from)
+                    resume_rejected = body is None
+                elif r.status_code == 200:
+                    # A whole body, also when a Range request was ignored.
+                    partial.reset()
+                elif r.status_code == 416 and asked_from is not None:
+                    partial.reset()
+                    resume_rejected = True
+                if resume_rejected or r.status_code not in (200, 206) or not looks_like_real_image(body):
                     import sys
                     body_len = len(r.content) if r.content else 0
+                    note = (" (resume rejected: not a continuation of the held bytes; "
+                            "next attempt starts from byte 0)" if resume_rejected else "")
                     print(
                         f"[-] curl_cffi status={r.status_code} "
-                        f"size={body_len} for URL: {url}",
+                        f"size={body_len} for URL: {url}{note}",
                         file=sys.stderr,
                     )
                     # A permanent 4xx will not become a 200 on attempt 4, and
@@ -1108,8 +1274,11 @@ class BaseSiteHandler:
                     # two 4xx that genuinely mean "later", so they keep retrying.
                     # Mirrors _classify_response_failure's permanent/retryable
                     # split on the slow path.
+                    # A rejected resume (incl. 416) says nothing about the
+                    # page: the retry asks for the whole object.
                     permanent = (
-                        400 <= r.status_code < 500
+                        not resume_rejected
+                        and 400 <= r.status_code < 500
                         and r.status_code not in (408, 429)
                     )
                     if attempt < n_attempts - 1 and not permanent:
@@ -1138,7 +1307,7 @@ class BaseSiteHandler:
                 try:
                     os.makedirs(folder, exist_ok=True)
                     with open(pending_path, "wb") as fh:
-                        fh.write(r.content)
+                        fh.write(body)
                 except OSError:
                     return page_idx, None
                 content_type = ""

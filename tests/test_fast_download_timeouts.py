@@ -140,7 +140,9 @@ def test_both_aio_dl_call_sites_pass_the_users_retry_budget():
 
 
 # ────────────────────────────────────────────────────────────────────────
-# The near-miss retry ordering in _process_chapter_strict
+# The near-miss retry in _process_chapter_strict. Its ORDER (primary retries,
+# resuming, before any other site) is tested by driving main() in
+# tests/test_multisource_rescue.py (grep test_primary_retries_run_before).
 # ────────────────────────────────────────────────────────────────────────
 
 def _aio_dl_source():
@@ -149,52 +151,10 @@ def _aio_dl_source():
         return fh.read()
 
 
-def test_near_miss_retry_runs_before_alternatives_and_before_lazy_discovery():
-    """Ordering IS the feature. A chapter that only just missed must get one
-    more shot at the primary before --multi-source can replace it with a
-    shorter third-party re-host — and before the deferred cross-site search
-    is paid for, since a chapter that recovers here never needs alternatives
-    at all. Structural because _process_chapter_strict is a closure inside
-    main() and cannot be imported."""
-    src = _aio_dl_source()
-    near_miss = src.index("# NEAR-MISS quick retry on the primary")
-    lazy_discovery = src.index("if _ms_lazy_pending and not aux_veto:")
-    alts_loop = src.index("trying {len(alts)} alternative source(s)")
-    assert near_miss < lazy_discovery < alts_loop
-
-
-def test_near_miss_retry_is_gated_to_incomplete_only():
-    """ghost_chapter / host_poison / time_budget / locked all describe
-    something a few seconds will not change; only 'incomplete' means the host
-    just served nearly the whole chapter and deserves a second try."""
-    src = _aio_dl_source()
-    assert src.count('if primary_err.reason == "incomplete" and not run_cancelled():') == 1
-
-
-def test_near_miss_retry_is_a_single_attempt():
-    """It is a quick second chance, not a retry loop — the long backoff loop
-    below still owns CDN-recovery retries. Asserted on CODE lines only: the
-    block's own prose says "for" plenty of times, and its interruptible-sleep
-    `while` is a legitimate loop that must not be confused for a retry loop."""
-    src = _aio_dl_source()
-    block = src[src.index("# NEAR-MISS quick retry on the primary"):]
-    block = block[:block.index("# Faithful-archival veto")]
-    code = [
-        line.strip()
-        for line in block.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
-    assert block.count("near_miss_attempts = 1") == 1
-    # Exactly one download attempt, and nothing loops over it.
-    assert sum(1 for line in code if "_process_chapter(" in line) == 1
-    assert not [line for line in code if line.startswith("for ")], (
-        "the near-miss retry must not become a loop"
-    )
-
-
 def test_near_miss_backoff_is_short_relative_to_the_cdn_recovery_backoff():
-    """If these converged, the near-miss retry would just be a slower path to
-    the same place and the alternatives-first ordering would win by default."""
+    """The near-miss retry is a blip-length pause for a host that just served
+    nearly the whole chapter; if it converged on the CDN-recovery wait it would
+    only be one more slow rung of the long ladder."""
     import re
 
     src = _aio_dl_source()

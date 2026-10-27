@@ -155,7 +155,8 @@ const profiles = require("./profiles");
 const planner = require("./planner");
 const { loadRecordView } = require("./provenance");
 const { labelPreview } = require("./chapter-labels");
-const { segmentProblem, spaceNeeded, AdbTransport, FolderTransport, shq } = require("./transports");
+const { segmentProblem, AdbTransport, FolderTransport, shq } = require("./transports");
+const { simulateRun } = require("./space");
 const { WriteQueue, RecordStore, readJson, sweepTmp, newShardId } = require("./store");
 const { HashPool, workerCountFor } = require("./hash-pool");
 const { walkLibrary, pcSignature } = require("./pc-inventory");
@@ -1222,6 +1223,19 @@ function initDeviceSync(deps) {
     return true;
   }
 
+  // update-target changed deletePolicy: rt.plan still carries the OLD
+  // policy's pre-selection, which is what tells a user's flip from a stored
+  // default (planner.js pruneDefaultChoices). No plan yet = nothing to tell
+  // them apart by, so the stored choices stay.
+  async function _prunePolicyChoices(targetId) {
+    const rt = rts.get(targetId);
+    if (!rt || !rt.plan || !rt.selOps) return;
+    const ops = planner.pruneDefaultChoices(rt.plan, rt.selOps);
+    if (ops === rt.selOps) return;
+    rt.selOps = ops;
+    await _persistSelection(rt, targetId);
+  }
+
   // The device-ready line (prepare.js deviceReady; deviation 14) goes out
   // once per job, immediately, as progress.preflight. A job can prepare
   // twice (a verify job, a plan with verifyFirst); only the first counts.
@@ -1309,35 +1323,39 @@ function initDeviceSync(deps) {
   }
 
   /**
-   * Capacity for the gauge (user decision 2): `free` is prepare's one
-   * reading; `needed` follows the selection through spaceNeeded, the same
-   * formula as the executor's pre-flight. `freeableEarly` is what the
-   * executor may delete before pushing (gate-free deletes); `fits` mirrors
-   * its refusal test, null while free space is unknown.
+   * Capacity for the gauge (user decision 2) and Review's fit line. `free`
+   * is prepare's one reading; the rest is space.js simulateRun over the
+   * selection, the same model and series order the executor admits and
+   * runs, so the gauge can't promise a fit the executor refuses (grep:
+   * simulateRun). Fields:
+   *   needed   how far free space dips during the run (Review's "needs")
+   *   lowest   free space at that tightest moment
+   *   shortBy / shortAt  bytes missing above the reserve, and the first
+   *            series that overruns (0 / null when it fits)
+   *   after    free once the run is done; only removals the plan can prove
+   *            count (a gated delete whose copy may not land is not credited)
+   *   freeable every ticked removal's bytes, proven or not
+   *   fits     the executor's admission test; null while free is unknown
    */
   function _capacity(rt, sel) {
     const ops = planner.selectedOps(rt.plan, sel);
     const kind = rt.prep && rt.prep.target ? rt.prep.target.kind : "folder";
     const fsr = (rt.prep && rt.prep.freeSpace) || { bytes: null, asOf: null };
-    const delBytes = (o) => (o.devFile && o.devFile.size) || 0;
-    const deletes = ops.filter((o) => o.kind === "delete");
-    const freeable = deletes.reduce((n, o) => n + delBytes(o), 0);
-    const freeableEarly = deletes.filter((o) => !o.gate).reduce((n, o) => n + delBytes(o), 0);
-    const needed = spaceNeeded(kind, ops);
     const free = fsr.bytes;
+    const sim = simulateRun(kind, ops, { free, reserve: RESERVE_BYTES });
     return {
       free,
       // UI-pass U2-5: the gauge's "used" part; null when the transport
       // can't say (then the bar is drawn against free space alone).
       total: fsr.total == null ? null : fsr.total,
-      needed,
+      needed: sim.needed,
+      lowest: sim.lowest,
       reserve: RESERVE_BYTES,
-      freeable,
-      freeableEarly,
-      // Free space once the selection has run: growth minus what its
-      // deletes give back. The gauge's ghost bar and "after sync" label.
-      after: free == null ? null : free - needed + freeable,
-      fits: free == null ? null : needed <= 0 || needed <= free - RESERVE_BYTES + freeableEarly,
+      freeable: sim.freeable,
+      after: sim.after,
+      shortBy: sim.shortBy,
+      shortAt: sim.shortAt,
+      fits: sim.fits,
       asOf: fsr.asOf,
     };
   }
@@ -2073,7 +2091,12 @@ function initDeviceSync(deps) {
     // An identity edit clears the record and must plan in full (review R10:
     // with no re-plan a target whose last plan failed stayed autoHold
     // forever); any other field only changes the derivation (_derive).
-    return { next: { ...config, targets: _targets().map((x) => (x.id === t.id ? next : x)) }, after: identity ? () => _identityClear(t.id, _cfg(next)) : null, targetId: t.id, replan: identity ? "full" : "derive" };
+    if (identity) return { next: { ...config, targets: _targets().map((x) => (x.id === t.id ? next : x)) }, after: () => _identityClear(t.id, _cfg(next)), targetId: t.id, replan: "full" };
+    // A Removals change: stored choices that merely repeat the old policy's
+    // default follow the new one (planner.js pruneDefaultChoices), persisted
+    // before the derive reads them.
+    const policyChanged = "deletePolicy" in p.patch && _cfg(next).deletePolicy !== _cfg(t).deletePolicy;
+    return { next: { ...config, targets: _targets().map((x) => (x.id === t.id ? next : x)) }, after: policyChanged ? () => _prunePolicyChoices(t.id) : null, targetId: t.id, replan: "derive" };
   };
 
   OPS["remove-target"] = async (p) => {

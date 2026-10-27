@@ -190,6 +190,10 @@
   .sync-gauge-ghost {
     background: repeating-linear-gradient(135deg, hsl(var(--primary) / 0.85) 0 3px, hsl(var(--primary) / 0.45) 3px 6px);
   }
+  /* Space the run holds only mid-run (CapacityGauge: lowest below after). */
+  .sync-gauge-dip {
+    background: repeating-linear-gradient(135deg, hsl(var(--primary) / 0.35) 0 3px, transparent 3px 6px);
+  }
   .sync-gauge-reserve {
     background: repeating-linear-gradient(135deg, hsl(var(--destructive) / 0.35) 0 2px, transparent 2px 4px);
   }

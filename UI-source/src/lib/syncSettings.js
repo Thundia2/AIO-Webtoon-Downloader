@@ -30,7 +30,7 @@ export const SYNC_DEFAULTS = Object.freeze({
 // Every preset the backend accepts, in its order (decision 6: all exposed).
 // syncSizeWarnPct 0 is "off".
 export const SYNC_PRESETS = Object.freeze({
-  syncDeletePolicy: Object.freeze(["guarded", "add-only"]),
+  syncDeletePolicy: Object.freeze(["guarded", "add-only", "auto-replace"]),
   syncHashMode: Object.freeze(["cached", "rehash"]),
   syncErrorBudget: Object.freeze([1, 3, 5, 10]),
   syncSizeWarnPct: Object.freeze([0, 15, 30, 50]),

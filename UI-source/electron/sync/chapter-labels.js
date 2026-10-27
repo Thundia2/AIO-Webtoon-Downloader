@@ -122,7 +122,12 @@ function _numeric(label) {
  *   start?:string, end?:string, sortValue:number, convention:string, tilde:boolean}}
  *   label is the conservative chapter label (chapter), "<start>-<end>"
  *   (range), the volume number (volume), else null. tilde marks a legacy
- *   "~" decimal, which Komikku's ChapterRecognition misreads.
+ *   "~" decimal, which Komikku's ChapterRecognition misreads. appLabel
+ *   (chapters only) = the name is one AIO writes (Komikku "Ch.N…", legacy
+ *   "Title Ch N" with nothing after N), so the label is the chapter's own
+ *   number, not a running index ("#N -") or a guess from a longer token.
+ *   planner.js lets only such a label pre-select a foreign file's
+ *   replacement (grep appLabel).
  */
 function labelFile(name, folderName, patterns) {
   const stem = _nameNoExt(name);
@@ -130,7 +135,7 @@ function labelFile(name, folderName, patterns) {
   const k = stem.match(KOMIKKU_CH_RE);
   if (k) {
     const label = conservativeLabel(k[1]);
-    if (label != null) return _chapter(label, "komikku", false);
+    if (label != null) return _chapter(label, "komikku", false, true);
   }
 
   const chIdx = stem.lastIndexOf(" Ch ");
@@ -159,7 +164,10 @@ function labelFile(name, folderName, patterns) {
         const label =
           (lead && conservativeLabel(lead[1])) ||
           conservativeLabel(String(parseFloat(chPart.replace("~", "."))));
-        if (label != null) return _chapter(label, "legacy", chPart.includes("~"));
+        // "Title Ch 5" is AIO's legacy name; "Title Ch 5 - Extra" is not one it
+        // writes, so its leading number is a guess (appLabel false).
+        const whole = /^\d+(?:[.~]\d+)?[a-z]?$/i.test(chPart);
+        if (label != null) return _chapter(label, "legacy", chPart.includes("~"), whole);
       }
     }
   }
@@ -172,7 +180,7 @@ function labelFile(name, folderName, patterns) {
     if (c.unit === "volume") {
       return { unit: "volume", label, sortValue: _numeric(label), convention: c.id, tilde: false };
     }
-    return _chapter(label, c.id, m[1].includes("~"));
+    return _chapter(label, c.id, m[1].includes("~"), false);
   }
 
   if (folderName) {
@@ -189,14 +197,14 @@ function labelFile(name, folderName, patterns) {
     const m = stem.match(re);
     const token = m && m.groups && m.groups.ch;
     const label = token != null ? conservativeLabel(token) : null;
-    if (label != null) return _chapter(label, "custom", String(token).includes("~"));
+    if (label != null) return _chapter(label, "custom", String(token).includes("~"), false);
   }
 
   return { unit: "unknown", label: null, sortValue: Infinity, convention: "none", tilde: false };
 }
 
-function _chapter(label, convention, tilde) {
-  return { unit: "chapter", label, sortValue: _numeric(label), convention, tilde };
+function _chapter(label, convention, tilde, appLabel) {
+  return { unit: "chapter", label, sortValue: _numeric(label), convention, tilde, appLabel };
 }
 
 const _collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });

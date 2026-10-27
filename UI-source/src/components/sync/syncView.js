@@ -19,7 +19,7 @@
 // ============================================================
 
 import { formatBytes } from "@/lib/utils";
-import { DEVICE_STATE_COPY, DROPPED_REASON_COPY, HASH_MODE_COPY, jobReasonCopy, lastRunTitle, skipReasonCopy } from "./copy";
+import { DELETE_POLICY_PLANNED, DEVICE_STATE_COPY, DROPPED_REASON_COPY, HASH_MODE_COPY, jobReasonCopy, lastRunTitle, skipReasonCopy } from "./copy";
 
 export const TILE_IDS = Object.freeze(["push", "delete", "synced", "only", "attn"]);
 export const SORTS = Object.freeze([
@@ -326,10 +326,39 @@ export function pickTargets(targets, devices, folderPresence) {
   return list.map((x) => ({ target: x.t, status: x.s }));
 }
 
+/**
+ * CapacityGauge's numbers from a capacity, or null when free space is unknown.
+ * net = what the run takes once done; dip = the extra it holds mid-run;
+ * showDip = the dip is at least 1% of the bar (smaller can't be seen).
+ */
+export function gaugeView(capacity) {
+  const c = capacity || {};
+  if (c.free == null) return null;
+  const net = typeof c.after === "number" ? Math.max(0, c.free - c.after) : Math.max(0, (c.needed || 0) - (c.freeable || 0));
+  const after = typeof c.after === "number" ? c.after : c.free - net;
+  const lowest = typeof c.lowest === "number" ? Math.min(c.lowest, after) : after;
+  const dip = Math.max(0, Math.min(after, c.free) - lowest);
+  const total = c.total && c.total > 0 ? c.total : c.free;
+  const used = c.total ? Math.max(0, c.total - c.free) : 0;
+  return {
+    free: c.free,
+    total,
+    used,
+    net,
+    dip,
+    after,
+    lowest,
+    reserve: c.reserve || 0,
+    short: c.fits === false,
+    shortBy: c.shortBy || 0,
+    showDip: c.fits !== false && dip > 0 && dip >= total * 0.01,
+  };
+}
+
 /** Review's read-only "Planned with…" line (design D6). */
 export function plannedWithLine(policy, tn) {
   const p = policy || {};
-  const removals = p.deletePolicy === "add-only" ? "removals off (add only)" : "guarded removals";
+  const removals = DELETE_POLICY_PLANNED[p.deletePolicy] || DELETE_POLICY_PLANNED.guarded;
   const pc = `${((HASH_MODE_COPY[p.hashMode] || HASH_MODE_COPY.cached).label || "Cached").toLowerCase()} PC files`;
   const dev =
     p.verifyMode === "read-back"
@@ -345,6 +374,11 @@ export function clock(ms) {
   if (!ms) return "";
   const d = new Date(ms);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** Writes that landed in a run summary; older summaries without `files` fall back to filesDone. */
+function _landed(s) {
+  return s.files && typeof s.files === "object" ? s.files.done || 0 : s.filesDone || 0;
 }
 
 function count(n, one, many) {
@@ -373,17 +407,25 @@ export function lastRunView(run, tn, titleOf) {
     else if (phase === "rename") line = s.reason === "same-name" ? "The folder already had that name" : "Folder renamed";
     // executor.js verify counts series folders in filesDone.
     else if (phase === "verify") line = `${count(s.filesDone || 0, "series", "series")} checked`;
-    else line = `${count(s.filesDone || 0, "file")} · ${bytes} copied${deleted ? ` · ${deleted} removed` : ""}`;
+    // Files that LANDED (service.js _runSummary `files` by outcome):
+    // filesDone also counts skips, so a run that left files read as copying
+    // them (plan A1b, review F7).
+    else line = `${count(_landed(s), "file")} · ${bytes} copied${deleted ? ` · ${deleted} removed` : ""}`;
     note = `Finished ${clock(run.at)}`;
+    if (s.reason === "out-of-room") {
+      tone = "warn";
+      icon = "alert-triangle";
+      action = "recheck-space";
+    }
   } else if (run.status === "cancelled") {
     tone = "muted";
     icon = "stop";
-    line = `${s.filesDone || 0} of ${count(s.filesTotal || 0, "file")} copied (${bytes}) before you cancelled`;
+    line = `${_landed(s)} of ${count(s.filesTotal || 0, "file")} copied (${bytes}) before you cancelled`;
     note = `${clock(run.at)} · finished files stay on ${tn} and count as synced`;
   } else if (run.status === "disconnected") {
     tone = "warn";
     icon = "unlink";
-    line = `${s.filesDone || 0} of ${count(s.filesTotal || 0, "file")} copied`;
+    line = `${_landed(s)} of ${count(s.filesTotal || 0, "file")} copied`;
     note = `${clock(run.at)} · plug it back in and the plan picks up from there`;
     action = "recheck";
   } else {
@@ -392,7 +434,7 @@ export function lastRunView(run, tn, titleOf) {
     const why = s.reason ? jobReasonCopy(s.reason, tn) : s.refusal ? null : s.message;
     const at = s.failed && s.failed[0] ? ` at ${s.failed[0].folder} / ${s.failed[0].name}` : "";
     line = why ? `${why[0].toUpperCase()}${why.slice(1)}${at}` : s.refusal ? "Start was refused" : "It stopped";
-    note = `${clock(run.at)}${s.filesDone ? ` · ${count(s.filesDone, "file")} copied before it stopped` : ""}`;
+    note = `${clock(run.at)}${_landed(s) ? ` · ${count(_landed(s), "file")} copied before it stopped` : ""}`;
     action = s.reason === "no-space" ? "recheck-space" : "recheck";
   }
   const skippedSeries = (s.skippedSeries || []).map((x) => `${name(x.seriesKey || x.folder)} (${jobReasonCopy(x.reason, tn)})`);

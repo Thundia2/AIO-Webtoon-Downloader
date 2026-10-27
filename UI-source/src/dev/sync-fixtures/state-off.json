@@ -29,7 +29,8 @@
         "default": "guarded",
         "presets": [
           "guarded",
-          "add-only"
+          "add-only",
+          "auto-replace"
         ]
       },
       "syncHashMode": {
@@ -77,16 +78,16 @@
       "job": {
         "runId": 1,
         "phase": "plan",
-        "targetId": "t90ac5d6733",
+        "targetId": "tf50fe92999",
         "serial": "R5CW71ABCDE",
         "auto": true,
         "state": "done",
-        "startedAt": 1792575341532,
-        "finishedAt": 1792575341634,
+        "startedAt": 1793121385248,
+        "finishedAt": 1793121385380,
         "progress": {
           "bytesDone": 0,
           "bytesTotal": 0,
-          "filesDone": 0,
+          "filesDone": 1,
           "filesTotal": 2,
           "current": {
             "folder": "Dungeon Meshi"
@@ -111,7 +112,7 @@
             "refusal": null
           },
           "step": "verify",
-          "at": 1792575341624,
+          "at": 1793121385366,
           "lane": null
         },
         "status": "cancelled",

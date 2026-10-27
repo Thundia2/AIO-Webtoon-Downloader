@@ -4,11 +4,14 @@
 // Owns MAKING a reviewed plan happen on one target, and the record writes
 // that keep every step recoverable:
 //   apply()        parent rules 6-7: per series, in this order:
-//                    [new or gone folder] STA2 the chosen name (must be
-//                    ENOENT) → write the shard → mkdir
-//                    cleanup names → renames → pushes/updates/replaces →
-//                    the post-series listing (devMtime, quick verify) →
-//                    deletes (delete gate, slot guard) → a confirming listing
+//                    series in space.js's order (the free-space model)
+//                    [new or gone folder] its first chapter fits → STA2
+//                    the chosen name (must be ENOENT) → write the shard → mkdir
+//                    cleanup names → renames → gate-free deletes →
+//                    pushes/updates/replaces (each admitted by the space
+//                    ledger, _roomFor) → the post-series listing (devMtime,
+//                    quick verify) → gated deletes (delete gate, slot
+//                    guard) → a confirming listing
 //                    [series being removed from the target, planner 8b]
 //                    rmdir if empty → drop its shard (result.evictions)
 //   verify()       rule 8 / "Verify modes": device-hash, read-back, adopt-size
@@ -36,7 +39,11 @@
 //   remote-fail, timeout, session-closed  → charged (err.charges) against the
 //                                           consecutive-failure budget; a
 //                                           success resets it
-//   no-space, read-only, record-write-failed, server-unavailable → abort
+//   no-space on a write, .nomedia or a new series' mkdir → uncharged; the
+//                                           space ledger decides (_onNoSpace:
+//                                           go on, or stop writing and finish
+//                                           "out-of-room"); elsewhere → abort
+//   read-only, record-write-failed, server-unavailable → abort
 //   device-lost, offline                  → abort once: "disconnected"
 //   unauthorized                          → abort (USB-debugging guidance)
 //   connecting                            → wait up to CONNECT_WAIT_MS for the
@@ -58,17 +65,22 @@
 const crypto = require("crypto");
 const { slotKey } = require("./naming");
 const { labelFile } = require("./chapter-labels");
-const { isChapterFormat, recordIdentity } = require("./profiles");
-const { classifyDeviceFile, resolvePending, mergeVerify, verifyFailed } = require("./provenance");
+const { recordIdentity } = require("./profiles");
+const { classifyDeviceFile, resolvePending, mergeVerify, verifyFailed, isOurs } = require("./provenance");
 const { pcSeriesKey, EVICT_REASON, isSettling } = require("./planner");
 const { newEpoch, newShardId } = require("./store");
 const { segmentProblem } = require("./transports");
+const { opCost, simulateRun, gateLabels, vouchedLabel } = require("./space");
 const { refuse } = require("./contract");
 
 // Pushes must fit in free space minus this (parent rule 6). It also absorbs
 // a file unlinked while Komikku holds it open, which frees nothing yet
 // (review #16).
 const RESERVE_BYTES = 1024 * 1024 * 1024;
+// The running ledger re-measures free space after this much written or
+// this long (_roomFor): its estimate can't see other apps' writes.
+const REFRESH_BYTES = 1024 * 1024 * 1024;
+const REFRESH_MS = 30 * 1000;
 // Apply's re-stat refuses a settling file (planner isSettling, one rule for
 // plan and apply); the planner offers it as `settling` (deviation 9).
 const { SETTLE_MS } = require("./planner");
@@ -186,6 +198,12 @@ class Executor {
     this.budgetLimit = Math.max(1, (this.settings.syncErrorBudget | 0) || DEFAULT_BUDGET);
     this.failStreak = 0;
     this.verifyListings = new Map(); // folder → listing.files of each folder verify() listed
+    // space.js's cost model differs by kind (adb overwrites in place, a
+    // folder writes a temp beside the old copy). Test stubs may omit it.
+    this.kind = this.transport.kind || (this.target && this.target.kind) || "folder";
+    this.room = { free: null, at: 0, written: 0 }; // the running ledger (_roomFor)
+    this.outOfRoom = false;
+    this.noRoom = { files: 0, bytes: 0, emptied: [] };
   }
 
   // ---------------------------------------------------------------- plumbing
@@ -318,32 +336,34 @@ class Executor {
       warnings: [],
     };
     this.result = result;
+    this.outOfRoom = false;
+    this.noSpaceSeen = 0;
+    this.noRoom = { files: 0, bytes: 0, emptied: [] };
     this.pcBySeries = new Map(((a.pc && a.pc.series) || []).map((s) => [pcSeriesKey(s.folder), s]));
     this.device = a.device || {};
 
-    // Free space (rule 6): growth must fit in free minus the reserve, or
-    // gate-free deletes (accepted losses, extras, sidecars) run first.
-    let deletesFirst = false;
-    const need = this.transport.freeSpaceNeeded(writes);
-    if (need > 0) {
-      let free = null;
+    // Free space (rule 6, plan A1b): the run is admitted when space.js's
+    // simulation of it, in the order it runs, never dips into the reserve;
+    // the same simulation gives that order. The running ledger
+    // (_roomFor) then holds every write to the free space measured as it
+    // goes, so a run that turns out worse skips writes instead of filling
+    // the target.
+    let free = null;
+    if (writes.length) {
       try {
-        free = await this._dev(() => this.transport.freeSpace());
+        free = await this._readFree();
       } catch (e) {
-        if (policyFor(e).action === "stop") return this._finish(result, e);
-      }
-      if (free == null) result.warnings.push({ kind: "free-space-unknown", need });
-      else if (need > free - this.reserveBytes) {
-        const early = ops.filter((o) => o.kind === "delete" && !o.gate).reduce((n, o) => n + ((o.devFile && o.devFile.size) || 0), 0);
-        if (need > free - this.reserveBytes + early) {
-          return refuse("blocked", "the pushes don't fit in the free space", {
-            blocking: [{ kind: "free-space", need, free, reserve: this.reserveBytes, freeable: early }],
-          });
-        }
-        deletesFirst = true;
-        result.warnings.push({ kind: "deletes-first", need, free });
+        return this._finish(result, e);
       }
     }
+    const sim = simulateRun(this.kind, ops, { free, reserve: this.reserveBytes, ack });
+    if (writes.length && free == null) result.warnings.push({ kind: "free-space-unknown", need: sim.needed });
+    else if (sim.fits === false) {
+      return refuse("blocked", "the pushes don't fit in the free space", {
+        blocking: [{ kind: "free-space", need: sim.needed, free, reserve: this.reserveBytes, shortBy: sim.shortBy, at: sim.shortAt }],
+      });
+    }
+    this.room = { free, at: this.now(), written: 0 };
 
     try {
       // The first apply ends the target's first sync (provenance
@@ -361,16 +381,108 @@ class Executor {
         if (!bySeries.has(op.seriesKey)) bySeries.set(op.seriesKey, []);
         bySeries.get(op.seriesKey).push(op);
       }
-      for (const [seriesKey, sOps] of bySeries) {
+      for (const seriesKey of sim.order) {
         this._checkCancel();
         const sp = plan.bySeriesKey.get(seriesKey);
         if (!sp) continue;
-        await this._applySeries(sp, sOps, { ack, deletesFirst });
+        await this._applySeries(sp, bySeries.get(seriesKey), { ack });
       }
     } catch (e) {
       return this._finish(result, e);
     }
+    if (this.noRoom.files) {
+      // Completed, not failed: everything that fit ran (plan A1b). The
+      // renderer reads the reason (syncView lastRunView); a re-plan offers
+      // what was left.
+      result.reason = "out-of-room";
+      result.warnings.push({ kind: "out-of-room", files: this.noRoom.files, bytes: this.noRoom.bytes, emptied: this.noRoom.emptied.slice(0, 50) });
+    }
     return this._finish(result, null);
+  }
+
+  // ---------------------------------------------------------------- space
+
+  /** Free bytes on the target now, or null when the transport can't say. A stop-class error escapes. */
+  async _readFree() {
+    if (typeof this.transport.freeSpace !== "function") return null;
+    try {
+      const b = await this._dev(() => this.transport.freeSpace());
+      return Number.isFinite(b) ? b : null;
+    } catch (e) {
+      if (policyFor(e).action === "stop") throw e;
+      return null;
+    }
+  }
+
+  /** Re-measure the ledger (a failed read keeps the estimate). */
+  async _refreshFree() {
+    const b = await this._readFree();
+    if (b != null) this.room = { free: b, at: this.now(), written: 0 };
+    else this.room.at = this.now();
+    return this.room.free;
+  }
+
+  /**
+   * The running ledger's admission for one write's `peak` (space.js
+   * opCost). The estimate is re-measured when it is stale (REFRESH_BYTES
+   * written or REFRESH_MS since the last reading) and once more before
+   * refusing, so space other apps took or a held-open unlinked file never
+   * makes the run write past the reserve, and space a delete freed is seen.
+   * Unknown free space admits everything (the no-space backstop in _send
+   * remains). On admission the estimate is charged `net` at once, so a
+   * batch of intents reserves its whole cost.
+   */
+  async _roomFor(cost, { charge = true } = {}) {
+    if (this.outOfRoom) return false;
+    const r = this.room;
+    if (r.free == null) return true;
+    let fresh = false;
+    if (r.written >= REFRESH_BYTES || this.now() - r.at >= REFRESH_MS) {
+      await this._refreshFree();
+      fresh = true;
+    }
+    if (this.room.free - this.reserveBytes < cost.peak && !fresh) await this._refreshFree();
+    if (this.room.free == null) return true;
+    if (this.room.free - this.reserveBytes < cost.peak) return false;
+    if (!charge) return true;
+    this.room.free -= cost.net;
+    this.room.written += Math.max(0, cost.peak);
+    return true;
+  }
+
+  /** Record a write the ledger turned away (counted for the out-of-room result). */
+  _noRoom(op, rec) {
+    rec.outcome = "skipped";
+    rec.reason = "no-room";
+    this.result.filesDone += 1;
+    this.noRoom.files += 1;
+    this.noRoom.bytes += op.size || 0;
+  }
+
+  /**
+   * A write the target refused for space (adb FAIL ENOSPC, folder ENOSPC).
+   * Uncharged. When a fresh reading shows room again the shortage was
+   * someone else's and the run goes on; otherwise every later write is
+   * skipped (adb's SEND unlinks before writing, so even a shrinking
+   * overwrite could empty a slot) while deletes still run: gated ones only
+   * where their copy landed, which frees space and loses nothing.
+   */
+  async _onNoSpace(op, rec) {
+    rec.outcome = "failed";
+    rec.reason = "no-space";
+    this.noRoom.files += 1;
+    this.noRoom.bytes += op.size || 0;
+    // adb SEND unlinked the old copy before failing: the slot is empty now
+    // (provenance resolvePending reads it as absent). A folder target's temp
+    // failed beside the untouched old file.
+    if (this.kind === "adb" && (op.kind === "update" || op.kind === "replace")) this.noRoom.emptied.push(this._rel(rec.folder, op.name));
+    await this._refreshFree();
+    // One second chance only: a reading that keeps showing room while the
+    // target keeps refusing (inodes, a quota, a lying statfs) would
+    // otherwise empty one overwritten slot per file.
+    this.noSpaceSeen = (this.noSpaceSeen || 0) + 1;
+    if (this.noSpaceSeen === 1 && this.room.free != null && this.room.free - this.reserveBytes >= opCost(this.kind, op).peak) return;
+    this.outOfRoom = true;
   }
 
   async _finish(result, e) {
@@ -436,7 +548,9 @@ class Executor {
       if (st.exists) return;
       await this._dev(() => this.transport.pushBuffer(".nomedia", Buffer.alloc(0)));
     } catch (e) {
-      if (policyFor(e).action === "stop" && !(e && e.kind === "remote-fail")) throw e;
+      // A full target fails this empty file too; the ledger's reading then
+      // decides what the series can still write (_roomFor).
+      if (policyFor(e).action === "stop" && !(e && (e.kind === "remote-fail" || e.kind === "no-space"))) throw e;
       result.warnings.push({ kind: "nomedia-failed", message: e && e.message });
     }
   }
@@ -447,7 +561,17 @@ class Executor {
     return null;
   }
 
-  async _applySeries(sp, sOps, { ack, deletesFirst }) {
+  /** A whole series the ledger can't start: every write is a no-room skip. */
+  _skipSeriesNoRoom(sp, writes) {
+    this.result.skippedSeries.push({ seriesKey: sp.seriesKey, folder: sp.deviceFolder, reason: "no-room" });
+    for (const op of writes) {
+      const rec = { opId: op.id, kind: op.kind, folder: sp.deviceFolder, name: op.name, size: op.size, outcome: null };
+      this.result.files.push(rec);
+      this._noRoom(op, rec);
+    }
+  }
+
+  async _applySeries(sp, sOps, { ack }) {
     const result = this.result;
     const folder = sp.deviceFolder;
     const creating = sp.state === "new" || sp.state === "gone";
@@ -456,8 +580,21 @@ class Executor {
       result.skippedSeries.push({ seriesKey: sp.seriesKey, folder, reason: `invalid-folder-${why}` });
       return;
     }
+    const renames = sOps.filter((o) => o.kind === "rename");
+    const writes = sOps.filter((o) => o.kind === "push" || o.kind === "update" || o.kind === "replace");
+    const deletes = sOps.filter((o) => o.kind === "delete");
+    // Each series starts from a measured reading (_roomFor).
+    if (writes.length) await this._refreshFree();
     let shard = this._shardFor(sp);
     if (creating) {
+      // A new folder only when its first chapter fits (review F6): an empty
+      // folder, or one holding only sidecars, reads in Komikku as a broken
+      // series, and its created shard would plan as gone next time.
+      const first = writes.find((o) => !o.sidecar) || writes[0];
+      if (first && !(await this._roomFor(opCost(this.kind, first), { charge: false }))) {
+        this._skipSeriesNoRoom(sp, writes);
+        return;
+      }
       // The folder must still be absent: SEND unlinks an existing file, so
       // writing into a folder that reappeared since the plan could replace
       // files nobody reviewed.
@@ -483,7 +620,18 @@ class Executor {
       this.shards.set(shard.shardId, shard);
       await this._writeShard(shard);
       await this._hook("after-shard-rewrite", { seriesKey: sp.seriesKey, shardId: shard.shardId, folder });
-      await this._dev(() => this.transport.mkdirp(folder));
+      try {
+        await this._dev(() => this.transport.mkdirp(folder));
+      } catch (e) {
+        if (!(e && e.kind === "no-space")) throw e;
+        // Not even a directory fits: the target is full. The shard stays as
+        // a kill after-shard-rewrite leaves it (the next plan reads the
+        // folder as gone and offers it again).
+        await this._refreshFree();
+        this.outOfRoom = true;
+        this._skipSeriesNoRoom(sp, writes);
+        return;
+      }
       await this._hook("after-mkdir", { seriesKey: sp.seriesKey, folder });
     } else if (!shard) {
       shard = {
@@ -501,9 +649,12 @@ class Executor {
     }
     const pcSeries = this.pcBySeries.get(sp.seriesKey) || { files: [] };
     const pushedSlots = new Set();
-    const renames = sOps.filter((o) => o.kind === "rename");
-    const writes = sOps.filter((o) => o.kind === "push" || o.kind === "update" || o.kind === "replace");
-    const deletes = sOps.filter((o) => o.kind === "delete");
+    // Gate-free deletes (no gate, or a loss the user accepted) always run
+    // before the writes: they free space and wait on nothing (space.js
+    // models them there). Gated ones wait for the post-series listing.
+    const gated = (o) => !!o.gate && !ack.has(o.id);
+    const early = deletes.filter((o) => !gated(o));
+    const late = deletes.filter(gated);
 
     // The lane names THIS series from its first step (renames and early
     // deletes run before _writes); left alone it carried the previous
@@ -514,10 +665,7 @@ class Executor {
       this._checkCancel();
       await this._renameFile(shard, op);
     }
-    if (deletesFirst) {
-      const early = deletes.filter((o) => !o.gate);
-      if (early.length) await this._deletes(sp, shard, early, { ack, pcSeries, pushedSlots, listing: null, early: true });
-    }
+    if (early.length) await this._deletes(sp, shard, early, { ack, pcSeries, pushedSlots, listing: null });
     await this._writes(sp, shard, writes, pushedSlots);
 
     // The post-series listing: devMtime for this run's pushes, and the quick
@@ -527,7 +675,6 @@ class Executor {
     if (listing.ok) await this._reconcile(shard, listing, { quickVerify: true });
     else result.warnings.push({ kind: "post-listing-failed", folder, error: listing.error });
 
-    const late = deletesFirst ? deletes.filter((o) => o.gate) : deletes;
     if (late.length) await this._deletes(sp, shard, late, { ack, pcSeries, pushedSlots, listing: listing.ok ? listing : null });
     if (sp.evict) await this._finishEviction(sp, shard);
   }
@@ -688,8 +835,11 @@ class Executor {
         const rec = { opId: op.id, kind: op.kind, folder: shard.name, name: op.name, size: op.size, outcome: null };
         this.result.files.push(rec);
         const ready = await this._guard(sp, op, rec);
-        if (ready) batch.push({ op, rec, pc: ready });
-        else this.result.filesDone += 1;
+        if (!ready) this.result.filesDone += 1;
+        // The ledger admits it before its intent is written (a batch
+        // reserves every member's cost).
+        else if (!(await this._roomFor(opCost(this.kind, op)))) this._noRoom(op, rec);
+        else batch.push({ op, rec, pc: ready });
       }
       if (!batch.length) continue;
       // Intent first: one awaited shard write for the batch. If it fails,
@@ -789,9 +939,13 @@ class Executor {
     } catch (e) {
       this.result.bytesDone = base;
       this.result.filesDone += 1;
+      // The ledger charged this write's cost on admission; whatever the
+      // failure left, the next admission measures again.
+      this.room.at = 0;
       // The entry stays `pending`: the post-series listing (or the next
       // plan) resolves what the slot holds.
-      this._onFault(e, this.result, rec);
+      if (e && e.kind === "no-space") await this._onNoSpace(op, rec);
+      else this._onFault(e, this.result, rec);
       return null;
     }
     this.result.bytesDone = base + (r.bytes || 0);
@@ -855,7 +1009,9 @@ class Executor {
    * of any PC file of the series, nor one pushed this run; a removal from
    * the target, EVICT_REASON, is exempt from the PC half); the delete gate
    * (a replacement delete runs only when the post-push listing shows its
-   * label at an exact PC size, unless the user accepted it as a loss). The
+   * label at an exact PC size in a file pushed this run or recorded as the
+   * PC's copy, and not one this batch deletes; unless the user accepted it
+   * as a loss). The
    * run log is written before and after the batch.
    */
   async _deletes(sp, shard, dels, { ack, pcSeries, pushedSlots, listing }) {
@@ -870,6 +1026,7 @@ class Executor {
     }
     const listed = new Map(current.files.map((f) => [this._slot(f.name), f]));
     const pcSlots = new Set((pcSeries.files || []).map((f) => this._slot(f.name)));
+    const deleting = new Set(dels.map((o) => this._slot(o.name)));
     const go = [];
     for (const op of dels) {
       const rec = { opId: op.id, folder, name: op.name, reason: op.reason, outcome: null };
@@ -889,13 +1046,25 @@ class Executor {
         continue;
       }
       if (op.gate && !ack.has(op.id)) {
-        const g = op.gate;
-        const sizes = new Set((g.files || []).map((x) => x.size));
-        const landed = current.files.some((x) => {
-          if (!isChapterFormat(x.name) || !sizes.has(x.size)) return false;
-          const lab = this._labelOf(x.name, folder);
-          return lab.unit === "chapter" && lab.label === g.label;
-        });
+        // Only a file that IS the PC's copy may vouch: pushed this run, or a
+        // pushed/adopted entry still unchanged. Never the op's own file nor
+        // another file this batch deletes: two identical foreign copies
+        // under other names would otherwise vouch for each other after a
+        // failed push and both go (auto-replace plan, "Executor"). Every
+        // label the gate requires must land (a range gate names several).
+        // The label/size test is space.js vouchedLabel, which planner.js
+        // gateCredit also uses, so the gauge credits what this passes.
+        const required = gateLabels(op.gate);
+        const got = new Set();
+        for (const x of current.files) {
+          const xs = this._slot(x.name);
+          if (deleting.has(xs)) continue;
+          const e = shard.files.get(xs);
+          if (!pushedSlots.has(xs) && !(e && (e.origin === "pushed" || e.origin === "adopted") && isOurs(e, x))) continue;
+          const l = vouchedLabel(required, x.name, x.size, (n) => this._labelOf(n, folder));
+          if (l != null) got.add(l);
+        }
+        const landed = required.length > 0 && required.every((r) => got.has(r.label));
         if (!landed) {
           rec.outcome = "kept";
           rec.reason = "replacement-did-not-land";

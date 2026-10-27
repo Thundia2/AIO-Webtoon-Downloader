@@ -35,7 +35,8 @@
 //   mkdirp(rel); remove(rels) → {ok, failed, sent}; move(fromRel, toRel) →
 //   {ok, reason?}; rmdirIfEmpty(rel) → {removed}
 //   hashFolder(name, {largest, signal}) → {ok, rc, hashes:Map name→sha}
-//   freeSpace() → bytes | null;  freeSpaceNeeded(ops) (sync) → bytes
+//   freeSpace() → bytes | null (what an apply needs is space.js's, by
+//     `kind`: adb overwrites in place, a folder writes temp-then-rename)
 //   storage() → {free, total} (each bytes | null): the Sync tab's gauge
 //     (prepare.js _readFreeSpace); freeSpace() is storage().free
 //   waitReady({timeoutMs, signal}) → {state}   (adb `connecting` policy)
@@ -170,33 +171,6 @@ function flipAsciiCase(name) {
 
 function _hex(buf) {
   return Buffer.from(buf).toString("hex");
-}
-
-/** Push growth: Σ max(0, new − old) over the ops that write a file. */
-function _growth(ops) {
-  let n = 0;
-  for (const op of ops || []) {
-    if (op.kind !== "push" && op.kind !== "update" && op.kind !== "replace") continue;
-    const old = op.devFile && Number.isFinite(op.devFile.size) ? op.devFile.size : 0;
-    n += Math.max(0, (op.size || 0) - old);
-  }
-  return n;
-}
-
-/**
- * What an apply of `ops` needs free on a target of this kind. The ONE
- * formula: each transport's freeSpaceNeeded (the executor's pre-flight) and
- * service.js's plan capacity (the Sync tab's gauge) both call it, so the
- * gauge can't promise a fit the executor then refuses. grep: spaceNeeded
- * Folder targets add the largest update: its temp sits beside the old copy
- * (FolderTransport writes temp-then-rename; adb pushes in place).
- */
-function spaceNeeded(kind, ops) {
-  let largest = 0;
-  if (kind === "folder") {
-    for (const op of ops || []) if ((op.kind === "update" || op.kind === "replace") && (op.size || 0) > largest) largest = op.size;
-  }
-  return _growth(ops) + largest;
 }
 
 function _emptyListing(method) {
@@ -637,11 +611,6 @@ class AdbTransport {
       if (kb != null) return { free: kb.avail * 1024, total: kb.total == null ? null : kb.total * 1024 };
     }
     return { free: null, total: null };
-  }
-
-  /** adb writes in place (SEND unlinks the old file first): growth only. */
-  freeSpaceNeeded(ops) {
-    return spaceNeeded("adb", ops);
   }
 
   /**
@@ -1099,11 +1068,6 @@ class FolderTransport {
     }
   }
 
-  /** Growth, plus the largest updated file (spaceNeeded). */
-  freeSpaceNeeded(ops) {
-    return spaceNeeded("folder", ops);
-  }
-
   /**
    * Presence for the monitor: an async stat raced with a timeout, one check
    * in flight per target (a second caller joins the first).
@@ -1162,7 +1126,6 @@ module.exports = {
   FOLDER_TMP_PREFIX,
   validatePath,
   segmentProblem,
-  spaceNeeded,
   shq,
   flipAsciiCase,
   AdbTransport,

@@ -27,6 +27,28 @@
 // Gone detection itself runs before planning: goneCandidates() names the
 // shards to STA2, and the confirmed set comes back as opts.gone.
 //
+// AUTO-REPLACE (deletePolicy "auto-replace", plan sync-temp/plans/device-
+// sync-auto-replace.md). Everything guarded pre-selects, plus a foreign
+// file (Verify hashed it, it matches no PC file, unchanged since) that the
+// PC's own copy of the same chapter replaces: its `replace` (same slot) or
+// its "replacement" delete (other name, a pre-selected push brings the
+// label). Why: after a Link every device copy verifies foreign, and leaving
+// the old copies unticked makes a sync duplicate the library. Held back by
+// a delete-blocking tag or `mixed`, and when the device name isn't one AIO
+// writes (labelFile appLabel). `ch0-asymmetry` does NOT hold it back: on the
+// user's tablet no Ch.000-asymmetric series was shifted by a number
+// (content check 2026-10-27, plan "Measured"). Still never unverified, so
+// the two-pass rule above holds. The executor's gate (executor.js _deletes)
+// still runs every replacement delete only after the push landed.
+//
+// DELETE GATES AND THEIR CREDIT (plan A1b). A gated delete runs only once
+// the post-series listing shows its label(s) in a file that IS the PC's copy
+// (executor.js _deletes). Gated: "replacement" deletes, and a range extra
+// ("Ch 1-10") whose chapters the PC covers, since its "not a loss" rests on
+// those copies landing. Each gated delete carries `gateCredit`
+// (_gateCredits): how the plan can prove the gate passes, so space.js
+// credits the freed bytes only for removals that will happen.
+//
 // INPUT SHAPES (P3's pc-inventory.js and transports.js produce them):
 //   pc     {ok, series:[{folder, folderPath, title, identityKey, url,
 //           anilistId, synonyms[], imageOnly, malformedJson[],
@@ -50,8 +72,9 @@ const { refuse } = require("./contract");
 const naming = require("./naming");
 const { labelFile, compareLabels, extOf } = require("./chapter-labels");
 const { isChapterFormat, isSidecar, isMirrored, SIDECAR_NAMES } = require("./profiles");
-const { classifyDeviceFile, adoptMissingDevMtime, ORIGINS_OURS } = require("./provenance");
+const { classifyDeviceFile, adoptMissingDevMtime, isForeignCurrent, ORIGINS_OURS } = require("./provenance");
 const { deltaTags, deleteBlockingTags, contentAnomalies, makeAnomaly, ROOT_SERIES_KEY } = require("./analysis");
+const { gateLabels, vouchedLabel, isWrite } = require("./space");
 
 const { slotKey, compactKey, stripHidSuffix, segmentError } = naming;
 
@@ -376,6 +399,9 @@ function buildPlan(input) {
       binding: { identityKey: s.identityKey, urlKey: s.urlKey, pcFolder: s.folder },
       tags: [],
       blockingTags: [],
+      // auto-replace only: the tags that kept a swap it would have ticked
+      // unticked (_planExisting; the series detail's note, SeriesSheet.jsx).
+      autoHeld: [],
       anomalyIds: [],
       opIds: [],
       rows: [],
@@ -999,8 +1025,18 @@ function _planExisting(plan, sp, cfg, device, now, ack, settings) {
     if (!keptPool.has(k)) keptPool.set(k, slot);
   }
 
-  const guarded = policy === "guarded";
+  // auto-replace is guarded plus one rule (header "AUTO-REPLACE"): a
+  // hash-verified foreign copy the PC's own file replaces is pre-selected.
+  const autoReplace = policy === "auto-replace";
+  const guarded = policy === "guarded" || autoReplace;
   const renamePre = guarded && cfg.renameToMatch;
+  const autoOk = autoReplace && !sp.blockingTags.length && !sp.tags.includes("mixed");
+  const foreignCurrent = (x) => isForeignCurrent(x.e, x.d) && x.lab.unit === "chapter" && !!x.lab.appLabel;
+  // A swap auto-replace would tick but for the series' tags (plan R9): the
+  // detail names those tags so an unticked swap isn't a silent surprise.
+  const heldBack = () => {
+    if (autoReplace && !autoOk && !sp.autoHeld.length) sp.autoHeld = [...sp.blockingTags, ...(sp.tags.includes("mixed") ? ["mixed"] : [])];
+  };
   for (const [slot, f] of pcMirrored) {
     const lab = _labelInfo(f.name, s.folder, patterns);
     const x = dev.get(slot);
@@ -1039,7 +1075,10 @@ function _planExisting(plan, sp, cfg, device, now, ack, settings) {
         } else {
           kind = "replace";
           reason = x.cls === "changed" ? "changed-on-device" : x.cls;
-          pre = false;
+          // Same slot, so the PC file brings this very label. Only a foreign
+          // copy: a changed file of ours is the user's edit on the device.
+          pre = autoOk && x.cls === "foreign" && foreignCurrent(x);
+          if (x.cls === "foreign" && foreignCurrent(x)) heldBack();
         }
         const op = _addOp(plan, sp, {
           id: opId(kind, sp.deviceFolder, x.d.name),
@@ -1133,12 +1172,23 @@ function _planExisting(plan, sp, cfg, device, now, ack, settings) {
     const strongCover =
       lab.unit === "chapter" && (sp.cover.get(lab.label) || []).some((c) => (c.opId == null ? c.strong : plan.ops.get(c.opId).preselected));
     const pre =
-      guarded &&
-      x.cls === "ours" &&
-      x.e.origin !== "adopted-size" &&
-      !sp.blockingTags.length &&
-      (sidecar || strongCover);
+      (guarded &&
+        x.cls === "ours" &&
+        x.e.origin !== "adopted-size" &&
+        !sp.blockingTags.length &&
+        (sidecar || strongCover)) ||
+      (autoOk && reason === "replacement" && x.cls === "foreign" && foreignCurrent(x) && strongCover);
+    if (reason === "replacement" && x.cls === "foreign" && foreignCurrent(x) && strongCover) heldBack();
     const coverFiles = lab.unit === "chapter" ? (pcByLabel.get(lab.label) || []).slice() : [];
+    // A range extra whose chapters the PC covers rests on them landing
+    // (seriesLosses counts a brought label as carried), so it waits for them
+    // like a replacement; labels the PC lacks are a loss, acked or blocking.
+    const rangeCovered = !sidecar && lab.unit === "range" ? (_rangeInts(lab.start, lab.end) || []).filter((l) => sp.cover.has(l)) : [];
+    let gate = null;
+    if (reason === "replacement") gate = { label: lab.label, files: coverFiles };
+    else if (rangeCovered.length) {
+      gate = { labels: rangeCovered, files: rangeCovered.flatMap((l) => (pcByLabel.get(l) || []).map((f) => ({ ...f, label: l }))) };
+    }
     const op = _addOp(plan, sp, {
       id: opId("delete", sp.deviceFolder, x.d.name),
       kind: "delete",
@@ -1151,9 +1201,9 @@ function _planExisting(plan, sp, cfg, device, now, ack, settings) {
       sidecar,
       origin: x.e ? x.e.origin : null,
       ours: x.cls === "ours",
-      // Rule 6's delete gate: a replacement delete runs only after the
-      // post-push listing shows its label at an exact PC size.
-      gate: reason === "replacement" ? { label: lab.label, files: coverFiles } : null,
+      // Rule 6's delete gate: runs only after the post-push listing shows
+      // its label(s) at an exact PC size (header DELETE GATES).
+      gate,
       preselected: pre,
     });
     if (op) {
@@ -1161,6 +1211,45 @@ function _planExisting(plan, sp, cfg, device, now, ack, settings) {
       sp.rows.push(_row("delete", { opId: op.id, name: x.d.name, deviceName: x.d.name, size: x.d.size, lab, origin: x.e ? x.e.origin : null, reason }));
     }
     if (chapterFmt) sp.devFiles.push(_devFile(x));
+  }
+  _gateCredits(plan, sp, dev, patterns);
+}
+
+/**
+ * `gateCredit` on every gated delete of a series (header DELETE GATES): per
+ * required label, the ways the executor's gate can find it landed. It mirrors
+ * executor.js _deletes: a voucher is a chapter file labelled (with the DEVICE
+ * folder, as the executor labels) at a gate size that is either written this
+ * run ({op}: a push/update/replace, or a rename onto such a name) or already
+ * ours from a push or hash adoption ({unless}: the ops that would take it
+ * away: its delete, a rename off the label, an overwrite of its slot).
+ * Optimistic only where the executor can still fail at run time (a push that
+ * fails, a file the guard skips); space.js treats the rest as kept.
+ */
+function _gateCredits(plan, sp, dev, patterns) {
+  const labelOf = (name) => _labelInfo(name, sp.deviceFolder, patterns);
+  const ops = sp.opIds.map((id) => plan.ops.get(id));
+  const writeBySlot = new Map();
+  for (const op of ops) if (isWrite(op)) writeBySlot.set(slotKey(op.name, plan.caseInsensitive), op);
+  const renameOf = new Map();
+  for (const op of ops) if (op.kind === "rename") renameOf.set(slotKey(op.from, plan.caseInsensitive), op);
+  for (const op of ops) {
+    if (op.kind !== "delete" || !op.gate) continue;
+    const required = gateLabels(op.gate);
+    const ways = new Map(required.map((r) => [r.label, []]));
+    const add = (label, w) => label != null && ways.has(label) && ways.get(label).push(w);
+    for (const w of ops) if (isWrite(w)) add(vouchedLabel(required, w.name, w.size, labelOf), { op: w.id });
+    for (const [slot, x] of dev) {
+      if (x.cls !== "ours" || (x.e.origin !== "pushed" && x.e.origin !== "adopted")) continue;
+      if (x.deleteOpId === op.id) continue;
+      const write = writeBySlot.get(slot);
+      const ren = renameOf.get(slot);
+      const unless = [x.deleteOpId, write && write.id].filter(Boolean);
+      const here = vouchedLabel(required, x.d.name, x.d.size, labelOf);
+      if (here != null) add(here, { unless: ren ? [...unless, ren.id] : unless });
+      if (ren) add(vouchedLabel(required, ren.to, x.d.size, labelOf), { op: ren.id, unless });
+    }
+    op.gateCredit = required.map((r) => ways.get(r.label));
   }
 }
 
@@ -1347,6 +1436,10 @@ function evaluateSelection(plan, selected) {
   const losses = [];
   const lossIfSelected = [];
   let deletes = 0;
+  let overwrites = 0;
+  // Gated deletes (header DELETE GATES): the executor removes them only once
+  // the PC's copy of their chapter(s) landed, so Review words them as swaps.
+  let swaps = 0;
   let massSeries = 0;
   const perSeries = new Map();
   for (const sp of plan.series) {
@@ -1360,8 +1453,18 @@ function evaluateSelection(plan, selected) {
       if (op.kind === "delete") {
         totals.delete.bytes += op.devFile ? op.devFile.size : 0;
         deletes += 1;
+        if (op.gate) swaps += 1;
         if (!op.sidecar && op.unit !== "sidecar") chapterDeletes += 1;
-      } else if (op.kind !== "rename") {
+      }
+      // Overwriting a foreign chapter destroys a copy the PC never had, as a
+      // delete does (adb SEND unlinks first), and auto-replace ticks them in
+      // bulk after a Link: they count toward the mass check, which is the
+      // wrong-Link guard for same-named files.
+      if (op.kind === "replace" && op.reason === "foreign" && !op.sidecar && isChapterFormat(op.name)) {
+        overwrites += 1;
+        chapterDeletes += 1;
+      }
+      if (op.kind !== "delete" && op.kind !== "rename") {
         totals[op.kind].bytes += op.size;
         totals.files += 1;
         totals.bytes += op.size;
@@ -1376,9 +1479,16 @@ function evaluateSelection(plan, selected) {
     if (counts.push || counts.update || counts.replace || counts.rename || counts.delete) totals.series += 1;
     perSeries.set(sp.seriesKey, counts);
   }
+  // count is what Start's acknowledgment must equal (ackMassDelete), so it
+  // covers the overwrites too. The split is for Review's copy (copy.js
+  // massDeleteCopy): overwrites + swaps are replaced by the PC's copy,
+  // deletes - swaps are removals nothing replaces (extras, sidecars, losses).
   const massDelete = {
-    required: massSeries > 0 || deletes >= MASS_TOTAL_DELETES,
-    count: deletes,
+    required: massSeries > 0 || deletes + overwrites >= MASS_TOTAL_DELETES,
+    count: deletes + overwrites,
+    deletes,
+    overwrites,
+    swaps,
     series: massSeries,
   };
   const repushing = plan.series.filter(
@@ -1478,6 +1588,30 @@ function changeSelection(plan, storedOps, req) {
 }
 
 /**
+ * A Removals policy change (service.js update-target, grep
+ * pruneDefaultChoices): drop every stored choice that only repeats what
+ * `plan` (built under the OLD policy) pre-selects, so the new policy's
+ * pre-selection applies to it; a choice that differs from the old default
+ * is a flip the user made and stays (user decision Q3, plan
+ * device-sync-auto-replace.md). changeSelection stores defaults too (a
+ * group checkbox re-setting what was already ticked), hence this pass.
+ * Choices for ops not in `plan`, or with another sha, are kept: their old
+ * default is unknown, and a stale sha already doesn't apply.
+ * @returns {object} the stored ops, the same object when nothing dropped.
+ */
+function pruneDefaultChoices(plan, storedOps) {
+  const stored = storedOps || {};
+  let out = null;
+  for (const [id, s] of Object.entries(stored)) {
+    const op = plan.ops.get(id);
+    if (!op || !s || s.sha !== op.sha || !!s.selected !== !!op.preselected) continue;
+    if (!out) out = { ...stored };
+    delete out[id];
+  }
+  return out || stored;
+}
+
+/**
  * sync:set-selection {rebind}. Validates against the plan's choices and
  * returns the new `rebinds` map; the caller re-plans, since the folder name
  * is part of every op id.
@@ -1510,6 +1644,10 @@ function _signature(op) {
     op.sha,
     op.pcPath,
     op.devFile ? [op.devFile.size, op.devFile.devMtime] : null,
+    // Not the gate: a delete that turned gated or gate-free since the review
+    // is still the reviewed removal (the loss check re-runs on the fresh
+    // plan), and executor.apply simulates space over the FRESH ops, so a
+    // changed gate can only make it refuse, never overrun.
   ]);
 }
 
@@ -1803,6 +1941,7 @@ function seriesDetail(plan, seriesKey, selected) {
     heldReason: sp.heldReason,
     removing: !!sp.evict,
     tags: sp.tags,
+    autoHeld: sp.autoHeld,
     rows,
     anomalies: plan.anomalies.filter((a) => a.seriesKey === seriesKey),
     suggestions: plan.suggestions.filter((g) => g.seriesKey === seriesKey),
@@ -1891,7 +2030,7 @@ function _attention(plan, sp, selected, lossSet, ackedAnomaly, verifyKeys) {
   return out;
 }
 
-/** The selected ops, in plan order (service.js's capacity: spaceNeeded). */
+/** The selected ops, in plan order (service.js _capacity: space.js simulateRun). */
 function selectedOps(plan, selected) {
   const out = [];
   for (const op of plan.ops.values()) if (selected.get(op.id) === true) out.push(op);
@@ -1999,6 +2138,7 @@ module.exports = {
   seriesLosses,
   evaluateSelection,
   changeSelection,
+  pruneDefaultChoices,
   applyRebind,
   reconcileForApply,
   promptSummary,

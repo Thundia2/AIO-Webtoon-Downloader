@@ -23,7 +23,7 @@
 // ============================================================
 
 import React, { useEffect, useState } from "react";
-import { AlertTriangle, ChevronDown, ChevronRight, EyeOff, Link, Loader2, Pencil, Trash2 } from "lucide-react";
+import { AlertTriangle, ChevronDown, ChevronRight, EyeOff, Info, Link, Loader2, Pencil, Trash2 } from "lucide-react";
 import { Badge, Button, Checkbox, Input } from "@/components/ui/primitives";
 import { Sheet } from "@/components/ui/overlay";
 import { cn, formatBytes } from "@/lib/utils";
@@ -31,7 +31,7 @@ import ChapterStrip, { SEG_CLASS } from "./ChapterStrip";
 import { Cover } from "./Ledger";
 import { useArm } from "./TargetEditor";
 import {
-  anomalyCopy, DEVICE_ONLY_COPY, heldReasonCopy, liveStateCopy, opReasonCopy, READER_ISSUE_COPY, seriesStateCopy, SUGGESTION_TIER_COPY, TAG_COPY,
+  anomalyCopy, autoHeldCopy, DEVICE_ONLY_COPY, heldReasonCopy, liveStateCopy, opReasonCopy, READER_ISSUE_COPY, seriesStateCopy, SUGGESTION_TIER_COPY, TAG_COPY,
 } from "./copy";
 import { chLabel, detailGroups, groupChanges, seriesPathLine } from "./syncView";
 
@@ -280,6 +280,14 @@ export default function SeriesSheet({ open, onClose, targetId, seriesKey, row, t
           </div>
         )}
       </div>
+      {detail && autoHeldCopy(detail.autoHeld, tn) && (
+        // Auto-replace only (planner.js sp.autoHeld, plan R9): the tags that
+        // kept its swaps unticked here, so the leftover copies aren't a mystery.
+        <div className="flex items-start gap-2 border-b px-4 py-2.5 text-[12.5px] text-muted-foreground">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-info" aria-hidden="true" />
+          <span>{autoHeldCopy(detail.autoHeld, tn)}</span>
+        </div>
+      )}
       {renaming != null && (
         <form
           className="flex items-center gap-2 border-b px-4 py-2.5"

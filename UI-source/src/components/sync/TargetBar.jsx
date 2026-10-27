@@ -22,16 +22,18 @@ import { Button, Select, SegmentedControl } from "@/components/ui/primitives";
 import { Popover } from "@/components/ui/overlay";
 import { cn } from "@/lib/utils";
 import CapacityGauge from "./CapacityGauge";
-import { DELETE_POLICY_COPY, HASH_MODE_COPY } from "./copy";
+import { DELETE_POLICY_COPY, DELETE_POLICY_ORDER, HASH_MODE_COPY } from "./copy";
 import { clock } from "./syncView";
 
 const DOT = { ok: "bg-success", info: "bg-info", warn: "bg-warning", bad: "bg-destructive", muted: "bg-muted-foreground/60" };
 const XS = "h-[26px] gap-1 px-2 text-[11.5px] [&_svg]:h-[13px] [&_svg]:w-[13px]";
 
-function MenuRow({ label, sub, children }) {
+// `stacked` puts the control under its label: Removals' three choices need
+// ~235 px, more than the 300 px menu leaves beside a label.
+function MenuRow({ label, sub, stacked, children }) {
   return (
     <div className="flex flex-col gap-1 px-1.5 py-1.5">
-      <div className="flex items-center gap-2 text-xs">
+      <div className={cn("flex gap-2 text-xs", stacked ? "flex-col items-start gap-1.5" : "items-center")}>
         <span className="flex-1 font-semibold">{label}</span>
         {children}
       </div>
@@ -123,17 +125,17 @@ function SettingsMenu({ target, tn, ops, policyNow, onOpenAll }) {
         </Button>
       }
     >
-      <MenuRow
-        label="Removals"
-        sub={`${DELETE_POLICY_COPY.guarded.label} removes chapters only after you confirm each series in Review. ${DELETE_POLICY_COPY["add-only"].label} never removes anything from ${tn}.`}
-      >
+      {/* The sub line explains the policy in force (three no longer fit one
+          sentence each in the 300 px menu); the editor and Settings → Sync
+          show the same hint. */}
+      <MenuRow label="Removals" stacked sub={(DELETE_POLICY_COPY[policy] || DELETE_POLICY_COPY.guarded).hint}>
         <SegmentedControl
           size="xs"
           aria-label="Removals"
           value={policy}
           onChange={setPolicy}
           disabled={ops.pending}
-          options={[{ value: "guarded", label: DELETE_POLICY_COPY.guarded.label }, { value: "add-only", label: DELETE_POLICY_COPY["add-only"].label }]}
+          options={DELETE_POLICY_ORDER.map((k) => ({ value: k, label: DELETE_POLICY_COPY[k].label }))}
         />
       </MenuRow>
       {err && <div className="px-1.5 pb-1 text-[11px] text-destructive">{err}</div>}
