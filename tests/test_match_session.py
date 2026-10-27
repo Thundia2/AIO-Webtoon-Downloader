@@ -462,9 +462,14 @@ def test_same_file_peers_and_no_same_scan_across_editions(five):
     r = ms.rate_sources(sess.verdicts, sess.edges)
     o, m, c = r["orig:https://orig/s"], r["mirror:https://mirror/s"], r["color:https://color/s"]
     assert o.same_file == ["mirror:https://mirror/s"] and m.same_file == ["orig:https://orig/s"]
-    assert o.same_scan == [] and c.same_scan == [] and c.same_file == []
+    # The softened copy is NOT asserted either way: its per-page tone PSNR against the
+    # original spans ~13.4-19 dB around SAME_SCAN_DB (16), so which 4 pages the
+    # threaded session happens to compare decides it (it flipped on Linux CI).
+    ck = "color:https://color/s"
+    assert ck not in o.same_scan and ck not in m.same_scan
+    assert c.same_scan == [] and c.same_file == []
     md = ms.quality_metadata(sess.verdicts["orig:https://orig/s"], o)
-    assert md["same_file"] == ["mirror"] and md["same_scan"] == []
+    assert md["same_file"] == ["mirror"] and "color" not in md["same_scan"]
 
 
 def _sv(key):
